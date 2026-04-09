@@ -1,0 +1,154 @@
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+from sqlglot import exp
+from sqlglot import parse
+from sqlglot.errors import ParseError
+
+GO_PATTERN = re.compile(r"(^|\s)GO(\s|$)", re.IGNORECASE)
+EXEC_PATTERN = re.compile(r"\bEXEC(?:UTE)?\b", re.IGNORECASE)
+OPENROWSET_PATTERN = re.compile(
+    r"\b(OPENROWSET|OPENQUERY|OPENDATASOURCE)\b",
+    re.IGNORECASE,
+)
+DBCC_PATTERN = re.compile(r"\bDBCC\b", re.IGNORECASE)
+TEMP_TABLE_PATTERN = re.compile(r"#[A-Za-z0-9_]+")
+WAITFOR_PATTERN = re.compile(r"\bWAITFOR\b", re.IGNORECASE)
+EXECUTE_AS_PATTERN = re.compile(r"\bEXECUTE\s+AS\b", re.IGNORECASE)
+SP_EXECUTESQL_PATTERN = re.compile(r"\bsp_executesql\b", re.IGNORECASE)
+DANGEROUS_HINTS_PATTERN = re.compile(
+    r"\bWITH\s*\(\s*(UPDLOCK|XLOCK|TABLOCKX)\b",
+    re.IGNORECASE,
+)
+MAXRECURSION_ZERO_PATTERN = re.compile(
+    r"\bMAXRECURSION\s+0\b",
+    re.IGNORECASE,
+)
+BLOCKED_FUNCTIONS = frozenset(
+    {
+        # Extended stored procedures
+        "xp_cmdshell",
+        "xp_dirtree",
+        "xp_fileexist",
+        "xp_fixeddrives",
+        "xp_getfiledetails",
+        "xp_loginconfig",
+        "xp_msver",
+        "xp_regread",
+        "xp_regwrite",
+        "xp_servicecontrol",
+        "xp_subdirs",
+        # OLE Automation / COM access
+        "sp_oacreate",
+        "sp_oadestroy",
+        "sp_oageterrorinfo",
+        "sp_oagetproperty",
+        "sp_oamethod",
+        "sp_oasetproperty",
+        # Mail / external notification
+        "sp_send_dbmail",
+        "xp_sendmail",
+        # Dangerous metadata / filesystem helpers
+        "fn_get_sql",
+        "fn_servershareddrives",
+    }
+)
+
+
+@dataclass(frozen=True)
+class ValidatedQuery:
+    normalized_sql: str
+
+
+class SafeSqlValidator:
+    def validate_read_only(self, sql: str) -> ValidatedQuery:
+        candidate = sql.strip()
+        if not candidate:
+            raise ValueError("SQL cannot be empty.")
+        self._check_text_rules(candidate)
+
+        try:
+            statements = parse(candidate, read="tsql")
+        except ParseError as exc:
+            raise ValueError(f"Invalid T-SQL: {exc}") from exc
+
+        if len(statements) != 1:
+            raise ValueError("Exactly one SQL statement is allowed.")
+
+        statement = statements[0]
+        self._check_statement(statement)
+
+        return ValidatedQuery(normalized_sql=statement.sql(dialect="tsql"))
+
+    def _check_text_rules(self, candidate: str) -> None:
+        if GO_PATTERN.search(candidate):
+            raise ValueError("Batch separators such as GO are not allowed.")
+        if DBCC_PATTERN.search(candidate):
+            raise ValueError("DBCC commands are not allowed in restricted mode.")
+        if EXECUTE_AS_PATTERN.search(candidate):
+            raise ValueError("EXECUTE AS is not allowed in restricted mode (privilege escalation risk).")
+        if EXEC_PATTERN.search(candidate):
+            raise ValueError("EXEC is not allowed in restricted mode.")
+        if OPENROWSET_PATTERN.search(candidate):
+            raise ValueError("External rowset access is not allowed in restricted mode.")
+        if TEMP_TABLE_PATTERN.search(candidate):
+            raise ValueError("Temporary table references are not allowed in restricted mode.")
+        if WAITFOR_PATTERN.search(candidate):
+            raise ValueError("WAITFOR is not allowed in restricted mode (DoS risk).")
+        if SP_EXECUTESQL_PATTERN.search(candidate):
+            raise ValueError("sp_executesql is not allowed in restricted mode (dynamic SQL risk).")
+        if DANGEROUS_HINTS_PATTERN.search(candidate):
+            raise ValueError(
+                "Locking hints (UPDLOCK, XLOCK, TABLOCKX) are not allowed in restricted mode."
+            )
+        if MAXRECURSION_ZERO_PATTERN.search(candidate):
+            raise ValueError(
+                "MAXRECURSION 0 (unlimited recursion) is not allowed in restricted mode."
+            )
+
+    def _check_statement(self, statement: exp.Expression) -> None:
+        if not isinstance(statement, (exp.Select, exp.Union, exp.Except, exp.Intersect)):
+            raise ValueError("Restricted mode only supports SELECT queries.")
+
+        banned_nodes = (
+            exp.Insert,
+            exp.Update,
+            exp.Delete,
+            exp.Merge,
+            exp.Create,
+            exp.Drop,
+            exp.Alter,
+            exp.Command,
+            exp.Transaction,
+        )
+        for node in statement.walk():
+            if isinstance(node, banned_nodes):
+                raise ValueError(
+                    f"Restricted mode rejected unsafe SQL node: {node.__class__.__name__}."
+                )
+
+            if isinstance(node, exp.Into):
+                raise ValueError("SELECT INTO is not allowed in restricted mode.")
+
+            if isinstance(node, exp.Table):
+                self._check_table_reference(node)
+
+            if isinstance(node, exp.Anonymous):
+                self._check_function_call(node)
+
+    def _check_table_reference(self, table: exp.Table) -> None:
+        if table.args.get("catalog") is not None:
+            raise ValueError(
+                "Cross-database and linked-server references are not allowed in restricted mode."
+            )
+        if str(table.this).startswith("#"):
+            raise ValueError("Temporary table references are not allowed in restricted mode.")
+
+    def _check_function_call(self, function: exp.Anonymous) -> None:
+        function_name = str(function.this).lower()
+        if function_name in BLOCKED_FUNCTIONS:
+            raise ValueError(
+                f"Function '{function_name}' is not allowed in restricted mode."
+            )

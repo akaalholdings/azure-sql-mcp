@@ -1,0 +1,30 @@
+services:
+  azure-sql-mcp:
+    build:
+      context: .
+    ports:
+      - "8000:8000"
+    environment:
+      AZURE_SQL_SERVER: ${AZURE_SQL_SERVER:-sqlserver}
+      AZURE_SQL_DEFAULT_DATABASE: ${AZURE_SQL_DEFAULT_DATABASE:-master}
+      AZURE_SQL_ALLOWED_DATABASES: ${AZURE_SQL_ALLOWED_DATABASES:-master}
+      AZURE_SQL_AUTH_MODE: ${AZURE_SQL_AUTH_MODE:-sql-password}
+      AZURE_SQL_USERNAME: ${AZURE_SQL_USERNAME:-sa}
+      AZURE_SQL_PASSWORD: ${AZURE_SQL_PASSWORD:-YourStrong!Passw0rd}
+      AZURE_SQL_ACCESS_MODE: ${AZURE_SQL_ACCESS_MODE:-restricted}
+    depends_on:
+      - sqlserver
+
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "YourStrong!Passw0rd"
+      MSSQL_PID: "Developer"
+    ports:
+      - "1433:1433"
+    volumes:
+      - sqlserver_data:/var/opt/mssql
+
+volumes:
+  sqlserver_data:

@@ -1,0 +1,63 @@
+from __future__ import annotations
+
+import pytest
+
+from azure_sql_mcp.query_store import QueryStoreService
+
+
+class FakeExecutor:
+    def __init__(self):
+        self.query = None
+        self.params = None
+
+    async def fetch_all(self, database_name, query, params=None):
+        self.query = query
+        self.params = params
+        return []
+
+
+@pytest.mark.asyncio
+async def test_top_queries_uses_requested_sort_expression():
+    executor = FakeExecutor()
+    service = QueryStoreService(executor)
+
+    await service.get_top_queries("appdb", "cpu", 30, 5)
+
+    assert "ORDER BY SUM(rs.avg_cpu_time * rs.count_executions) DESC" in executor.query
+    assert executor.params == [5, 30]
+
+
+@pytest.mark.asyncio
+async def test_top_queries_supports_extended_sort_metrics():
+    executor = FakeExecutor()
+    service = QueryStoreService(executor)
+
+    await service.get_top_queries("appdb", "logical_io", 45, 10)
+
+    assert "SUM(rs.avg_logical_io_reads * rs.count_executions)" in executor.query
+    assert "avg_query_max_used_memory" in executor.query
+    assert "CAST(MAX(rsi.end_time) AS datetime2(7)) AS last_seen_utc" in executor.query
+    assert executor.params == [10, 45]
+
+
+@pytest.mark.asyncio
+async def test_top_queries_uses_resource_blend_query_shape():
+    executor = FakeExecutor()
+    service = QueryStoreService(executor)
+
+    await service.get_top_queries("appdb", "resource_blend", 60, 7)
+
+    assert "WITH QueryMetrics AS" in executor.query
+    assert "resource_blend_score" in executor.query
+    assert "MAX(total_logical_io_reads) AS max_logical_io_reads" in executor.query
+    assert "CAST(MAX(rsi.end_time) AS datetime2(7)) AS last_seen_utc" in executor.query
+    assert executor.params == [60, 7]
+
+
+@pytest.mark.asyncio
+async def test_top_queries_rejects_unknown_sort():
+    executor = FakeExecutor()
+    service = QueryStoreService(executor)
+
+    with pytest.raises(ValueError, match="resource_blend"):
+        await service.get_top_queries("appdb", "bad-sort", 30, 5)
