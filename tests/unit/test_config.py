@@ -118,3 +118,31 @@ def test_sql_password_requires_credentials(monkeypatch):
         assert "AZURE_SQL_USERNAME and AZURE_SQL_PASSWORD" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("Expected sql-password validation failure.")
+
+
+def test_validate_database_name_is_case_insensitive(monkeypatch):
+    """Azure SQL database names are case-insensitive; a client sending 'AppDb'
+    must resolve to the canonical allowlist spelling instead of failing."""
+    monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
+    monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "appdb")
+    monkeypatch.setenv("AZURE_SQL_ALLOWED_DATABASES", "appdb,ReportingDb")
+
+    config = load_server_config([])
+
+    assert config.validate_database_name("AppDb") == "appdb"
+    assert config.validate_database_name("reportingdb") == "ReportingDb"
+    with pytest.raises(ValueError, match="not in AZURE_SQL_ALLOWED_DATABASES"):
+        config.validate_database_name("otherdb")
+
+
+def test_tool_timeout_must_cover_query_timeout(monkeypatch):
+    """A tool timeout below the query timeout would cancel every long query
+    before the driver-level timeout can fire."""
+    monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
+    monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "appdb")
+    monkeypatch.setenv("AZURE_SQL_ALLOWED_DATABASES", "appdb")
+    monkeypatch.setenv("AZURE_SQL_QUERY_TIMEOUT_SECONDS", "30")
+    monkeypatch.setenv("AZURE_SQL_TOOL_TIMEOUT_SECONDS", "10")
+
+    with pytest.raises(ValueError, match="TOOL_TIMEOUT_SECONDS must be >="):
+        load_server_config([])

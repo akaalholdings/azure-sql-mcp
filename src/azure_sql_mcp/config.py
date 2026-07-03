@@ -145,12 +145,18 @@ class ServerConfig:
     remote_admin_enabled: bool
 
     def validate_database_name(self, database_name: str | None) -> str:
+        """Resolve a database against the allowlist, case-insensitively.
+
+        Azure SQL database names are case-insensitive; the canonical allowlist
+        spelling is returned so downstream code sees one consistent name.
+        """
         candidate = (database_name or self.default_database).strip()
-        if candidate not in self.allowed_databases:
-            raise ValueError(
-                f"Database '{candidate}' is not in AZURE_SQL_ALLOWED_DATABASES."
-            )
-        return candidate
+        for allowed in self.allowed_databases:
+            if candidate.casefold() == allowed.casefold():
+                return allowed
+        raise ValueError(
+            f"Database '{candidate}' is not in AZURE_SQL_ALLOWED_DATABASES."
+        )
 
     def is_tool_enabled(self, tool_name: str) -> bool:
         """Check whether a tool should be registered based on configured tool_groups."""
@@ -295,6 +301,11 @@ def load_server_config(argv: list[str] | None = None) -> ServerConfig:
         if tool_timeout_raw
         else query_timeout_seconds + 15
     )
+    if tool_timeout_seconds < query_timeout_seconds:
+        raise ValueError(
+            "AZURE_SQL_TOOL_TIMEOUT_SECONDS must be >= AZURE_SQL_QUERY_TIMEOUT_SECONDS: "
+            "the outer tool timeout would cancel every query before its own timeout."
+        )
 
     if not server:
         raise ValueError("AZURE_SQL_SERVER is required.")
