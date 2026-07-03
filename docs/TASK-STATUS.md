@@ -271,6 +271,25 @@
 | 20.4 | Sanitize error messages — strip connection strings, server names, IPs | `done` | — | 2026-04-01 | 2026-04-01 | `sanitize_error_message()` integrated into both `_run_tool` exception paths |
 | 20.5 | Unit tests for observability enhancements | `done` | — | 2026-04-01 | 2026-04-01 | `test_observability.py`: 11 tests |
 
+## Phase 21 — Ultimate MCP Hardening
+
+| # | Task | Status | Owner | Started | Completed | Notes |
+|---|------|--------|-------|---------|-----------|-------|
+| 21.1 | HTTP/SSE bearer auth | `done` | codex | 2026-07-01 | 2026-07-01 | `AZURE_SQL_MCP_BEARER_TOKEN` required for `sse`/`streamable-http`; FastMCP auth settings + `token_verifier` use constant-time comparison |
+| 21.2 | Admin write policy and audit | `done` | codex | 2026-07-01 | 2026-07-01 | `AZURE_SQL_WRITE_POLICY`, dry-run defaults, raw SQL limited to read-only SELECT batches, remote admin opt-in, JSONL audit with redacted SQL by default |
+| 21.3 | Structured output and token-safe artifacts | `done` | codex | 2026-07-01 | 2026-07-01 | Tools return structured dictionaries; raw SHOWPLAN XML defaults to bounded `azuresql-artifact://...` resource metadata |
+| 21.4 | Query Store plan enforcement workflow | `done` | codex | 2026-07-01 | 2026-07-01 | `review_plan_enforcement`, `dry_run_plan_action`, `apply_plan_action`, and dry-run `plan_enforcer_tick`; review windows flow into Query Store evidence |
+| 21.5 | Quality gates | `done` | codex | 2026-07-01 | 2026-07-01 | Added `py.typed`, ruff/pyright dev deps, CI gates for ruff, pyright, compileall, pytest, and `uv build` |
+
+## Phase 22 — Azure SQL Diagnostic Query Parity
+
+| # | Task | Status | Owner | Started | Completed | Notes |
+|---|------|--------|-------|---------|-----------|-------|
+| 22.1 | Diagnostic query parity service | `done` | codex | 2026-07-01 | 2026-07-01 | Added `diagnostics.py` with DB-safe configuration, storage/log/VLF, connection, cache, routine, and object/index diagnostics |
+| 22.2 | Six read-only performance tools | `done` | codex | 2026-07-01 | 2026-07-01 | `get_database_configuration`, `get_storage_diagnostics`, `get_connection_diagnostics`, `get_top_cached_queries`, `get_cached_routine_stats`, `get_object_index_diagnostics` |
+| 22.3 | Diagnostic script coverage matrix | `done` | codex | 2026-07-01 | 2026-07-01 | `docs/diagnostic-query-coverage.md` maps all 56 reference queries to added, covered, or skipped outcomes |
+| 22.4 | Unit and registration coverage | `done` | codex | 2026-07-01 | 2026-07-01 | Service tests cover bounds, optional DMV failures, no raw plan XML, and restricted-mode performance tool registration |
+
 ---
 
 ## Stripped Items (Not Applicable to Azure SQL DB PaaS)

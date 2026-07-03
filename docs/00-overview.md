@@ -7,32 +7,38 @@ Transform the Azure SQL MCP server from a functional implementation into a best-
 ## Current State
 
 The server is a Python 3.12+ FastMCP application providing:
-- 11 MCP tools (list_databases, check_capabilities, list_schemas, list_objects, get_object_details, execute_sql, explain_query, get_top_queries, analyze_index_recommendations, analyze_db_health, execute_tsql_unrestricted)
+- 57 MCP tools in unrestricted mode; 51 tools in restricted mode
 - Restricted (read-only) and unrestricted execution modes
 - 4 auth modes (Entra default, service principal, interactive, SQL password)
-- 3 transports (STDIO, SSE, Streamable HTTP)
+- 3 transports (STDIO, SSE, Streamable HTTP) with bearer auth required for HTTP/SSE and explicit remote-admin opt-in for apply-capable admin behavior
 - SQL validation via sqlglot AST walking
 - Database allowlist enforcement
+- Structured tool output, prompt/resources support, and token-safe artifact resources
+- Audited admin write policy with dry-run defaults, read-only raw SQL apply, and generated Query Store force/unforce workflows
 
 ## Feature Gap Analysis
 
 | Feature | Status | Action |
 |---------|--------|--------|
-| Buffer/cache hit rates | Missing | **Add** |
-| Connection health | Missing | **Add** |
-| Constraint health (invalid FKs) | Missing | **Add** |
-| Index health (duplicates, bloat) | Partial (frag + unused) | **Enhance** |
-| Replication/geo-rep health | Missing | **Add** |
-| Sequence/identity exhaustion | Missing | **Add** |
-| Workload-based index recs | DMV-only | **Enhance** |
-| Query-specific index analysis | Missing | **Add** |
-| Resource-blended top queries | Single-metric sort | **Enhance** |
-| Connection pooling | Missing | **Add** |
-| Retry for transient errors | Missing | **Add** |
-| SQL validation approach | Blacklist (banned nodes) | **Enhance** |
-| MCP Resources | Missing | **Add** |
-| MCP Prompts | Missing | **Add** |
-| Schema comparison | Missing | **Add** |
+| Buffer/cache hit rates | Done | Maintain |
+| Connection health | Done | Maintain |
+| Constraint health (invalid FKs) | Done | Maintain |
+| Index health (duplicates, bloat) | Done | Maintain |
+| Replication/geo-rep health | Done | Maintain |
+| Sequence/identity exhaustion | Done | Maintain |
+| Workload-based index recs | Done | Maintain |
+| Query-specific index analysis | Done | Maintain |
+| Resource-blended top queries | Done | Maintain |
+| Connection pooling | Done | Maintain |
+| Retry for transient errors | Done | Maintain |
+| SQL validation approach | Hardened | Maintain |
+| MCP Resources | Done | Includes artifact resources |
+| MCP Prompts | Done | Maintain |
+| Schema comparison | Done | Maintain |
+| HTTP/SSE bearer auth | Done | Maintain |
+| Admin write policy/audit | Done | Maintain |
+| Query Store plan enforcement | Done | Review/dry-run/apply |
+| Azure SQL diagnostic query parity | Done | Maintain DB-safe DMV coverage |
 
 ### Existing Strengths
 
@@ -85,6 +91,9 @@ src/azure_sql_mcp/
   __init__.py
   server.py                  # MCP app, tool/resource/prompt registration
   config.py                  # CLI + env var configuration
+  transport_auth.py          # HTTP/SSE bearer token verifier
+  admin_policy.py            # write policy, hard denylist, JSONL audit
+  artifact_store.py          # token-safe artifact resources
   auth.py                    # Azure credential management
   connection.py              # Query executor (uses pool)
   connection_pool.py         # [NEW] Per-database connection pooling
@@ -95,7 +104,9 @@ src/azure_sql_mcp/
   introspection.py           # Schema/object discovery (enhanced)
   plans.py                   # Execution plans (enhanced with what-if)
   query_store.py             # Query Store analysis (enhanced)
+  plan_enforcement.py        # Query Store review/dry-run/apply workflow
   health.py                  # Health checks (6 new categories)
+  diagnostics.py             # Azure SQL DB diagnostic query parity tools
   index_recommendations.py   # Index analysis (enhanced)
   query_index_analysis.py    # [NEW] Query-specific index analysis
   capabilities.py            # Capability probing

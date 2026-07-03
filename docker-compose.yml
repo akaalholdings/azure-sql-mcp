@@ -12,6 +12,13 @@ services:
       AZURE_SQL_USERNAME: ${AZURE_SQL_USERNAME:-sa}
       AZURE_SQL_PASSWORD: ${AZURE_SQL_PASSWORD:-YourStrong!Passw0rd}
       AZURE_SQL_ACCESS_MODE: ${AZURE_SQL_ACCESS_MODE:-restricted}
+      AZURE_SQL_MCP_BEARER_TOKEN: ${AZURE_SQL_MCP_BEARER_TOKEN:?Set AZURE_SQL_MCP_BEARER_TOKEN for HTTP transport}
+      AZURE_SQL_WRITE_POLICY: ${AZURE_SQL_WRITE_POLICY:-review}
+      AZURE_SQL_ENABLE_REMOTE_ADMIN: ${AZURE_SQL_ENABLE_REMOTE_ADMIN:-0}
+      AZURE_SQL_AUDIT_DIR: ${AZURE_SQL_AUDIT_DIR:-/audit}
+      AZURE_SQL_AUDIT_FULL_SQL: ${AZURE_SQL_AUDIT_FULL_SQL:-0}
+    volumes:
+      - azure_sql_mcp_audit:/audit
     depends_on:
       - sqlserver
 
@@ -28,3 +35,4 @@ services:
 
 volumes:
   sqlserver_data:
+  azure_sql_mcp_audit:

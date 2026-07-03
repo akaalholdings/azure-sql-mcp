@@ -25,5 +25,17 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
+      - name: Ruff
+        run: uv run ruff check src tests
+
+      - name: Pyright
+        run: uv run pyright
+
+      - name: Compile
+        run: uv run python -m compileall -q src tests
+
       - name: Run tests
         run: uv run pytest -q
+
+      - name: Build
+        run: uv build

@@ -40,11 +40,18 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
+    "pyright>=1.1.407",
     "pytest>=8.4.0",
     "pytest-asyncio>=1.2.0",
+    "ruff>=0.14.0",
 ]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 asyncio_default_fixture_loop_scope = "function"
 addopts = "--import-mode=importlib"
+
+[tool.pyright]
+include = ["src"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"

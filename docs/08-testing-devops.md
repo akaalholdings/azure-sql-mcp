@@ -124,11 +124,12 @@ async def test_release_and_reuse(sample_config):
 
 Add to `pyproject.toml`:
 ```toml
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
+    "pyright>=1.1.407",
     "pytest>=8.4.0",
     "pytest-asyncio>=1.2.0",
-    "pytest-mock>=3.14.0",
+    "ruff>=0.14.0",
 ]
 ```
 
@@ -253,10 +254,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
-      - run: cd AzureSqlMcp && uv sync --dev
-      - run: cd AzureSqlMcp && uv run pytest tests/unit/ -v
-      - run: cd AzureSqlMcp && uv run ruff check src/
-      - run: cd AzureSqlMcp && uv run mypy src/ --ignore-missing-imports
+      - run: uv sync
+      - run: uv run ruff check src tests
+      - run: uv run pyright
+      - run: uv run python -m compileall -q src tests
+      - run: uv run pytest -q
+      - run: uv build
 ```
 
 ### integration.yml (manual dispatch or on main merge)
@@ -300,13 +303,12 @@ jobs:
 
 Add to `pyproject.toml`:
 ```toml
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
+    "pyright>=1.1.407",
     "pytest>=8.4.0",
     "pytest-asyncio>=1.2.0",
-    "pytest-mock>=3.14.0",
-    "ruff>=0.8.0",
-    "mypy>=1.14.0",
+    "ruff>=0.14.0",
 ]
 ```
 
@@ -383,8 +385,9 @@ graph TD
 
 ## Verification
 
-1. `uv run pytest tests/unit/ -v` -- all tests pass
-2. `uv run ruff check src/` -- no lint errors
-3. `docker build -t azure-sql-mcp .` -- builds successfully
-4. `docker-compose up` -- server starts and connects to local SQL Server
-5. CI pipeline runs green on a test PR
+1. `uv run ruff check src tests` -- no lint errors
+2. `uv run pyright` -- source type check passes
+3. `uv run python -m compileall -q src tests` -- source and tests compile
+4. `uv run pytest -q` -- all tests pass
+5. `uv build` -- package builds successfully
+6. `docker build -t azure-sql-mcp .` -- image builds successfully
