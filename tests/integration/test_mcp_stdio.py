@@ -59,6 +59,13 @@ def _tool_payload(result: Any) -> Any:
     return json.loads(result.content[0].text)
 
 
+def _rows(payload: Any) -> Any:
+    """List-returning tools are wrapped by _format_response as {'result': [...]}."""
+    if isinstance(payload, dict) and set(payload) == {"result"}:
+        return payload["result"]
+    return payload
+
+
 def _resource_payload(result: Any) -> Any:
     assert len(result.contents) == 1
     return json.loads(result.contents[0].text)
@@ -147,7 +154,7 @@ async def test_mcp_stdio_end_to_end(
                     {"database_name": integration_database_name},
                 )
             )
-            assert any(row["schema_name"] == prepared_test_schema for row in schemas)
+            assert any(row["schema_name"] == prepared_test_schema for row in _rows(schemas))
 
             tables = _tool_payload(
                 await session.call_tool(
@@ -159,7 +166,7 @@ async def test_mcp_stdio_end_to_end(
                     },
                 )
             )
-            assert {row["object_name"] for row in tables} >= {"Customers", "Orders"}
+            assert {row["object_name"] for row in _rows(tables)} >= {"Customers", "Orders"}
 
             views = _tool_payload(
                 await session.call_tool(
@@ -171,7 +178,7 @@ async def test_mcp_stdio_end_to_end(
                     },
                 )
             )
-            assert {row["object_name"] for row in views} >= {"vw_OrderSummary"}
+            assert {row["object_name"] for row in _rows(views)} >= {"vw_OrderSummary"}
 
             procedures = _tool_payload(
                 await session.call_tool(
@@ -183,7 +190,7 @@ async def test_mcp_stdio_end_to_end(
                     },
                 )
             )
-            assert {row["object_name"] for row in procedures} >= {"usp_GetOrders"}
+            assert {row["object_name"] for row in _rows(procedures)} >= {"usp_GetOrders"}
 
             matches = _tool_payload(
                 await session.call_tool(
@@ -194,7 +201,7 @@ async def test_mcp_stdio_end_to_end(
                     },
                 )
             )
-            assert {row["object_name"] for row in matches} >= {
+            assert {row["object_name"] for row in _rows(matches)} >= {
                 "Orders",
                 "vw_OrderSummary",
                 "usp_GetOrders",
@@ -243,7 +250,7 @@ async def test_mcp_stdio_end_to_end(
                     },
                 )
             )
-            stats_by_table = {row["table_name"]: row for row in stats}
+            stats_by_table = {row["table_name"]: row for row in _rows(stats)}
             assert stats_by_table["Orders"]["approximate_row_count"] >= 2
 
             active_sessions = _tool_payload(
