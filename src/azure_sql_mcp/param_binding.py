@@ -10,6 +10,15 @@ logger = logging.getLogger(__name__)
 
 PARAM_PATTERN = re.compile(r"@(\w+)")
 
+# Type names come from sys.types and are embedded into DECLARE statements, so
+# they must look like a plain (optionally parameterized) type. Anything else —
+# e.g. a hostile user-defined type name — falls back to nvarchar(256).
+SAFE_TYPE_PATTERN = re.compile(
+    r"^[a-z_][a-z0-9_]*(?:\(\s*(?:max|\d{1,5}(?:\s*,\s*\d{1,5})?)\s*\))?$",
+    re.IGNORECASE,
+)
+SAFE_FALLBACK_TYPE = "nvarchar(256)"
+
 # Type-based fallback values (18.3) when stats are unavailable
 TYPE_FALLBACKS: dict[str, str] = {
     "int": "1",
@@ -310,6 +319,8 @@ class ParameterBindingService:
         if base_type in {"datetime2", "datetimeoffset", "time"}:
             scale = int(row.get("scale", 7))
             return f"{base_type}({scale})"
+        if not SAFE_TYPE_PATTERN.match(base_type):
+            return SAFE_FALLBACK_TYPE
         return base_type
 
     def _format_literal(self, data_type: str, value: Any) -> str:

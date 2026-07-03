@@ -487,7 +487,11 @@ class AzureSqlMcpApplication:
             )
 
         @self.mcp.tool(
-            description="Execute a read-only SQL query in restricted mode.",
+            description=(
+                "Execute a read-only SQL query in restricted mode. The query may be "
+                "preceded by DECLARE @var and SET @var = ... statements, followed by "
+                "exactly one SELECT."
+            ),
             annotations=ToolAnnotations(
                 title="Execute SQL",
                 readOnlyHint=True,

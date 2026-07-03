@@ -65,6 +65,13 @@ class ValidatedQuery:
 
 class SafeSqlValidator:
     def validate_read_only(self, sql: str) -> ValidatedQuery:
+        """Validate a read-only batch: optional DECLARE / SET @variable statements
+        followed by exactly one SELECT-style statement.
+
+        The variable prefix exists so parameterized queries can be executed with
+        bound values (T-SQL variables are batch-scoped, so the DECLARE/SET block
+        and the query must ship as a single batch).
+        """
         candidate = sql.strip()
         if not candidate:
             raise ValueError("SQL cannot be empty.")
@@ -75,25 +82,36 @@ class SafeSqlValidator:
         except ParseError as exc:
             raise ValueError(f"Invalid T-SQL: {exc}") from exc
 
-        if len(statements) != 1:
-            raise ValueError("Exactly one SQL statement is allowed.")
+        if not statements:
+            raise ValueError("Invalid T-SQL: parser returned no statements.")
 
-        statement = statements[0]
-        if statement is None:
+        *prefix, final = statements
+        for statement in prefix:
+            if statement is None:
+                raise ValueError("Invalid T-SQL: parser returned an empty statement.")
+            self._check_prefix_statement(statement)
+        if final is None:
             raise ValueError("Invalid T-SQL: parser returned an empty statement.")
-        self._check_statement(statement)
+        self._check_statement(final)
 
-        return ValidatedQuery(normalized_sql=statement.sql(dialect="tsql"))
+        normalized = ";\n".join(
+            statement.sql(dialect="tsql") for statement in statements if statement
+        )
+        return ValidatedQuery(normalized_sql=normalized)
 
     def extract_table_references(self, sql: str) -> list[dict[str, str | None]]:
         """Return base table references from a validated read-only statement."""
         validated = self.validate_read_only(sql)
-        statements = parse(validated.normalized_sql, read="tsql")
-        statement = statements[0]
-        if statement is None:
+        statements = [
+            statement
+            for statement in parse(validated.normalized_sql, read="tsql")
+            if statement is not None
+        ]
+        if not statements:
             raise ValueError("Invalid T-SQL: parser returned an empty statement.")
         cte_names = {
             str(cte.alias_or_name).lower()
+            for statement in statements
             for cte in statement.find_all(exp.CTE)
             if cte.alias_or_name
         }
@@ -102,7 +120,10 @@ class SafeSqlValidator:
         positions: dict[tuple[str | None, str], int] = {}
         references: list[dict[str, str | None]] = []
         normalized_lookup = validated.normalized_sql.lower()
-        for table in statement.find_all(exp.Table):
+        all_tables = (
+            table for statement in statements for table in statement.find_all(exp.Table)
+        )
+        for table in all_tables:
             table_name = str(table.this).strip("[]")
             if not table_name or table_name.lower() in cte_names:
                 continue
@@ -155,7 +176,37 @@ class SafeSqlValidator:
     def _check_statement(self, statement: Any) -> None:
         if not isinstance(statement, (exp.Select, exp.Union, exp.Except, exp.Intersect)):
             raise ValueError("Restricted mode only supports SELECT queries.")
+        self._check_tree(statement)
 
+    def _check_prefix_statement(self, statement: Any) -> None:
+        """Allow only DECLARE and SET @variable statements before the final SELECT."""
+        if isinstance(statement, exp.Declare):
+            self._check_tree(statement)
+            return
+        if isinstance(statement, exp.Set) and self._is_variable_assignment(statement):
+            self._check_tree(statement)
+            return
+        raise ValueError(
+            "Exactly one SQL statement is allowed. Only DECLARE and SET @variable "
+            "assignments may precede the final SELECT statement."
+        )
+
+    @staticmethod
+    def _is_variable_assignment(statement: exp.Set) -> bool:
+        """True only for `SET @var = ...`; session options like SET NOCOUNT ON
+        parse with a Column (not a Parameter) on the left and are rejected."""
+        items = statement.expressions
+        if not items:
+            return False
+        for item in items:
+            assignment = item.this if isinstance(item, exp.SetItem) else None
+            if not isinstance(assignment, exp.EQ):
+                return False
+            if not isinstance(assignment.this, exp.Parameter):
+                return False
+        return True
+
+    def _check_tree(self, statement: Any) -> None:
         banned_nodes = (
             exp.Insert,
             exp.Update,

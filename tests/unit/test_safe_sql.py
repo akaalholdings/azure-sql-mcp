@@ -101,6 +101,75 @@ def test_allows_maxrecursion_nonzero(validator):
     assert validated.normalized_sql
 
 
+def test_allows_declare_set_prefix_before_select(validator):
+    """Auto-bound parameterized queries ship as DECLARE/SET + SELECT batches."""
+    validated = validator.validate_read_only(
+        "DECLARE @UserId int;\n"
+        "SET @UserId = 42;\n\n"
+        "SELECT * FROM dbo.Users WHERE UserId = @UserId"
+    )
+    assert "DECLARE" in validated.normalized_sql.upper()
+    assert "SELECT" in validated.normalized_sql.upper()
+
+
+def test_allows_declare_with_inline_default(validator):
+    validated = validator.validate_read_only(
+        "DECLARE @Cutoff datetime2(7) = SYSDATETIME(); SELECT * FROM dbo.Orders WHERE CreatedAt >= @Cutoff"
+    )
+    assert validated.normalized_sql
+
+
+def test_validated_prefix_batch_revalidates(validator):
+    """The normalized batch must itself pass validation (idempotent round-trip)."""
+    validated = validator.validate_read_only(
+        "DECLARE @n int; SET @n = 5; SELECT TOP (@n) name FROM sys.objects"
+    )
+    revalidated = validator.validate_read_only(validated.normalized_sql)
+    assert revalidated.normalized_sql
+
+
+@pytest.mark.parametrize(
+    "sql, match",
+    [
+        (
+            "SET NOCOUNT ON; SELECT 1",
+            "Only DECLARE and SET @variable",
+        ),
+        (
+            "SET SHOWPLAN_XML ON; SELECT 1",
+            "Only DECLARE and SET @variable",
+        ),
+        (
+            "DECLARE @x int; DELETE FROM dbo.Users",
+            "Restricted mode only supports SELECT queries.",
+        ),
+        (
+            "DECLARE @x int; SET @x = 1; SELECT 1; SELECT 2",
+            "Only DECLARE and SET @variable",
+        ),
+        (
+            "SELECT 1; DECLARE @x int",
+            "Only DECLARE and SET @variable",
+        ),
+        (
+            "SET @x = (SELECT TOP 1 id FROM [Other].[dbo].[T]); SELECT @x",
+            "Cross-database and linked-server references are not allowed in restricted mode.",
+        ),
+    ],
+)
+def test_rejects_unsafe_prefix_batches(validator, sql, match):
+    with pytest.raises(ValueError, match=match):
+        validator.validate_read_only(sql)
+
+
+def test_extract_table_references_from_bound_batch(validator):
+    refs = validator.extract_table_references(
+        "DECLARE @UserId int;\nSET @UserId = 42;\n\n"
+        "SELECT * FROM dbo.Users WHERE UserId = @UserId"
+    )
+    assert refs == [{"schema": "dbo", "table": "Users"}]
+
+
 def test_extract_table_references_excludes_cte_names(validator):
     refs = validator.extract_table_references(
         """

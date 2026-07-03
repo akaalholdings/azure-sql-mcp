@@ -423,6 +423,43 @@ async def test_tune_query_returns_structured_evidence_pack(app: AzureSqlMcpAppli
 
 
 @pytest.mark.asyncio
+async def test_tune_query_auto_bind_params_survives_validation(app: AzureSqlMcpApplication) -> None:
+    """Regression: auto-bound DECLARE/SET + SELECT batches must pass the read-only
+    validator end-to-end. Only the executor is mocked; param binding, the
+    validator, and the plans service run for real."""
+    from azure_sql_mcp.connection import QueryResult
+
+    plan_xml = (
+        '<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">'
+        "</ShowPlanXML>"
+    )
+    app.executor.fetch_all = AsyncMock(return_value=[])  # type: ignore[method-assign]
+    app.executor.execute_session = AsyncMock(  # type: ignore[method-assign]
+        return_value=[
+            [],
+            [QueryResult(columns=("plan",), rows=[{"plan": plan_xml}])],
+            [],
+        ]
+    )
+
+    payload = await app._tune_query(
+        "appdb",
+        "SELECT * FROM dbo.Users WHERE UserId = @UserId",
+        analyze=True,
+        auto_bind_params=True,
+        include_raw_xml=False,
+        window_minutes=60,
+    )
+
+    binding = payload["parameter_binding"]
+    assert binding is not None
+    assert binding["parameters"][0]["name"] == "@UserId"
+    assert payload["evidence"]["plan"]["summary"]["statement_count"] == 0
+    # The bound batch reached execution (validator accepted the DECLARE prefix).
+    assert "DECLARE" in payload["evidence"]["execution_sample"]["normalized_sql"].upper()
+
+
+@pytest.mark.asyncio
 async def test_benchmark_query_rewrite_reports_sample_equivalence(app: AzureSqlMcpApplication) -> None:
     app._explain_query = AsyncMock(  # type: ignore[method-assign]
         return_value={

@@ -81,6 +81,20 @@ def test_type_fallback_unknown_returns_null() -> None:
     assert get_type_fallback("geometry") == "NULL"
 
 
+def test_format_data_type_rejects_hostile_type_names() -> None:
+    """Catalog type names are embedded in DECLARE statements; a hostile UDT name
+    must fall back to a safe type instead of being interpolated verbatim."""
+    service = ParameterBindingService(executor=FakeExecutor())
+    row = {"data_type": "int; DROP TABLE dbo.Users --", "max_length": 4}
+    assert service._format_data_type(row) == "nvarchar(256)"
+
+
+def test_format_data_type_allows_plain_types() -> None:
+    service = ParameterBindingService(executor=FakeExecutor())
+    assert service._format_data_type({"data_type": "int"}) == "int"
+    assert service._format_data_type({"data_type": "uniqueidentifier"}) == "uniqueidentifier"
+
+
 # --- 18.2 + 18.4: Binding service tests ---
 
 @pytest.mark.asyncio
