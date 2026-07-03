@@ -186,3 +186,25 @@ def test_extract_table_references_excludes_cte_names(validator):
         {"schema": "dbo", "table": "Orders"},
         {"schema": "sales", "table": "Customers"},
     ]
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # Words that trip text rules when they appear as string data, not code.
+        "SELECT * FROM dbo.Notes WHERE body = 'time to go home'",
+        "SELECT * FROM dbo.Items WHERE tag = 'item#1'",
+        "SELECT * FROM dbo.Logs WHERE message = 'please execute the plan'",
+        "SELECT * FROM dbo.Jobs WHERE description = 'waitfor approval'",
+        "SELECT 1 AS n -- EXEC in a comment is not code",
+    ],
+)
+def test_text_rules_ignore_literals_and_comments(validator, sql):
+    assert validator.validate_read_only(sql).normalized_sql
+
+
+def test_text_rules_still_reject_code_outside_literals(validator):
+    with pytest.raises(ValueError, match="EXEC is not allowed"):
+        validator.validate_read_only("EXEC dbo.DoThing 'safe string'")
+    with pytest.raises(ValueError, match="Temporary table references"):
+        validator.validate_read_only("SELECT * FROM #tmp")

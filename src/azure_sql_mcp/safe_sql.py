@@ -27,6 +27,10 @@ MAXRECURSION_ZERO_PATTERN = re.compile(
     r"\bMAXRECURSION\s+0\b",
     re.IGNORECASE,
 )
+_LINE_COMMENT_PATTERN = re.compile(r"--[^\r\n]*")
+_BLOCK_COMMENT_PATTERN = re.compile(r"/\*.*?\*/", re.DOTALL)
+_STRING_LITERAL_PATTERN = re.compile(r"N?'(?:''|[^'])*'", re.IGNORECASE)
+
 BLOCKED_FUNCTIONS = frozenset(
     {
         # Extended stored procedures
@@ -56,6 +60,17 @@ BLOCKED_FUNCTIONS = frozenset(
         "fn_servershareddrives",
     }
 )
+
+
+def strip_literals_and_comments(sql: str) -> str:
+    """Replace comments and string literals so text-rule scans only see code.
+
+    Keyword patterns (GO, EXEC, WAITFOR, #temp, ...) must not fire on words
+    that merely appear inside string data or comments.
+    """
+    without_block_comments = _BLOCK_COMMENT_PATTERN.sub(" ", sql)
+    without_comments = _LINE_COMMENT_PATTERN.sub(" ", without_block_comments)
+    return _STRING_LITERAL_PATTERN.sub("?", without_comments)
 
 
 @dataclass(frozen=True)
@@ -147,7 +162,12 @@ class SafeSqlValidator:
             key=lambda ref: positions[(ref.get("schema"), str(ref["table"]))],
         )
 
-    def _check_text_rules(self, candidate: str) -> None:
+    def _check_text_rules(self, sql: str) -> None:
+        # Scan with literals and comments removed: a WHERE clause comparing
+        # against 'go home' or 'item#1' is data, not a batch separator or a
+        # temp table. Actual EXEC/DML in code positions is still caught here
+        # and again by the AST walk.
+        candidate = strip_literals_and_comments(sql)
         if GO_PATTERN.search(candidate):
             raise ValueError("Batch separators such as GO are not allowed.")
         if DBCC_PATTERN.search(candidate):

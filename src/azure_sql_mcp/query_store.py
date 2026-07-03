@@ -4,6 +4,19 @@ from typing import Any
 
 from .connection import AzureSqlExecutor
 
+def _escape_like_pattern(value: str) -> str:
+    """Escape LIKE wildcards so query text matches as a literal substring.
+
+    Query text routinely contains % and _ (LIKE clauses, identifiers); left
+    unescaped they turn the fingerprint into a wildcard pattern.
+    """
+    return (
+        value.replace("[", "[[]")
+        .replace("%", "[%]")
+        .replace("_", "[_]")
+    )
+
+
 SORT_BY_EXPRESSIONS = {
     "total_duration": "SUM(rs.avg_duration * rs.count_executions)",
     "avg_duration": "AVG(rs.avg_duration)",
@@ -118,7 +131,7 @@ class QueryStoreService:
         rows = await self.executor.fetch_all(
             database_name,
             query,
-            params=[limit, window_minutes, fingerprint, fingerprint],
+            params=[limit, window_minutes, _escape_like_pattern(fingerprint), fingerprint],
         )
         return {
             "database_name": database_name,

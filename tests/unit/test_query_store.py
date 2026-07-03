@@ -61,3 +61,22 @@ async def test_top_queries_rejects_unknown_sort():
 
     with pytest.raises(ValueError, match="resource_blend"):
         await service.get_top_queries("appdb", "bad-sort", 30, 5)
+
+
+@pytest.mark.asyncio
+async def test_query_history_escapes_like_wildcards():
+    """Query text routinely contains % and _; the fingerprint must match as a
+    literal substring, not as a wildcard pattern."""
+    executor = FakeExecutor()
+    service = QueryStoreService(executor)
+
+    await service.get_query_history_by_text(
+        "appdb",
+        "SELECT * FROM t WHERE name LIKE '%foo_bar%'",
+    )
+
+    escaped_fingerprint = executor.params[2]
+    assert "[%]" in escaped_fingerprint
+    assert "[_]" in escaped_fingerprint
+    # The reversed containment clause still receives the raw fingerprint value.
+    assert executor.params[3] == "SELECT * FROM t WHERE name LIKE '%foo_bar%'"

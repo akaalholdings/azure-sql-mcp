@@ -18,6 +18,7 @@ from sqlglot.errors import ParseError
 from .config import ServerConfig
 from .config import WritePolicy
 from .connection import QueryResult
+from .safe_sql import strip_literals_and_comments
 
 
 _HARD_DENY_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -38,9 +39,6 @@ _HARD_DENY_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bUSE\s+[\[\]\w]+", re.IGNORECASE), "database context switch"),
     (re.compile(r"\bSET\s+IDENTITY_INSERT\b", re.IGNORECASE), "identity insert override"),
 )
-_LINE_COMMENT_PATTERN = re.compile(r"--[^\r\n]*")
-_BLOCK_COMMENT_PATTERN = re.compile(r"/\*.*?\*/", re.DOTALL)
-_STRING_LITERAL_PATTERN = re.compile(r"N?'(?:''|[^'])*'", re.IGNORECASE)
 _ALLOWED_RAW_ROOTS = (exp.Select, exp.Union, exp.Except, exp.Intersect)
 _BANNED_RAW_NODES = (
     exp.Insert,
@@ -72,7 +70,7 @@ class AdminPolicy:
         self.audit = AdminAuditLog(config.audit_dir, include_full_sql=config.audit_full_sql)
 
     def validate_sql(self, sql: str) -> None:
-        scan_sql = _sql_for_policy_scan(sql)
+        scan_sql = strip_literals_and_comments(sql)
         for pattern, reason in _HARD_DENY_PATTERNS:
             if pattern.search(scan_sql):
                 raise PermissionError(f"SQL rejected by admin hard denylist: {reason}.")
@@ -241,12 +239,6 @@ def _serialize_result_sets(result_sets: Any) -> list[dict[str, Any]]:
         elif isinstance(result, dict):
             serialized.append(result)
     return serialized
-
-
-def _sql_for_policy_scan(sql: str) -> str:
-    without_block_comments = _BLOCK_COMMENT_PATTERN.sub(" ", sql)
-    without_comments = _LINE_COMMENT_PATTERN.sub(" ", without_block_comments)
-    return _STRING_LITERAL_PATTERN.sub("?", without_comments)
 
 
 def _validate_raw_sql_is_read_only(sql: str) -> None:
