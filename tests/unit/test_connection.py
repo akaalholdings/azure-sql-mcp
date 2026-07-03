@@ -134,6 +134,15 @@ def test_coerce_value_handles_memoryview_and_bytes(sample_server_config) -> None
     assert executor._coerce_value(42) == 42
 
 
+def test_coerce_value_hex_encodes_non_utf8_binary(sample_server_config) -> None:
+    """Genuine binary data (hashes, rowversion) must round-trip losslessly as
+    hex instead of being mangled by a lossy utf-8 decode."""
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), MagicMock())
+
+    assert executor._coerce_value(b"\x00\x01\xff") == "0x0001FF"
+    assert executor._coerce_value(memoryview(b"\x8b\xad")) == "0x8BAD"
+
+
 def test_execute_with_connection_closes_cursor(sample_server_config) -> None:
     executor = AzureSqlExecutor(sample_server_config, MagicMock(), MagicMock())
     cursor = MagicMock()

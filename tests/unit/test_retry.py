@@ -119,3 +119,12 @@ def test_is_transient_handles_cycle_in_exception_chain() -> None:
     exc.__context__ = exc
 
     assert _is_transient(exc) is False
+
+
+def test_is_transient_requires_digit_boundaries() -> None:
+    """Code 233 must not fire on messages containing 12330 or 2331 — substring
+    matches previously caused retries of non-transient failures."""
+    assert _is_transient(Exception("12330 rows affected")) is False
+    assert _is_transient(Exception("native error 2331")) is False
+    assert _is_transient(Exception("SQL Server error 40613: database unavailable")) is True
+    assert _is_transient(Exception("(233) connection closed during login")) is True

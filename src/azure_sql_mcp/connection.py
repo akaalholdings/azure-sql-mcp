@@ -345,7 +345,13 @@ class AzureSqlExecutor:
 
     def _coerce_value(self, value: Any) -> Any:
         if isinstance(value, memoryview):
-            return value.tobytes().decode("utf-8", errors="ignore")
+            value = value.tobytes()
         if isinstance(value, bytes):
-            return value.decode("utf-8", errors="ignore")
+            # Text stored in binary columns decodes cleanly; genuine binary
+            # data (hashes, rowversion, images) is hex-encoded rather than
+            # silently mangled by a lossy decode.
+            try:
+                return value.decode("utf-8")
+            except UnicodeDecodeError:
+                return "0x" + value.hex().upper()
         return value
