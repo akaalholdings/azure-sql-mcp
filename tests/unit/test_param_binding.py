@@ -150,6 +150,12 @@ async def test_bind_parameters_with_histogram_value() -> None:
     assert "DECLARE @CustomerId int;" in result["bound_sql"]
     assert "SET @CustomerId = 42;" in result["bound_sql"]
 
+    # range_high_key is sql_variant, which the driver cannot fetch; the
+    # histogram query must CONVERT it server-side or binding never works live.
+    histogram_queries = [q for _, q, _ in executor.calls if "dm_db_stats_histogram" in q]
+    assert histogram_queries
+    assert "CONVERT(NVARCHAR(4000), range_high_key, 121)" in histogram_queries[0]
+
 
 @pytest.mark.asyncio
 async def test_bind_parameters_falls_back_to_type_default() -> None:

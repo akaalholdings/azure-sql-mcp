@@ -269,10 +269,12 @@ class ParameterBindingService:
         if stats_id is None or table_name is None:
             return {"data_type": data_type, "value": None, "source": "type_fallback"}
 
-        # Get histogram for representative value
+        # Get histogram for representative value. range_high_key is sql_variant,
+        # which the driver cannot fetch — CONVERT server-side (style 121 keeps
+        # datetime values ISO-formatted).
         histogram_query = """
         SELECT TOP 1
-            range_high_key,
+            CONVERT(NVARCHAR(4000), range_high_key, 121) AS range_high_key,
             equal_rows
         FROM sys.dm_db_stats_histogram(
             OBJECT_ID(?),
