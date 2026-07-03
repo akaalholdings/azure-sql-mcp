@@ -372,7 +372,7 @@ These are real bugs found and fixed during live testing against an Azure SQL DB 
 
 4. **Serverless cold-starts time out.** Auto-paused databases take 30+ seconds to wake up and the first connection usually fails with `TCP Provider: Timeout error [258]`. Prime each database with a `SELECT 1` warm-up before running a test suite.
 
-5. **`mssql-python` (1.4.0) holds the GIL for the duration of `cursor.execute`.** Wrapping calls in `asyncio.to_thread` does not restore concurrency: while any query executes, the whole process — including the outer asyncio tool timeout — is paused. Containment therefore relies on driver-level limits, which this server always sets (`cursor.timeout = AZURE_SQL_QUERY_TIMEOUT_SECONDS` plus `SET LOCK_TIMEOUT` to the same value), so no tool call can stall the process beyond the query timeout; the asyncio timeout is a backstop that fires once the driver returns. Found live: a worker thread's `WAITFOR DELAY '00:00:10'` froze the main thread for the full 10 seconds.
+5. **`mssql-python` older than 1.10 holds the GIL for the duration of `cursor.execute`.** On affected versions, `asyncio.to_thread` gives no concurrency — one in-flight query pauses the whole process, including the outer asyncio tool timeout. Found live on 1.4.0 (a worker thread's `WAITFOR DELAY '00:00:10'` froze the main thread for the full 10 seconds) and verified fixed on 1.10.0, which this project now requires. The executor still sets driver-level limits (`cursor.timeout` plus `SET LOCK_TIMEOUT`) as defense-in-depth, so a stuck query is contained even if a future driver regression reintroduces the problem.
 
 ---
 
@@ -453,7 +453,6 @@ src/azure_sql_mcp/
 
 ## Known limitations
 
-- **One in-flight query per process.** The underlying driver holds the GIL during execution, so concurrent MCP requests serialize behind the running query (see gotcha 5). This is invisible for stdio single-client use; for multi-client HTTP deployments, run multiple server instances behind a load balancer.
 - **Azure SQL Database** is the supported surface for v1. SQL Server on-prem and Azure SQL Managed Instance work for most tools but are not part of the live test matrix.
 - **No control-plane integration.** Server-level operations, ARM, and Azure Resource Graph are out of scope.
 - **No automatic index deployment.** Index/stat maintenance remains explicit, dry-run by default, audited, and gated by `AZURE_SQL_WRITE_POLICY=apply`.

@@ -30,7 +30,7 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ### Changed
 
-- Documented that mssql-python holds the GIL during `cursor.execute`: driver-level query/lock timeouts are the effective containment; the asyncio tool timeout is a backstop (README gotcha 5).
+- Require `mssql-python>=1.10.0`: versions before 1.10 hold the GIL during `cursor.execute`, serializing the entire server behind any in-flight query and preventing the asyncio tool timeout from firing. Verified live on 1.10.0: GIL released, concurrent tool calls work, all 61 live checks and the integration suite pass. Driver-level query/lock timeouts remain set as defense-in-depth (README gotcha 5).
 - Pooled connections are no longer recycled on a 45-minute token clock (tokens only matter at login); `SELECT 1` validation runs only after 60s of idle time instead of on every acquire.
 - Tool surface is now 63 tools (53 restricted); README counts corrected.
 

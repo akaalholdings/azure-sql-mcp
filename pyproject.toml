@@ -22,7 +22,7 @@ classifiers = [
 dependencies = [
     "azure-identity>=1.23.0",
     "mcp[cli]>=1.25.0",
-    "mssql-python>=1.4.0",
+    "mssql-python>=1.10.0",
     "sqlglot>=27.17.0",
 ]
 
