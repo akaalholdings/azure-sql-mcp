@@ -35,7 +35,9 @@ ACTUAL_SHOWPLAN = """\
                     StatementSubTreeCost="0.42"
                     StatementEstRows="12"
                     StatementOptmLevel="FULL"
-                    CardinalityEstimationModelVersion="170">
+                    CardinalityEstimationModelVersion="170"
+                    QueryHash="0x90FC7E5399EA52A5"
+                    QueryPlanHash="0x36B85B3A4F4A25A6">
           <QueryPlan>
             <MemoryGrantInfo SerialRequiredMemory="1024" SerialDesiredMemory="2048"
                              RequestedMemory="2048" GrantedMemory="2048"
@@ -136,6 +138,9 @@ def test_summarize_showplan_xml_extracts_actual_plan_evidence():
     summary = service.summarize_showplan_xml(ACTUAL_SHOWPLAN)
 
     assert summary["statements"][0]["cardinality_estimation_model_version"] == "170"
+    # Stable Query Store correlation ids: tune_query matches history by hash.
+    assert summary["statements"][0]["query_hash"] == "0x90FC7E5399EA52A5"
+    assert summary["statements"][0]["query_plan_hash"] == "0x36B85B3A4F4A25A6"
     assert summary["actual_metrics"]["actual_rows"] == 34
     assert summary["actual_metrics"]["actual_cpu_ms"] == 8
     assert summary["actual_metrics"]["actual_elapsed_ms"] == 11

@@ -7,6 +7,7 @@ from .connection import AzureSqlExecutor
 from .index_recommendations import build_create_index_statement
 from .index_recommendations import split_index_columns
 from .observability import sanitize_error_message
+from .param_binding import ParameterBindingService
 from .query_text import strip_query_store_parameter_declarations
 from .safe_sql import SafeSqlValidator
 
@@ -19,6 +20,7 @@ class QueryIndexAnalysisService:
     def __init__(self, executor: AzureSqlExecutor, validator: SafeSqlValidator):
         self.executor = executor
         self.validator = validator
+        self.param_binding = ParameterBindingService(executor)
 
     async def analyze_queries(
         self,
@@ -78,7 +80,9 @@ class QueryIndexAnalysisService:
             if not sql_text or not sql_text.strip():
                 continue
             try:
-                normalized_sql = strip_query_store_parameter_declarations(sql_text)
+                normalized_sql = await self.param_binding.prepare_query_store_text(
+                    database_name, sql_text,
+                )
                 validated = self.validator.validate_read_only(normalized_sql)
                 plan_xml = await self._get_estimated_plan(database_name, validated.normalized_sql)
                 missing = self._extract_missing_indexes(plan_xml)

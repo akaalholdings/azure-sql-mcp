@@ -425,7 +425,10 @@ async def test_tune_query_returns_structured_evidence_pack(app: AzureSqlMcpAppli
     assert payload["query_hash"]
     assert payload["evidence"]["plan"]["summary"]["statement_count"] == 1
     assert payload["evidence"]["execution_sample"]["row_count"] == 1
-    assert payload["evidence"]["query_store_history"] == {"matches": []}
+    assert payload["evidence"]["query_store_history"] == {
+        "matches": [],
+        "matched_by": "text",
+    }
     assert payload["evidence"]["metadata_inventory"] == {"table_references": []}
     assert "No database changes" in payload["scripts"]["rollback"]
 
@@ -589,3 +592,36 @@ async def test_async_main_configures_logging(monkeypatch: pytest.MonkeyPatch) ->
 
     configure.assert_called_once_with(config.log_level, config.log_format)
     run.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_tune_history_prefers_query_hash(app: AzureSqlMcpApplication) -> None:
+    """History must match by plan query_hash when available — text matching
+    fails for parameterized queries because stored text uses @P1 naming."""
+    app.query_store.get_query_history_by_hash = AsyncMock(
+        return_value={"matches": [{"query_id": 7}]}
+    )
+    app.query_store.get_query_history_by_text = AsyncMock()
+
+    plan = {"summary": {"statements": [{"query_hash": "0x90FC7E5399EA52A5"}]}}
+    history = await app._query_store_history_for_plan("appdb", "SELECT 1", plan, 60)
+
+    assert history["matched_by"] == "query_hash"
+    assert history["matches"] == [{"query_id": 7}]
+    app.query_store.get_query_history_by_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tune_history_falls_back_to_original_sql_text(app: AzureSqlMcpApplication) -> None:
+    """Without a usable hash (or with no hash matches), fall back to text
+    matching using the ORIGINAL sql — the bound DECLARE batch never matches."""
+    app.query_store.get_query_history_by_hash = AsyncMock(return_value={"matches": []})
+    app.query_store.get_query_history_by_text = AsyncMock(return_value={"matches": []})
+
+    plan = {"summary": {"statements": [{"query_hash": "0x90FC7E5399EA52A5"}]}}
+    original_sql = "SELECT * FROM dbo.Users WHERE UserId = @UserId"
+    history = await app._query_store_history_for_plan("appdb", original_sql, plan, 60)
+
+    assert history["matched_by"] == "text"
+    text_call = app.query_store.get_query_history_by_text.await_args
+    assert text_call.args[1] == original_sql

@@ -2785,11 +2785,11 @@ class AzureSqlMcpApplication:
             lambda: self._analyze_query_indexes(database_name, [effective_sql], False),
         )
         query_store_history = await self._optional_evidence(
-            lambda: self.query_store.get_query_history_by_text(
+            lambda: self._query_store_history_for_plan(
                 database_name,
-                effective_sql,
-                window_minutes=window_minutes,
-                limit=10,
+                sql,
+                plan,
+                window_minutes,
             ),
         )
         waits = await self._optional_evidence(
@@ -3019,6 +3019,47 @@ class AzureSqlMcpApplication:
             "table_stats_by_schema": table_stats,
             "unresolved": unresolved,
         }
+
+    async def _query_store_history_for_plan(
+        self,
+        database_name: str,
+        original_sql: str,
+        plan: dict[str, Any],
+        window_minutes: int,
+    ) -> dict[str, Any]:
+        """Query Store history for tune_query evidence.
+
+        Prefer query_hash from the captured plan — it survives parameter
+        renaming (@CustomerId vs @P1). Fall back to text matching with the
+        ORIGINAL sql; the auto-bound DECLARE batch never matches stored text.
+        """
+        summary = plan.get("summary")
+        statements = summary.get("statements") if isinstance(summary, dict) else None
+        query_hash = None
+        if isinstance(statements, list) and statements:
+            first = statements[0]
+            if isinstance(first, dict):
+                query_hash = first.get("query_hash")
+
+        if isinstance(query_hash, str) and query_hash.lower().startswith("0x"):
+            history = await self.query_store.get_query_history_by_hash(
+                database_name,
+                query_hash,
+                window_minutes=window_minutes,
+                limit=10,
+            )
+            if history.get("matches"):
+                history["matched_by"] = "query_hash"
+                return history
+
+        history = await self.query_store.get_query_history_by_text(
+            database_name,
+            original_sql,
+            window_minutes=window_minutes,
+            limit=10,
+        )
+        history["matched_by"] = "text"
+        return history
 
     async def _prepare_query(
         self,

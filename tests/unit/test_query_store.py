@@ -80,3 +80,27 @@ async def test_query_history_escapes_like_wildcards():
     assert "[_]" in escaped_fingerprint
     # The reversed containment clause still receives the raw fingerprint value.
     assert executor.params[3] == "SELECT * FROM t WHERE name LIKE '%foo_bar%'"
+
+
+@pytest.mark.asyncio
+async def test_query_history_by_hash_converts_hex_string():
+    """Hash matching survives parameter renaming (@CustomerId vs @P1) that
+    defeats text matching; the hex string must be converted to BINARY(8)."""
+    executor = FakeExecutor()
+    service = QueryStoreService(executor)
+
+    result = await service.get_query_history_by_hash(
+        "appdb", "0x90FC7E5399EA52A5", window_minutes=60, limit=5,
+    )
+
+    assert "CONVERT(BINARY(8), ?, 1)" in executor.query
+    assert executor.params == [5, 60, "0x90FC7E5399EA52A5"]
+    assert result["matches"] == []
+    assert result["query_hash"] == "0x90FC7E5399EA52A5"
+
+
+@pytest.mark.asyncio
+async def test_query_history_by_hash_rejects_non_hex():
+    service = QueryStoreService(FakeExecutor())
+    with pytest.raises(ValueError, match="0x-prefixed"):
+        await service.get_query_history_by_hash("appdb", "DROP TABLE x")

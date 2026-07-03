@@ -11,7 +11,7 @@ from .connection import AzureSqlExecutor
 from .index_recommendations import build_create_index_statement
 from .index_recommendations import split_index_columns
 from .observability import sanitize_error_message
-from .query_text import strip_query_store_parameter_declarations
+from .param_binding import ParameterBindingService
 from .safe_sql import SafeSqlValidator
 
 SHOWPLAN_NAMESPACE = {"sp": "http://schemas.microsoft.com/sqlserver/2004/07/showplan"}
@@ -151,6 +151,7 @@ class IndexOptimizer:
     ):
         self.executor = executor
         self.validator = validator
+        self.param_binding = ParameterBindingService(executor)
 
     async def optimize(
         self,
@@ -230,7 +231,9 @@ class IndexOptimizer:
             if not sql_text or not sql_text.strip():
                 continue
             try:
-                normalized_sql = strip_query_store_parameter_declarations(sql_text)
+                normalized_sql = await self.param_binding.prepare_query_store_text(
+                    database_name, sql_text,
+                )
                 validated = self.validator.validate_read_only(normalized_sql)
                 plan_xml = await self._get_estimated_plan(database_name, validated.normalized_sql)
                 subtree_cost = self._extract_statement_cost(plan_xml)
@@ -397,7 +400,7 @@ class IndexOptimizer:
         self, database_name: str, schema: str, table: str,
     ) -> int:
         query = """
-        SELECT SUM(p.rows) AS row_count
+        SELECT SUM(p.row_count) AS row_count
         FROM sys.dm_db_partition_stats p
         JOIN sys.tables t ON p.object_id = t.object_id
         JOIN sys.schemas s ON t.schema_id = s.schema_id

@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 from .connection import AzureSqlExecutor
+from .query_text import strip_query_store_parameter_declarations
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +143,22 @@ class ParameterBindingService:
             "bound_sql": bound_sql,
             "parameters": parameters,
         }
+
+    async def prepare_query_store_text(self, database_name: str, sql_text: str) -> str:
+        """Turn Query Store text into executable SQL.
+
+        Stored text often looks like ``(@P1 int)SELECT ... WHERE x = @P1`` —
+        SHOWPLAN compilation fails on the bare body ("must declare the scalar
+        variable"), so after stripping the declaration prefix any remaining
+        parameters are bound to representative values.
+        """
+        stripped = strip_query_store_parameter_declarations(sql_text)
+        if not detect_parameters(stripped):
+            return stripped
+        binding = await self.bind_parameters(database_name, stripped)
+        if binding.get("parameters"):
+            return str(binding["bound_sql"])
+        return stripped
 
     async def _resolve_parameters(
         self,

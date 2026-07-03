@@ -99,6 +99,9 @@ class PlansService:
                     "cardinality_estimation_model_version": node.attrib.get(
                         "CardinalityEstimationModelVersion"
                     ),
+                    # Stable identifiers for Query Store correlation
+                    "query_hash": node.attrib.get("QueryHash"),
+                    "query_plan_hash": node.attrib.get("QueryPlanHash"),
                 }
             )
 
