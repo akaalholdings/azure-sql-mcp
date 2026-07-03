@@ -931,23 +931,25 @@ class HealthService:
             findings=findings,
         )
 
+    _GOVERNANCE_FIELDS = (
+        "primary_max_cpu_percent",
+        "primary_max_log_rate_per_db_in_bytes_per_second",
+        "primary_group_max_io",
+        "pool_max_io",
+        "max_db_memory",
+        "checkpoint_rate_mbps",
+    )
+
     async def _fetch_governance_limits(
         self, database_name: str,
     ) -> dict[str, Any]:
-        query = """
-        SELECT TOP 1
-            primary_max_cpu_percent,
-            primary_max_log_rate_per_db_in_bytes_per_second,
-            primary_group_max_io,
-            pool_max_io,
-            max_db_memory,
-            primary_max_worker_count_for_single_query AS max_workers_per_query,
-            checkpoint_rate_mbps
-        FROM sys.dm_user_db_resource_governance
-        """
+        # Column availability in sys.dm_user_db_resource_governance varies by
+        # service tier (e.g. primary_max_cpu_percent is absent on serverless
+        # General Purpose): SELECT * and project, so a missing column degrades
+        # to an absent field instead of failing the whole probe.
+        query = "SELECT TOP 1 * FROM sys.dm_user_db_resource_governance"
         try:
             rows = await self.executor.fetch_all(database_name, query)
-            return rows[0] if rows else {}
         except Exception:
             logger.warning(
                 "Failed to fetch resource governance limits for '%s'",
@@ -955,6 +957,18 @@ class HealthService:
                 exc_info=True,
             )
             return {}
+        if not rows:
+            return {}
+        row = rows[0]
+        limits = {
+            field: row.get(field)
+            for field in self._GOVERNANCE_FIELDS
+            if row.get(field) is not None
+        }
+        workers = row.get("primary_max_worker_count_for_single_query")
+        if workers is not None:
+            limits["max_workers_per_query"] = workers
+        return limits
 
     def _compare_against_governance(
         self,

@@ -498,7 +498,7 @@ async def test_resource_health_governance_comparison_warns():
                         "primary_group_max_io": 5000,
                         "pool_max_io": 10000,
                         "max_db_memory": 2097152,
-                        "max_workers_per_query": 64,
+                        "primary_max_worker_count_for_single_query": 64,
                         "checkpoint_rate_mbps": 200,
                     }
                 ],
@@ -513,3 +513,30 @@ async def test_resource_health_governance_comparison_warns():
     assert resource_check["details"].get("governance_limits")
     findings_text = " ".join(resource_check["findings"])
     assert "governance" in findings_text.lower() or "peaked" in findings_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_governance_limits_tolerate_tier_specific_columns():
+    """primary_max_cpu_percent is absent on serverless GP tiers; the probe now
+    SELECTs * and projects, so missing columns degrade to absent fields
+    instead of failing the query (found live on GP_S_Gen5_2)."""
+    service, _, _ = build_service(
+        responses=[
+            (
+                "sys.dm_user_db_resource_governance",
+                [
+                    {
+                        # serverless-shaped row: no primary_max_cpu_percent
+                        "primary_group_max_io": 640,
+                        "max_db_memory": 9741328,
+                        "slo_name": "SQLDB_GP_S_Gen5_2",
+                        "unrelated_tier_column": 1,
+                    }
+                ],
+            ),
+        ]
+    )
+
+    limits = await service._fetch_governance_limits("appdb")
+
+    assert limits == {"primary_group_max_io": 640, "max_db_memory": 9741328}

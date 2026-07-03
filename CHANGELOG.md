@@ -12,6 +12,7 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 - Workload index analysis (`analyze_workload_indexes`, `optimize_indexes`) failed on every parameterized Query Store text ('must declare the scalar variable @P1'); stored text is now auto-bound before plan compilation, and captured DDL/DML statements are skipped instead of reported as errors.
 - Histogram-based parameter binding never worked live: `range_high_key` is sql_variant, which the driver cannot fetch; it is now CONVERTed server-side (style 121).
 - `optimize_indexes` size estimation used `sys.dm_db_partition_stats.rows`; the column is `row_count`.
+- `analyze_db_health` resource-governance probe named tier-specific columns (`primary_max_cpu_percent` is absent on serverless GP) and silently returned nothing; it now SELECTs * and projects, so serverless tiers get their real limits.
 - `tune_query` Query Store history now matches by query_hash from the captured plan (with original-text fallback); the bound DECLARE batch could never match stored text.
 - `tune_query`, `benchmark_query_rewrite`, and `explain_query` with `auto_bind_params` no longer fail on parameterized SQL: the read-only validator accepts a `DECLARE` / `SET @variable` prefix before the single SELECT (T-SQL variables are batch-scoped). Session SET options are still rejected.
 - `explain_query` with `analyze=true` bounds its result-set fetches (`row_limit + 1`); previously the executed query's full result set was fetched into memory before the plan XML.
