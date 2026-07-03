@@ -2565,13 +2565,18 @@ class AzureSqlMcpApplication:
         if query_id <= 0:
             raise ValueError("query_id must be greater than 0.")
         validated_hints = validate_query_hints(query_hints)
+        # The driver binds str parameters as varchar, but the proc requires
+        # nvarchar — route the hints through an nvarchar variable.
         payload = await self.admin_policy.execute(
             AdminAction(
                 tool_name="set_query_store_hints",
                 database_name=database_name,
                 action_type="query_store",
-                sql="EXEC sys.sp_query_store_set_hints @query_id = ?, @query_hints = ?",
-                params=(int(query_id), validated_hints),
+                sql=(
+                    "DECLARE @hints nvarchar(max) = ?;\n"
+                    "EXEC sys.sp_query_store_set_hints @query_id = ?, @query_hints = @hints"
+                ),
+                params=(validated_hints, int(query_id)),
                 rollback_sql=(
                     f"EXEC sys.sp_query_store_clear_hints @query_id = {int(query_id)}"
                 ),

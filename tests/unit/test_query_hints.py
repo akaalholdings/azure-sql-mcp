@@ -172,3 +172,27 @@ async def test_clear_hints_dry_run_previews() -> None:
     assert payload["status"] == "dry_run"
     assert payload["action"] == "hints_cleared"
     assert "sp_query_store_clear_hints" in payload["sql_preview"]
+
+
+@pytest.mark.asyncio
+async def test_set_hints_routes_hints_through_nvarchar_variable() -> None:
+    """The driver binds str params as varchar but sp_query_store_set_hints
+    demands nvarchar ('Procedure expects parameter @query_hints of type
+    nvarchar' live) — the batch must assign through an nvarchar variable."""
+    app = AzureSqlMcpApplication(make_config(access_mode=AccessMode.UNRESTRICTED))
+    executed: dict = {}
+
+    async def fake_execute(action, executor, *, dry_run, max_rows=None):
+        executed["sql"] = action.sql
+        executed["params"] = action.params
+        return {"status": "completed", "dry_run": False, "audit_id": "x",
+                "database_name": action.database_name, "tool_name": action.tool_name,
+                "action_type": action.action_type, "sql_preview": action.sql,
+                "sql_hash": "h"}
+
+    app.admin_policy.execute = fake_execute  # type: ignore[method-assign]
+    await app._set_query_store_hints("appdb", 42, "OPTION(RECOMPILE)", dry_run=False)
+
+    assert "DECLARE @hints nvarchar(max) = ?" in executed["sql"]
+    assert "@query_hints = @hints" in executed["sql"]
+    assert executed["params"] == ("OPTION(RECOMPILE)", 42)

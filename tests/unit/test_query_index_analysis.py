@@ -93,3 +93,41 @@ async def test_analyze_workload_binds_query_store_parameterized_sql() -> None:
     assert session_batch[1].upper().startswith("DECLARE @P1 INT")
     assert "SET @P1 = 1" in session_batch[1]
     assert "(@P1 int)SELECT" not in session_batch[1]
+
+
+@pytest.mark.asyncio
+async def test_analyze_workload_skips_non_select_statements() -> None:
+    """Query Store also captures DDL/DML (index maintenance, stats updates);
+    those must be skipped, not surfaced as validator errors."""
+    executor = MagicMock()
+    executor.config.row_limit = 200
+
+    async def fetch_router(database_name, query, params=None):
+        if "query_store_runtime_stats" in query:
+            return [
+                {"query_id": 1, "plan_id": 1, "query_sql_text": "CREATE NONCLUSTERED INDEX [IX_Testing_X] ON [dbo].[T] ([A])",
+                 "executions": 1, "total_cpu_us": 10, "total_duration_us": 10, "total_logical_io_reads": 1},
+                {"query_id": 2, "plan_id": 2, "query_sql_text": "(@samplePercent float)UPDATE STATISTICS [dbo].[T] WITH SAMPLE 50 PERCENT",
+                 "executions": 1, "total_cpu_us": 10, "total_duration_us": 10, "total_logical_io_reads": 1},
+                {"query_id": 3, "plan_id": 3, "query_sql_text": "SELECT name FROM dbo.T",
+                 "executions": 1, "total_cpu_us": 10, "total_duration_us": 10, "total_logical_io_reads": 1},
+            ]
+        return []
+
+    executor.fetch_all = AsyncMock(side_effect=fetch_router)
+    executor.execute_session = AsyncMock(
+        return_value=[
+            [],
+            [QueryResult(columns=("plan_xml",), rows=[{"plan_xml": "<ShowPlanXML/>"}])],
+            [],
+        ]
+    )
+
+    service = QueryIndexAnalysisService(executor, SafeSqlValidator())
+    service._extract_missing_indexes = MagicMock(return_value=[])
+
+    result = await service.analyze_workload("appdb", window_minutes=60, top_n=5)
+
+    assert result["skipped_non_select"] == 2
+    assert result["queries_analyzed"] == 1
+    assert all("error" not in q for q in result["analyzed_queries"])

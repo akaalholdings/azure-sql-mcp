@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import xml.etree.ElementTree as ET
 from typing import Any
 
@@ -12,6 +13,7 @@ from .query_text import strip_query_store_parameter_declarations
 from .safe_sql import SafeSqlValidator
 
 SHOWPLAN_NAMESPACE = {"sp": "http://schemas.microsoft.com/sqlserver/2004/07/showplan"}
+_SELECT_START_PATTERN = re.compile(r"^\s*(SELECT|WITH)\b", re.IGNORECASE)
 
 
 class QueryIndexAnalysisService:
@@ -75,9 +77,18 @@ class QueryIndexAnalysisService:
         all_recommendations: list[dict[str, Any]] = []
         analyzed_queries: list[dict[str, Any]] = []
 
+        skipped_non_select = 0
         for row in top_queries:
             sql_text = row.get("query_sql_text", "")
             if not sql_text or not sql_text.strip():
+                continue
+            # Query Store also captures DDL/DML (index maintenance, stats
+            # updates, application writes). Those aren't index-tunable SELECTs;
+            # skip them instead of surfacing validator rejections as errors.
+            if not _SELECT_START_PATTERN.match(
+                strip_query_store_parameter_declarations(sql_text)
+            ):
+                skipped_non_select += 1
                 continue
             try:
                 normalized_sql = await self.param_binding.prepare_query_store_text(
@@ -127,6 +138,7 @@ class QueryIndexAnalysisService:
             "database_name": database_name,
             "window_minutes": window_minutes,
             "queries_analyzed": len(analyzed_queries),
+            "skipped_non_select": skipped_non_select,
             "analyzed_queries": analyzed_queries,
             "recommendations": consolidated,
             "dmv_recommendations": dmv_recommendations,
