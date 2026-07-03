@@ -99,3 +99,21 @@ def test_allows_maxrecursion_nonzero(validator):
         "SELECT * FROM cte OPTION (MAXRECURSION 100)"
     )
     assert validated.normalized_sql
+
+
+def test_extract_table_references_excludes_cte_names(validator):
+    refs = validator.extract_table_references(
+        """
+        WITH recent AS (
+            SELECT * FROM dbo.Orders WHERE CreatedAt >= '20260101'
+        )
+        SELECT c.CustomerId
+        FROM recent AS r
+        JOIN sales.Customers AS c ON c.CustomerId = r.CustomerId
+        """
+    )
+
+    assert refs == [
+        {"schema": "dbo", "table": "Orders"},
+        {"schema": "sales", "table": "Customers"},
+    ]

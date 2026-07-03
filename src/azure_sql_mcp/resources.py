@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
 
+from .artifact_store import ArtifactStore
 from .artifacts import json_text
 from .config import ServerConfig
 from .introspection import IntrospectionService
@@ -11,6 +12,7 @@ def register_resources(
     mcp: FastMCP,
     config: ServerConfig,
     introspection: IntrospectionService,
+    artifact_store: ArtifactStore | None = None,
 ) -> None:
     """Register MCP resource templates for schema browsing."""
 
@@ -70,3 +72,14 @@ def register_resources(
         resolved = config.validate_database_name(database)
         result = await introspection.get_object_details(resolved, schema, table, "table")
         return json_text(result)
+
+    if artifact_store is not None:
+
+        @mcp.resource(
+            "azuresql-artifact://{artifact_id}",
+            description="Read a token-safe Azure SQL MCP artifact by id.",
+            mime_type="text/plain",
+        )
+        async def artifact_text(artifact_id: str) -> str:
+            """Read an artifact captured by a tool response."""
+            return artifact_store.get(artifact_id).text

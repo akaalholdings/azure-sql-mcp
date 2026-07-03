@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from azure_sql_mcp.schema_diff import DiffCategory
 from azure_sql_mcp.schema_diff import DiffType
 from azure_sql_mcp.schema_diff import compare_snapshots

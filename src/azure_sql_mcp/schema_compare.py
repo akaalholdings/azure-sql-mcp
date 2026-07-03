@@ -7,8 +7,6 @@ from typing import Sequence
 
 from .connection import AzureSqlExecutor
 from .ddl_generator import generate_migration_script as build_migration_script
-from .schema_diff import DiffCategory
-from .schema_diff import DiffType
 from .schema_diff import SchemaDifference
 from .schema_diff import compare_snapshots
 from .schema_snapshot import capture_snapshot

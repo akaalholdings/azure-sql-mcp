@@ -6,8 +6,8 @@ import time
 import traceback
 from collections import defaultdict
 from dataclasses import dataclass
-from dataclasses import field
 from typing import Any
+from typing import cast
 
 from .auth import AzureSqlAuthenticator
 from .config import AuthMode
@@ -107,13 +107,14 @@ class ConnectionPool:
         return (time.monotonic() - self._token_acquired_at) >= TOKEN_REFRESH_SECONDS
 
     def _create_connection(self, database_name: str):
-        driver = _import_mssql_python()
+        driver = cast(Any, _import_mssql_python())
         if self._needs_token_refresh():
             self._token_acquired_at = time.monotonic()
         connect_args = self.authenticator.build_connection_arguments(database_name)
+        attrs_before: dict[int, int | str | bytes] = dict(connect_args.attrs_before or {})
         connection = driver.connect(
             connect_args.connection_string,
-            attrs_before=connect_args.attrs_before or {},
+            attrs_before=attrs_before,
             autocommit=True,
             timeout=self.config.query_timeout_seconds,
         )

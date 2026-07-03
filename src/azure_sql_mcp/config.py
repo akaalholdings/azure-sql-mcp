@@ -18,6 +18,12 @@ class AccessMode(str, Enum):
     UNRESTRICTED = "unrestricted"
 
 
+class WritePolicy(str, Enum):
+    DISABLED = "disabled"
+    REVIEW = "review"
+    APPLY = "apply"
+
+
 class ToolGroup(str, Enum):
     CORE = "core"
     PERFORMANCE = "performance"
@@ -39,6 +45,8 @@ TOOL_GROUPS: dict[str, ToolGroup] = {
     "get_table_stats": ToolGroup.CORE,
     "execute_sql": ToolGroup.CORE,
     "explain_query": ToolGroup.CORE,
+    "tune_query": ToolGroup.CORE,
+    "benchmark_query_rewrite": ToolGroup.CORE,
     "analyze_db_health": ToolGroup.CORE,
     "get_top_queries": ToolGroup.CORE,
     "analyze_index_recommendations": ToolGroup.CORE,
@@ -58,13 +66,24 @@ TOOL_GROUPS: dict[str, ToolGroup] = {
     "get_io_stats": ToolGroup.PERFORMANCE,
     "get_resource_limits": ToolGroup.PERFORMANCE,
     "get_resource_stats_history": ToolGroup.PERFORMANCE,
+    "get_database_configuration": ToolGroup.PERFORMANCE,
+    "get_storage_diagnostics": ToolGroup.PERFORMANCE,
+    "get_connection_diagnostics": ToolGroup.PERFORMANCE,
+    "get_top_cached_queries": ToolGroup.PERFORMANCE,
+    "get_cached_routine_stats": ToolGroup.PERFORMANCE,
+    "get_object_index_diagnostics": ToolGroup.PERFORMANCE,
     "check_statistics_health": ToolGroup.PERFORMANCE,
     "get_plan_cache_analysis": ToolGroup.PERFORMANCE,
     "get_query_compilation_stats": ToolGroup.PERFORMANCE,
     "detect_parameter_sniffing": ToolGroup.PERFORMANCE,
     "detect_regressed_queries": ToolGroup.PERFORMANCE,
+    "get_query_parameter_buckets": ToolGroup.PERFORMANCE,
     "compare_query_plans": ToolGroup.PERFORMANCE,
     "get_forced_plans": ToolGroup.PERFORMANCE,
+    "plan_health_review": ToolGroup.PERFORMANCE,
+    "plan_enforcer_tick": ToolGroup.PERFORMANCE,
+    "review_plan_enforcement": ToolGroup.PERFORMANCE,
+    "dry_run_plan_action": ToolGroup.PERFORMANCE,
     "get_active_sessions": ToolGroup.PERFORMANCE,
     # schema: schema comparison & migration
     "capture_schema_snapshot": ToolGroup.SCHEMA,
@@ -75,6 +94,11 @@ TOOL_GROUPS: dict[str, ToolGroup] = {
     "rebuild_index": ToolGroup.ADMIN,
     "update_statistics": ToolGroup.ADMIN,
     "force_query_plan": ToolGroup.ADMIN,
+    "set_query_store_hints": ToolGroup.ADMIN,
+    "clear_query_store_hints": ToolGroup.ADMIN,
+    "create_test_index": ToolGroup.ADMIN,
+    "drop_test_index": ToolGroup.ADMIN,
+    "apply_plan_action": ToolGroup.ADMIN,
     "kill_session": ToolGroup.ADMIN,
 }
 
@@ -113,6 +137,11 @@ class ServerConfig:
     transport: TransportConfig
     tool_groups: frozenset[ToolGroup]
     log_level: str
+    mcp_bearer_token: str | None
+    write_policy: WritePolicy
+    audit_dir: str
+    audit_full_sql: bool
+    remote_admin_enabled: bool
 
     def validate_database_name(self, database_name: str | None) -> str:
         candidate = (database_name or self.default_database).strip()
@@ -124,11 +153,17 @@ class ServerConfig:
 
     def is_tool_enabled(self, tool_name: str) -> bool:
         """Check whether a tool should be registered based on configured tool_groups."""
-        if ToolGroup.ALL in self.tool_groups:
-            return True
         group = TOOL_GROUPS.get(tool_name)
         if group is None:
             # Unknown tools are always registered
+            return True
+        if (
+            group == ToolGroup.ADMIN
+            and self.transport.mode != TransportMode.STDIO
+            and not self.remote_admin_enabled
+        ):
+            return False
+        if ToolGroup.ALL in self.tool_groups:
             return True
         return group in self.tool_groups
 
@@ -154,6 +189,17 @@ def positive_int(raw_value: str | None, default: int, field_name: str) -> int:
     if value <= 0:
         raise ValueError(f"{field_name} must be greater than 0.")
     return value
+
+
+def parse_bool(raw_value: str | None, default: bool = False) -> bool:
+    if raw_value is None or raw_value == "":
+        return default
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean value: {raw_value!r}.")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -186,6 +232,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--azure-tenant-id", dest="azure_tenant_id")
     parser.add_argument("--azure-client-id", dest="azure_client_id")
     parser.add_argument("--azure-client-secret", dest="azure_client_secret")
+    parser.add_argument("--azure-sql-mcp-bearer-token", dest="azure_sql_mcp_bearer_token")
+    parser.add_argument(
+        "--azure-sql-write-policy",
+        dest="azure_sql_write_policy",
+        choices=[policy.value for policy in WritePolicy],
+    )
+    parser.add_argument("--azure-sql-audit-dir", dest="azure_sql_audit_dir")
+    parser.add_argument("--azure-sql-audit-full-sql", dest="azure_sql_audit_full_sql")
+    parser.add_argument("--azure-sql-enable-remote-admin", dest="azure_sql_enable_remote_admin")
     parser.add_argument(
         "--transport",
         choices=[mode.value for mode in TransportMode],
@@ -272,6 +327,12 @@ def load_server_config(argv: list[str] | None = None) -> ServerConfig:
         port=positive_int(args.port, default=8000, field_name="port"),
     )
 
+    mcp_bearer_token = env_or_arg(args, "azure_sql_mcp_bearer_token")
+    if transport.mode != TransportMode.STDIO and not mcp_bearer_token:
+        raise ValueError(
+            "AZURE_SQL_MCP_BEARER_TOKEN is required for sse and streamable-http transports."
+        )
+
     log_format = args.log_format.lower()
     if log_format not in {"text", "json"}:
         raise ValueError("AZURE_SQL_LOG_FORMAT must be 'text' or 'json'.")
@@ -282,6 +343,28 @@ def load_server_config(argv: list[str] | None = None) -> ServerConfig:
         for g in tool_groups_raw.split(",")
         if g.strip()
     )
+    write_policy_raw = env_or_arg(args, "azure_sql_write_policy")
+    if access_mode == AccessMode.RESTRICTED:
+        write_policy = WritePolicy.DISABLED
+    elif write_policy_raw:
+        write_policy = WritePolicy(write_policy_raw)
+    else:
+        write_policy = WritePolicy.REVIEW
+    audit_dir = (
+        env_or_arg(args, "azure_sql_audit_dir")
+        or os.path.expanduser("~/.azure-sql-mcp/audit")
+    )
+    audit_full_sql = parse_bool(env_or_arg(args, "azure_sql_audit_full_sql"))
+    remote_admin_enabled = parse_bool(env_or_arg(args, "azure_sql_enable_remote_admin"))
+    if (
+        transport.mode != TransportMode.STDIO
+        and not remote_admin_enabled
+        and write_policy == WritePolicy.APPLY
+    ):
+        raise ValueError(
+            "AZURE_SQL_ENABLE_REMOTE_ADMIN=1 is required to use "
+            "AZURE_SQL_WRITE_POLICY=apply over sse or streamable-http transports."
+        )
 
     return ServerConfig(
         server=server,
@@ -303,4 +386,9 @@ def load_server_config(argv: list[str] | None = None) -> ServerConfig:
         transport=transport,
         tool_groups=tool_groups,
         log_level=args.log_level.upper(),
+        mcp_bearer_token=mcp_bearer_token,
+        write_policy=write_policy,
+        audit_dir=audit_dir,
+        audit_full_sql=audit_full_sql,
+        remote_admin_enabled=remote_admin_enabled,
     )

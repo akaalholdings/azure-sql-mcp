@@ -10,6 +10,7 @@ from azure_sql_mcp.config import ServerConfig
 from azure_sql_mcp.config import ToolGroup
 from azure_sql_mcp.config import TransportConfig
 from azure_sql_mcp.config import TransportMode
+from azure_sql_mcp.config import WritePolicy
 
 
 @pytest.fixture
@@ -39,6 +40,11 @@ def server_config_factory() -> Callable[..., ServerConfig]:
             ),
             "tool_groups": frozenset({ToolGroup.ALL}),
             "log_level": "INFO",
+            "mcp_bearer_token": None,
+            "write_policy": WritePolicy.DISABLED,
+            "audit_dir": "/tmp/azure-sql-mcp-test-audit",
+            "audit_full_sql": False,
+            "remote_admin_enabled": False,
         }
         config.update(overrides)
         return ServerConfig(**config)

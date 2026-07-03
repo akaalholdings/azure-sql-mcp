@@ -12,7 +12,6 @@ from azure_sql_mcp.config import AuthMode
 from azure_sql_mcp.connection_pool import CIRCUIT_BREAKER_COOLDOWN
 from azure_sql_mcp.connection_pool import CIRCUIT_BREAKER_THRESHOLD
 from azure_sql_mcp.connection_pool import ConnectionPool
-from azure_sql_mcp.connection_pool import PoolMetrics
 from azure_sql_mcp.connection_pool import TOKEN_REFRESH_SECONDS
 from azure_sql_mcp.connection_pool import VALIDATION_TIMEOUT_SECONDS
 

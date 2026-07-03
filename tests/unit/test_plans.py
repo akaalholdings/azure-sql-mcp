@@ -23,6 +23,62 @@ SAMPLE_SHOWPLAN = """\
 </ShowPlanXML>
 """
 
+ACTUAL_SHOWPLAN = """\
+<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">
+  <BatchSequence>
+    <Batch>
+      <Statements>
+        <StmtSimple StatementText="SELECT * FROM dbo.Orders WHERE CustomerId = @CustomerId"
+                    StatementType="SELECT"
+                    StatementSubTreeCost="0.42"
+                    StatementEstRows="12"
+                    StatementOptmLevel="FULL"
+                    CardinalityEstimationModelVersion="170">
+          <QueryPlan>
+            <MemoryGrantInfo SerialRequiredMemory="1024" SerialDesiredMemory="2048"
+                             RequestedMemory="2048" GrantedMemory="2048"
+                             MaxUsedMemory="512" />
+            <ParameterList>
+              <ColumnReference Column="@CustomerId"
+                               ParameterCompiledValue="(1)"
+                               ParameterRuntimeValue="(42)" />
+            </ParameterList>
+            <MissingIndexes>
+              <MissingIndexGroup Impact="87.5">
+                <MissingIndex Database="[appdb]" Schema="[dbo]" Table="[Orders]">
+                  <ColumnGroup Usage="EQUALITY">
+                    <Column Name="[CustomerId]" />
+                  </ColumnGroup>
+                  <ColumnGroup Usage="INCLUDE">
+                    <Column Name="[Status]" />
+                  </ColumnGroup>
+                </MissingIndex>
+              </MissingIndexGroup>
+            </MissingIndexes>
+            <RelOp PhysicalOp="Hash Match" LogicalOp="Inner Join"
+                   EstimateRows="12" EstimateIO="0.01" EstimateCPU="0.03"
+                   EstimatedTotalSubtreeCost="0.42">
+              <RunTimeInformation>
+                <RunTimeCountersPerThread Thread="0"
+                                          ActualRows="34"
+                                          ActualExecutions="1"
+                                          ActualLogicalReads="120"
+                                          ActualPhysicalReads="3"
+                                          ActualCPUms="8"
+                                          ActualElapsedms="11" />
+              </RunTimeInformation>
+              <Warnings>
+                <SpillToTempDb SpillLevel="1" SpilledThreadCount="1" />
+              </Warnings>
+            </RelOp>
+          </QueryPlan>
+        </StmtSimple>
+      </Statements>
+    </Batch>
+  </BatchSequence>
+</ShowPlanXML>
+"""
+
 
 class FakeExecutor:
     def __init__(self, *, can_create_index=True, fail_create=False):
@@ -72,48 +128,29 @@ def test_summarize_showplan_xml():
     assert summary["warnings"] == [{"NoJoinPredicate": "false"}]
 
 
+def test_summarize_showplan_xml_extracts_actual_plan_evidence():
+    service = PlansService(executor=None, validator=SafeSqlValidator())  # type: ignore[arg-type]
+    summary = service.summarize_showplan_xml(ACTUAL_SHOWPLAN)
+
+    assert summary["statements"][0]["cardinality_estimation_model_version"] == "170"
+    assert summary["actual_metrics"]["actual_rows"] == 34
+    assert summary["actual_metrics"]["actual_cpu_ms"] == 8
+    assert summary["actual_metrics"]["actual_elapsed_ms"] == 11
+    assert summary["actual_metrics"]["actual_logical_reads"] == 120
+    assert summary["memory_grants"][0]["granted_memory_kb"] == 2048
+    assert summary["missing_indexes"][0]["impact_pct"] == 87.5
+    assert summary["missing_indexes"][0]["equality_columns"] == ["CustomerId"]
+    assert summary["parameters"][0]["compiled_value"] == "(1)"
+    assert summary["parameters"][0]["runtime_value"] == "(42)"
+    assert summary["warnings"][0]["spills_to_tempdb"][0]["SpillLevel"] == "1"
+
+
 @pytest.mark.asyncio
-async def test_explain_query_with_hypothetical_indexes_creates_plan_and_cleans_up():
+async def test_explain_query_rejects_hypothetical_indexes_without_writes():
     executor = FakeExecutor()
     service = PlansService(executor=executor, validator=SafeSqlValidator())
 
-    artifact = await service.explain_query(
-        database_name="appdb",
-        sql="SELECT name FROM sys.objects",
-        analyze=False,
-        hypothetical_indexes=[
-            {
-                "schema": "dbo",
-                "table": "Orders",
-                "columns": ["CustomerId", "CreatedAt"],
-                "include_columns": ["Status"],
-            }
-        ],
-    )
-
-    assert artifact.summary["hypothetical_analysis"] is True
-    assert len(artifact.summary["hypothetical_indexes"]) == 1
-    assert executor.fetch_history
-    assert any(
-        query.startswith("CREATE NONCLUSTERED INDEX")
-        for _, query, _ in executor.non_query_history
-    )
-    assert any(
-        query.startswith("DROP INDEX")
-        for _, query, _ in executor.non_query_history
-    )
-    assert executor.session_history, "expected execute_session to be invoked"
-    statements = executor.session_history[0][1]
-    assert any("SET SHOWPLAN_XML ON" in s for s in statements)
-    assert any("SET SHOWPLAN_XML OFF" in s for s in statements)
-
-
-@pytest.mark.asyncio
-async def test_explain_query_with_hypothetical_indexes_requires_permission():
-    executor = FakeExecutor(can_create_index=False)
-    service = PlansService(executor=executor, validator=SafeSqlValidator())
-
-    with pytest.raises(PermissionError, match="CREATE INDEX permission"):
+    with pytest.raises(ValueError, match="Hypothetical index analysis is disabled"):
         await service.explain_query(
             database_name="appdb",
             sql="SELECT name FROM sys.objects",
@@ -123,21 +160,5 @@ async def test_explain_query_with_hypothetical_indexes_requires_permission():
             ],
         )
 
-
-@pytest.mark.asyncio
-async def test_explain_query_cleans_up_hypothetical_indexes_on_failure():
-    executor = FakeExecutor(fail_create=True)
-    service = PlansService(executor=executor, validator=SafeSqlValidator())
-
-    with pytest.raises(RuntimeError, match="Hypothetical index analysis failed"):
-        await service.explain_query(
-            database_name="appdb",
-            sql="SELECT name FROM sys.objects",
-            analyze=False,
-            hypothetical_indexes=[
-                {"schema": "dbo", "table": "Orders", "columns": ["CustomerId"]}
-            ],
-        )
-
-    # Failed CREATE should not prevent the drop path from being attempted for any completed setup.
-    assert executor.non_query_history[0][1].startswith("CREATE NONCLUSTERED INDEX")
+    assert executor.non_query_history == []
+    assert executor.session_history == []

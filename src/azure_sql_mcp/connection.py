@@ -79,6 +79,7 @@ class AzureSqlExecutor:
                 return result
             except asyncio.CancelledError:
                 if execution_task is not None:
+                    self._request_cancel(connection)
                     deferred_cleanup = True
                     asyncio.create_task(
                         self._discard_connection_when_task_finishes(
@@ -132,6 +133,7 @@ class AzureSqlExecutor:
                 return result
             except asyncio.CancelledError:
                 if execution_task is not None:
+                    self._request_cancel(connection)
                     deferred_cleanup = True
                     asyncio.create_task(
                         self._discard_connection_when_task_finishes(
@@ -177,6 +179,7 @@ class AzureSqlExecutor:
                 return rowcount
             except asyncio.CancelledError:
                 if execution_task is not None:
+                    self._request_cancel(connection)
                     deferred_cleanup = True
                     asyncio.create_task(
                         self._discard_connection_when_task_finishes(
@@ -230,6 +233,8 @@ class AzureSqlExecutor:
         )
         cursor = connection.cursor()
         try:
+            self._configure_cursor(cursor)
+            self._set_lock_timeout(cursor)
             cursor.execute(query, params)
             return self._consume_batches(cursor, max_rows=max_rows)
         finally:
@@ -252,9 +257,12 @@ class AzureSqlExecutor:
             },
         )
         per_statement_results: list[list[QueryResult]] = []
-        for statement in statements:
+        for index, statement in enumerate(statements):
             cursor = connection.cursor()
             try:
+                self._configure_cursor(cursor)
+                if index == 0:
+                    self._set_lock_timeout(cursor)
                 cursor.execute(statement)
                 per_statement_results.append(
                     self._consume_batches(cursor, max_rows=max_rows)
@@ -279,6 +287,8 @@ class AzureSqlExecutor:
         )
         cursor = connection.cursor()
         try:
+            self._configure_cursor(cursor)
+            self._set_lock_timeout(cursor)
             cursor.execute(query, params)
             rowcount = 0
             while True:
@@ -290,6 +300,22 @@ class AzureSqlExecutor:
         finally:
             with contextlib.suppress(Exception):
                 cursor.close()
+
+    def _configure_cursor(self, cursor) -> None:
+        with contextlib.suppress(Exception):
+            cursor.timeout = self.config.query_timeout_seconds
+
+    def _set_lock_timeout(self, cursor) -> None:
+        lock_timeout_ms = max(1, int(self.config.query_timeout_seconds)) * 1000
+        cursor.execute(f"SET LOCK_TIMEOUT {lock_timeout_ms}", ())
+
+    def _request_cancel(self, connection) -> None:
+        for method_name in ("cancel", "interrupt"):
+            method = getattr(connection, method_name, None)
+            if callable(method):
+                with contextlib.suppress(Exception):
+                    method()
+                return
 
     def _consume_batches(
         self, cursor, *, max_rows: int | None = None,

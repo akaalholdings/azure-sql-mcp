@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from unittest.mock import AsyncMock
 from unittest.mock import Mock
 
 import pytest
 
+from azure_sql_mcp.artifacts import ExplainPlanArtifact
 from azure_sql_mcp.config import AccessMode
 from azure_sql_mcp.config import AuthMode
 from azure_sql_mcp.config import ServerConfig
 from azure_sql_mcp.config import ToolGroup
 from azure_sql_mcp.config import TransportConfig
 from azure_sql_mcp.config import TransportMode
+from azure_sql_mcp.config import WritePolicy
 from azure_sql_mcp.server import async_main
 from azure_sql_mcp.server import AzureSqlMcpApplication
 
@@ -20,6 +23,7 @@ def make_config(
     access_mode: AccessMode = AccessMode.RESTRICTED,
     *,
     tool_timeout_seconds: float = 45,
+    tool_groups: frozenset[ToolGroup] | None = None,
 ) -> ServerConfig:
     return ServerConfig(
         server="server.database.windows.net",
@@ -43,8 +47,13 @@ def make_config(
             host="127.0.0.1",
             port=8000,
         ),
-        tool_groups=frozenset({ToolGroup.ALL}),
+        tool_groups=tool_groups or frozenset({ToolGroup.ALL}),
         log_level="INFO",
+        mcp_bearer_token=None,
+        write_policy=WritePolicy.DISABLED,
+        audit_dir="/tmp/azure-sql-mcp-test-audit",
+        audit_full_sql=False,
+        remote_admin_enabled=False,
     )
 
 
@@ -71,6 +80,8 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
         "get_active_sessions",
         "execute_sql",
         "explain_query",
+        "tune_query",
+        "benchmark_query_rewrite",
         "get_top_queries",
         "analyze_query_indexes",
         "analyze_workload_indexes",
@@ -92,6 +103,13 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
         "get_io_stats",
         "get_resource_limits",
         "get_resource_stats_history",
+        # Phase 22: Diagnostic Query Parity
+        "get_database_configuration",
+        "get_storage_diagnostics",
+        "get_connection_diagnostics",
+        "get_top_cached_queries",
+        "get_cached_routine_stats",
+        "get_object_index_diagnostics",
         # Phase 13: Statistics & Plan Cache
         "check_statistics_health",
         "get_plan_cache_analysis",
@@ -99,8 +117,13 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
         # Phase 14: Parameter Sniffing & Regression
         "detect_parameter_sniffing",
         "detect_regressed_queries",
+        "get_query_parameter_buckets",
         "compare_query_plans",
         "get_forced_plans",
+        "plan_health_review",
+        "plan_enforcer_tick",
+        "review_plan_enforcement",
+        "dry_run_plan_action",
         "analyze_db_health",
     }
 
@@ -110,6 +133,12 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
     assert tools["get_dependencies"].annotations.openWorldHint is True
     assert tools["execute_sql"].annotations.idempotentHint is False
     assert tools["analyze_db_health"].annotations.idempotentHint is True
+    assert tools["get_database_configuration"].annotations.readOnlyHint is True
+    assert tools["get_storage_diagnostics"].annotations.readOnlyHint is True
+    assert tools["get_connection_diagnostics"].annotations.readOnlyHint is True
+    assert tools["get_top_cached_queries"].annotations.readOnlyHint is True
+    assert tools["get_cached_routine_stats"].annotations.readOnlyHint is True
+    assert tools["get_object_index_diagnostics"].annotations.readOnlyHint is True
 
 
 def test_registers_resources_and_prompts(app: AzureSqlMcpApplication) -> None:
@@ -119,6 +148,7 @@ def test_registers_resources_and_prompts(app: AzureSqlMcpApplication) -> None:
         "azuresql://{database}/{schema}/{table}",
         "azuresql://{database}/{schema}/views",
         "azuresql://{database}/{schema}/procedures",
+        "azuresql-artifact://{artifact_id}",
     }
     assert set(app.mcp._prompt_manager._prompts) == {
         "analyze-slow-queries",
@@ -129,6 +159,64 @@ def test_registers_resources_and_prompts(app: AzureSqlMcpApplication) -> None:
     }
 
 
+def test_tools_advertise_structured_output_schemas(app: AzureSqlMcpApplication) -> None:
+    for name in (
+        "list_databases",
+        "execute_sql",
+        "explain_query",
+        "get_database_configuration",
+        "get_storage_diagnostics",
+        "get_connection_diagnostics",
+        "get_top_cached_queries",
+        "get_cached_routine_stats",
+        "get_object_index_diagnostics",
+    ):
+        schema = app.mcp._tool_manager._tools[name].fn_metadata.output_schema
+        assert schema is not None
+        assert schema["type"] == "object"
+
+
+def test_diagnostic_tools_are_performance_group_and_available_restricted() -> None:
+    app = AzureSqlMcpApplication(
+        make_config(tool_groups=frozenset({ToolGroup.PERFORMANCE}))
+    )
+    tools = app.mcp._tool_manager._tools
+
+    for name in (
+        "get_database_configuration",
+        "get_storage_diagnostics",
+        "get_connection_diagnostics",
+        "get_top_cached_queries",
+        "get_cached_routine_stats",
+        "get_object_index_diagnostics",
+    ):
+        assert name in tools
+        assert tools[name].annotations.readOnlyHint is True
+        assert tools[name].annotations.destructiveHint is False
+
+    assert "execute_tsql_unrestricted" not in tools
+
+
+def test_remote_transport_hides_admin_tools_without_remote_admin_opt_in() -> None:
+    config = replace(
+        make_config(access_mode=AccessMode.UNRESTRICTED),
+        transport=TransportConfig(
+            mode=TransportMode.STREAMABLE_HTTP,
+            host="127.0.0.1",
+            port=8000,
+        ),
+        mcp_bearer_token="token",
+        remote_admin_enabled=False,
+    )
+    app = AzureSqlMcpApplication(config)
+
+    tools = app.mcp._tool_manager._tools
+
+    assert "execute_tsql_unrestricted" not in tools
+    assert "apply_plan_action" not in tools
+    assert "rebuild_index" not in tools
+
+
 @pytest.mark.asyncio
 async def test_run_tool_formats_errors_from_callback(app: AzureSqlMcpApplication) -> None:
     async def boom(_: str) -> dict[str, str]:
@@ -136,10 +224,8 @@ async def test_run_tool_formats_errors_from_callback(app: AzureSqlMcpApplication
 
     response = await app._run_tool("sample_tool", None, boom)
 
-    assert len(response) == 1
-    payload = response[0].text
-    assert '"code": "tool_error"' in payload
-    assert '"message": "boom"' in payload
+    assert response["code"] == "tool_error"
+    assert response["message"] == "boom"
 
 
 @pytest.mark.asyncio
@@ -159,8 +245,8 @@ async def test_run_tool_logs_sanitized_errors(monkeypatch: pytest.MonkeyPatch, a
 
     response = await app._run_tool("sample_tool", None, boom)
 
-    assert '"code": "tool_error"' in response[0].text
-    assert "secret!" not in response[0].text
+    assert response["code"] == "tool_error"
+    assert "secret!" not in response["message"]
 
     extra = logged["extra"]
     assert isinstance(extra, dict)
@@ -190,8 +276,8 @@ async def test_run_database_pair_tool_logs_sanitized_errors(
 
     response = await app._run_database_pair_tool("sample_pair_tool", "appdb", "appdb", boom)
 
-    assert '"code": "tool_error"' in response[0].text
-    assert "secret!" not in response[0].text
+    assert response["code"] == "tool_error"
+    assert "secret!" not in response["message"]
 
     extra = logged["extra"]
     assert isinstance(extra, dict)
@@ -220,9 +306,8 @@ def test_truncate_rows_enforces_row_limit(app: AzureSqlMcpApplication) -> None:
 def test_format_error_returns_serialized_error_payload(app: AzureSqlMcpApplication) -> None:
     response = app._format_error("bad_request", "invalid input")
 
-    assert len(response) == 1
-    assert '"code": "bad_request"' in response[0].text
-    assert '"message": "invalid input"' in response[0].text
+    assert response["code"] == "bad_request"
+    assert response["message"] == "invalid input"
 
 
 @pytest.mark.asyncio
@@ -236,7 +321,7 @@ async def test_run_tool_uses_configured_database_when_missing(app: AzureSqlMcpAp
     response = await app._run_tool("sample_tool", None, capture)
 
     assert observed == ["appdb"]
-    assert '"database_name": "appdb"' in response[0].text
+    assert response["database_name"] == "appdb"
 
 
 @pytest.mark.asyncio
@@ -249,8 +334,8 @@ async def test_run_tool_returns_timeout_error() -> None:
 
     response = await app._run_tool("slow_tool", None, slow)
 
-    assert '"code": "timeout"' in response[0].text
-    assert "timed out after 0.01s" in response[0].text
+    assert response["code"] == "timeout"
+    assert "timed out after 0.01s" in response["message"]
 
 
 @pytest.mark.asyncio
@@ -264,6 +349,167 @@ async def test_explain_query_rejects_hypothetical_indexes_in_read_only_tool(app:
                 {"schema": "dbo", "table": "Orders", "columns": ["CustomerId"]},
             ],
         )
+
+
+@pytest.mark.asyncio
+async def test_explain_query_omits_raw_xml_by_default(app: AzureSqlMcpApplication) -> None:
+    app.plans.explain_query = AsyncMock(
+        return_value=ExplainPlanArtifact(
+            database_name="appdb",
+            analyze=False,
+            summary={"statement_count": 1},
+            raw_xml="<ShowPlanXML />",
+        )
+    )
+
+    payload = await app._explain_query("appdb", "SELECT 1", analyze=False)
+
+    assert "raw_xml" not in payload
+    assert payload["raw_xml_length"] == len("<ShowPlanXML />")
+    assert payload["raw_xml_resource_uri"].startswith("azuresql-artifact://showplan-xml-")
+    artifact_id = payload["raw_xml_resource"]["artifact_id"]
+    assert app.artifacts.get(artifact_id).text == "<ShowPlanXML />"
+
+
+@pytest.mark.asyncio
+async def test_explain_query_can_include_raw_xml_when_requested(app: AzureSqlMcpApplication) -> None:
+    app.plans.explain_query = AsyncMock(
+        return_value=ExplainPlanArtifact(
+            database_name="appdb",
+            analyze=False,
+            summary={"statement_count": 1},
+            raw_xml="<ShowPlanXML />",
+        )
+    )
+
+    payload = await app._explain_query(
+        "appdb",
+        "SELECT 1",
+        analyze=False,
+        include_raw_xml=True,
+    )
+
+    assert payload["raw_xml"] == "<ShowPlanXML />"
+
+
+@pytest.mark.asyncio
+async def test_tune_query_returns_structured_evidence_pack(app: AzureSqlMcpApplication) -> None:
+    app._explain_query = AsyncMock(return_value={"summary": {"statement_count": 1}})  # type: ignore[method-assign]
+    app._execute_safe_sql = AsyncMock(  # type: ignore[method-assign]
+        return_value={"rows": [{"id": 1}], "row_count": 1, "truncated": False}
+    )
+    app._analyze_query_indexes = AsyncMock(return_value={"recommendations": []})  # type: ignore[method-assign]
+    app.query_store.get_query_history_by_text = AsyncMock(return_value={"matches": []})
+    app.wait_stats.get_wait_stats = AsyncMock(return_value={"top_waits": []})
+    app.plan_cache.check_statistics_health = AsyncMock(return_value={"total_stats": 0})
+    app._metadata_inventory = AsyncMock(return_value={"table_references": []})  # type: ignore[method-assign]
+
+    payload = await app._tune_query(
+        "appdb",
+        "SELECT id FROM dbo.Orders",
+        analyze=True,
+        auto_bind_params=False,
+        include_raw_xml=False,
+        window_minutes=60,
+    )
+
+    assert payload["database_name"] == "appdb"
+    assert payload["query_hash"]
+    assert payload["evidence"]["plan"]["summary"]["statement_count"] == 1
+    assert payload["evidence"]["execution_sample"]["row_count"] == 1
+    assert payload["evidence"]["query_store_history"] == {"matches": []}
+    assert payload["evidence"]["metadata_inventory"] == {"table_references": []}
+    assert "No database changes" in payload["scripts"]["rollback"]
+
+
+@pytest.mark.asyncio
+async def test_benchmark_query_rewrite_reports_sample_equivalence(app: AzureSqlMcpApplication) -> None:
+    app._explain_query = AsyncMock(  # type: ignore[method-assign]
+        return_value={
+            "summary": {
+                "actual_metrics": {"actual_cpu_ms": 1, "actual_logical_reads": 2},
+                "memory_grants": [],
+                "warnings": [],
+                "missing_indexes": [],
+            }
+        }
+    )
+    app._execute_safe_sql = AsyncMock(  # type: ignore[method-assign]
+        return_value={"rows": [{"id": 1}], "row_count": 1, "truncated": False}
+    )
+
+    payload = await app._benchmark_query_rewrite(
+        "appdb",
+        "SELECT id FROM dbo.Orders",
+        "SELECT id FROM dbo.Orders",
+        analyze=True,
+        auto_bind_params=False,
+        include_raw_xml=False,
+    )
+
+    assert payload["equivalence"]["status"] == "sample_match"
+    assert payload["equivalence"]["full_equivalence_proven"] is True
+    assert payload["scenarios"]["baseline"]["metrics"]["actual_cpu_ms"] == 1
+    assert payload["scenarios"]["rewrite"]["metrics"]["actual_logical_reads"] == 2
+    # single-run default keeps the historical payload shape (no spread/run_metrics)
+    assert payload["runs"] == 1
+    assert "spread" not in payload["scenarios"]["baseline"]["metrics"]
+    assert "run_metrics" not in payload["scenarios"]["baseline"]
+
+
+@pytest.mark.asyncio
+async def test_benchmark_query_rewrite_runs_k_reports_median_and_spread(
+    app: AzureSqlMcpApplication,
+) -> None:
+    # 3 runs per side, 6 explains total: cpu varies so the median is unambiguous.
+    cpu_sequence = [90, 10, 20, 300, 100, 200]  # baseline: 90,10,20 -> median 20
+    app._explain_query = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[
+            {
+                "summary": {
+                    "actual_metrics": {"actual_cpu_ms": cpu, "actual_logical_reads": cpu * 10},
+                    "memory_grants": [],
+                    "warnings": [],
+                    "missing_indexes": [],
+                }
+            }
+            for cpu in cpu_sequence
+        ]
+    )
+    app._execute_safe_sql = AsyncMock(  # type: ignore[method-assign]
+        return_value={"rows": [{"id": 1}], "row_count": 1, "truncated": False}
+    )
+
+    payload = await app._benchmark_query_rewrite(
+        "appdb",
+        "SELECT id FROM dbo.Orders",
+        "SELECT id FROM dbo.Orders",
+        analyze=True,
+        auto_bind_params=False,
+        include_raw_xml=False,
+        runs=3,
+    )
+
+    baseline = payload["scenarios"]["baseline"]
+    rewrite = payload["scenarios"]["rewrite"]
+    assert payload["runs"] == 3
+    assert baseline["metrics"]["actual_cpu_ms"] == 20          # median of 90,10,20
+    assert baseline["metrics"]["spread"]["actual_cpu_ms"] == {"min": 10, "max": 90}
+    assert rewrite["metrics"]["actual_cpu_ms"] == 200          # median of 300,100,200
+    assert len(baseline["run_metrics"]) == 3
+    assert "cold-cache" in baseline["metrics_note"]
+
+
+@pytest.mark.asyncio
+async def test_benchmark_query_rewrite_rejects_out_of_range_runs(
+    app: AzureSqlMcpApplication,
+) -> None:
+    for bad in (0, 11, -1):
+        with pytest.raises(ValueError, match="runs"):
+            await app._benchmark_query_rewrite(
+                "appdb", "SELECT 1", "SELECT 1",
+                analyze=True, auto_bind_params=False, include_raw_xml=False, runs=bad,
+            )
 
 
 def test_quote_identifier_escapes_closing_brackets(app: AzureSqlMcpApplication) -> None:

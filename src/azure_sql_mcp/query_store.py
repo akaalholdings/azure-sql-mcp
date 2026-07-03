@@ -58,6 +58,75 @@ class QueryStoreService:
             params=params,
         )
 
+    async def get_query_history_by_text(
+        self,
+        database_name: str,
+        sql: str,
+        window_minutes: int = 1440,
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        """Best-effort Query Store history for SQL text similar to the supplied query."""
+        fingerprint = " ".join(sql.split())[:1000]
+        if not fingerprint:
+            raise ValueError("sql must not be empty.")
+        if window_minutes <= 0:
+            raise ValueError("window_minutes must be greater than 0.")
+        if limit <= 0:
+            raise ValueError("limit must be greater than 0.")
+
+        query = """
+        SELECT TOP (?)
+            q.query_id,
+            p.plan_id,
+            p.is_forced_plan,
+            p.force_failure_count,
+            p.last_force_failure_reason_desc,
+            qt.query_sql_text,
+            SUM(rs.count_executions) AS executions,
+            SUM(rs.avg_duration * rs.count_executions) / 1000.0 AS total_duration_ms,
+            AVG(rs.avg_duration) / 1000.0 AS avg_duration_ms,
+            SUM(rs.avg_cpu_time * rs.count_executions) / 1000.0 AS total_cpu_ms,
+            AVG(rs.avg_cpu_time) / 1000.0 AS avg_cpu_ms,
+            SUM(rs.avg_logical_io_reads * rs.count_executions) AS total_logical_io_reads,
+            SUM(rs.avg_physical_io_reads * rs.count_executions) AS total_physical_io_reads,
+            AVG(rs.avg_query_max_used_memory) AS avg_query_max_used_memory,
+            MIN(rsi.start_time) AS first_seen_utc,
+            MAX(rsi.end_time) AS last_seen_utc
+        FROM sys.query_store_query_text AS qt
+        INNER JOIN sys.query_store_query AS q
+            ON qt.query_text_id = q.query_text_id
+        INNER JOIN sys.query_store_plan AS p
+            ON q.query_id = p.query_id
+        INNER JOIN sys.query_store_runtime_stats AS rs
+            ON p.plan_id = rs.plan_id
+        INNER JOIN sys.query_store_runtime_stats_interval AS rsi
+            ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
+        WHERE rsi.end_time >= DATEADD(MINUTE, -?, SYSUTCDATETIME())
+          AND (
+                qt.query_sql_text LIKE '%' + ? + '%'
+             OR ? LIKE '%' + LEFT(qt.query_sql_text, 1000) + '%'
+          )
+        GROUP BY
+            q.query_id,
+            p.plan_id,
+            p.is_forced_plan,
+            p.force_failure_count,
+            p.last_force_failure_reason_desc,
+            qt.query_sql_text
+        ORDER BY total_cpu_ms DESC, total_duration_ms DESC
+        """
+        rows = await self.executor.fetch_all(
+            database_name,
+            query,
+            params=[limit, window_minutes, fingerprint, fingerprint],
+        )
+        return {
+            "database_name": database_name,
+            "window_minutes": window_minutes,
+            "fingerprint_length": len(fingerprint),
+            "matches": rows,
+        }
+
     def _build_top_queries_query(self, sort_by: str) -> str:
         if sort_by == "resource_blend":
             return """

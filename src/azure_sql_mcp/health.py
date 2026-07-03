@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 from typing import Awaitable
 from typing import Callable
@@ -9,6 +10,8 @@ from .observability import sanitize_error_message
 from .query_store import QueryStoreService
 
 HealthCheck = Callable[[str], Awaitable[dict[str, Any]]]
+
+logger = logging.getLogger(__name__)
 
 CHECK_NAMES = (
     "index",
@@ -69,7 +72,7 @@ class HealthService:
 
     def _parse_requested_checks(self, health_type: str) -> set[str]:
         normalized = health_type.lower()
-        requested = (
+        requested: set[str] = (
             set(CHECK_NAMES)
             if normalized == "all"
             else {part.strip() for part in normalized.split(",") if part.strip()}
@@ -704,14 +707,15 @@ class HealthService:
     async def _query_store_health(self, database_name: str) -> dict[str, Any]:
         result = await self.query_store_service.get_status(database_name)
         details = dict(result)
-        status_row = result.get("status") if isinstance(result.get("status"), dict) else {}
+        raw_status = result.get("status")
+        status_row: dict[str, Any] = raw_status if isinstance(raw_status, dict) else {}
 
         storage_used_percent = None
         current_storage_size_mb = self._to_float(
             status_row.get("current_storage_size_mb")
         )
         max_storage_size_mb = self._to_float(status_row.get("max_storage_size_mb"))
-        if max_storage_size_mb:
+        if max_storage_size_mb and current_storage_size_mb is not None:
             storage_used_percent = self._round(
                 current_storage_size_mb / max_storage_size_mb * 100.0
             )
@@ -1102,8 +1106,9 @@ class HealthService:
             size_mb = self._to_float(row.get("size_mb"))
             max_size_mb = self._to_float(row.get("max_size_mb"))
             used_percent = None
-            if max_size_mb:
+            if max_size_mb and size_mb is not None:
                 used_percent = self._round(size_mb / max_size_mb * 100.0)
+            if used_percent is not None:
                 if used_percent >= 95.0:
                     status = self._escalate(
                         status,

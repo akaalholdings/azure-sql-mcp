@@ -4,7 +4,7 @@ import asyncio
 import logging
 import random
 from typing import cast
-from typing import Any, Awaitable, Callable, TypeVar
+from typing import Awaitable, Callable, TypeVar
 
 logger = logging.getLogger(__name__)
 

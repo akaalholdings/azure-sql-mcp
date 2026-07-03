@@ -6,14 +6,10 @@ from enum import Enum
 import re
 from typing import Any
 
-from .schema_snapshot import ColumnDef
-from .schema_snapshot import ConstraintDef
-from .schema_snapshot import IndexDef
 from .schema_snapshot import ProgrammableObjectSnapshot
 from .schema_snapshot import SchemaSnapshot
 from .schema_snapshot import SequenceDef
 from .schema_snapshot import TableSnapshot
-from .schema_snapshot import TriggerDef
 
 WHITESPACE_PATTERN = re.compile(r"\s+")
 

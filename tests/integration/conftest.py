@@ -6,7 +6,6 @@ from typing import Iterator
 import mssql_python
 import pytest
 
-from azure_sql_mcp.auth import AzureSqlAuthenticator
 from azure_sql_mcp.auth import ConnectionArguments
 from azure_sql_mcp.config import AuthMode
 from azure_sql_mcp.config import load_server_config

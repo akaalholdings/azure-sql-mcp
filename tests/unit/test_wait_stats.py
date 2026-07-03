@@ -4,7 +4,6 @@ import pytest
 
 from azure_sql_mcp.wait_stats import (
     BENIGN_WAITS,
-    CATEGORY_RECOMMENDATIONS,
     WaitStatsService,
     classify_wait,
 )

@@ -146,6 +146,9 @@ def test_execute_with_connection_closes_cursor(sample_server_config) -> None:
     rows = executor._execute_with_connection(connection, "appdb", "SELECT 1", (), max_rows=None)
 
     assert rows == [QueryResult(columns=("id",), rows=[{"id": 1}])]
+    assert cursor.timeout == sample_server_config.query_timeout_seconds
+    assert cursor.execute.call_args_list[0] == call("SET LOCK_TIMEOUT 30000", ())
+    assert cursor.execute.call_args_list[1] == call("SELECT 1", ())
     cursor.close.assert_called_once()
 
 
@@ -164,7 +167,17 @@ def test_execute_non_query_with_connection_closes_cursor(sample_server_config) -
     )
 
     assert rowcount == 1
+    assert cursor.timeout == sample_server_config.query_timeout_seconds
     cursor.close.assert_called_once()
+
+
+def test_request_cancel_uses_driver_cancel_when_available(sample_server_config) -> None:
+    connection = MagicMock()
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), MagicMock())
+
+    executor._request_cancel(connection)
+
+    connection.cancel.assert_called_once()
 
 
 @pytest.mark.asyncio

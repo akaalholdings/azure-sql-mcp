@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Any
 
 from sqlglot import exp
 from sqlglot import parse
@@ -78,9 +79,52 @@ class SafeSqlValidator:
             raise ValueError("Exactly one SQL statement is allowed.")
 
         statement = statements[0]
+        if statement is None:
+            raise ValueError("Invalid T-SQL: parser returned an empty statement.")
         self._check_statement(statement)
 
         return ValidatedQuery(normalized_sql=statement.sql(dialect="tsql"))
+
+    def extract_table_references(self, sql: str) -> list[dict[str, str | None]]:
+        """Return base table references from a validated read-only statement."""
+        validated = self.validate_read_only(sql)
+        statements = parse(validated.normalized_sql, read="tsql")
+        statement = statements[0]
+        if statement is None:
+            raise ValueError("Invalid T-SQL: parser returned an empty statement.")
+        cte_names = {
+            str(cte.alias_or_name).lower()
+            for cte in statement.find_all(exp.CTE)
+            if cte.alias_or_name
+        }
+
+        seen: set[tuple[str | None, str]] = set()
+        positions: dict[tuple[str | None, str], int] = {}
+        references: list[dict[str, str | None]] = []
+        normalized_lookup = validated.normalized_sql.lower()
+        for table in statement.find_all(exp.Table):
+            table_name = str(table.this).strip("[]")
+            if not table_name or table_name.lower() in cte_names:
+                continue
+            schema_name = table.args.get("db")
+            schema = str(schema_name).strip("[]") if schema_name is not None else None
+            key = (schema, table_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            needle = f"{schema}.{table_name}" if schema else table_name
+            position = normalized_lookup.find(needle.lower())
+            positions[key] = position if position >= 0 else len(normalized_lookup)
+            references.append(
+                {
+                    "schema": schema,
+                    "table": table_name,
+                }
+            )
+        return sorted(
+            references,
+            key=lambda ref: positions[(ref.get("schema"), str(ref["table"]))],
+        )
 
     def _check_text_rules(self, candidate: str) -> None:
         if GO_PATTERN.search(candidate):
@@ -108,7 +152,7 @@ class SafeSqlValidator:
                 "MAXRECURSION 0 (unlimited recursion) is not allowed in restricted mode."
             )
 
-    def _check_statement(self, statement: exp.Expression) -> None:
+    def _check_statement(self, statement: Any) -> None:
         if not isinstance(statement, (exp.Select, exp.Union, exp.Except, exp.Intersect)):
             raise ValueError("Restricted mode only supports SELECT queries.")
 
