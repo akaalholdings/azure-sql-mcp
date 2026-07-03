@@ -66,6 +66,7 @@ TOOL_GROUPS: dict[str, ToolGroup] = {
     "get_io_stats": ToolGroup.PERFORMANCE,
     "get_resource_limits": ToolGroup.PERFORMANCE,
     "get_resource_stats_history": ToolGroup.PERFORMANCE,
+    "get_connection_pool_stats": ToolGroup.PERFORMANCE,
     "get_database_configuration": ToolGroup.PERFORMANCE,
     "get_storage_diagnostics": ToolGroup.PERFORMANCE,
     "get_connection_diagnostics": ToolGroup.PERFORMANCE,

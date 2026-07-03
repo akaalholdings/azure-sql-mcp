@@ -1114,6 +1114,30 @@ class AzureSqlMcpApplication:
                 self.tempdb_memory.get_memory_grants,
             )
 
+        @self.mcp.tool(
+            description=(
+                "Get MCP server connection pool statistics: per-database acquire/"
+                "release/discard counts, peak utilization, and possible connection "
+                "leaks. Diagnoses MCP-side slowness without touching the database."
+            ),
+            annotations=ToolAnnotations(
+                title="Get Connection Pool Stats",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=False,
+                openWorldHint=False,
+            ),
+        )
+        async def get_connection_pool_stats() -> ResponseType:
+            return self._format_response(
+                {
+                    "server": self.config.server,
+                    "pool_size_per_database": self.config.pool_size,
+                    "metrics": self.pool.get_metrics(),
+                    "possible_leaks": self.pool.check_leaked_connections(),
+                }
+            )
+
         # --- Phase 12: I/O & Azure Resource Governance ---
 
         @self.mcp.tool(

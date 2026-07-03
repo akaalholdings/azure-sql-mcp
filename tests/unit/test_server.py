@@ -103,6 +103,7 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
         "get_io_stats",
         "get_resource_limits",
         "get_resource_stats_history",
+        "get_connection_pool_stats",
         # Phase 22: Diagnostic Query Parity
         "get_database_configuration",
         "get_storage_diagnostics",

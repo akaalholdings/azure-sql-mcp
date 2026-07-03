@@ -12,8 +12,13 @@ from azure_sql_mcp.config import AuthMode
 from azure_sql_mcp.connection_pool import CIRCUIT_BREAKER_COOLDOWN
 from azure_sql_mcp.connection_pool import CIRCUIT_BREAKER_THRESHOLD
 from azure_sql_mcp.connection_pool import ConnectionPool
-from azure_sql_mcp.connection_pool import TOKEN_REFRESH_SECONDS
+from azure_sql_mcp.connection_pool import VALIDATION_IDLE_SECONDS
 from azure_sql_mcp.connection_pool import VALIDATION_TIMEOUT_SECONDS
+
+
+def _age_idle_connection(pool: ConnectionPool, connection) -> None:
+    """Make a pooled connection look idle long enough to require validation."""
+    pool._idle_since[id(connection)] = time.monotonic() - VALIDATION_IDLE_SECONDS - 1
 
 
 def _make_connection(name: str) -> MagicMock:
@@ -75,6 +80,7 @@ async def test_stale_connection_is_evicted_and_replaced(sample_server_config) ->
 
         first = await pool.acquire("appdb")
         await pool.release("appdb", first)
+        _age_idle_connection(pool, first)
         with patch.object(pool, "_validate_connection", side_effect=[False]):
             second = await pool.acquire("appdb")
 
@@ -99,28 +105,76 @@ def test_validate_connection_uses_short_validation_timeout(sample_server_config)
 
 
 @pytest.mark.asyncio
-async def test_token_refresh_discards_idle_entra_connection(
+async def test_entra_connection_survives_beyond_token_lifetime(
     server_config_factory,
 ) -> None:
+    """Access tokens only matter at login; a healthy pooled connection must not
+    be recycled on a token clock (the old 45-minute churn discarded every
+    pooled connection for no correctness gain)."""
     config = server_config_factory(auth_mode=AuthMode.ENTRA_DEFAULT)
     authenticator = MagicMock()
     authenticator.build_connection_arguments.return_value = ConnectionArguments("Driver=test;")
-    old_connection = _make_connection("old_connection")
-    refreshed_connection = _make_connection("refreshed_connection")
+    connection = _make_connection("long_lived_connection")
 
     with patch("azure_sql_mcp.connection_pool._import_mssql_python") as import_mssql_python:
-        import_mssql_python.return_value.connect.side_effect = [old_connection, refreshed_connection]
+        import_mssql_python.return_value.connect.return_value = connection
         pool = ConnectionPool(config, authenticator)
 
         first = await pool.acquire("appdb")
         await pool.release("appdb", first)
-        pool._token_acquired_at = time.monotonic() - TOKEN_REFRESH_SECONDS - 1
-
+        # Simulate a long idle period (past any token lifetime); validation runs
+        # and passes, so the same connection is reused instead of recreated.
+        _age_idle_connection(pool, first)
         second = await pool.acquire("appdb")
 
-    assert second is refreshed_connection
-    old_connection.close.assert_called_once()
-    assert authenticator.build_connection_arguments.call_count == 2
+    assert second is first
+    connection.close.assert_not_called()
+    assert import_mssql_python.return_value.connect.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_recently_released_connection_skips_validation(
+    server_config_factory,
+) -> None:
+    """A connection released moments ago must be reused without paying the
+    SELECT 1 round-trip on every acquire."""
+    config = server_config_factory(auth_mode=AuthMode.SQL_PASSWORD)
+    authenticator = MagicMock()
+    authenticator.build_connection_arguments.return_value = ConnectionArguments("Driver=test;")
+    connection = _make_connection("hot_connection")
+
+    with patch("azure_sql_mcp.connection_pool._import_mssql_python") as import_mssql_python:
+        import_mssql_python.return_value.connect.return_value = connection
+        pool = ConnectionPool(config, authenticator)
+
+        first = await pool.acquire("appdb")
+        await pool.release("appdb", first)
+        with patch.object(pool, "_validate_connection") as validate:
+            second = await pool.acquire("appdb")
+
+    assert second is first
+    validate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_long_idle_connection_is_validated(server_config_factory) -> None:
+    config = server_config_factory(auth_mode=AuthMode.SQL_PASSWORD)
+    authenticator = MagicMock()
+    authenticator.build_connection_arguments.return_value = ConnectionArguments("Driver=test;")
+    connection = _make_connection("idle_connection")
+
+    with patch("azure_sql_mcp.connection_pool._import_mssql_python") as import_mssql_python:
+        import_mssql_python.return_value.connect.return_value = connection
+        pool = ConnectionPool(config, authenticator)
+
+        first = await pool.acquire("appdb")
+        await pool.release("appdb", first)
+        _age_idle_connection(pool, first)
+        with patch.object(pool, "_validate_connection", return_value=True) as validate:
+            second = await pool.acquire("appdb")
+
+    assert second is first
+    validate.assert_called_once_with(connection)
 
 
 @pytest.mark.asyncio
