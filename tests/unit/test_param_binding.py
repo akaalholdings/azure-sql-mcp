@@ -232,3 +232,44 @@ async def test_bind_parameters_multiple_params() -> None:
     names = [p["name"] for p in result["parameters"]]
     assert "@StartDate" in names
     assert "@Cat" in names
+
+
+@pytest.mark.asyncio
+async def test_alias_table_hint_retries_without_hint() -> None:
+    """`o.CustomerId = @p` yields table hint 'o' (an alias, not a table). The
+    resolver must retry across all tables instead of silently falling back to
+    an nvarchar guess that breaks execution with a conversion error."""
+
+    class AliasAwareExecutor:
+        def __init__(self) -> None:
+            self.calls: list[list[Any]] = []
+
+        async def fetch_all(self, database_name, query, params=None):
+            self.calls.append(list(params or []))
+            if "AND t.name = ?" in query:
+                return []  # alias never matches a real table
+            if "sys.dm_db_stats_histogram" in query:
+                return []
+            return [{
+                "table_name": "Orders",
+                "schema_name": "Sales",
+                "data_type": "int",
+                "max_length": 4,
+                "precision": 10,
+                "scale": 0,
+                "stats_id": 1,
+            }]
+
+    executor = AliasAwareExecutor()
+    service = ParameterBindingService(executor)
+
+    result = await service.bind_parameters(
+        "appdb",
+        "SELECT o.OrderID FROM Sales.Orders AS o WHERE o.CustomerID = @CustomerId",
+    )
+
+    parameter = result["parameters"][0]
+    assert parameter["data_type"] == "int"
+    assert parameter["value"] == "1"  # int type fallback, not N'test'
+    assert ["CustomerID", "o"] in executor.calls  # hinted attempt happened
+    assert ["CustomerID"] in executor.calls  # unhinted retry happened

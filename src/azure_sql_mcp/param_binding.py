@@ -233,14 +233,22 @@ class ParameterBindingService:
         WHERE c.name = ?
           AND OBJECTPROPERTY(c.object_id, 'IsUserTable') = 1
         """
-        params: list[Any] = [column_name]
-        if table_hint:
-            type_query += "\n          AND t.name = ?"
-            params.append(table_hint)
-        type_query += "\n        ORDER BY st.stats_id"
+        hinted_query = type_query + "\n          AND t.name = ?\n        ORDER BY st.stats_id"
+        unhinted_query = type_query + "\n        ORDER BY st.stats_id"
 
         try:
-            type_rows = await self.executor.fetch_all(database_name, type_query, params=params)
+            type_rows: list[dict[str, Any]] = []
+            if table_hint:
+                type_rows = await self.executor.fetch_all(
+                    database_name, hinted_query, params=[column_name, table_hint],
+                )
+            if not type_rows:
+                # The hint is often a table alias (o.CustomerId), not a real
+                # table name — retry across all tables rather than silently
+                # falling back to an nvarchar guess that breaks execution.
+                type_rows = await self.executor.fetch_all(
+                    database_name, unhinted_query, params=[column_name],
+                )
         except Exception:
             logger.warning(
                 "Failed to resolve column type for parameter '%s'",

@@ -3238,9 +3238,11 @@ class AzureSqlMcpApplication:
     def _truncate_rows(self, payload: dict[str, Any]) -> dict[str, Any]:
         rows = payload.get("rows")
         if isinstance(rows, list):
-            payload["row_count"] = len(rows)
+            # Fetches use row_limit + 1 to detect truncation; row_count must
+            # describe the rows actually returned, not the sentinel row.
             payload["truncated"] = len(rows) > self.config.row_limit
             payload["rows"] = rows[: self.config.row_limit]
+            payload["row_count"] = len(payload["rows"])
         return payload
 
     def _format_response(self, payload: Any) -> ResponseType:

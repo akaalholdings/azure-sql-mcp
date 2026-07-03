@@ -289,6 +289,8 @@ async def test_run_database_pair_tool_logs_sanitized_errors(
 
 
 def test_truncate_rows_enforces_row_limit(app: AzureSqlMcpApplication) -> None:
+    """Fetches use row_limit + 1 to detect truncation; row_count must describe
+    the rows actually returned, not include the sentinel row (row_limit=2)."""
     payload = app._truncate_rows(
         {
             "rows": [
@@ -299,8 +301,13 @@ def test_truncate_rows_enforces_row_limit(app: AzureSqlMcpApplication) -> None:
         }
     )
 
-    assert payload["row_count"] == 3
+    assert payload["row_count"] == 2
     assert payload["truncated"] is True
+    assert len(payload["rows"]) == 2
+
+    exact = app._truncate_rows({"rows": [{"id": 1}, {"id": 2}]})
+    assert exact["truncated"] is False
+    assert exact["row_count"] == 2
     assert payload["rows"] == [{"id": 1}, {"id": 2}]
 
 
