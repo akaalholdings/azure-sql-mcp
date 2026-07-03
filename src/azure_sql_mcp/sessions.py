@@ -5,13 +5,21 @@ from typing import Any
 from .connection import AzureSqlExecutor
 
 
+MAX_SESSION_LIMIT = 1000
+
+
 class SessionsService:
     def __init__(self, executor: AzureSqlExecutor):
         self.executor = executor
 
-    async def get_active_sessions(self, database_name: str) -> dict[str, Any]:
+    async def get_active_sessions(
+        self,
+        database_name: str,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        bounded_limit = max(1, min(int(limit), MAX_SESSION_LIMIT))
         query = """
-        SELECT
+        SELECT TOP (?)
             r.session_id,
             s.login_name,
             s.status AS session_status,
@@ -62,10 +70,16 @@ class SessionsService:
           AND r.session_id != @@SPID
         ORDER BY r.total_elapsed_time DESC
         """
-        sessions = await self.executor.fetch_all(database_name, query)
+        sessions = await self.executor.fetch_all(
+            database_name, query, params=[bounded_limit + 1],
+        )
+        truncated = len(sessions) > bounded_limit
+        sessions = sessions[:bounded_limit]
         return {
             "database_name": database_name,
             "active_session_count": len(sessions),
+            "limit": bounded_limit,
+            "truncated": truncated,
             "sessions": sessions,
             "blocking_chains": self._detect_blocking_chains(sessions),
         }

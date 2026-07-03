@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from azure_sql_mcp.index_recommendations import IndexRecommendationService
@@ -41,6 +43,7 @@ class FakeExecutor:
     def __init__(self, dmv_rows=None, existing_index_rows=None):
         self.dmv_rows = dmv_rows or []
         self.existing_index_rows = existing_index_rows or []
+        self.config = SimpleNamespace(row_limit=200)
         self.fetch_history = []
         self.batch_history = []
         self.session_history = []

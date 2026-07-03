@@ -9,7 +9,8 @@ class FakeExecutor:
     def __init__(self, results: list[dict] | None = None):
         self.results = results or []
 
-    async def fetch_all(self, database_name: str, query: str) -> list[dict]:
+    async def fetch_all(self, database_name: str, query: str, params=None) -> list[dict]:
+        self.last_params = params
         return self.results
 
 
@@ -110,3 +111,41 @@ async def test_get_deadlock_history():
     result = await service.get_deadlock_history("testdb", max_events=5)
     assert result["deadlock_count"] == 0
     assert result["deadlocks"] == []
+
+
+@pytest.mark.asyncio
+async def test_get_lock_details_truncates_above_limit():
+    """dm_tran_locks can hold hundreds of thousands of rows; the tool must
+    bound what it returns and say so instead of flooding the context."""
+    rows = [
+        {"resource_type": "KEY", "request_status": "GRANT", "session_id": i}
+        for i in range(3)
+    ]
+    service = LockDiagnosticsService(FakeExecutor(rows))
+    result = await service.get_lock_details("testdb", limit=2)
+
+    assert result["truncated"] is True
+    assert result["limit"] == 2
+    assert len(result["locks"]) == 2
+    assert result["total_locks"] == 2
+
+
+@pytest.mark.asyncio
+async def test_get_open_transactions_truncates_above_limit():
+    rows = [
+        {"transaction_id": i, "duration_seconds": 1, "session_status": "running", "session_id": i}
+        for i in range(4)
+    ]
+    service = LockDiagnosticsService(FakeExecutor(rows))
+    result = await service.get_open_transactions("testdb", limit=3)
+
+    assert result["truncated"] is True
+    assert len(result["transactions"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_lock_limit_is_clamped_to_max():
+    service = LockDiagnosticsService(FakeExecutor([]))
+    result = await service.get_lock_details("testdb", limit=999999)
+    assert result["limit"] == 1000
+    assert service.executor.last_params == [1001]

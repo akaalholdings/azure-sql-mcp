@@ -132,6 +132,7 @@ class QueryIndexAnalysisService:
         per_statement_results = await self.executor.execute_session(
             database_name,
             ["SET SHOWPLAN_XML ON", sql, "SET SHOWPLAN_XML OFF"],
+            max_rows=self.executor.config.row_limit + 1,
         )
         plan_results = per_statement_results[1] if len(per_statement_results) > 1 else []
         for result in plan_results:

@@ -13,6 +13,7 @@ from azure_sql_mcp.safe_sql import SafeSqlValidator
 @pytest.mark.asyncio
 async def test_get_estimated_plan_uses_execute_session() -> None:
     executor = MagicMock()
+    executor.config.row_limit = 200
     executor.execute_session = AsyncMock(
         return_value=[
             [],
@@ -28,6 +29,7 @@ async def test_get_estimated_plan_uses_execute_session() -> None:
     executor.execute_session.assert_awaited_once_with(
         "appdb",
         ["SET SHOWPLAN_XML ON", "SELECT 1", "SET SHOWPLAN_XML OFF"],
+        max_rows=201,
     )
 
 

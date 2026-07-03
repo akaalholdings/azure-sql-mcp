@@ -10,8 +10,8 @@ class StubExecutor:
         self.rows = rows
         self.calls = []
 
-    async def fetch_all(self, database_name: str, query: str):
-        self.calls.append((database_name, query))
+    async def fetch_all(self, database_name: str, query: str, params=None):
+        self.calls.append((database_name, query, params))
         return self.rows
 
 
@@ -39,3 +39,20 @@ async def test_detect_blocking_chains_returns_empty_for_unblocked_sessions() -> 
     service = SessionsService(StubExecutor([]))
 
     assert service._detect_blocking_chains([{"session_id": 7, "blocking_session_id": None}]) == []
+
+
+@pytest.mark.asyncio
+async def test_get_active_sessions_truncates_above_limit() -> None:
+    rows = [
+        {"session_id": 50 + i, "blocking_session_id": None, "command": "SELECT"}
+        for i in range(3)
+    ]
+    executor = StubExecutor(rows)
+    service = SessionsService(executor)
+
+    result = await service.get_active_sessions("appdb", limit=2)
+
+    assert result["truncated"] is True
+    assert result["active_session_count"] == 2
+    # TOP is parameterized with limit + 1 to detect truncation
+    assert executor.calls[0][2] == [3]

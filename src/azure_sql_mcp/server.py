@@ -475,6 +475,10 @@ class AzureSqlMcpApplication:
             ),
         )
         async def get_active_sessions(
+            limit: int = Field(
+                default=200,
+                description="Maximum sessions to return (longest-running first, max 1000).",
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -483,7 +487,7 @@ class AzureSqlMcpApplication:
             return await self._run_tool(
                 "get_active_sessions",
                 database_name,
-                self.sessions.get_active_sessions,
+                lambda db: self.sessions.get_active_sessions(db, limit),
             )
 
         @self.mcp.tool(
@@ -957,6 +961,10 @@ class AzureSqlMcpApplication:
             ),
         )
         async def get_lock_details(
+            limit: int = Field(
+                default=200,
+                description="Maximum lock rows to return (waiting locks first, max 1000).",
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -965,7 +973,7 @@ class AzureSqlMcpApplication:
             return await self._run_tool(
                 "get_lock_details",
                 database_name,
-                self.lock_diagnostics.get_lock_details,
+                lambda db: self.lock_diagnostics.get_lock_details(db, limit),
             )
 
         @self.mcp.tool(
@@ -982,6 +990,10 @@ class AzureSqlMcpApplication:
             ),
         )
         async def get_open_transactions(
+            limit: int = Field(
+                default=100,
+                description="Maximum transactions to return (oldest first, max 1000).",
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -990,7 +1002,7 @@ class AzureSqlMcpApplication:
             return await self._run_tool(
                 "get_open_transactions",
                 database_name,
-                self.lock_diagnostics.get_open_transactions,
+                lambda db: self.lock_diagnostics.get_open_transactions(db, limit),
             )
 
         @self.mcp.tool(
@@ -1037,6 +1049,10 @@ class AzureSqlMcpApplication:
             ),
         )
         async def get_tempdb_usage(
+            limit: int = Field(
+                default=200,
+                description="Maximum sessions to return (largest tempdb consumers first, max 1000).",
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -1045,7 +1061,7 @@ class AzureSqlMcpApplication:
             return await self._run_tool(
                 "get_tempdb_usage",
                 database_name,
-                self.tempdb_memory.get_tempdb_usage,
+                lambda db: self.tempdb_memory.get_tempdb_usage(db, limit),
             )
 
         @self.mcp.tool(

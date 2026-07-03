@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from azure_sql_mcp.plans import PlansService
@@ -81,9 +83,10 @@ ACTUAL_SHOWPLAN = """\
 
 
 class FakeExecutor:
-    def __init__(self, *, can_create_index=True, fail_create=False):
+    def __init__(self, *, can_create_index=True, fail_create=False, row_limit=200):
         self.can_create_index = can_create_index
         self.fail_create = fail_create
+        self.config = SimpleNamespace(row_limit=row_limit)
         self.fetch_history = []
         self.batch_history = []
         self.session_history = []
@@ -102,7 +105,7 @@ class FakeExecutor:
         return [Result()]
 
     async def execute_session(self, database_name, statements, *, max_rows=None):
-        self.session_history.append((database_name, list(statements)))
+        self.session_history.append((database_name, list(statements), max_rows))
 
         class Result:
             rows = [{"plan_xml": SAMPLE_SHOWPLAN}]
@@ -162,3 +165,22 @@ async def test_explain_query_rejects_hypothetical_indexes_without_writes():
 
     assert executor.non_query_history == []
     assert executor.session_history == []
+
+
+@pytest.mark.asyncio
+async def test_explain_query_bounds_result_set_fetches():
+    """With STATISTICS XML the user query actually executes; the session fetch
+    must be bounded so a huge SELECT cannot pull an entire table into memory."""
+    executor = FakeExecutor(row_limit=50)
+    service = PlansService(executor=executor, validator=SafeSqlValidator())
+
+    artifact = await service.explain_query(
+        database_name="appdb",
+        sql="SELECT name FROM sys.objects",
+        analyze=True,
+    )
+
+    assert artifact.raw_xml == SAMPLE_SHOWPLAN
+    database_name, statements, max_rows = executor.session_history[0]
+    assert statements[0] == "SET STATISTICS XML ON"
+    assert max_rows == 51

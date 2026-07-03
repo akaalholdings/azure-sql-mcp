@@ -5,6 +5,9 @@ from typing import Any
 from .connection import AzureSqlExecutor
 
 
+MAX_SESSION_LIMIT = 1000
+
+
 class TempdbMemoryService:
     def __init__(self, executor: AzureSqlExecutor):
         self.executor = executor
@@ -12,10 +15,12 @@ class TempdbMemoryService:
     async def get_tempdb_usage(
         self,
         database_name: str,
+        limit: int = 200,
     ) -> dict[str, Any]:
         """Per-session tempdb consumption from sys.dm_db_session_space_usage."""
+        bounded_limit = max(1, min(int(limit), MAX_SESSION_LIMIT))
         query = """
-        SELECT
+        SELECT TOP (?)
             su.session_id,
             s.login_name,
             s.status AS session_status,
@@ -41,10 +46,16 @@ class TempdbMemoryService:
           )
         ORDER BY total_net_mb DESC
         """
-        rows = await self.executor.fetch_all(database_name, query)
+        rows = await self.executor.fetch_all(
+            database_name, query, params=[bounded_limit + 1],
+        )
+        truncated = len(rows) > bounded_limit
+        rows = rows[:bounded_limit]
         return {
             "database_name": database_name,
             "session_count": len(rows),
+            "limit": bounded_limit,
+            "truncated": truncated,
             "sessions": rows,
         }
 

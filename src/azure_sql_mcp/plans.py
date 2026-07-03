@@ -66,9 +66,13 @@ class PlansService:
             set_on = "SET SHOWPLAN_XML ON"
             set_off = "SET SHOWPLAN_XML OFF"
 
+        # Bound each result set: with STATISTICS XML the user query actually
+        # executes and returns its rows before the plan XML result set, so an
+        # unbounded fetch here could pull an entire table into memory.
         per_statement_results = await self.executor.execute_session(
             database_name,
             [set_on, sql, set_off],
+            max_rows=self.executor.config.row_limit + 1,
         )
         # The middle entry corresponds to the user query — that's where
         # the plan XML is returned by SQL Server.
