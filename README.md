@@ -2,7 +2,7 @@
 
 **Production-grade Model Context Protocol server for Azure SQL Database.**
 
-57 tools across query execution, deep performance diagnostics, schema comparison, token-safe artifacts, and audited administration — built and live-tested against real Azure SQL DB tiers. Restricted deployments expose 51 non-admin tools by default.
+63 tools across query execution, deep performance diagnostics, schema comparison, token-safe artifacts, and audited administration — built and live-tested against real Azure SQL DB tiers. Restricted deployments expose 53 non-admin tools by default.
 
 Comprehensive unit and integration coverage is included; run `uv run pytest -q` for the current test counts in your environment.
 
@@ -18,7 +18,7 @@ Most SQL MCP servers are toy wrappers around `cursor.execute()`. Azure SQL MCP i
 - **Memory-safe.** Server-side `fetchmany(row_limit + 1)` instead of `fetchall()`. A 10M-row `SELECT *` won't OOM the MCP host or burn the model's context window.
 - **Tier-aware.** DMV queries are written to survive across GeneralPurpose / BusinessCritical / Hyperscale, where columns like `primary_max_cpu_percent` and catalogs like `sys.master_files` only exist on some tiers. Found and fixed in live testing — see the [Azure SQL DB gotchas](#azure-sql-db-gotchas) section.
 - **Session-scoped SET handling.** Tools like `explain_query` need `SET SHOWPLAN_XML ON` to persist across a pooled connection — Azure SQL MCP has a custom `execute_session` path so the SET and the query share a single physical connection. Most other servers silently get this wrong.
-- **Token-efficient by tool grouping.** Run with `--azure-sql-tool-groups core` (15 tools) instead of the full restricted surface (51 tools) when you want a slim surface.
+- **Token-efficient by tool grouping.** Run with `--azure-sql-tool-groups core` (15 tools) instead of the full restricted surface (53 tools) when you want a slim surface.
 - **HTTP bearer auth.** SSE and Streamable HTTP transports require `AZURE_SQL_MCP_BEARER_TOKEN` and validate `Authorization: Bearer ...` with constant-time comparison.
 - **Audited write policy.** Unrestricted admin tools default to dry-run review. Raw arbitrary SQL execution is limited to read-only SELECT batches; writes run through generated, audited admin tools and require `AZURE_SQL_WRITE_POLICY=apply`.
 
@@ -100,7 +100,7 @@ All settings are env vars. CLI flags override env vars.
 |---|---|---|
 | `AZURE_SQL_TOOL_GROUPS` | `all` | Comma-separated list of `core`, `performance`, `schema`, `admin`, `all` |
 
-Example: `AZURE_SQL_TOOL_GROUPS=core,performance` exposes 48 tools instead of all 51 restricted tools.
+Example: `AZURE_SQL_TOOL_GROUPS=core,performance` exposes 50 tools instead of all 53 restricted tools.
 
 ### Limits & runtime
 
@@ -108,7 +108,7 @@ Example: `AZURE_SQL_TOOL_GROUPS=core,performance` exposes 48 tools instead of al
 |---|---|---|
 | `AZURE_SQL_ROW_LIMIT` | `200` | Max rows returned per query (server-side `fetchmany`) |
 | `AZURE_SQL_QUERY_TIMEOUT_SECONDS` | `30` | Per-query timeout |
-| `AZURE_SQL_TOOL_TIMEOUT_SECONDS` | `query_timeout + 15` | Outer per-tool-call timeout |
+| `AZURE_SQL_TOOL_TIMEOUT_SECONDS` | `query_timeout + 15` | Outer per-tool-call timeout; must be >= the query timeout |
 | `AZURE_SQL_POOL_SIZE` | `5` | Per-database connection pool size |
 | `AZURE_SQL_MAX_RETRIES` | `3` | Retries for transient connection failures |
 | `AZURE_SQL_LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
@@ -196,7 +196,7 @@ Bearer auth is transport-level protection only; use TLS from a reverse proxy/API
 
 ## Tool catalogue
 
-57 tools across 5 groups. Tools marked **(unrestricted)** require `AZURE_SQL_ACCESS_MODE=unrestricted`; restricted deployments advertise 51 tools.
+63 tools across 4 groups. Tools marked **(unrestricted)** require `AZURE_SQL_ACCESS_MODE=unrestricted`; restricted deployments advertise 53 tools.
 
 ### `core` — query, introspection, health (15 tools)
 
@@ -210,7 +210,7 @@ Bearer auth is transport-level protection only; use TLS from a reverse proxy/API
 | `get_object_details` | Columns, indexes, constraints, definition |
 | `get_dependencies` | What this object references and what references it |
 | `get_table_stats` | Approximate row counts and storage breakdown |
-| `execute_sql` | Read-only SQL through the safety validator |
+| `execute_sql` | Read-only SQL through the safety validator; optional `DECLARE`/`SET @var` prefix before a single SELECT |
 | `explain_query` | Estimated or actual execution plan for read-only SQL; raw SHOWPLAN XML is stored as an MCP artifact URI by default |
 | `tune_query` | Structured single-query evidence pack: plan summary, bounded sample, Query Store context, stats, waits, and index analysis |
 | `benchmark_query_rewrite` | Compare a baseline query and rewrite with bounded samples, plan summaries, and sample equivalence metadata |
@@ -218,7 +218,7 @@ Bearer auth is transport-level protection only; use TLS from a reverse proxy/API
 | `analyze_index_recommendations` | Missing-index DMV + automatic-tuning recommendations |
 | `analyze_db_health` | 11 health checks: index, buffer, autotune, storage, query-store, log-rate, etc. |
 
-### `performance` — deep diagnostics & tuning (34 tools)
+### `performance` — deep diagnostics & tuning (35 tools)
 
 **Query analysis & tuning**
 - `analyze_query_indexes` — recommend indexes for up to 10 queries via plan analysis
@@ -252,6 +252,7 @@ Bearer auth is transport-level protection only; use TLS from a reverse proxy/API
 - `get_io_stats` — per-file latency, throughput, pending I/O (Azure-SQL-DB-safe)
 - `get_resource_limits` — service objective + governance limits (tier-tolerant)
 - `get_resource_stats_history` — `sys.dm_db_resource_stats` history with sustained-pressure detection
+- `get_connection_pool_stats` — MCP-side connection pool metrics and leak detection (no database round-trip)
 
 **Diagnostic query parity**
 - `get_database_configuration` — version, database properties, scoped configs, Query Store, automatic tuning, geo-replication, and Azure DB properties
@@ -299,7 +300,7 @@ The `execute_sql` tool routes every query through `SafeSqlValidator` (`safe_sql.
 2. **`sqlglot` AST parse** in T-SQL dialect rejects anything that isn't a single read-only statement.
 3. **AST inspection** rejects any node referencing dangerous surface area.
 
-**Allowed:** `SELECT`, CTEs, set operators (`UNION`/`EXCEPT`/`INTERSECT`), `sys.*` catalog reads, `OPENJSON`, parameterized values.
+**Allowed:** `SELECT`, CTEs, set operators (`UNION`/`EXCEPT`/`INTERSECT`), `sys.*` catalog reads, `OPENJSON`, parameterized values, and an optional `DECLARE` / `SET @variable` prefix before the single SELECT (used by parameter auto-binding; session SET options are still rejected).
 
 **Blocked:** all DML/DDL, `EXEC`, `GO` batches, `DBCC`, temp tables, external rowsets (`OPENROWSET`, `OPENDATASOURCE`), extended procedures, OLE automation, cross-database three-part names, linked-server four-part names, dynamic SQL.
 
@@ -323,7 +324,7 @@ Query Store apply behavior is deliberately narrow: `apply_plan_action` and `forc
 
 ### Database allowlist
 
-Every tool call resolves `database_name` against `AZURE_SQL_ALLOWED_DATABASES`. Calls referencing a database not in the allowlist fail before any connection is opened. There is no way to escape the allowlist short of changing the env var.
+Every tool call resolves `database_name` against `AZURE_SQL_ALLOWED_DATABASES` (case-insensitively, matching Azure SQL semantics). Calls referencing a database not in the allowlist fail before any connection is opened. There is no way to escape the allowlist short of changing the env var.
 
 ### Memory safety
 
@@ -340,7 +341,7 @@ Large payloads are returned by reference. `explain_query` stores raw SHOWPLAN XM
 ```mermaid
 graph TD
     Client["MCP Client<br/>(Claude / Cursor / VS Code)"] -->|stdio · SSE · HTTP| FastMCP
-    FastMCP --> Tools["51 Tool Handlers<br/>(grouped, prunable)"]
+    FastMCP --> Tools["53 Tool Handlers (restricted)<br/>(grouped, prunable)"]
     Tools --> Validator["SafeSqlValidator<br/>(sqlglot T-SQL AST)"]
     Tools --> Services["Service Layer<br/>(introspection · plans · query-store ·<br/>health · waits · locks · tempdb ·<br/>resource-gov · schema-diff · ...)"]
     Services --> Executor["AzureSqlExecutor<br/>fetch_all / execute_batches /<br/>execute_session / execute_non_query"]
@@ -388,7 +389,7 @@ uv run pytest tests/unit/test_competitive_fixes.py -v   # R1/R2/R3/R7 + execute_
 
 ### Run live integration tests
 
-The repo includes live integration coverage against a real Azure SQL DB. It verifies:
+The repo includes integration coverage that runs against a real Azure SQL DB when the `AZURE_SQL_*` environment variables are set (the tests skip otherwise). It verifies:
 
 - Core tools
 - Query tools (including R2 fetchmany truncation, SHOWPLAN session fix)
@@ -399,8 +400,10 @@ The repo includes live integration coverage against a real Azure SQL DB. It veri
 You'll need a server in `AZURE_SQL_ALLOWED_DATABASES` and a valid auth chain.
 
 ```bash
-PATH="$PATH:$(dirname $(which az))" \
-  uv run python tests/live/test_live_mcp.py
+export AZURE_SQL_SERVER="your-server.database.windows.net"
+export AZURE_SQL_DEFAULT_DATABASE="appdb"
+export AZURE_SQL_ALLOWED_DATABASES="appdb"
+uv run pytest tests/integration -q
 ```
 
 ### Project layout
@@ -453,6 +456,7 @@ src/azure_sql_mcp/
 - **No automatic index deployment.** Index/stat maintenance remains explicit, dry-run by default, audited, and gated by `AZURE_SQL_WRITE_POLICY=apply`.
 - **Plan application is intentionally narrow.** Query Store force/unforce is supported because it is reversible; broader Query Store hints or index changes should be reviewed separately.
 - **DMV-backed tools require role visibility** that varies by principal. `check_capabilities` reports what the current principal can and can't see.
+- **Artifacts are in-memory and per-process.** `azuresql-artifact://` URIs expire (1h TTL, bounded LRU) and do not survive a server restart.
 - **`explain_query` does not support what-if index creation in v1.** Use `analyze_query_indexes` / `analyze_workload_indexes` for read-only index analysis.
 
 ---

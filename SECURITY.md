@@ -28,6 +28,7 @@ remediation guidance and release timelines when confirmed.
 - Keep `AZURE_SQL_ACCESS_MODE=restricted` unless an operator explicitly needs admin tooling.
 - `sse` and `streamable-http` require `AZURE_SQL_MCP_BEARER_TOKEN`; clients must send `Authorization: Bearer <token>`.
 - Put HTTP/SSE deployments behind TLS and a private network or gateway. The bearer token is not a replacement for TLS.
+- Pass secrets (`AZURE_SQL_PASSWORD`, `AZURE_CLIENT_SECRET`, `AZURE_SQL_MCP_BEARER_TOKEN`) as environment variables, not CLI flags — flags are visible in process listings.
 - Remote transports do not expose apply-capable admin behavior unless `AZURE_SQL_ENABLE_REMOTE_ADMIN=1` is set.
 - Write-capable generated tools default to dry-run review. Execution requires `dry_run=false` and `AZURE_SQL_WRITE_POLICY=apply`.
 - Raw arbitrary SQL execution is limited to read-only SELECT-style batches. Use generated admin tools for writes.
