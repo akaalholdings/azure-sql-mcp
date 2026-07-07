@@ -30,6 +30,7 @@ def server_config_factory() -> Callable[..., ServerConfig]:
             "log_format": "text",
             "username": None,
             "password": None,
+            "trust_server_certificate": False,
             "tenant_id": None,
             "client_id": None,
             "client_secret": None,

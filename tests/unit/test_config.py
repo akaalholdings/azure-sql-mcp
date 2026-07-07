@@ -21,8 +21,20 @@ def test_load_server_config_from_environment(monkeypatch):
     assert config.allowed_databases == ("appdb", "reportingdb")
     assert config.auth_mode == AuthMode.ENTRA_DEFAULT
     assert config.access_mode == AccessMode.RESTRICTED
+    assert config.trust_server_certificate is False
     assert config.transport.mode == TransportMode.STDIO
     assert config.write_policy == WritePolicy.DISABLED
+
+
+def test_trust_server_certificate_can_be_enabled_for_self_hosted_sql(monkeypatch):
+    monkeypatch.setenv("AZURE_SQL_SERVER", "192.168.55.53")
+    monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "master")
+    monkeypatch.setenv("AZURE_SQL_ALLOWED_DATABASES", "master")
+    monkeypatch.setenv("AZURE_SQL_TRUST_SERVER_CERTIFICATE", "true")
+
+    config = load_server_config([])
+
+    assert config.trust_server_certificate is True
 
 
 def test_cli_transport_overrides_environment(monkeypatch):

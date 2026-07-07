@@ -39,7 +39,7 @@ class AzureSqlAuthenticator:
             f"SERVER=tcp:{self.config.server},1433;"
             f"DATABASE={database_name};"
             "Encrypt=yes;"
-            "TrustServerCertificate=no;"
+            f"TrustServerCertificate={'yes' if self.config.trust_server_certificate else 'no'};"
         )
 
         if self.config.auth_mode == AuthMode.SQL_PASSWORD:

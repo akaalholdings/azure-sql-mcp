@@ -132,6 +132,7 @@ class ServerConfig:
     log_format: str
     username: str | None
     password: str | None
+    trust_server_certificate: bool
     tenant_id: str | None
     client_id: str | None
     client_secret: str | None
@@ -236,6 +237,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--azure-sql-username", dest="azure_sql_username")
     parser.add_argument("--azure-sql-password", dest="azure_sql_password")
+    parser.add_argument(
+        "--azure-sql-trust-server-certificate",
+        dest="azure_sql_trust_server_certificate",
+    )
     parser.add_argument("--azure-tenant-id", dest="azure_tenant_id")
     parser.add_argument("--azure-client-id", dest="azure_client_id")
     parser.add_argument("--azure-client-secret", dest="azure_client_secret")
@@ -318,6 +323,9 @@ def load_server_config(argv: list[str] | None = None) -> ServerConfig:
 
     username = env_or_arg(args, "azure_sql_username")
     password = env_or_arg(args, "azure_sql_password")
+    trust_server_certificate = parse_bool(
+        env_or_arg(args, "azure_sql_trust_server_certificate")
+    )
     tenant_id = env_or_arg(args, "azure_tenant_id")
     client_id = env_or_arg(args, "azure_client_id")
     client_secret = env_or_arg(args, "azure_client_secret")
@@ -392,6 +400,7 @@ def load_server_config(argv: list[str] | None = None) -> ServerConfig:
         log_format=log_format,
         username=username,
         password=password,
+        trust_server_certificate=trust_server_certificate,
         tenant_id=tenant_id,
         client_id=client_id,
         client_secret=client_secret,

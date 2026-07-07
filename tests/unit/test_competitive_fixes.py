@@ -61,6 +61,7 @@ def _make_app(
             log_format="text",
             username=None,
             password=None,
+        trust_server_certificate=False,
             tenant_id=None,
             client_id=None,
             client_secret=None,

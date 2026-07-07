@@ -80,6 +80,7 @@ All settings are env vars. CLI flags override env vars.
 | Variable | Default | Values |
 |---|---|---|
 | `AZURE_SQL_ACCESS_MODE` | `restricted` | `restricted` (read-only validator), `unrestricted` (adds arbitrary SQL + audited admin tools) |
+| `AZURE_SQL_TRUST_SERVER_CERTIFICATE` | `false` | Set `true` only for self-hosted/dev SQL Server endpoints with a self-signed certificate. |
 | `AZURE_SQL_WRITE_POLICY` | `review` in unrestricted, `disabled` in restricted | `disabled`, `review`, `apply`. Execution requires `apply`; dry-run previews work in `review`. |
 | `AZURE_SQL_AUDIT_DIR` | `~/.azure-sql-mcp/audit` | JSONL audit directory for write previews, applies, blocks, and failures |
 | `AZURE_SQL_AUDIT_FULL_SQL` | `0` | Set `1` to include full SQL in audit records. Default stores SQL hash + preview only. |
