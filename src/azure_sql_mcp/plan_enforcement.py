@@ -73,7 +73,7 @@ class PlanEnforcementService:
             "forced_plan_warnings": forced_plans.get("warnings", []),
         }
 
-    def dry_run_action(
+    async def dry_run_action(
         self,
         database_name: str,
         *,
@@ -81,6 +81,9 @@ class PlanEnforcementService:
         query_id: int,
         plan_id: int,
     ) -> dict[str, Any]:
+        # async so the tool wrapper can await it like every other service call
+        # (as a sync method the wrapper awaited its dict and the tool always
+        # failed with "'dict' object can't be awaited").
         return self.admin_policy.preview(
             self._build_action(
                 database_name,
@@ -98,6 +101,7 @@ class PlanEnforcementService:
         action: str,
         query_id: int,
         plan_id: int,
+        dry_run: bool = True,
     ) -> dict[str, Any]:
         admin_action = self._build_action(
             database_name,
@@ -109,7 +113,7 @@ class PlanEnforcementService:
         payload = await self.admin_policy.execute(
             admin_action,
             self.executor,
-            dry_run=False,
+            dry_run=dry_run,
         )
         payload["query_id"] = query_id
         payload["plan_id"] = plan_id

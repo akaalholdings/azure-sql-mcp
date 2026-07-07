@@ -8,6 +8,9 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ### Fixed
 
+- `apply_plan_action` ignored `dry_run`: the tool exposed no such parameter, so a client passing `dry_run=true` had it silently discarded and the Query Store force/unforce executed for real (only blocked by DB permissions in live testing). The tool now accepts `dry_run` defaulting to true, matching the documented admin-tool contract.
+- `dry_run_plan_action` always failed ("'dict' object can't be awaited"): the service method was synchronous while the tool wrapper awaits every callback. Now async; verified live with preview + audit + rollback SQL.
+
 - Row-capped fetches no longer drain the remaining result set: advancing past a truncated result set pulled every leftover row over the wire (a 17.9M-row `SELECT *` hit the tool timeout instead of returning 200 rows; now 0.09s). SHOWPLAN sessions still drain — their plan XML arrives as a later result set.
 - `check_capabilities` plan probes now target a user table: SQL Server exempts catalog-only statements from the SHOWPLAN permission check, so the old sys.objects probe reported plans as available under logins where explain_query would be denied.
 

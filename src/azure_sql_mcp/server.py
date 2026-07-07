@@ -1862,6 +1862,13 @@ class AzureSqlMcpApplication:
                 action: str = Field(description="'force' or 'unforce'."),
                 query_id: int = Field(description="Query Store query_id."),
                 plan_id: int = Field(description="Query Store plan_id."),
+                dry_run: bool = Field(
+                    default=True,
+                    description=(
+                        "Preview only when true (default). Execution requires "
+                        "dry_run=false and AZURE_SQL_WRITE_POLICY=apply."
+                    ),
+                ),
                 database_name: str | None = Field(
                     default=None,
                     description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -1875,6 +1882,7 @@ class AzureSqlMcpApplication:
                         action=action,
                         query_id=query_id,
                         plan_id=plan_id,
+                        dry_run=dry_run,
                     ),
                 )
 
