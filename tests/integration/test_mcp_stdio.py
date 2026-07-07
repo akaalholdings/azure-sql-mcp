@@ -45,6 +45,9 @@ def _server_env(app: AzureSqlMcpApplication, database_name: str) -> dict[str, st
         "AZURE_TENANT_ID": app.config.tenant_id,
         "AZURE_CLIENT_ID": app.config.client_id,
         "AZURE_CLIENT_SECRET": app.config.client_secret,
+        "AZURE_SQL_TRUST_SERVER_CERTIFICATE": (
+            "true" if app.config.trust_server_certificate else None
+        ),
     }
     for key, value in optional_values.items():
         if value:
@@ -80,8 +83,12 @@ async def test_mcp_stdio_end_to_end(
     if (
         integration_app.config.auth_mode == AuthMode.SQL_PASSWORD
         and integration_app.config.server.lower() in {"localhost", "127.0.0.1", "sqlserver"}
+        and not integration_app.config.trust_server_certificate
     ):
-        pytest.skip("stdio server integration test requires Azure SQL or a TLS-enabled SQL Server.")
+        pytest.skip(
+            "stdio server integration test against local SQL Server requires "
+            "AZURE_SQL_TRUST_SERVER_CERTIFICATE=true (self-signed certificate)."
+        )
 
     project_root = Path(__file__).resolve().parents[2]
     server = StdioServerParameters(

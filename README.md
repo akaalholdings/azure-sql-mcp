@@ -390,6 +390,26 @@ uv build
 uv run pytest tests/unit/test_competitive_fixes.py -v   # R1/R2/R3/R7 + execute_session
 ```
 
+### Run the suite against a local SQL Server container
+
+No Azure required — the integration suite (including the stdio end-to-end test)
+runs against a throwaway SQL Server 2022 container:
+
+```bash
+docker run -d --name mcp-sql-test --platform linux/amd64 -e ACCEPT_EULA=Y \
+  -e "MSSQL_SA_PASSWORD=LocalTest!Pass123" -p 1433:1433 \
+  mcr.microsoft.com/mssql/server:2022-latest
+
+AZURE_SQL_SERVER=127.0.0.1 \
+AZURE_SQL_DEFAULT_DATABASE=master \
+AZURE_SQL_ALLOWED_DATABASES=master \
+AZURE_SQL_AUTH_MODE=sql-password \
+AZURE_SQL_USERNAME=sa \
+AZURE_SQL_PASSWORD='LocalTest!Pass123' \
+AZURE_SQL_TRUST_SERVER_CERTIFICATE=true \
+  uv run pytest tests/integration -q
+```
+
 ### Run live integration tests
 
 The repo includes integration coverage that runs against a real Azure SQL DB when the `AZURE_SQL_*` environment variables are set (the tests skip otherwise). It verifies:
@@ -454,7 +474,7 @@ src/azure_sql_mcp/
 
 ## Known limitations
 
-- **Azure SQL Database** is the supported surface for v1. SQL Server on-prem and Azure SQL Managed Instance work for most tools but are not part of the live test matrix.
+- **Azure SQL Database** is the primary surface. Self-hosted SQL Server is verified against SQL Server 2022: 45 of 48 swept restricted tools work; `get_wait_stats`, `get_resource_limits`, and `get_resource_stats_history` rely on Azure-SQL-DB-only DMVs and fail with a clear error. Azure SQL Managed Instance is untested.
 - **No control-plane integration.** Server-level operations, ARM, and Azure Resource Graph are out of scope.
 - **No automatic index deployment.** Index/stat maintenance remains explicit, dry-run by default, audited, and gated by `AZURE_SQL_WRITE_POLICY=apply`.
 - **Plan application is intentionally narrow.** Query Store force/unforce is supported because it is reversible; broader Query Store hints or index changes should be reviewed separately.

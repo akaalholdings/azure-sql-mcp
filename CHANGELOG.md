@@ -27,6 +27,8 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ### Added
 
+- `AZURE_SQL_TRUST_SERVER_CERTIFICATE` (default false) for self-hosted SQL Server endpoints with self-signed certificates; encryption stays on. Verified live: the full integration suite (including the stdio end-to-end test, which previously skipped for localhost) passes against a SQL Server 2022 Docker container, and 45 of 48 swept restricted tools work on-prem.
+
 - `get_connection_pool_stats` tool (performance group): per-database pool metrics and connection-leak detection without a database round-trip.
 
 ### Changed
