@@ -221,3 +221,34 @@ async def test_discard_connection_when_task_finishes_waits_then_discards(
     await cleanup_task
 
     pool.discard.assert_awaited_once_with("appdb", connection)
+
+
+def test_consume_batches_stops_at_cap_without_draining(sample_server_config) -> None:
+    """Hitting the row cap must not call nextset(): advancing would drain every
+    remaining row over the wire (minutes on a 17.9M-row table); closing the
+    cursor discards them protocol-side instead."""
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), MagicMock())
+    cursor = MagicMock()
+    cursor.description = [("id",)]
+    cursor.fetchmany.return_value = [(i,) for i in range(3)]
+
+    results = executor._consume_batches(cursor, max_rows=3)
+
+    assert len(results) == 1
+    assert len(results[0].rows) == 3
+    cursor.nextset.assert_not_called()
+
+
+def test_consume_batches_session_path_keeps_draining_for_plan_xml(sample_server_config) -> None:
+    """SHOWPLAN sessions need the result set AFTER the capped data rows —
+    stop_on_cap=False keeps advancing."""
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), MagicMock())
+    cursor = MagicMock()
+    cursor.description = [("col",)]
+    cursor.fetchmany.side_effect = [[("row",)] * 3, [("<ShowPlanXML/>",)]]
+    cursor.nextset.side_effect = [True, False]
+
+    results = executor._consume_batches(cursor, max_rows=3, stop_on_cap=False)
+
+    assert len(results) == 2
+    assert results[1].rows == [{"col": "<ShowPlanXML/>"}]

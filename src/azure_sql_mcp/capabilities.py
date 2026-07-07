@@ -80,10 +80,33 @@ class CapabilityService:
     async def _check_query_store(self, database_name: str) -> Any:
         return await self.query_store_service.get_status(database_name)
 
+    async def _plan_probe_query(self, database_name: str) -> str:
+        """Probe plans against a user table when one exists.
+
+        SQL Server exempts catalog-only statements from the SHOWPLAN
+        permission check, so a sys.objects probe reports plans as available
+        even when explain_query on real tables would be denied (found live
+        with a db_datareader-only login).
+        """
+        rows = await self.executor.fetch_all(
+            database_name,
+            """
+            SELECT TOP (1)
+                QUOTENAME(s.name) + '.' + QUOTENAME(t.name) AS qualified_name
+            FROM sys.tables AS t
+            INNER JOIN sys.schemas AS s ON t.schema_id = s.schema_id
+            WHERE t.is_ms_shipped = 0
+            ORDER BY t.object_id
+            """,
+        )
+        if rows and rows[0].get("qualified_name"):
+            return f"SELECT TOP 1 * FROM {rows[0]['qualified_name']}"
+        return "SELECT TOP 1 name FROM sys.objects ORDER BY name"
+
     async def _check_estimated_plan(self, database_name: str) -> Any:
         plan = await self.plans_service.explain_query(
             database_name,
-            "SELECT TOP 1 name FROM sys.objects ORDER BY name",
+            await self._plan_probe_query(database_name),
             analyze=False,
         )
         return plan.summary
@@ -91,7 +114,7 @@ class CapabilityService:
     async def _check_actual_plan(self, database_name: str) -> Any:
         plan = await self.plans_service.explain_query(
             database_name,
-            "SELECT TOP 1 name FROM sys.objects ORDER BY name",
+            await self._plan_probe_query(database_name),
             analyze=True,
         )
         return plan.summary

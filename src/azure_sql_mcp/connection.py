@@ -265,7 +265,7 @@ class AzureSqlExecutor:
                     self._set_lock_timeout(cursor)
                 cursor.execute(statement)
                 per_statement_results.append(
-                    self._consume_batches(cursor, max_rows=max_rows)
+                    self._consume_batches(cursor, max_rows=max_rows, stop_on_cap=False)
                 )
             finally:
                 cursor.close()
@@ -318,7 +318,7 @@ class AzureSqlExecutor:
                 return
 
     def _consume_batches(
-        self, cursor, *, max_rows: int | None = None,
+        self, cursor, *, max_rows: int | None = None, stop_on_cap: bool = True,
     ) -> list[QueryResult]:
         results: list[QueryResult] = []
         while True:
@@ -337,6 +337,16 @@ class AzureSqlExecutor:
                     for raw_row in raw_rows
                 ]
                 results.append(QueryResult(columns=columns, rows=rows))
+
+                if stop_on_cap and max_rows is not None and len(raw_rows) >= max_rows:
+                    # Row cap hit: this result set is being truncated anyway.
+                    # nextset() would DRAIN every remaining row over the wire
+                    # to advance (minutes for a 17.9M-row SELECT); closing the
+                    # cursor discards pending rows protocol-side instead, so
+                    # stop here and skip any later result sets in the batch.
+                    # SHOWPLAN sessions pass stop_on_cap=False: their plan XML
+                    # arrives as a later result set and needs the drain.
+                    break
 
             has_next = cursor.nextset()
             if not has_next:

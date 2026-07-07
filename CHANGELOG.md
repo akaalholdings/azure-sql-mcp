@@ -8,6 +8,9 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ### Fixed
 
+- Row-capped fetches no longer drain the remaining result set: advancing past a truncated result set pulled every leftover row over the wire (a 17.9M-row `SELECT *` hit the tool timeout instead of returning 200 rows; now 0.09s). SHOWPLAN sessions still drain — their plan XML arrives as a later result set.
+- `check_capabilities` plan probes now target a user table: SQL Server exempts catalog-only statements from the SHOWPLAN permission check, so the old sys.objects probe reported plans as available under logins where explain_query would be denied.
+
 - `set_query_store_hints` never worked live: the driver binds str parameters as varchar while `sp_query_store_set_hints` requires nvarchar; the hints value is now routed through an `nvarchar(max)` variable.
 - Workload index analysis (`analyze_workload_indexes`, `optimize_indexes`) failed on every parameterized Query Store text ('must declare the scalar variable @P1'); stored text is now auto-bound before plan compilation, and captured DDL/DML statements are skipped instead of reported as errors.
 - Histogram-based parameter binding never worked live: `range_high_key` is sql_variant, which the driver cannot fetch; it is now CONVERTed server-side (style 121).
