@@ -60,6 +60,7 @@ async def test_detect_regressed_queries():
     assert result["recommendation_count"] == 1
     assert result["recommendations"][0]["score"] == 85
     assert "RecentPlanActivity" in executor.queries[0]
+    assert "execute_action_initiated_by" in executor.queries[0]
     assert executor.params == [[60]]
     # details should be parsed from JSON string
     assert result["recommendations"][0]["details"] == {"queryId": 42}
@@ -115,6 +116,7 @@ async def test_get_forced_plans_warns_stale_and_failing():
     assert "stale_forced_plans" in warning_types
     assert "failing_forced_plans" in warning_types
     assert "recent_execution_count" in executor.queries[0]
+    assert "plan_forcing_type_desc" in executor.queries[0]
     assert executor.params == [[120]]
 
 

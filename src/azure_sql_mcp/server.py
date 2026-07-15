@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
+import math
 import re
 import statistics
 import time
@@ -38,6 +40,7 @@ from .introspection import IntrospectionService
 from .lock_diagnostics import LockDiagnosticsService
 from .logging_config import configure_logging
 from .observability import sanitize_error_message
+from .param_binding import detect_parameters
 from .param_binding import ParameterBindingService
 from .plan_cache import PlanCacheService
 from .plan_enforcement import PlanEnforcementService
@@ -547,6 +550,13 @@ class AzureSqlMcpApplication:
                     "them using column statistics or type-based fallback values."
                 ),
             ),
+            parameter_values: dict[str, Any] | None = Field(
+                default=None,
+                description=(
+                    "Optional JSON parameter values keyed by name (for example "
+                    "{'CustomerId': 42}); values are safely rendered as T-SQL literals."
+                ),
+            ),
             include_raw_xml: bool = Field(
                 default=False,
                 description=(
@@ -569,6 +579,7 @@ class AzureSqlMcpApplication:
                     hypothetical_indexes,
                     auto_bind_params,
                     include_raw_xml,
+                    parameter_values,
                 ),
             )
 
@@ -596,6 +607,13 @@ class AzureSqlMcpApplication:
                 default=True,
                 description="Bind @param placeholders from column statistics where possible.",
             ),
+            parameter_values: dict[str, Any] | None = Field(
+                default=None,
+                description=(
+                    "Explicit parameter values for representative execution; prefer this "
+                    "over heuristic statistics/type fallback binding."
+                ),
+            ),
             include_raw_xml: bool = Field(
                 default=False,
                 description="Include raw SHOWPLAN XML inline. Defaults to token-safe artifact URI only.",
@@ -619,6 +637,7 @@ class AzureSqlMcpApplication:
                     auto_bind_params,
                     include_raw_xml,
                     window_minutes,
+                    parameter_values,
                 ),
             )
 
@@ -646,6 +665,17 @@ class AzureSqlMcpApplication:
             auto_bind_params: bool = Field(
                 default=True,
                 description="Bind @param placeholders from column statistics where possible.",
+            ),
+            parameter_values: dict[str, Any] | None = Field(
+                default=None,
+                description="Explicit parameter values for both baseline and rewrite.",
+            ),
+            compare_order: bool = Field(
+                default=True,
+                description=(
+                    "Compare result rows in returned order. Set false only when the "
+                    "query contract does not require ordering."
+                ),
             ),
             include_raw_xml: bool = Field(
                 default=False,
@@ -675,6 +705,8 @@ class AzureSqlMcpApplication:
                     auto_bind_params,
                     include_raw_xml,
                     runs,
+                    parameter_values,
+                    compare_order,
                 ),
             )
 
@@ -730,7 +762,9 @@ class AzureSqlMcpApplication:
         )
         async def analyze_query_indexes(
             queries: list[str] = Field(
-                description="List of SQL SELECT queries to analyze (max 10)."
+                min_length=1,
+                max_length=10,
+                description="List of SQL SELECT queries to analyze (max 10).",
             ),
             auto_bind_params: bool = Field(
                 default=False,
@@ -738,6 +772,10 @@ class AzureSqlMcpApplication:
                     "When true, automatically binds @param placeholders in queries "
                     "using column statistics before analyzing."
                 ),
+            ),
+            parameter_values: dict[str, Any] | None = Field(
+                default=None,
+                description="Explicit parameter values for the supplied queries.",
             ),
             database_name: str | None = Field(
                 default=None,
@@ -751,6 +789,7 @@ class AzureSqlMcpApplication:
                     resolved_database,
                     queries,
                     auto_bind_params,
+                    parameter_values,
                 ),
             )
 
@@ -1564,6 +1603,11 @@ class AzureSqlMcpApplication:
             ),
         )
         async def detect_regressed_queries(
+            window_minutes: int = Field(
+                default=1440,
+                ge=1,
+                description="Query Store lookback window in minutes (default 24 hours).",
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -1572,7 +1616,9 @@ class AzureSqlMcpApplication:
             return await self._run_tool(
                 "detect_regressed_queries",
                 database_name,
-                self.query_regression.detect_regressed_queries,
+                lambda db: self.query_regression.detect_regressed_queries(
+                    db, window_minutes
+                ),
             )
 
         @self.mcp.tool(
@@ -1623,6 +1669,11 @@ class AzureSqlMcpApplication:
             ),
         )
         async def get_forced_plans(
+            window_minutes: int = Field(
+                default=1440,
+                ge=1,
+                description="Query Store lookback window in minutes (default 24 hours).",
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -1631,7 +1682,7 @@ class AzureSqlMcpApplication:
             return await self._run_tool(
                 "get_forced_plans",
                 database_name,
-                self.query_regression.get_forced_plans,
+                lambda db: self.query_regression.get_forced_plans(db, window_minutes),
             )
 
         @self.mcp.tool(
@@ -2637,6 +2688,8 @@ class AzureSqlMcpApplication:
         online: bool,
         dry_run: bool = True,
     ) -> dict[str, Any]:
+        if not dry_run and self.config.write_policy.value == "apply":
+            self._require_test_index_database(database_name)
         index = self._validate_test_index_name(index_name)
         schema = self._validate_plain_identifier(schema_name, "schema_name")
         table = self._validate_plain_identifier(table_name, "table_name")
@@ -2697,6 +2750,8 @@ class AzureSqlMcpApplication:
         index_name: str,
         dry_run: bool = True,
     ) -> dict[str, Any]:
+        if not dry_run and self.config.write_policy.value == "apply":
+            self._require_test_index_database(database_name)
         index = self._validate_test_index_name(index_name)
         schema = self._validate_plain_identifier(schema_name, "schema_name")
         table = self._validate_plain_identifier(table_name, "table_name")
@@ -2717,6 +2772,19 @@ class AzureSqlMcpApplication:
             "action": "test_index_dropped",
         })
         return payload
+
+    def _require_test_index_database(self, database_name: str) -> None:
+        """Require an explicit sandbox/test database allowlist for live index DDL."""
+        allowed = self.config.test_index_databases
+        if not allowed:
+            raise PermissionError(
+                "AZURE_SQL_TEST_INDEX_DATABASES must explicitly allow a sandbox database "
+                "before test-index DDL can execute"
+            )
+        if database_name.casefold() not in {name.casefold() for name in allowed}:
+            raise PermissionError(
+                f"Database '{database_name}' is not in AZURE_SQL_TEST_INDEX_DATABASES."
+            )
 
     @staticmethod
     def _validate_plain_identifier(identifier: str, label: str) -> str:
@@ -2776,6 +2844,7 @@ class AzureSqlMcpApplication:
         auto_bind_params: bool,
         include_raw_xml: bool,
         window_minutes: int,
+        parameter_values: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if window_minutes <= 0:
             raise ValueError("window_minutes must be greater than 0.")
@@ -2783,6 +2852,7 @@ class AzureSqlMcpApplication:
             database_name,
             sql,
             auto_bind_params,
+            parameter_values,
         )
 
         plan = await self._explain_query(
@@ -2845,6 +2915,8 @@ class AzureSqlMcpApplication:
         auto_bind_params: bool,
         include_raw_xml: bool,
         runs: int = 1,
+        parameter_values: dict[str, Any] | None = None,
+        compare_order: bool = True,
     ) -> dict[str, Any]:
         if not 1 <= runs <= 10:
             raise ValueError("runs must be between 1 and 10.")
@@ -2852,18 +2924,38 @@ class AzureSqlMcpApplication:
             database_name,
             baseline_sql,
             auto_bind_params,
+            parameter_values,
         )
         rewrite_effective, rewrite_binding = await self._prepare_query(
             database_name,
             rewrite_sql,
             auto_bind_params,
+            parameter_values,
         )
 
-        async def measure_side(effective_sql: str) -> dict[str, Any]:
-            run_metrics: list[dict[str, Any]] = []
-            plan: dict[str, Any] = {}
-            execution: dict[str, Any] = {}
-            for _ in range(runs):
+        effective_by_side = {
+            "baseline": baseline_effective,
+            "rewrite": rewrite_effective,
+        }
+        run_metrics_by_side: dict[str, list[dict[str, Any]]] = {
+            "baseline": [],
+            "rewrite": [],
+        }
+        last_plan_by_side: dict[str, dict[str, Any]] = {
+            "baseline": {},
+            "rewrite": {},
+        }
+        last_execution_by_side: dict[str, dict[str, Any]] = {
+            "baseline": {},
+            "rewrite": {},
+        }
+
+        # Alternate A/B order so one side does not systematically receive all
+        # cold-cache or post-warmup executions.
+        for run_number in range(runs):
+            side_order = ("baseline", "rewrite") if run_number % 2 == 0 else ("rewrite", "baseline")
+            for side_name in side_order:
+                effective_sql = effective_by_side[side_name]
                 plan = await self._explain_query(
                     database_name,
                     effective_sql,
@@ -2873,25 +2965,30 @@ class AzureSqlMcpApplication:
                     include_raw_xml,
                 )
                 execution = await self._execute_safe_sql(database_name, effective_sql)
-                run_metrics.append(self._benchmark_metrics(plan, execution))
+                last_plan_by_side[side_name] = plan
+                last_execution_by_side[side_name] = execution
+                run_metrics_by_side[side_name].append(
+                    self._benchmark_metrics(plan, execution)
+                )
 
+        def build_side(side_name: str) -> dict[str, Any]:
             side: dict[str, Any] = {
-                "query_hash": self._sql_hash(effective_sql),
-                "plan": plan,  # last run's plan (shape is stable across runs)
-                "execution_sample": execution,
+                "query_hash": self._sql_hash(effective_by_side[side_name]),
+                "plan": last_plan_by_side[side_name],
+                "execution_sample": last_execution_by_side[side_name],
                 "runs": runs,
-                "metrics": self._aggregate_benchmark_metrics(run_metrics),
+                "metrics": self._aggregate_benchmark_metrics(run_metrics_by_side[side_name]),
             }
             if runs > 1:
-                side["run_metrics"] = run_metrics
+                side["run_metrics"] = run_metrics_by_side[side_name]
                 side["metrics_note"] = (
-                    "metrics are per-run medians with min/max spread; run 1 is "
-                    "typically cold-cache"
+                    "metrics are per-run medians with min/max spread; baseline and rewrite "
+                    "executions were interleaved, with the first execution typically cold-cache"
                 )
             return side
 
-        baseline = await measure_side(baseline_effective)
-        rewrite = await measure_side(rewrite_effective)
+        baseline = build_side("baseline")
+        rewrite = build_side("rewrite")
 
         return {
             "database_name": database_name,
@@ -2908,6 +3005,7 @@ class AzureSqlMcpApplication:
             "equivalence": self._compare_result_samples(
                 baseline["execution_sample"],
                 rewrite["execution_sample"],
+                compare_order=compare_order,
             ),
             "scripts": {
                 "rollback": "-- No database changes were applied by benchmark_query_rewrite.",
@@ -2936,7 +3034,13 @@ class AzureSqlMcpApplication:
         aggregated = dict(run_metrics[-1])
         spread: dict[str, dict[str, float]] = {}
         for field in numeric_fields:
-            values = [m[field] for m in run_metrics if isinstance(m.get(field), (int, float))]
+            values = [
+                m[field]
+                for m in run_metrics
+                if isinstance(m.get(field), (int, float))
+                and not isinstance(m.get(field), bool)
+                and math.isfinite(float(m[field]))
+            ]
             if not values:
                 continue
             aggregated[field] = statistics.median(values)
@@ -3079,10 +3183,13 @@ class AzureSqlMcpApplication:
         database_name: str,
         sql: str,
         auto_bind_params: bool,
+        parameter_values: dict[str, Any] | None = None,
     ) -> tuple[str, dict[str, Any] | None]:
-        if not auto_bind_params:
+        if not auto_bind_params and not parameter_values:
             return sql, None
-        binding_info = await self.param_binding.bind_parameters(database_name, sql)
+        binding_info = await self.param_binding.bind_parameters(
+            database_name, sql, parameter_values=parameter_values,
+        )
         if binding_info.get("parameters"):
             return str(binding_info["bound_sql"]), {
                 "original_sql": binding_info["original_sql"],
@@ -3148,13 +3255,45 @@ class AzureSqlMcpApplication:
     def _compare_result_samples(
         baseline_execution: dict[str, Any],
         rewrite_execution: dict[str, Any],
+        *,
+        compare_order: bool = True,
     ) -> dict[str, Any]:
         baseline_rows = baseline_execution.get("rows")
         rewrite_rows = rewrite_execution.get("rows")
-        same_sample = baseline_rows == rewrite_rows
-        row_counts_match = baseline_execution.get("row_count") == rewrite_execution.get("row_count")
+        rows_available = isinstance(baseline_rows, list) and isinstance(rewrite_rows, list)
+
+        def valid_row_count(value: Any) -> bool:
+            return (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value >= 0
+            )
+
+        counts_available = all(
+            valid_row_count(execution.get("row_count"))
+            for execution in (baseline_execution, rewrite_execution)
+        )
+        if compare_order:
+            comparable_baseline_rows = baseline_rows
+            comparable_rewrite_rows = rewrite_rows
+        else:
+            def row_key(row: Any) -> str:
+                try:
+                    return json.dumps(row, sort_keys=True, separators=(",", ":"), default=str)
+                except (TypeError, ValueError):
+                    return repr(row)
+
+            comparable_baseline_rows = sorted(baseline_rows or [], key=row_key)
+            comparable_rewrite_rows = sorted(rewrite_rows or [], key=row_key)
+        same_sample = rows_available and comparable_baseline_rows == comparable_rewrite_rows
+        row_counts_match = counts_available and (
+            baseline_execution.get("row_count") == rewrite_execution.get("row_count")
+        )
         truncated = bool(baseline_execution.get("truncated") or rewrite_execution.get("truncated"))
-        if same_sample and row_counts_match and not truncated:
+        if not rows_available or not counts_available:
+            status = "sample_unavailable"
+            proven = False
+        elif same_sample and row_counts_match and not truncated:
             status = "sample_match"
             proven = True
         elif same_sample and row_counts_match:
@@ -3165,14 +3304,24 @@ class AzureSqlMcpApplication:
             proven = False
         return {
             "status": status,
+            "sample_available": rows_available and counts_available,
             "sample_rows_match": same_sample,
+            "order_compared": compare_order,
             "row_counts_match": row_counts_match,
             "truncated": truncated,
-            "full_equivalence_proven": proven,
+            "complete_result_match": proven,
+            "sample_equivalence_proven": proven,
+            # One current-data execution cannot prove semantic equivalence for
+            # every parameter/data state. The optimizer skill performs exact,
+            # bidirectional set checks before accepting a rewrite.
+            "full_equivalence_proven": False,
             "note": (
-                "Full equivalence requires set-based EXCEPT/INTERSECT checks over the complete result."
+                "Full equivalence requires exact bidirectional set checks across the query contract."
                 if not proven
-                else "Bounded samples and reported row counts match; verify complete results before deploy."
+                else (
+                    "The complete returned results match for this execution; this is supporting "
+                    "evidence, not semantic equivalence across all data and parameter values."
+                )
             ),
         }
 
@@ -3184,6 +3333,7 @@ class AzureSqlMcpApplication:
         hypothetical_indexes: list[dict[str, Any]] | None = None,
         auto_bind_params: bool = False,
         include_raw_xml: bool = False,
+        parameter_values: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if hypothetical_indexes:
             raise ValueError(
@@ -3192,9 +3342,9 @@ class AzureSqlMcpApplication:
             )
         effective_sql = sql
         binding_info: dict[str, Any] | None = None
-        if auto_bind_params:
+        if auto_bind_params or parameter_values:
             binding_info = await self.param_binding.bind_parameters(
-                database_name, sql,
+                database_name, sql, parameter_values=parameter_values,
             )
             if binding_info.get("parameters"):
                 effective_sql = binding_info["bound_sql"]
@@ -3225,12 +3375,39 @@ class AzureSqlMcpApplication:
         database_name: str,
         queries: list[str],
         auto_bind_params: bool = False,
+        parameter_values: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         effective_queries = queries
-        if auto_bind_params:
+        if auto_bind_params or parameter_values:
+            normalized_values: dict[str, Any] = {}
+            for raw_name, value in (parameter_values or {}).items():
+                name = str(raw_name).lstrip("@").strip().casefold()
+                if not name:
+                    raise ValueError("explicit parameter name must not be empty")
+                if name in normalized_values:
+                    raise ValueError(f"duplicate explicit parameter name: {name}")
+                normalized_values[name] = value
+            detected_by_query = [
+                {name.casefold() for name in detect_parameters(query)}
+                for query in queries
+            ]
+            detected_any = set().union(*detected_by_query) if detected_by_query else set()
+            unknown_names = sorted(set(normalized_values) - detected_any)
+            if unknown_names:
+                raise ValueError(
+                    "explicit value supplied for unknown parameter(s): "
+                    + ", ".join(unknown_names)
+                )
             bound_queries: list[str] = []
-            for query in queries:
-                binding = await self.param_binding.bind_parameters(database_name, query)
+            for query, detected_names in zip(queries, detected_by_query, strict=True):
+                query_values = {
+                    name: value
+                    for name, value in normalized_values.items()
+                    if name in detected_names
+                }
+                binding = await self.param_binding.bind_parameters(
+                    database_name, query, parameter_values=query_values,
+                )
                 if binding.get("parameters"):
                     bound_queries.append(binding["bound_sql"])
                 else:

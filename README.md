@@ -82,6 +82,7 @@ All settings are env vars. CLI flags override env vars.
 | `AZURE_SQL_ACCESS_MODE` | `restricted` | `restricted` (read-only validator), `unrestricted` (adds arbitrary SQL + audited admin tools) |
 | `AZURE_SQL_TRUST_SERVER_CERTIFICATE` | `false` | Set `true` only for self-hosted/dev SQL Server endpoints with a self-signed certificate. |
 | `AZURE_SQL_WRITE_POLICY` | `review` in unrestricted, `disabled` in restricted | `disabled`, `review`, `apply`. Execution requires `apply`; dry-run previews work in `review`. |
+| `AZURE_SQL_TEST_INDEX_DATABASES` | empty | Comma-separated sandbox/test databases permitted for live `create_test_index` / `drop_test_index`; empty blocks live test-index DDL. |
 | `AZURE_SQL_AUDIT_DIR` | `~/.azure-sql-mcp/audit` | JSONL audit directory for write previews, applies, blocks, and failures |
 | `AZURE_SQL_AUDIT_FULL_SQL` | `0` | Set `1` to include full SQL in audit records. Default stores SQL hash + preview only. |
 | `AZURE_SQL_ENABLE_REMOTE_ADMIN` | `0` | Required to expose apply-capable admin tools or `AZURE_SQL_WRITE_POLICY=apply` over `sse`/`streamable-http`. `stdio` local-process admin behavior is unchanged. |
@@ -219,6 +220,11 @@ Bearer auth is transport-level protection only; use TLS from a reverse proxy/API
 | `analyze_index_recommendations` | Missing-index DMV + automatic-tuning recommendations |
 | `analyze_db_health` | 11 health checks: index, buffer, autotune, storage, query-store, log-rate, etc. |
 
+`benchmark_query_rewrite` reports whether the complete returned results matched for the
+tested parameter set. It deliberately never labels that single execution as full semantic
+equivalence; deployment still requires exact bidirectional result checks across the query
+contract and representative parameter buckets.
+
 ### `performance` — deep diagnostics & tuning (35 tools)
 
 **Query analysis & tuning**
@@ -287,7 +293,7 @@ Bearer auth is transport-level protection only; use TLS from a reverse proxy/API
 - `apply_plan_action` — audited Query Store force/unforce apply path for reviewed plan actions
 - `kill_session` — `KILL <spid>` with system-SPID guard (refuses `<= 50`)
 
-Every admin tool accepts `dry_run` and defaults to `true`. Execution requires both `dry_run=false` and `AZURE_SQL_WRITE_POLICY=apply`.
+Every admin tool accepts `dry_run` and defaults to `true`. Execution requires both `dry_run=false` and `AZURE_SQL_WRITE_POLICY=apply`. Live test-index creation/drop additionally requires the target database in `AZURE_SQL_TEST_INDEX_DATABASES`.
 
 ---
 

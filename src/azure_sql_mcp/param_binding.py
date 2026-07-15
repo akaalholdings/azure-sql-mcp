@@ -6,10 +6,22 @@ from typing import Any
 
 from .connection import AzureSqlExecutor
 from .query_text import strip_query_store_parameter_declarations
+from .safe_sql import strip_literals_and_comments
 
 logger = logging.getLogger(__name__)
 
 PARAM_PATTERN = re.compile(r"@(\w+)")
+DECLARE_STATEMENT_PATTERN = re.compile(
+    r"\bDECLARE\b(?P<body>.*?)(?=;|\b(?:SELECT|WITH|INSERT|UPDATE|DELETE|MERGE|"
+    r"EXEC(?:UTE)?|IF|BEGIN|SET)\b|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+DECLARED_PARAMETER_PATTERN = re.compile(
+    r"(?:^|,)\s*@(?P<name>\w+)\s+"
+    r"(?:\[[^\]]+\]|\w+)(?:\s*\.\s*(?:\[[^\]]+\]|\w+))?"
+    r"(?:\s*\([^)]*\))?",
+    re.IGNORECASE,
+)
 
 # Type names come from sys.types and are embedded into DECLARE statements, so
 # they must look like a plain (optionally parameterized) type. Anything else —
@@ -61,15 +73,24 @@ def detect_parameters(sql: str) -> list[str]:
     Returns unique parameter names in order of first appearance.
     Excludes known system variables (@@ROWCOUNT, @@IDENTITY, etc.).
     """
+    code = strip_literals_and_comments(sql)
+    declared = {
+        parameter.group("name").casefold()
+        for statement in DECLARE_STATEMENT_PATTERN.finditer(code)
+        for parameter in DECLARED_PARAMETER_PATTERN.finditer(statement.group("body"))
+    }
     params: list[str] = []
     seen: set[str] = set()
-    for match in PARAM_PATTERN.finditer(sql):
+    for match in PARAM_PATTERN.finditer(code):
         name = match.group(1)
         # Skip system @@ variables captured as single @
-        if match.start() > 0 and sql[match.start() - 1] == "@":
+        if match.start() > 0 and code[match.start() - 1] == "@":
             continue
-        if name not in seen:
-            seen.add(name)
+        if name.casefold() in declared:
+            continue
+        key = name.casefold()
+        if key not in seen:
+            seen.add(key)
             params.append(name)
     return params
 
@@ -92,6 +113,7 @@ class ParameterBindingService:
         self,
         database_name: str,
         sql: str,
+        parameter_values: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Detect parameters and bind them using stats or type fallbacks.
 
@@ -100,7 +122,24 @@ class ParameterBindingService:
         - bound_sql: SQL with DECLARE/SET block prepended
         - parameters: list of {name, value, source, data_type}
         """
+        parameter_values = parameter_values or {}
+        normalized_values: dict[str, Any] = {}
+        for raw_name, value in parameter_values.items():
+            name = str(raw_name).lstrip("@").strip().casefold()
+            if not name:
+                raise ValueError("explicit parameter name must not be empty")
+            if name in normalized_values:
+                raise ValueError(f"duplicate explicit parameter name: {name}")
+            normalized_values[name] = value
+
         param_names = detect_parameters(sql)
+        detected_names = {name.casefold() for name in param_names}
+        unknown_names = sorted(set(normalized_values) - detected_names)
+        if unknown_names:
+            raise ValueError(
+                "explicit value supplied for unknown parameter(s): "
+                + ", ".join(unknown_names)
+            )
         if not param_names:
             return {
                 "original_sql": sql,
@@ -117,12 +156,18 @@ class ParameterBindingService:
         parameters: list[dict[str, Any]] = []
 
         for name in param_names:
-            info = param_info.get(name, {})
+            info = next(
+                (value for key, value in param_info.items() if key.casefold() == name.casefold()),
+                {},
+            )
             data_type = info.get("data_type", "nvarchar(256)")
             value = info.get("value")
             source = info.get("source", "type_fallback")
 
-            if value is None:
+            if name.casefold() in normalized_values:
+                value = self._format_literal(data_type, normalized_values[name.casefold()])
+                source = "explicit"
+            elif value is None:
                 value = get_type_fallback(data_type)
                 source = "type_fallback"
 
@@ -201,26 +246,42 @@ class ParameterBindingService:
         Returns {param_name: (table_hint, column_name)}.
         """
         mappings: dict[str, tuple[str | None, str]] = {}
-        param_set = set(param_names)
+        param_lookup = {name.casefold(): name for name in param_names}
+        code = strip_literals_and_comments(sql)
+        identifier = r"(?:\[[^\]]+\]|\"[^\"]+\"|\w+)"
+        operator = r"(?:>=|<=|<>|!=|=|>|<|LIKE|IN\s*\()"
+        keywords = {
+            "SET", "SELECT", "WHERE", "AND", "OR", "FROM", "JOIN", "ON",
+            "IN", "LIKE", "NOT", "IS", "NULL", "BETWEEN", "EXISTS", "HAVING",
+            "GROUP", "ORDER", "CASE", "WHEN", "THEN", "ELSE", "END", "AS",
+        }
 
-        # Pattern: [alias.]column_name {=|>|<|>=|<=|<>|!=|LIKE|IN} @param
+        def add_mapping(table_hint: str | None, column_name: str, param_name: str) -> None:
+            canonical_param = param_lookup.get(param_name.casefold())
+            if canonical_param is None or canonical_param in mappings:
+                return
+            clean_column = column_name.strip("[]\"")
+            if clean_column.upper() not in keywords:
+                mappings[canonical_param] = (
+                    table_hint.strip("[]\"") if table_hint else None,
+                    clean_column,
+                )
+
         column_then_param = re.compile(
-            r"(?:(\w+)\.)?(\w+)\s*(?:=|>|<|>=|<=|<>|!=|LIKE)\s*@(\w+)",
+            rf"(?:(?P<table>{identifier})\s*\.)?(?P<column>{identifier})\s*"
+            rf"{operator}\s*@(?P<param>\w+)",
             re.IGNORECASE,
         )
-        for match in column_then_param.finditer(sql):
-            table_hint = match.group(1)
-            column_name = match.group(2)
-            param_name = match.group(3)
-            if param_name in param_set and param_name not in mappings:
-                # Skip SQL keywords that look like column names
-                if column_name.upper() not in {
-                    "SET", "SELECT", "WHERE", "AND", "OR", "FROM",
-                    "JOIN", "ON", "IN", "LIKE", "NOT", "IS", "NULL",
-                    "BETWEEN", "EXISTS", "HAVING", "GROUP", "ORDER",
-                    "CASE", "WHEN", "THEN", "ELSE", "END", "AS",
-                }:
-                    mappings[param_name] = (table_hint, column_name)
+        for match in column_then_param.finditer(code):
+            add_mapping(match.group("table"), match.group("column"), match.group("param"))
+
+        param_then_column = re.compile(
+            rf"@(?P<param>\w+)\s*{operator}\s*"
+            rf"(?:(?P<table>{identifier})\s*\.)?(?P<column>{identifier})",
+            re.IGNORECASE,
+        )
+        for match in param_then_column.finditer(code):
+            add_mapping(match.group("table"), match.group("column"), match.group("param"))
 
         return mappings
 
@@ -353,11 +414,23 @@ class ParameterBindingService:
     def _format_literal(self, data_type: str, value: Any) -> str:
         """Format a raw value as a T-SQL literal."""
         base_type = data_type.lower().split("(")[0].strip()
+        if value is None:
+            return "NULL"
+        if isinstance(value, bool):
+            return "1" if value else "0"
         str_value = str(value)
 
-        if base_type in {"int", "bigint", "smallint", "tinyint", "bit"}:
+        if base_type == "bit":
+            if str_value not in {"0", "1"}:
+                raise ValueError(f"explicit value is not valid for {data_type}")
+            return str_value
+        if base_type in {"int", "bigint", "smallint", "tinyint"}:
+            if not re.fullmatch(r"-?\d+", str_value):
+                raise ValueError(f"explicit value is not valid for {data_type}")
             return str_value
         if base_type in {"decimal", "numeric", "float", "real", "money", "smallmoney"}:
+            if not re.fullmatch(r"-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", str_value):
+                raise ValueError(f"explicit value is not valid for {data_type}")
             return str_value
         if base_type in {"nvarchar", "nchar", "ntext"}:
             escaped = str_value.replace("'", "''")
@@ -375,7 +448,10 @@ class ParameterBindingService:
             escaped = str_value.replace("'", "''")
             return f"'{escaped}'"
         if base_type in {"binary", "varbinary"}:
-            return f"0x{str_value}" if not str_value.startswith("0x") else str_value
+            hex_value = str_value[2:] if str_value.lower().startswith("0x") else str_value
+            if not re.fullmatch(r"[0-9a-fA-F]*", hex_value):
+                raise ValueError(f"explicit value is not valid for {data_type}")
+            return f"0x{hex_value}"
 
         escaped = str_value.replace("'", "''")
         return f"N'{escaped}'"

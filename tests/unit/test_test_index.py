@@ -17,7 +17,12 @@ from azure_sql_mcp.server import AzureSqlMcpApplication
 from azure_sql_mcp.server import TEST_INDEX_PREFIX
 
 
-def make_config(access_mode: AccessMode = AccessMode.RESTRICTED) -> ServerConfig:
+def make_config(
+    access_mode: AccessMode = AccessMode.RESTRICTED,
+    *,
+    test_index_databases: tuple[str, ...] = (),
+    write_policy: WritePolicy = WritePolicy.DISABLED,
+) -> ServerConfig:
     return ServerConfig(
         server="server.database.windows.net",
         default_database="appdb",
@@ -40,10 +45,11 @@ def make_config(access_mode: AccessMode = AccessMode.RESTRICTED) -> ServerConfig
         tool_groups=frozenset({ToolGroup.ALL}),
         log_level="INFO",
         mcp_bearer_token=None,
-        write_policy=WritePolicy.DISABLED,
+        write_policy=write_policy,
         audit_dir="/tmp/azure-sql-mcp-test-audit",
         audit_full_sql=False,
         remote_admin_enabled=False,
+        test_index_databases=test_index_databases,
     )
 
 
@@ -143,4 +149,46 @@ async def test_execution_blocked_without_apply_policy() -> None:
         await app._create_test_index(
             "appdb", "dbo", "Orders", f"{TEST_INDEX_PREFIX}Orders_Status",
             key_columns=["Status"], include_columns=None, online=True, dry_run=False,
+        )
+
+
+def test_live_test_index_database_must_be_explicitly_allowlisted() -> None:
+    app = AzureSqlMcpApplication(
+        make_config(
+            access_mode=AccessMode.UNRESTRICTED,
+            test_index_databases=("sandbox-db",),
+        )
+    )
+    app._require_test_index_database("SANDBOX-DB")
+    with pytest.raises(PermissionError, match="AZURE_SQL_TEST_INDEX_DATABASES"):
+        app._require_test_index_database("appdb")
+
+
+@pytest.mark.asyncio
+async def test_live_create_and_drop_block_before_execution_without_database_allowlist() -> None:
+    app = AzureSqlMcpApplication(
+        make_config(
+            access_mode=AccessMode.UNRESTRICTED,
+            write_policy=WritePolicy.APPLY,
+        )
+    )
+
+    with pytest.raises(PermissionError, match="AZURE_SQL_TEST_INDEX_DATABASES"):
+        await app._create_test_index(
+            "appdb",
+            "dbo",
+            "Orders",
+            f"{TEST_INDEX_PREFIX}Orders_Status",
+            key_columns=["Status"],
+            include_columns=None,
+            online=True,
+            dry_run=False,
+        )
+    with pytest.raises(PermissionError, match="AZURE_SQL_TEST_INDEX_DATABASES"):
+        await app._drop_test_index(
+            "appdb",
+            "dbo",
+            "Orders",
+            f"{TEST_INDEX_PREFIX}Orders_Status",
+            dry_run=False,
         )

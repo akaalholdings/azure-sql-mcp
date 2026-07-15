@@ -144,6 +144,7 @@ class ServerConfig:
     audit_dir: str
     audit_full_sql: bool
     remote_admin_enabled: bool
+    test_index_databases: tuple[str, ...] = ()
 
     def validate_database_name(self, database_name: str | None) -> str:
         """Resolve a database against the allowlist, case-insensitively.
@@ -376,6 +377,7 @@ def load_server_config(argv: list[str] | None = None) -> ServerConfig:
     )
     audit_full_sql = parse_bool(env_or_arg(args, "azure_sql_audit_full_sql"))
     remote_admin_enabled = parse_bool(env_or_arg(args, "azure_sql_enable_remote_admin"))
+    test_index_databases = parse_csv(os.getenv("AZURE_SQL_TEST_INDEX_DATABASES"))
     if (
         transport.mode != TransportMode.STDIO
         and not remote_admin_enabled
@@ -412,4 +414,5 @@ def load_server_config(argv: list[str] | None = None) -> ServerConfig:
         audit_dir=audit_dir,
         audit_full_sql=audit_full_sql,
         remote_admin_enabled=remote_admin_enabled,
+        test_index_databases=test_index_databases,
     )

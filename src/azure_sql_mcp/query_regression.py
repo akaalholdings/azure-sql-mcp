@@ -87,6 +87,12 @@ class QueryRegressionService:
                 JSON_VALUE(details, '$.recommendedPlanId') AS recommended_plan_id,
                 JSON_VALUE(details, '$.estimatedCpuGain') AS estimated_cpu_gain,
                 JSON_VALUE(details, '$.estimatedDurationGain') AS estimated_duration_gain,
+                is_executable_action,
+                is_revertable_action,
+                execute_action_initiated_by,
+                revert_action_initiated_by,
+                valid_since,
+                last_refresh,
                 details
             FROM sys.dm_db_tuning_recommendations
         ),
@@ -115,6 +121,12 @@ class QueryRegressionService:
             tr.recommended_plan_id,
             tr.estimated_cpu_gain,
             tr.estimated_duration_gain,
+            tr.is_executable_action,
+            tr.is_revertable_action,
+            tr.execute_action_initiated_by,
+            tr.revert_action_initiated_by,
+            tr.valid_since,
+            tr.last_refresh,
             rpa.last_seen_utc,
             rpa.recent_execution_count,
             tr.details
@@ -258,6 +270,7 @@ class QueryRegressionService:
                 p.query_id,
                 qt.query_sql_text,
                 p.is_forced_plan,
+                p.plan_forcing_type_desc,
                 p.force_failure_count,
                 p.last_force_failure_reason_desc,
                 MAX(rs.avg_duration) / 1000.0 AS avg_duration_ms,
@@ -287,6 +300,7 @@ class QueryRegressionService:
                 p.query_id,
                 qt.query_sql_text,
                 p.is_forced_plan,
+                p.plan_forcing_type_desc,
                 p.force_failure_count,
                 p.last_force_failure_reason_desc
         )
@@ -295,6 +309,7 @@ class QueryRegressionService:
             query_id,
             query_sql_text,
             is_forced_plan,
+            plan_forcing_type_desc,
             force_failure_count,
             last_force_failure_reason_desc,
             avg_duration_ms,

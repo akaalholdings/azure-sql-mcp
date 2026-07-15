@@ -58,6 +58,49 @@ def test_detect_parameters_empty_for_no_params() -> None:
     assert params == []
 
 
+def test_detect_parameters_ignores_literals_comments_and_existing_declarations() -> None:
+    sql = """
+    DECLARE @AlreadyDeclared int;
+    SELECT '@fake', [o].[CustomerId] = @CustomerId -- @comment_param
+    FROM dbo.Orders AS o
+    WHERE @Status = o.Status AND @AlreadyDeclared = 1;
+    """
+    assert detect_parameters(sql) == ["CustomerId", "Status"]
+
+
+def test_detect_parameters_ignores_every_variable_in_multi_declare() -> None:
+    sql = """
+    DECLARE @First int, @Second nvarchar(20);
+    SELECT @First, @Second, @External;
+    """
+    assert detect_parameters(sql) == ["External"]
+
+
+def test_detect_parameters_keeps_external_initializer_references() -> None:
+    sql = """
+    DECLARE @Local int = COALESCE(@External, 0), @Other int = 1;
+    SELECT @Local + @Other;
+    """
+    assert detect_parameters(sql) == ["External"]
+
+
+def test_detect_parameters_treats_names_case_insensitively() -> None:
+    sql = "SELECT 1 FROM dbo.Orders WHERE Id = @CustomerId OR Id = @customerid"
+    assert detect_parameters(sql) == ["CustomerId"]
+
+
+def test_column_mapping_supports_brackets_and_reverse_comparison() -> None:
+    service = ParameterBindingService(executor=FakeExecutor())
+    mappings = service._extract_column_mappings(
+        "SELECT 1 FROM [dbo].[Orders] AS o WHERE [o].[CustomerId] = @CustomerId AND @Status = o.Status",
+        ["CustomerId", "Status"],
+    )
+    assert mappings == {
+        "CustomerId": ("o", "CustomerId"),
+        "Status": ("o", "Status"),
+    }
+
+
 # --- 18.3: Type fallback tests ---
 
 def test_type_fallback_int() -> None:
@@ -95,6 +138,18 @@ def test_format_data_type_allows_plain_types() -> None:
     assert service._format_data_type({"data_type": "uniqueidentifier"}) == "uniqueidentifier"
 
 
+def test_binary_literal_rejects_non_hex_input() -> None:
+    service = ParameterBindingService(executor=FakeExecutor())
+    with pytest.raises(ValueError, match="not valid"):
+        service._format_literal("varbinary(16)", "00; DROP TABLE dbo.Users")
+
+
+def test_bit_literal_rejects_values_other_than_zero_or_one() -> None:
+    service = ParameterBindingService(executor=FakeExecutor())
+    with pytest.raises(ValueError, match="not valid"):
+        service._format_literal("bit", 2)
+
+
 # --- 18.2 + 18.4: Binding service tests ---
 
 @pytest.mark.asyncio
@@ -106,6 +161,52 @@ async def test_bind_parameters_no_params_returns_original() -> None:
 
     assert result["bound_sql"] == "SELECT * FROM Orders"
     assert result["parameters"] == []
+
+
+@pytest.mark.asyncio
+async def test_bind_parameters_uses_explicit_values() -> None:
+    service = ParameterBindingService(FakeExecutor())
+    result = await service.bind_parameters(
+        "testdb",
+        "SELECT * FROM Orders WHERE Name = @Name AND IsActive = @IsActive",
+        parameter_values={"Name": "O'Reilly", "@IsActive": True},
+    )
+
+    assert [p["source"] for p in result["parameters"]] == ["explicit", "explicit"]
+    assert "N'O''Reilly'" in result["bound_sql"]
+    assert "SET @IsActive = 1;" in result["bound_sql"]
+
+
+@pytest.mark.asyncio
+async def test_bind_parameters_matches_explicit_names_case_insensitively() -> None:
+    service = ParameterBindingService(FakeExecutor())
+    result = await service.bind_parameters(
+        "testdb",
+        "SELECT * FROM Orders WHERE Name = @Name",
+        parameter_values={"@name": "Alice"},
+    )
+
+    assert result["parameters"][0]["source"] == "explicit"
+    assert "SET @Name = N'Alice';" in result["bound_sql"]
+
+
+@pytest.mark.asyncio
+async def test_bind_parameters_rejects_unknown_or_duplicate_explicit_names() -> None:
+    service = ParameterBindingService(FakeExecutor())
+
+    with pytest.raises(ValueError, match="unknown parameter"):
+        await service.bind_parameters(
+            "testdb",
+            "SELECT * FROM Orders WHERE Name = @Name",
+            parameter_values={"Nmae": "Alice"},
+        )
+
+    with pytest.raises(ValueError, match="duplicate explicit parameter"):
+        await service.bind_parameters(
+            "testdb",
+            "SELECT * FROM Orders WHERE Name = @Name",
+            parameter_values={"Name": "Alice", "@name": "Bob"},
+        )
 
 
 @pytest.mark.asyncio

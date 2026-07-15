@@ -178,6 +178,69 @@ def test_tools_advertise_structured_output_schemas(app: AzureSqlMcpApplication) 
         assert schema["type"] == "object"
 
 
+def test_registered_query_regression_input_schemas(app: AzureSqlMcpApplication) -> None:
+    tools = app.mcp._tool_manager._tools
+
+    for name in ("detect_regressed_queries", "get_forced_plans"):
+        schema = tools[name].fn_metadata.arg_model.model_json_schema()
+        window_schema = schema["properties"]["window_minutes"]
+        assert window_schema["type"] == "integer"
+        assert window_schema["default"] == 1440
+        assert window_schema["minimum"] == 1
+
+    index_schema = tools["analyze_query_indexes"].fn_metadata.arg_model.model_json_schema()
+    queries_schema = index_schema["properties"]["queries"]
+    assert queries_schema["type"] == "array"
+    assert queries_schema["items"] == {"type": "string"}
+    assert queries_schema["minItems"] == 1
+    assert queries_schema["maxItems"] == 10
+    assert "queries" in index_schema["required"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "service_method"),
+    (
+        ("detect_regressed_queries", "detect_regressed_queries"),
+        ("get_forced_plans", "get_forced_plans"),
+    ),
+)
+async def test_registered_query_regression_tools_forward_window_minutes(
+    app: AzureSqlMcpApplication,
+    tool_name: str,
+    service_method: str,
+) -> None:
+    service_call = AsyncMock(return_value={"tool": tool_name})
+    setattr(app.query_regression, service_method, service_call)
+
+    payload = await app.mcp._tool_manager.call_tool(
+        tool_name,
+        {"database_name": "appdb", "window_minutes": 90},
+    )
+
+    assert payload == {"tool": tool_name}
+    service_call.assert_awaited_once_with("appdb", 90)
+
+
+@pytest.mark.asyncio
+async def test_registered_analyze_query_indexes_forwards_queries_array(
+    app: AzureSqlMcpApplication,
+) -> None:
+    app._analyze_query_indexes = AsyncMock(  # type: ignore[method-assign]
+        return_value={"queries_analyzed": 1}
+    )
+
+    payload = await app.mcp._tool_manager.call_tool(
+        "analyze_query_indexes",
+        {"database_name": "appdb", "queries": ["SELECT 1"]},
+    )
+
+    assert payload == {"queries_analyzed": 1}
+    app._analyze_query_indexes.assert_awaited_once_with(
+        "appdb", ["SELECT 1"], False, None
+    )
+
+
 def test_diagnostic_tools_are_performance_group_and_available_restricted() -> None:
     app = AzureSqlMcpApplication(
         make_config(tool_groups=frozenset({ToolGroup.PERFORMANCE}))
@@ -435,6 +498,57 @@ async def test_tune_query_returns_structured_evidence_pack(app: AzureSqlMcpAppli
 
 
 @pytest.mark.asyncio
+async def test_tune_query_binds_explicit_parameters_once(app: AzureSqlMcpApplication) -> None:
+    app.param_binding.bind_parameters = AsyncMock(
+        return_value={
+            "original_sql": "SELECT @OrderId",
+            "bound_sql": "DECLARE @OrderId int = 42;\nSELECT @OrderId",
+            "parameters": [
+                {
+                    "name": "@OrderId",
+                    "value": "42",
+                    "source": "explicit",
+                    "data_type": "int",
+                }
+            ],
+        }
+    )
+    app.plans.explain_query = AsyncMock(
+        return_value=ExplainPlanArtifact(
+            database_name="appdb",
+            analyze=False,
+            summary={"statement_count": 1},
+            raw_xml="<ShowPlanXML />",
+        )
+    )
+    app._execute_safe_sql = AsyncMock(  # type: ignore[method-assign]
+        return_value={"rows": [{"OrderId": 42}], "row_count": 1, "truncated": False}
+    )
+    app._analyze_query_indexes = AsyncMock(return_value={"recommendations": []})  # type: ignore[method-assign]
+    app.query_store.get_query_history_by_text = AsyncMock(return_value={"matches": []})
+    app.wait_stats.get_wait_stats = AsyncMock(return_value={"top_waits": []})
+    app.plan_cache.check_statistics_health = AsyncMock(return_value={"total_stats": 0})
+    app._metadata_inventory = AsyncMock(return_value={"table_references": []})  # type: ignore[method-assign]
+
+    payload = await app._tune_query(
+        "appdb",
+        "SELECT @OrderId",
+        analyze=False,
+        auto_bind_params=False,
+        include_raw_xml=False,
+        window_minutes=60,
+        parameter_values={"OrderId": 42},
+    )
+
+    assert payload["parameter_binding"]["parameters"][0]["source"] == "explicit"
+    app.param_binding.bind_parameters.assert_awaited_once_with(
+        "appdb",
+        "SELECT @OrderId",
+        parameter_values={"OrderId": 42},
+    )
+
+
+@pytest.mark.asyncio
 async def test_tune_query_auto_bind_params_survives_validation(app: AzureSqlMcpApplication) -> None:
     """Regression: auto-bound DECLARE/SET + SELECT batches must pass the read-only
     validator end-to-end. Only the executor is mocked; param binding, the
@@ -497,7 +611,9 @@ async def test_benchmark_query_rewrite_reports_sample_equivalence(app: AzureSqlM
     )
 
     assert payload["equivalence"]["status"] == "sample_match"
-    assert payload["equivalence"]["full_equivalence_proven"] is True
+    assert payload["equivalence"]["complete_result_match"] is True
+    assert payload["equivalence"]["sample_equivalence_proven"] is True
+    assert payload["equivalence"]["full_equivalence_proven"] is False
     assert payload["scenarios"]["baseline"]["metrics"]["actual_cpu_ms"] == 1
     assert payload["scenarios"]["rewrite"]["metrics"]["actual_logical_reads"] == 2
     # single-run default keeps the historical payload shape (no spread/run_metrics)
@@ -510,8 +626,8 @@ async def test_benchmark_query_rewrite_reports_sample_equivalence(app: AzureSqlM
 async def test_benchmark_query_rewrite_runs_k_reports_median_and_spread(
     app: AzureSqlMcpApplication,
 ) -> None:
-    # 3 runs per side, 6 explains total: cpu varies so the median is unambiguous.
-    cpu_sequence = [90, 10, 20, 300, 100, 200]  # baseline: 90,10,20 -> median 20
+    # 3 interleaved runs per side, 6 explains total: cpu varies so medians are unambiguous.
+    cpu_sequence = [90, 10, 20, 300, 100, 200]
     app._explain_query = AsyncMock(  # type: ignore[method-assign]
         side_effect=[
             {
@@ -542,11 +658,97 @@ async def test_benchmark_query_rewrite_runs_k_reports_median_and_spread(
     baseline = payload["scenarios"]["baseline"]
     rewrite = payload["scenarios"]["rewrite"]
     assert payload["runs"] == 3
-    assert baseline["metrics"]["actual_cpu_ms"] == 20          # median of 90,10,20
-    assert baseline["metrics"]["spread"]["actual_cpu_ms"] == {"min": 10, "max": 90}
-    assert rewrite["metrics"]["actual_cpu_ms"] == 200          # median of 300,100,200
+    assert baseline["metrics"]["actual_cpu_ms"] == 100         # baseline: 90,300,100
+    assert baseline["metrics"]["spread"]["actual_cpu_ms"] == {"min": 90, "max": 300}
+    assert rewrite["metrics"]["actual_cpu_ms"] == 20           # rewrite: 10,20,200
     assert len(baseline["run_metrics"]) == 3
-    assert "cold-cache" in baseline["metrics_note"]
+    assert "interleaved" in baseline["metrics_note"]
+
+
+@pytest.mark.asyncio
+async def test_benchmark_can_compare_unordered_result_samples(
+    app: AzureSqlMcpApplication,
+) -> None:
+    app._explain_query = AsyncMock(  # type: ignore[method-assign]
+        return_value={"summary": {"actual_metrics": {}, "memory_grants": [], "warnings": [], "missing_indexes": []}}
+    )
+    app._execute_safe_sql = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[
+            {"rows": [{"id": 2}, {"id": 1}], "row_count": 2, "truncated": False},
+            {"rows": [{"id": 1}, {"id": 2}], "row_count": 2, "truncated": False},
+        ]
+    )
+
+    payload = await app._benchmark_query_rewrite(
+        "appdb",
+        "SELECT id FROM dbo.Orders",
+        "SELECT id FROM dbo.Orders",
+        analyze=True,
+        auto_bind_params=False,
+        include_raw_xml=False,
+        compare_order=False,
+    )
+
+    assert payload["equivalence"]["status"] == "sample_match"
+    assert payload["equivalence"]["order_compared"] is False
+
+
+def test_result_equivalence_fails_closed_when_sample_is_missing() -> None:
+    result = AzureSqlMcpApplication._compare_result_samples(
+        {"row_count": None},
+        {"row_count": None},
+    )
+    assert result["status"] == "sample_unavailable"
+    assert result["row_counts_match"] is False
+    assert result["full_equivalence_proven"] is False
+
+
+def test_result_equivalence_rejects_nonfinite_row_counts() -> None:
+    result = AzureSqlMcpApplication._compare_result_samples(
+        {"rows": [], "row_count": float("nan")},
+        {"rows": [], "row_count": float("nan")},
+    )
+    assert result["status"] == "sample_unavailable"
+    assert result["row_counts_match"] is False
+
+
+def test_result_equivalence_rejects_non_integer_row_counts() -> None:
+    result = AzureSqlMcpApplication._compare_result_samples(
+        {"rows": [], "row_count": 0.5},
+        {"rows": [], "row_count": 0.5},
+    )
+    assert result["status"] == "sample_unavailable"
+    assert result["complete_result_match"] is False
+
+
+@pytest.mark.asyncio
+async def test_analyze_query_indexes_scopes_explicit_values_per_query(
+    app: AzureSqlMcpApplication,
+) -> None:
+    app.param_binding.bind_parameters = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[
+            {"parameters": [], "bound_sql": "SELECT 1"},
+            {"parameters": [], "bound_sql": "SELECT 2"},
+        ]
+    )
+    app.query_index_analysis.analyze_queries = AsyncMock(  # type: ignore[method-assign]
+        return_value={"queries_analyzed": 2}
+    )
+    queries = ["SELECT @First", "SELECT @Second"]
+
+    result = await app._analyze_query_indexes(
+        "appdb",
+        queries,
+        parameter_values={"First": 1, "Second": 2},
+    )
+
+    assert result == {"queries_analyzed": 2}
+    assert app.param_binding.bind_parameters.await_args_list[0].kwargs["parameter_values"] == {
+        "first": 1
+    }
+    assert app.param_binding.bind_parameters.await_args_list[1].kwargs["parameter_values"] == {
+        "second": 2
+    }
 
 
 @pytest.mark.asyncio
