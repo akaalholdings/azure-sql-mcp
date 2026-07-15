@@ -92,7 +92,7 @@ async def test_plan_enforcer_tick_defaults_to_dry_run_preview():
 
 
 @pytest.mark.asyncio
-async def test_plan_enforcer_tick_can_apply_when_requested():
+async def test_plan_enforcer_tick_rejects_apply_requests():
     policy = FakeAdminPolicy()
     service = PlanEnforcementService(
         executor=object(),  # type: ignore[arg-type]
@@ -100,16 +100,10 @@ async def test_plan_enforcer_tick_can_apply_when_requested():
         admin_policy=policy,  # type: ignore[arg-type]
     )
 
-    result = await service.tick("appdb", dry_run=False)
-
-    assert result["dry_run"] is False
-    assert result["actions"][0]["status"] == "completed"
+    with pytest.raises(PermissionError, match="permanently preview-only"):
+        await service.tick("appdb", dry_run=False)
     assert policy.previewed == []
-    assert len(policy.executed) == 1
-    action, dry_run, max_rows = policy.executed[0]
-    assert action.tool_name == "plan_enforcer_tick"
-    assert dry_run is False
-    assert max_rows is None
+    assert policy.executed == []
 
 
 @pytest.mark.asyncio
@@ -138,10 +132,8 @@ async def test_dry_run_plan_action_works_through_the_tool_wrapper() -> None:
 
 
 @pytest.mark.asyncio
-async def test_apply_plan_action_defaults_to_dry_run() -> None:
-    """Regression: apply_plan_action had no dry_run parameter — a client
-    passing dry_run=true had the argument silently discarded and the force
-    executed for real. Every admin tool must default to preview."""
+async def test_direct_apply_plan_action_cannot_mutate() -> None:
+    """Only a prepared intent may cross the mutation boundary."""
     from unittest.mock import AsyncMock
 
     from tests.unit.test_server import make_config
@@ -161,9 +153,11 @@ async def test_apply_plan_action_defaults_to_dry_run() -> None:
     assert payload.get("code") is None, payload.get("message")
     assert app.admin_policy.execute.await_args.kwargs["dry_run"] is True
 
-    # explicit opt-in is passed through
-    await app.mcp._tool_manager.call_tool(
+    # Explicit direct apply is rejected and never reaches a live policy call.
+    payload = await app.mcp._tool_manager.call_tool(
         "apply_plan_action",
         {"action": "force", "query_id": 42, "plan_id": 7, "dry_run": False, "database_name": "appdb"},
     )
-    assert app.admin_policy.execute.await_args.kwargs["dry_run"] is False
+    assert payload["code"] == "tool_error"
+    assert "preview-only" in payload["message"]
+    assert app.admin_policy.execute.await_count == 1

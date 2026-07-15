@@ -7,7 +7,7 @@ Transform the Azure SQL MCP server from a functional implementation into a best-
 ## Current State
 
 The server is a Python 3.12+ FastMCP application providing:
-- 63 MCP tools in unrestricted mode; 53 tools in restricted mode
+- Profile-specific MCP tool surfaces for read-only triage, iterative optimization, sandbox index testing, plan review, and prepared apply
 - Restricted (read-only) and unrestricted execution modes
 - 4 auth modes (Entra default, service principal, interactive, SQL password)
 - 3 transports (STDIO, SSE, Streamable HTTP) with bearer auth required for HTTP/SSE and explicit remote-admin opt-in for apply-capable admin behavior

@@ -156,11 +156,10 @@ async def test_set_hints_rejects_bad_hints_before_any_policy_work() -> None:
 
 @pytest.mark.asyncio
 async def test_set_hints_execution_blocked_without_apply_policy() -> None:
-    # Unrestricted but write_policy=disabled (the make_config default): a real
-    # execution attempt must be refused by AdminPolicy, not silently run.
+    # Direct mutation is blocked before any write policy can be consulted.
     app = AzureSqlMcpApplication(make_config(access_mode=AccessMode.UNRESTRICTED))
     assert app.config.write_policy is not WritePolicy.APPLY
-    with pytest.raises(PermissionError, match="AZURE_SQL_WRITE_POLICY"):
+    with pytest.raises(PermissionError, match="prepared workflow"):
         await app._set_query_store_hints(
             "appdb", 42, "OPTION(RECOMPILE)", dry_run=False,
         )
@@ -176,10 +175,7 @@ async def test_clear_hints_dry_run_previews() -> None:
 
 
 @pytest.mark.asyncio
-async def test_set_hints_routes_hints_through_nvarchar_variable() -> None:
-    """The driver binds str params as varchar but sp_query_store_set_hints
-    demands nvarchar ('Procedure expects parameter @query_hints of type
-    nvarchar' live) — the batch must assign through an nvarchar variable."""
+async def test_direct_set_hints_cannot_bypass_prepared_workflow() -> None:
     app = AzureSqlMcpApplication(make_config(access_mode=AccessMode.UNRESTRICTED))
     executed: dict = {}
 
@@ -192,8 +188,8 @@ async def test_set_hints_routes_hints_through_nvarchar_variable() -> None:
                 "sql_hash": "h"}
 
     app.admin_policy.execute = fake_execute  # type: ignore[method-assign]
-    await app._set_query_store_hints("appdb", 42, "OPTION(RECOMPILE)", dry_run=False)
-
-    assert "DECLARE @hints nvarchar(max) = ?" in executed["sql"]
-    assert "@query_hints = @hints" in executed["sql"]
-    assert executed["params"] == ("OPTION(RECOMPILE)", 42)
+    with pytest.raises(PermissionError, match="prepared workflow"):
+        await app._set_query_store_hints(
+            "appdb", 42, "OPTION(RECOMPILE)", dry_run=False
+        )
+    assert executed == {}

@@ -5,6 +5,10 @@ import xml.etree.ElementTree as ET
 from typing import Any
 
 from .connection import AzureSqlExecutor
+from .index_metadata import ExistingIndex
+from .index_metadata import coerce_existing_indexes
+from .index_metadata import collect_existing_indexes
+from .index_metadata import existing_index_covers_candidate
 from .index_recommendations import build_create_index_statement
 from .index_recommendations import split_index_columns
 from .observability import sanitize_error_message
@@ -60,6 +64,7 @@ class QueryIndexAnalysisService:
             "queries_analyzed": len(queries),
             "query_details": query_details,
             "recommendations": consolidated,
+            "existing_indexes": [index.as_dict() for index in existing_indexes],
         }
 
     async def analyze_workload(
@@ -142,6 +147,7 @@ class QueryIndexAnalysisService:
             "analyzed_queries": analyzed_queries,
             "recommendations": consolidated,
             "dmv_recommendations": dmv_recommendations,
+            "existing_indexes": [index.as_dict() for index in existing_indexes],
         }
 
     async def _get_estimated_plan(self, database_name: str, sql: str) -> str:
@@ -203,17 +209,39 @@ class QueryIndexAnalysisService:
         self,
         recommendations: list[dict[str, Any]],
         *,
-        existing_indexes: set[tuple[str, str, tuple[str, ...]]] | None = None,
+        existing_indexes: (
+            list[ExistingIndex]
+            | set[tuple[str, str, tuple[str, ...]]]
+            | None
+        ) = None,
         dmv_recommendations: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         """Merge recommendations for the same table + key columns."""
         seen: dict[tuple[str, str, tuple[str, ...]], dict[str, Any]] = {}
         dmv_lookup = self._build_dmv_lookup(dmv_recommendations or [])
+        existing_metadata = (
+            coerce_existing_indexes(existing_indexes)
+            if existing_indexes
+            else []
+        )
 
         for rec in recommendations:
             signature = self._recommendation_signature(rec)
-            if existing_indexes and signature in existing_indexes:
-                continue
+            if existing_metadata:
+                if any(
+                    existing_index_covers_candidate(
+                        index,
+                        schema=rec.get("schema", "dbo"),
+                        table=rec.get("table", ""),
+                        key_columns=(
+                            rec.get("equality_columns", [])
+                            + rec.get("inequality_columns", [])
+                        ),
+                        include_columns=rec.get("include_columns", []),
+                    )
+                    for index in existing_metadata
+                ):
+                    continue
 
             if signature in seen:
                 existing = seen[signature]
@@ -378,55 +406,8 @@ class QueryIndexAnalysisService:
     async def _get_existing_indexes(
         self,
         database_name: str,
-    ) -> set[tuple[str, str, tuple[str, ...]]]:
-        query = """
-        SELECT
-            s.name AS schema_name,
-            t.name AS table_name,
-            i.index_id,
-            i.name AS index_name,
-            ic.is_included_column,
-            ic.key_ordinal,
-            c.name AS column_name
-        FROM sys.indexes AS i
-        INNER JOIN sys.tables AS t
-            ON i.object_id = t.object_id
-        INNER JOIN sys.schemas AS s
-            ON t.schema_id = s.schema_id
-        INNER JOIN sys.index_columns AS ic
-            ON i.object_id = ic.object_id
-            AND i.index_id = ic.index_id
-        INNER JOIN sys.columns AS c
-            ON ic.object_id = c.object_id
-            AND ic.column_id = c.column_id
-        WHERE i.is_hypothetical = 0
-            AND i.index_id > 0
-        ORDER BY s.name, t.name, i.index_id, ic.key_ordinal, ic.index_column_id
-        """
-        rows = await self.executor.fetch_all(database_name, query)
-        by_index: dict[tuple[str, str, Any], list[tuple[int, str]]] = {}
-        for row in rows:
-            if row.get("is_included_column"):
-                continue
-            key = (
-                row.get("schema_name") or "dbo",
-                row.get("table_name") or "",
-                row.get("index_id"),
-            )
-            by_index.setdefault(key, []).append(
-                (int(row.get("key_ordinal") or 0), row.get("column_name") or "")
-            )
-
-        signatures: set[tuple[str, str, tuple[str, ...]]] = set()
-        for (schema_name, table_name, _index_id), columns in by_index.items():
-            ordered_columns = tuple(
-                column_name
-                for _, column_name in sorted(columns, key=lambda item: item[0])
-                if column_name
-            )
-            if ordered_columns:
-                signatures.add((schema_name, table_name, ordered_columns))
-        return signatures
+    ) -> list[ExistingIndex]:
+        return await collect_existing_indexes(self.executor, database_name)
 
     def _recommendation_signature(
         self,

@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from azure_sql_mcp.connection import AzureSqlExecutor
+from azure_sql_mcp.connection import ProfiledExecution
 from azure_sql_mcp.connection import QueryResult
 
 
@@ -124,6 +125,85 @@ def test_execute_non_query_with_connection_counts_only_positive_rowcounts(
     )
 
     assert rowcount == 10
+
+
+@pytest.mark.asyncio
+async def test_profiled_execution_runs_one_user_query_without_retry(
+    sample_server_config,
+) -> None:
+    connection = MagicMock()
+    pool = SimpleNamespace(
+        acquire=AsyncMock(return_value=connection),
+        release=AsyncMock(),
+        discard=AsyncMock(),
+    )
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), pool)
+    expected = ProfiledExecution(result_sets=[], elapsed_wall_ms=12.0)
+
+    with patch.object(
+        executor,
+        "_execute_profiled_with_connection",
+        return_value=expected,
+    ) as execute_mock:
+        result = await executor.execute_profiled_read_only("appdb", "SELECT 1")
+
+    assert result.user_query_executions == 1
+    execute_mock.assert_called_once()
+    pool.release.assert_awaited_once_with("appdb", connection)
+    pool.discard.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_profiled_execution_failure_is_not_automatically_retried(
+    sample_server_config,
+) -> None:
+    connection = MagicMock()
+    pool = SimpleNamespace(
+        acquire=AsyncMock(return_value=connection),
+        release=AsyncMock(),
+        discard=AsyncMock(),
+    )
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), pool)
+
+    with patch.object(
+        executor,
+        "_execute_profiled_with_connection",
+        side_effect=RuntimeError("synthetic failure"),
+    ) as execute_mock:
+        with pytest.raises(RuntimeError, match="synthetic failure"):
+            await executor.execute_profiled_read_only("appdb", "SELECT 1")
+
+    execute_mock.assert_called_once()
+    pool.release.assert_not_awaited()
+    pool.discard.assert_awaited_once_with("appdb", connection)
+
+
+@pytest.mark.asyncio
+async def test_exact_session_failure_is_not_automatically_retried(
+    sample_server_config,
+) -> None:
+    connection = MagicMock()
+    pool = SimpleNamespace(
+        acquire=AsyncMock(return_value=connection),
+        release=AsyncMock(),
+        discard=AsyncMock(),
+    )
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), pool)
+
+    with patch.object(
+        executor,
+        "_execute_session_with_connection",
+        side_effect=RuntimeError("synthetic comparison failure"),
+    ) as execute_mock:
+        with pytest.raises(RuntimeError, match="synthetic comparison failure"):
+            await executor.execute_session_exactly_once(
+                "appdb",
+                ["BEGIN TRANSACTION", "SELECT 1", "ROLLBACK TRANSACTION"],
+            )
+
+    execute_mock.assert_called_once()
+    pool.release.assert_not_awaited()
+    pool.discard.assert_awaited_once_with("appdb", connection)
 
 
 def test_coerce_value_handles_memoryview_and_bytes(sample_server_config) -> None:
@@ -252,3 +332,19 @@ def test_consume_batches_session_path_keeps_draining_for_plan_xml(sample_server_
 
     assert len(results) == 2
     assert results[1].rows == [{"col": "<ShowPlanXML/>"}]
+
+
+def test_consume_batches_captures_driver_type_and_nullability_metadata(
+    sample_server_config,
+) -> None:
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), MagicMock())
+    cursor = MagicMock()
+    cursor.description = [("id", int, None, 8, 10, 0, False)]
+    cursor.fetchall.return_value = [(1,)]
+    cursor.nextset.return_value = False
+
+    results = executor._consume_batches(cursor)
+
+    assert results[0].column_type_signatures == (
+        "builtins.int|None|8|10|0|False",
+    )

@@ -6,6 +6,30 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-07-15
+
+### Added
+
+- Versioned performance-case, evidence, tuning-session, tuning-candidate, and plan-action contracts with permission-restricted SQLite persistence.
+- Named `triage`, `optimizer`, `sandbox`, `enforcer-review`, and `enforcer-apply` profiles plus a fail-closed local database policy.
+- Iterative rewrite benchmarking, duplicate- and order-aware snapshot comparison, arbitrary plan-summary comparison, durable index leases, and exact plan-action rollback.
+- Fail-closed plan verification for matching parameter buckets and non-overlapping Query Store evidence windows.
+
+### Changed
+
+- Measured samples now execute each user query exactly once while returning its result sample and actual plan.
+- Full result comparison now preserves duplicate multiplicity, requested ordering, and column type signatures; unavailable or truncated proof is inconclusive.
+- Query tuning continues after neutral, regressed, failed, or cleanup-required candidates and records an explicit terminal outcome for every experiment.
+- Sandbox index screening and finalist validation measure every recorded parameter bucket within the same 80-execution session budget.
+- Direct Query Store and test-index mutation tools are preview-only; writes use prepared plan actions or the leased sandbox index workflow.
+- Query-health triage now uses Azure SQL resource, Query Store, wait, blocking, statistics, parameter-sensitivity, and regression evidence. PLE, buffer-cache ratio, and fragmentation are not health classifiers.
+
+### Security
+
+- Durable state omits raw SQL by default, stores fingerprints and redacted evidence, and uses owner-only directory and file permissions.
+- Plan apply requires a reviewed intent, evidence hash, exact prior state, server and database policy, an open kill switch, explicit authorization, and an idempotency key.
+- Concurrent or uncertain plan applies and rollbacks enter durable reconciliation states instead of crossing the database boundary twice.
+
 ### Fixed
 
 - `apply_plan_action` ignored `dry_run`: the tool exposed no such parameter, so a client passing `dry_run=true` had it silently discarded and the Query Store force/unforce executed for real (only blocked by DB permissions in live testing). The tool now accepts `dry_run` defaulting to true, matching the documented admin-tool contract.
@@ -41,7 +65,7 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 - Require `mssql-python>=1.10.0`: versions before 1.10 hold the GIL during `cursor.execute`, serializing the entire server behind any in-flight query and preventing the asyncio tool timeout from firing. Verified live on 1.10.0: GIL released, concurrent tool calls work, all 61 live checks and the integration suite pass. Driver-level query/lock timeouts remain set as defense-in-depth (README gotcha 5).
 - Pooled connections are no longer recycled on a 45-minute token clock (tokens only matter at login); `SELECT 1` validation runs only after 60s of idle time instead of on every acquire.
-- Tool surface is now 63 tools (53 restricted); README counts corrected.
+- Named profiles expose intentionally different tool surfaces, so documentation no longer relies on one global tool count.
 
 - Aligned docs with current `explain_query` safety behavior (hypothetical indexes disabled on this tool).
 - Updated integration workflow bootstrap scripts to use `mssql_python` instead of undeclared `pyodbc`.

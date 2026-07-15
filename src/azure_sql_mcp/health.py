@@ -14,8 +14,6 @@ HealthCheck = Callable[[str], Awaitable[dict[str, Any]]]
 logger = logging.getLogger(__name__)
 
 CHECK_NAMES = (
-    "index",
-    "buffer",
     "connection",
     "constraint",
     "replication",
@@ -26,6 +24,8 @@ CHECK_NAMES = (
     "storage",
     "statistics",
 )
+
+RETIRED_QUERY_HEALTH_CHECKS = frozenset({"index", "buffer"})
 
 STATUS_SEVERITY = {
     "pass": 0,
@@ -46,8 +46,6 @@ class HealthService:
     async def analyze(self, database_name: str, health_type: str) -> dict[str, Any]:
         requested = self._parse_requested_checks(health_type)
         handlers: dict[str, HealthCheck] = {
-            "index": self._index_health,
-            "buffer": self._buffer_health,
             "connection": self._connection_health,
             "constraint": self._constraint_health,
             "replication": self._replication_health,
@@ -79,6 +77,14 @@ class HealthService:
         )
         invalid = requested - set(CHECK_NAMES)
         if invalid:
+            retired = invalid & RETIRED_QUERY_HEALTH_CHECKS
+            if retired:
+                raise ValueError(
+                    "PLE, buffer-cache ratio, and fragmentation are not query-health "
+                    "classifiers. Use collect_performance_evidence for Azure SQL "
+                    "resource, Query Store, wait, blocking, statistics, parameter "
+                    "sensitivity, and regression evidence."
+                )
             raise ValueError(
                 f"Unsupported health_type values: {', '.join(sorted(invalid))}."
             )

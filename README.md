@@ -1,208 +1,78 @@
 # Azure SQL MCP
 
-Azure SQL Database server for the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/). It gives an MCP client structured access to Azure SQL Database query execution, schema metadata, performance diagnostics, Query Store evidence, schema comparison, and guarded administration.
+`azure-sql-mcp` is the typed execution and evidence layer for Azure SQL Database performance work. It gives MCP clients bounded read access, durable performance cases, iterative query benchmarks, leased sandbox index tests, and reviewed Query Store plan actions.
 
-The implementation exposes 63 tools when all groups are enabled in unrestricted local mode: 53 non-admin tools plus 10 admin tools. Restricted mode is the default and exposes the 53 non-admin tools. The server also provides five schema resource templates, a token-safe artifact resource, and five guided prompts.
+The supported tuning path is evidence-first but rewrite-active: a missing plan lowers confidence; it does not prevent a concrete static rewrite. A failed or slower experiment rejects only that candidate and does not end the session.
 
-## Contents
+## What it owns
 
-- [Support boundary and routing](#support-boundary-and-routing)
-- [Prerequisites and installation](#prerequisites-and-installation)
-- [Quick start](#quick-start)
-- [Run the server](#run-the-server)
-- [MCP client configuration](#mcp-client-configuration)
-- [Authentication](#authentication)
-- [Safety model](#safety-model)
-- [Configuration reference](#configuration-reference)
-- [Tool groups and recommended paths](#tool-groups-and-recommended-paths)
-- [Examples](#examples)
-- [Testing](#testing)
-- [Troubleshooting](#troubleshooting)
-- [Repository location and history](#repository-location-and-history)
+- Read-only SQL execution, metadata, plans, Query Store, waits, blocking, resource, statistics, and parameter-sensitivity evidence.
+- Versioned `EvidenceEnvelopeV1`, `PerformanceCaseV1`, `TuningSessionV1`, `TuningCandidateV1`, and `PlanActionIntentV1` contracts.
+- Redacted SQLite state under `~/.azure-sql-mcp/state` by default.
+- Exactly-once measured query samples with the result sample and actual plan from the same execution.
+- Interleaved baseline/candidate benchmarking with medians, spread, noise classification, and parameter buckets.
+- Snapshot-consistent, shape-, duplicate-, and order-aware result comparison where a complete bounded comparison is possible.
+- Durable temporary-index leases, automatic cleanup, and startup recovery of expired leases.
+- Prepared Query Store plan actions with prior-state capture, policy checks, verification, and exact rollback.
 
-## Support boundary and routing
+The Copilot operating instructions live in [`../skills/`](../skills/). The skills decide what to investigate and how to present the result; this package owns database execution, policy, durable state, and deterministic workflow transitions.
 
-### Supported surface
+## Support boundary
 
-- Azure SQL Database data-plane access to databases on one logical server per MCP process.
-- Microsoft Entra token authentication through `DefaultAzureCredential`, service principal, or interactive browser credentials.
-- Azure SQL Database SQL authentication through `sql-password` mode.
-- Local MCP clients over stdio, or HTTP clients over Streamable HTTP or SSE.
-- Read-only exploration, query evidence, performance diagnostics, schema comparison, migration-script generation, and explicitly gated maintenance operations.
+Supported:
 
-### Out of scope
+- Azure SQL Database PaaS.
+- Local MCP clients over stdio.
+- Streamable HTTP or SSE for read-only private-service use when bearer authentication and network controls are configured.
+- Microsoft Entra authentication through `DefaultAzureCredential`, service principal, or interactive browser credentials.
+- SQL password authentication when supplied from protected local secret storage.
+- Read-only SELECT-shaped active benchmarks. DML and side-effecting procedures are not executed by the tuning workflow.
 
-- Azure control-plane operations such as ARM, Azure Resource Graph, server provisioning, firewall changes, or service-tier changes.
-- Automatic deployment of generated migration scripts, indexes, statistics changes, Query Store changes, or other maintenance.
-- A general SQL Server or Azure SQL Managed Instance compatibility layer. `AZURE_SQL_TRUST_SERVER_CERTIFICATE=true` exists for controlled development or test endpoints; it does not expand the supported production target beyond Azure SQL Database.
+Not supported:
 
-### Choose the operating path
+- Azure control-plane changes, server provisioning, firewall changes, or service-tier changes.
+- Automatic production index deployment.
+- Autonomous plan forcing.
+- Treating a bounded sample as proof of equivalence.
+- Treating PLE, buffer-cache ratio, or fragmentation thresholds as query-health conclusions.
 
-| Situation | Recommended path |
-|---|---|
-| Claude Desktop, Cursor, VS Code, or another client on the same machine | Use stdio with `AZURE_SQL_ACCESS_MODE=restricted`. Start with `core`, or use the default `all` group. |
-| A private service used by one or more remote clients | Use Streamable HTTP, require `AZURE_SQL_MCP_BEARER_TOKEN`, put it behind TLS and a private network or gateway, and leave remote admin disabled. |
-| A client that requires SSE | Use the SSE transport with the same bearer-token and network controls. |
-| Schema discovery | Use the `explore-schema` prompt or the `azuresql://...` resources, then `list_objects` and `get_object_details`. |
-| Query tuning | Start with `tune_query`; use `benchmark_query_rewrite` for a baseline/rewrite comparison; use `plan_health_review` and `get_top_queries` for workload evidence. |
-| Potential writes or plan enforcement | Stay in restricted mode until the read-only evidence is reviewed. If administration is required, use local stdio unrestricted mode, preview first, and apply only through the write gates described below. |
+## Install
 
-## Prerequisites and installation
-
-You need:
-
-- Python 3.12 or newer.
-- [`uv`](https://docs.astral.sh/uv/).
-- An Azure SQL Database logical server and at least one database.
-- A database principal with the permissions required by the tools you intend to use. DMV, Query Store, SHOWPLAN, and diagnostic visibility varies by principal and database configuration.
-
-From this directory:
+Requirements: Python 3.12 or newer and [`uv`](https://docs.astral.sh/uv/).
 
 ```bash
-uv sync --dev
+cd azure-sql-mcp
+uv sync --dev --locked
 uv run azure-sql-mcp --help
 ```
 
-The project uses `mssql-python`, `azure-identity`, `mcp[cli]`, and `sqlglot`. The Dockerfile installs the Debian runtime libraries needed by `mssql-python`. If a native Linux installation cannot load the driver libraries, use the Docker path below or install the equivalent system libraries for that distribution.
+The server does not load `.env` files automatically. Supply local settings through the MCP client, a process manager, or protected environment injection. [`.env.example`](.env.example) contains placeholders only.
 
-`.env.example` is a configuration reference. The server does not load `.env` files itself; export variables, pass them through the MCP client's `env` configuration, or use a process manager/container to load an environment file. Do not commit credentials.
-
-## Quick start
-
-The following starts a restricted, read-only stdio server. Replace the non-secret placeholders with values for the target Azure SQL Database.
+## Minimal read-only start
 
 ```bash
-cd /absolute/path/to/SQL/azure-sql-mcp
-uv sync --dev
-
 export AZURE_SQL_SERVER="your-server.database.windows.net"
-export AZURE_SQL_DEFAULT_DATABASE="appdb"
-export AZURE_SQL_ALLOWED_DATABASES="appdb,reportingdb"
+export AZURE_SQL_DEFAULT_DATABASE="your-database"
+export AZURE_SQL_ALLOWED_DATABASES="your-database"
 export AZURE_SQL_AUTH_MODE="entra-default"
 export AZURE_SQL_ACCESS_MODE="restricted"
+export AZURE_SQL_WRITE_POLICY="disabled"
+export AZURE_SQL_PROFILE="triage"
+export AZURE_SQL_TOOL_GROUPS="core,performance"
 
-# Authenticate through a credential available to DefaultAzureCredential,
-# such as an Azure CLI login or managed identity.
 uv run azure-sql-mcp
 ```
 
-`AZURE_SQL_DEFAULT_DATABASE` must appear in `AZURE_SQL_ALLOWED_DATABASES`. A tool call that names another database is rejected before a connection is opened.
+The default transport is stdio. This configuration can inspect only databases in `AZURE_SQL_ALLOWED_DATABASES`; Azure SQL permissions remain the final authority.
 
-## Run the server
+## VS Code Copilot
 
-### Stdio
-
-Stdio is the default and does not require an MCP bearer token:
-
-```bash
-uv run azure-sql-mcp
-```
-
-The executable name is `azure-sql-mcp`; the import package is `azure_sql_mcp`. MCP clients should launch the executable through `uv` with the project directory set to this directory.
-
-### Streamable HTTP
-
-Streamable HTTP listens on `127.0.0.1:8000` by default. Non-stdio transports require a bearer token at startup:
-
-```bash
-export AZURE_SQL_MCP_BEARER_TOKEN="replace-with-a-long-random-token"
-uv run azure-sql-mcp \
-  --transport streamable-http \
-  --host 127.0.0.1 \
-  --port 8000
-```
-
-The Streamable HTTP MCP endpoint is `/mcp`:
-
-```bash
-curl -i \
-  -H "Authorization: Bearer replace-with-a-long-random-token" \
-  http://127.0.0.1:8000/mcp
-```
-
-Use `--host 0.0.0.0` only when a private network boundary, TLS reverse proxy, or API gateway protects the service. Bearer authentication is not a replacement for TLS.
-
-### SSE
-
-```bash
-export AZURE_SQL_MCP_BEARER_TOKEN="replace-with-a-long-random-token"
-uv run azure-sql-mcp \
-  --transport sse \
-  --host 127.0.0.1 \
-  --port 8000
-```
-
-For FastMCP's SSE transport, clients connect to `http://127.0.0.1:8000/sse` and send the same `Authorization: Bearer ...` header. Check the client transport documentation if it uses a different SSE configuration shape.
-
-### Docker
-
-The Dockerfile starts Streamable HTTP on `0.0.0.0:8000` and uses the same environment variables as the native server. Build it from the monorepo checkout:
-
-```bash
-docker build -t azure-sql-mcp ./azure-sql-mcp
-docker run --rm \
-  --publish 8000:8000 \
-  --env-file /absolute/path/to/SQL/azure-sql-mcp/.env \
-  azure-sql-mcp
-```
-
-The environment file supplied to Docker must contain the required connection variables and `AZURE_SQL_MCP_BEARER_TOKEN`. Docker reads that file; the Python server still does not load dotenv files on its own.
-
-`docker-compose.yml` starts the MCP server together with a local SQL Server Developer container for development and integration testing:
-
-```bash
-export MSSQL_SA_PASSWORD="LocalTest-$(openssl rand -hex 16)!Aa1"
-export AZURE_SQL_MCP_BEARER_TOKEN="$(openssl rand -hex 32)"
-docker compose -f azure-sql-mcp/docker-compose.yml up --build
-unset MSSQL_SA_PASSWORD AZURE_SQL_MCP_BEARER_TOKEN
-```
-
-That Compose stack is a local test fixture, not an Azure SQL Database deployment. It requires
-runtime-generated SQL and bearer credentials and contains no checked-in password. Use it only
-as a throwaway development environment.
-
-## MCP client configuration
-
-Keep secrets out of checked-in client configuration. The examples use placeholders only.
-
-### Claude Desktop and Cursor: stdio
-
-Both clients use an `mcpServers` object for local stdio servers. Add the following entry to the relevant client configuration and replace the project path and connection placeholders:
-
-```json
-{
-  "mcpServers": {
-    "azure-sql": {
-      "command": "uv",
-      "args": [
-        "--directory",
-        "/absolute/path/to/SQL/azure-sql-mcp",
-        "run",
-        "azure-sql-mcp"
-      ],
-      "env": {
-        "AZURE_SQL_SERVER": "your-server.database.windows.net",
-        "AZURE_SQL_DEFAULT_DATABASE": "appdb",
-        "AZURE_SQL_ALLOWED_DATABASES": "appdb",
-        "AZURE_SQL_AUTH_MODE": "entra-default",
-        "AZURE_SQL_ACCESS_MODE": "restricted",
-        "AZURE_SQL_TOOL_GROUPS": "core"
-      }
-    }
-  }
-}
-```
-
-For SQL password authentication, add `AZURE_SQL_USERNAME` and `AZURE_SQL_PASSWORD` with secret values supplied by the client or process manager. Do not put real passwords in a repository file.
-
-### VS Code: stdio
-
-VS Code uses `.vscode/mcp.json` with a top-level `servers` object:
+Create a local `.vscode/mcp.json` in the workspace. Do not commit machine paths or environment-specific values.
 
 ```json
 {
   "servers": {
-    "azure-sql": {
+    "azure-sql-triage": {
       "type": "stdio",
       "command": "uv",
       "args": [
@@ -213,302 +83,256 @@ VS Code uses `.vscode/mcp.json` with a top-level `servers` object:
       ],
       "env": {
         "AZURE_SQL_SERVER": "your-server.database.windows.net",
-        "AZURE_SQL_DEFAULT_DATABASE": "appdb",
-        "AZURE_SQL_ALLOWED_DATABASES": "appdb",
+        "AZURE_SQL_DEFAULT_DATABASE": "your-database",
+        "AZURE_SQL_ALLOWED_DATABASES": "your-database",
         "AZURE_SQL_AUTH_MODE": "entra-default",
-        "AZURE_SQL_ACCESS_MODE": "restricted"
+        "AZURE_SQL_ACCESS_MODE": "restricted",
+        "AZURE_SQL_WRITE_POLICY": "disabled",
+        "AZURE_SQL_PROFILE": "triage",
+        "AZURE_SQL_TOOL_GROUPS": "core,performance"
       }
     }
   }
 }
 ```
 
-### HTTP client configuration
+Reload VS Code, enable the server in Copilot Chat, then call `list_databases` and `check_capabilities`. Full client setup and profile runbooks are in [`docs/09-operations.md`](docs/09-operations.md).
 
-For a client that supports remote MCP servers, configure Streamable HTTP with the `/mcp` URL and a bearer header:
+## Named profiles
+
+`AZURE_SQL_PROFILE` is enforced by the server. It removes tools that do not belong to the selected workflow; it does not grant database permission or silently enable writes.
+
+| Profile | Purpose | Required posture | Important tools |
+| --- | --- | --- | --- |
+| `triage` | Incident and broad performance diagnosis | restricted, write disabled | performance cases, evidence collection, waits, blocking, Query Store, resources, statistics |
+| `optimizer` | Read-only rewrite benchmarking | restricted, write disabled, benchmark policy | tuning sessions, candidates, rewrite benchmark, result and plan comparison |
+| `sandbox` | Disposable non-production index tests | local stdio, unrestricted, write apply, sandbox policy | optimizer tools plus leased `benchmark_index_candidate` |
+| `enforcer-review` | Query Store review and intent preparation | restricted, write disabled | plan health, preview-only review, `prepare_plan_action` |
+| `enforcer-apply` | One authorized prepared plan action | local stdio, unrestricted, write apply, apply policy, kill switch open | apply, verify, and rollback prepared intents |
+
+Named profiles always hide direct force, hint, raw plan-apply, and direct test-index mutation tools. The compatibility implementations of those tools are preview-only even when a server is started without a profile.
+
+Profiles compose with `AZURE_SQL_TOOL_GROUPS`. A required tool must survive both filters.
+
+## Local database policy
+
+Repeated benchmarks, temporary indexes, and prepared plan actions fail closed unless `AZURE_SQL_DATABASE_POLICY_FILE` points to a valid local JSON document. Keep this file outside Git.
+
+Synthetic policy example:
 
 ```json
 {
-  "type": "http",
-  "url": "http://127.0.0.1:8000/mcp",
-  "headers": {
-    "Authorization": "Bearer replace-with-a-long-random-token"
+  "version": 1,
+  "databases": {
+    "your-sandbox-database": {
+      "environment": "sandbox",
+      "allow_read": true,
+      "allow_benchmark": true,
+      "allow_test_indexes": true,
+      "allow_plan_apply": false,
+      "max_benchmark_executions": 80
+    },
+    "your-production-database": {
+      "environment": "production",
+      "allow_read": true,
+      "allow_benchmark": false,
+      "allow_test_indexes": false,
+      "allow_plan_apply": false,
+      "max_benchmark_executions": 0
+    }
   }
 }
 ```
 
-For SSE-capable clients, use `type: "sse"` and `http://127.0.0.1:8000/sse`. Use HTTPS and a secret-management facility for non-local deployments.
+Rules:
+
+- Unknown databases are denied.
+- `allow_read` does not imply benchmark or write permission.
+- `max_benchmark_executions` is a hard per-request database-policy ceiling; the tuning session also has its own 80-execution default budget.
+- Temporary indexes are rejected when the policy environment is `production`, `prod`, or `live`, even if another field is misconfigured.
+- Plan apply requires `allow_plan_apply=true` in addition to every server and intent gate.
+
+## Durable state and privacy
+
+`AZURE_SQL_PERFORMANCE_STATE_DIR` defaults to `~/.azure-sql-mcp/state`. The directory is created with owner-only permissions and the SQLite file with owner read/write permissions where the platform supports POSIX modes.
+
+Performance state stores:
+
+- SQL and database fingerprints;
+- plan fingerprints and sourced summaries;
+- metric aggregates and evidence availability;
+- artifact references;
+- session/candidate state and budgets;
+- plan-action prior state and verification decisions;
+- temporary-index lease identifiers and cleanup targets.
+
+Performance state does not persist raw SQL. Secret-like metadata and SQL-shaped metadata fields are dropped at the persistence boundary. The separate admin audit can include full generated SQL only when `AZURE_SQL_AUDIT_FULL_SQL=1`; leave it disabled unless an approved local audit process requires it.
+
+## Read-only triage workflow
+
+1. `start_performance_case` with the affected SELECT and up to four named parameter cases.
+2. `collect_performance_evidence` with `execute_query=false` for broad read-only evidence.
+3. Inspect the result status: `healthy`, `actionable`, `partial`, or `inconclusive`.
+4. Use `get_performance_case` to retrieve redacted evidence and event history.
+5. Hand the same case id to the optimizer or the Query Store review process.
+
+Every diagnostic section carries collection window, availability, truncation, units, provenance, and stable query identity. Missing or truncated required evidence cannot produce `healthy`.
+
+`collect_performance_evidence` focuses on Azure SQL resource history, Query Store state/history, waits, blocking/open transactions, statistics, parameter sensitivity, and regressions. `analyze_db_health` remains available for operational checks such as connections, constraints, replication, identity, Query Store configuration, storage, and statistics; it no longer grades PLE, buffer-cache ratio, or fragmentation as query health.
+
+## Iterative optimizer workflow
+
+1. Record result shape, NULL, duplicate, ordering, tie, isolation, and parameter semantics in the client workflow.
+2. Produce concrete static rewrites before plan access whenever safe.
+3. `start_performance_case` for the baseline and parameter cases.
+4. `start_tuning_session`.
+5. For each single-change experiment, call `add_tuning_candidate` with one family: predicate, join, aggregation, cardinality, index, or combined.
+6. Call `benchmark_tuning_candidate` in `screening` phase.
+7. Continue after neutral, regressed, equivalence-failed, timed-out, or otherwise inconclusive candidates.
+8. Re-run credible winners in `finalist` phase.
+9. Call `finalize_tuning_session` with the winner, if any, and an explicit stopping reason.
+
+Default session limits:
+
+| Limit | Default |
+| --- | ---: |
+| Candidates | 10 |
+| Screening runs per candidate and parameter case | 3 |
+| Finalist runs per candidate and parameter case | 5 |
+| Parameter cases | 4 |
+| Measured query executions | 80 |
+| Wall-clock duration | 20 minutes |
+
+Each measured sample runs the user query once. Baseline and rewrite order alternates between runs. The result includes per-side medians, min/max spread, sourced plan deltas, equivalence status, and execution count.
+
+Candidate outcomes are `improved`, `neutral`, `regressed`, `equivalence_failed`, `inconclusive`, or `cleanup_required`. A screening winner remains open for finalist validation; finalization marks every unresolved experiment `inconclusive`, so the leaderboard has no ambiguous unfinished candidate.
+
+### Equivalence
+
+`compare_query_results` executes both SELECT-shaped queries inside one snapshot transaction. A match is proven only for the supplied parameter case when:
+
+- result shape matches;
+- the complete result fits inside the configured bound;
+- values and duplicate multiplicity match;
+- row order matches when `compare_order=true`;
+- both statements complete in the same snapshot.
+
+If the result is truncated, snapshot comparison is unavailable, or execution fails, the result is `inconclusive`, never proven. The client remains responsible for testing semantic cases beyond the supplied buckets.
+
+### Compatibility tools
+
+- `tune_query` starts a performance case/session and returns an evidence pack plus the next rewrite step.
+- `benchmark_query_rewrite` wraps one screening candidate in the session engine.
+
+They remain available for existing clients, but new integrations should use the explicit case/session tools to preserve a complete leaderboard.
+
+## Sandbox index workflow
+
+Use only `benchmark_index_candidate`; direct create/drop tools cannot perform live DDL.
+
+Required gates:
+
+- `AZURE_SQL_PROFILE=sandbox`;
+- local stdio transport;
+- `AZURE_SQL_ACCESS_MODE=unrestricted`;
+- `AZURE_SQL_WRITE_POLICY=apply`;
+- target in the normal database allowlist;
+- local policy with non-production environment, benchmark permission, and temporary-index permission;
+- active tuning session and matching candidate/query fingerprints.
+
+The workflow writes a durable lease before DDL, measures the baseline and candidate for every parameter case recorded on the performance case, performs a full bounded result comparison for each case, and drops the `IX_Testing_` index in `finally`. The default four-bucket budget is 32 executions for screening and 48 for a finalist, exactly filling the 80-execution session limit. Cleanup failure produces `cleanup_required` and blocks another index experiment for that database. On the next sandbox start, expired leases are checked and cleanup is retried before the server accepts work.
+
+The returned payload contains generated index DDL, rollback DDL, lease state, plan/metric deltas, classification, and the instruction to continue the tuning session.
+
+## Reviewed plan enforcement
+
+The only mutation path is:
+
+1. Use `plan_health_review`, `review_plan_enforcement`, or preview-only `plan_enforcer_tick` under `enforcer-review`.
+2. Call `prepare_plan_action` with the shared tuning session id, reviewed evidence, reviewer, reason, operation, and unique idempotency key.
+3. Review the intent and exact prior force/hint state.
+4. Start a local `enforcer-apply` process that points at the same state directory.
+5. Set `AZURE_SQL_PLAN_APPLY_KILL_SWITCH=false` only for the authorized action.
+6. Call `apply_prepared_plan_action` with the intent id and an explicit authorization reference.
+7. Collect a non-overlapping post-change window for the same parameter buckets.
+8. Call `verify_plan_action`.
+9. Keep on improvement, return `hold` on insufficient evidence, or restore the exact prior force/hint state on regression.
+
+Apply gates include the named profile, unrestricted local server, write policy, database policy, kill switch, prepared intent, evidence hash, exact current-vs-prior state, manual ownership, authorization reference, and idempotency key. Automatic Tuning ownership is detected and cannot be silently overridden.
+
+`rollback_plan_action` restores the exact force-plan and Query Store hint state captured during preparation, then confirms the resulting state.
 
 ## Authentication
 
-There are two separate authentication layers:
+| `AZURE_SQL_AUTH_MODE` | Required local values |
+| --- | --- |
+| `entra-default` | A working `DefaultAzureCredential` source, such as Azure CLI or managed identity |
+| `service-principal` | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` |
+| `interactive` | Interactive browser sign-in support |
+| `sql-password` | `AZURE_SQL_USERNAME`, `AZURE_SQL_PASSWORD` |
 
-1. Database authentication from the MCP process to Azure SQL Database.
-2. Static bearer authentication from an HTTP/SSE MCP client to the server.
-
-### Database authentication modes
-
-Set `AZURE_SQL_AUTH_MODE` to one of these values:
-
-| Mode | Required variables | Behavior |
-|---|---|---|
-| `entra-default` (default) | None enforced by config | Uses `DefaultAzureCredential`, such as Azure CLI credentials, managed identity, or another supported Entra credential source. |
-| `service-principal` | `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` | Uses `ClientSecretCredential`. |
-| `interactive` | None enforced by config; `AZURE_TENANT_ID` and `AZURE_CLIENT_ID` may be supplied | Uses `InteractiveBrowserCredential`. |
-| `sql-password` | `AZURE_SQL_USERNAME`, `AZURE_SQL_PASSWORD` | Uses SQL authentication over an encrypted connection. |
-
-The connection uses `Encrypt=yes` by default. Keep `AZURE_SQL_TRUST_SERVER_CERTIFICATE=false` for Azure SQL Database. Only set it to `true` for a controlled development or test endpoint with a certificate that cannot be validated normally.
-
-### MCP HTTP authentication
-
-`stdio` is local-process transport and does not require `AZURE_SQL_MCP_BEARER_TOKEN`. `sse` and `streamable-http` fail startup without that variable and require clients to send an exact `Authorization: Bearer <token>` value. Pass the token through the environment or a secret manager rather than a shell command that could be exposed in process listings.
-
-## Safety model
-
-### Restricted mode: default
-
-`AZURE_SQL_ACCESS_MODE=restricted` is the safe starting point:
-
-- Admin tools are not registered.
-- `execute_sql` accepts a single read-only SELECT-style statement after text checks, T-SQL parsing with `sqlglot`, and AST inspection. The supported parameter-binding form may include `DECLARE` and `SET @variable` statements before the SELECT; session SET options are not accepted.
-- DML and DDL, `EXEC`, `GO` batches, `DBCC`, temporary tables, external rowsets, dynamic SQL, cross-database three-part names, linked-server four-part names, and other blocked constructs are rejected by the validator.
-- Diagnostic tools remain read-only, although some require database permissions such as Query Store, SHOWPLAN, or DMV visibility.
-- Every database argument is resolved against `AZURE_SQL_ALLOWED_DATABASES` before a connection is opened.
-- Result fetching is bounded. The executor fetches at most `AZURE_SQL_ROW_LIMIT + 1` rows to detect truncation and returns only the configured limit.
-
-Restricted mode does not mean every diagnostic will be available: capability-sensitive tools can return unavailable or permission-related results for a given principal or Azure SQL Database tier.
-
-### Unrestricted mode: explicit administration surface
-
-`AZURE_SQL_ACCESS_MODE=unrestricted` registers the 10 admin tools in addition to the read-only tools. It does not weaken the validator used by `execute_sql`.
-
-Admin operations use the following gates:
-
-1. Admin tool calls default to `dry_run=true` and return a preview plus an audit ID.
-2. `AZURE_SQL_WRITE_POLICY=review` is the unrestricted default. It permits previews but refuses write execution.
-3. Execution requires both `dry_run=false` in the tool call and `AZURE_SQL_WRITE_POLICY=apply`.
-4. `AZURE_SQL_WRITE_POLICY=disabled` blocks write execution.
-5. Remote admin tools are not advertised over SSE or Streamable HTTP unless `AZURE_SQL_ENABLE_REMOTE_ADMIN=1`. Remote `apply` also requires that setting; otherwise configuration fails closed.
-6. Live `create_test_index` and `drop_test_index` additionally require the target database to be listed in `AZURE_SQL_TEST_INDEX_DATABASES`. Test indexes use the enforced `IX_Testing_` prefix.
-
-`execute_tsql_unrestricted` is still restricted to read-only SELECT-style batches after a hard denylist and parser checks. Use the generated admin tools for maintenance and Query Store actions. The supported plan-application tools are deliberately narrow and return rollback SQL where applicable.
-
-Audit records are JSONL under `AZURE_SQL_AUDIT_DIR`. By default they include a SQL hash and preview, not full SQL. Set `AZURE_SQL_AUDIT_FULL_SQL=1` only when the environment can safely retain the submitted SQL, because query text can contain sensitive literals.
-
-### Token-safe artifacts
-
-Large plan payloads are stored as bounded, in-memory MCP resources such as `azuresql-artifact://...`. Tool responses include a resource URI, length, hash, and expiry metadata instead of embedding raw SHOWPLAN XML by default. Artifacts are per-process and do not survive a restart.
+Keep credentials in the operating-system credential store, managed identity, or a protected local environment source. Do not put them in MCP JSON committed to Git.
 
 ## Configuration reference
 
-All values can be supplied as environment variables. Supported CLI flags take precedence when explicitly supplied. The server reads no `.env` file automatically.
+### Connection and workflow
 
-### Required connection settings
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `AZURE_SQL_SERVER` | required | Azure SQL logical server host |
+| `AZURE_SQL_DEFAULT_DATABASE` | required | Default database for omitted tool arguments |
+| `AZURE_SQL_ALLOWED_DATABASES` | required | Comma-separated database allowlist |
+| `AZURE_SQL_AUTH_MODE` | `entra-default` | Authentication mode |
+| `AZURE_SQL_ACCESS_MODE` | `restricted` | `restricted` or `unrestricted` |
+| `AZURE_SQL_PROFILE` | none | Enforced named workflow profile; use one for suite operations |
+| `AZURE_SQL_TOOL_GROUPS` | `all` | `core`, `performance`, `schema`, `admin`, or `all` |
+| `AZURE_SQL_DATABASE_POLICY_FILE` | none | Local versioned policy; no file means benchmark and write denial |
+| `AZURE_SQL_PERFORMANCE_STATE_DIR` | `~/.azure-sql-mcp/state` | Protected durable workflow state |
+| `AZURE_SQL_PLAN_APPLY_KILL_SWITCH` | `true` | `true` blocks prepared plan apply; set `false` only during authorization |
 
-| Variable | Default | Description |
-|---|---:|---|
-| `AZURE_SQL_SERVER` | — | Required logical server name, normally an Azure SQL Database FQDN. |
-| `AZURE_SQL_DEFAULT_DATABASE` | — | Required database used when a tool omits `database_name`; it must be present in the allowlist. |
-| `AZURE_SQL_ALLOWED_DATABASES` | — | Required comma-separated database allowlist. |
+### Limits and transport
 
-### Authentication and TLS
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `AZURE_SQL_ROW_LIMIT` | `200` | Maximum returned rows for bounded query paths |
+| `AZURE_SQL_QUERY_TIMEOUT_SECONDS` | `30` | Per-query timeout |
+| `AZURE_SQL_TOOL_TIMEOUT_SECONDS` | query timeout + 15 | Outer tool timeout; cannot be lower than query timeout |
+| `AZURE_SQL_POOL_SIZE` | `5` | Connections per database pool |
+| `AZURE_SQL_MAX_RETRIES` | `3` | Retry count for retry-safe connection operations; profiled samples are not retried |
+| `AZURE_SQL_TRANSPORT` | `stdio` | `stdio`, `sse`, or `streamable-http` |
+| `AZURE_SQL_HOST` | `127.0.0.1` | HTTP/SSE bind host |
+| `AZURE_SQL_PORT` | `8000` | HTTP/SSE port |
+| `AZURE_SQL_MCP_BEARER_TOKEN` | required remotely | Bearer token for SSE/HTTP |
+| `AZURE_SQL_ENABLE_REMOTE_ADMIN` | `0` | Additional remote admin exposure gate; named write profiles should remain local |
 
-| Variable | Default | Description |
-|---|---:|---|
-| `AZURE_SQL_AUTH_MODE` | `entra-default` | `entra-default`, `service-principal`, `interactive`, or `sql-password`. |
-| `AZURE_SQL_USERNAME` | — | Required for `sql-password`. |
-| `AZURE_SQL_PASSWORD` | — | Required for `sql-password`; keep it in secret storage. |
-| `AZURE_TENANT_ID` | — | Required for `service-principal`; optional input for `interactive`. |
-| `AZURE_CLIENT_ID` | — | Required for `service-principal`; optional input for `interactive`. |
-| `AZURE_CLIENT_SECRET` | — | Required for `service-principal`; keep it in secret storage. |
-| `AZURE_SQL_TRUST_SERVER_CERTIFICATE` | `false` | Whether to trust an unverified server certificate. Keep `false` for Azure SQL Database. |
+### Audit and TLS
 
-### Access, tools, and write policy
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `AZURE_SQL_WRITE_POLICY` | disabled when restricted, otherwise review | `disabled`, `review`, or `apply` |
+| `AZURE_SQL_AUDIT_DIR` | `~/.azure-sql-mcp/audit` | Permission-restricted admin audit directory |
+| `AZURE_SQL_AUDIT_FULL_SQL` | `0` | Opt in to full generated SQL in admin audit records |
+| `AZURE_SQL_TRUST_SERVER_CERTIFICATE` | `false` | Keep false for Azure SQL Database |
+| `AZURE_SQL_LOG_LEVEL` | `INFO` | Logging level |
+| `AZURE_SQL_LOG_FORMAT` | `text` | `text` or `json` |
 
-| Variable | Default | Description |
-|---|---:|---|
-| `AZURE_SQL_ACCESS_MODE` | `restricted` | `restricted` or `unrestricted`. |
-| `AZURE_SQL_TOOL_GROUPS` | `all` | Comma-separated `core`, `performance`, `schema`, `admin`, or `all`. Group pruning controls which tools are advertised. |
-| `AZURE_SQL_WRITE_POLICY` | `disabled` in restricted; `review` in unrestricted | `disabled`, `review`, or `apply`. Restricted mode always resolves to `disabled`. |
-| `AZURE_SQL_TEST_INDEX_DATABASES` | empty | Comma-separated databases permitted for live test-index create/drop operations. |
-| `AZURE_SQL_ENABLE_REMOTE_ADMIN` | `0` | Set `1` to advertise admin tools over SSE or Streamable HTTP and to permit remote apply configuration. |
+Equivalent `--azure-sql-*` flags are available in `uv run azure-sql-mcp --help`.
 
-### Query and process limits
+## Tool groups
 
-| Variable | Default | Description |
-|---|---:|---|
-| `AZURE_SQL_ROW_LIMIT` | `200` | Maximum rows returned by bounded query results. |
-| `AZURE_SQL_QUERY_TIMEOUT_SECONDS` | `30` | Per-query timeout; must be positive. |
-| `AZURE_SQL_TOOL_TIMEOUT_SECONDS` | query timeout + `15` | Outer per-tool timeout; must be at least the query timeout. |
-| `AZURE_SQL_POOL_SIZE` | `5` | Maximum pooled connections per database. |
-| `AZURE_SQL_MAX_RETRIES` | `3` | Transient connection retry count; may be `0`. |
-| `AZURE_SQL_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
-| `AZURE_SQL_LOG_FORMAT` | `text` | `text` or `json`. |
+- `core`: bounded query execution, introspection, performance cases, tuning sessions, result/plan comparison, Query Store top queries, and operational health.
+- `performance`: waits, blocking, resource history, statistics, query/index analysis, plan regression, and plan review.
+- `schema`: schema capture, comparison, and migration-script generation. Generated scripts are not executed.
+- `admin`: guarded maintenance and prepared apply tools. Named profiles prune unrelated direct mutation tools.
 
-### Transport and audit
+Resources include schema views and token-safe plan artifacts under `azuresql-artifact://{artifact_id}`. Artifact content is process-local and expires with the server.
 
-| Variable | Default | Description |
-|---|---:|---|
-| `AZURE_SQL_TRANSPORT` | `stdio` | `stdio`, `sse`, or `streamable-http`. |
-| `AZURE_SQL_HOST` | `127.0.0.1` | HTTP/SSE bind host. |
-| `AZURE_SQL_PORT` | `8000` | HTTP/SSE bind port. |
-| `AZURE_SQL_MCP_BEARER_TOKEN` | — | Required for SSE and Streamable HTTP; not required for stdio. |
-| `AZURE_SQL_AUDIT_DIR` | `~/.azure-sql-mcp/audit` | Directory for JSONL previews, applies, blocks, and failures. |
-| `AZURE_SQL_AUDIT_FULL_SQL` | `0` | Set `1` to include full SQL in audit records; default is hash plus preview. |
+## Verification
 
-The corresponding frequently used CLI flags are `--transport`, `--host`, `--port`, `--log-level`, `--log-format`, `--azure-sql-server`, `--azure-sql-default-database`, `--azure-sql-allowed-databases`, `--azure-sql-auth-mode`, `--azure-sql-access-mode`, `--azure-sql-tool-groups`, and the `--azure-sql-*` options shown by `uv run azure-sql-mcp --help`.
-
-## Tool groups and recommended paths
-
-The default `all` group advertises every tool allowed by the selected access and transport mode. Set `AZURE_SQL_TOOL_GROUPS=core` for the smallest useful read-only surface. Tools not in the configured group are removed before the MCP client sees them.
-
-### `core` — query, introspection, and health (15 tools)
-
-| Tool | Use |
-|---|---|
-| `list_databases` | Confirm the server's configured database allowlist. |
-| `check_capabilities` | Check Query Store, SHOWPLAN, and DMV-sensitive capabilities. |
-| `list_schemas` | Enumerate schemas. |
-| `list_objects` | List tables, views, procedures, functions, or indexes in a schema. |
-| `search_objects` | Find objects by a SQL `LIKE` pattern across schemas. |
-| `get_object_details` | Inspect columns, constraints, indexes, and definitions. |
-| `get_dependencies` | Inspect references to and from an object. |
-| `get_table_stats` | Get approximate row counts and storage information. |
-| `execute_sql` | Execute validated read-only SQL. |
-| `explain_query` | Capture an estimated or actual plan for read-only SQL. |
-| `tune_query` | Build a single-query evidence pack. |
-| `benchmark_query_rewrite` | Compare a baseline and rewrite with bounded samples and plan summaries. |
-| `get_top_queries` | Read Query Store top queries by duration, CPU, IO, executions, memory, or resource blend. |
-| `analyze_index_recommendations` | Read missing-index DMV and automatic-tuning recommendations. |
-| `analyze_db_health` | Run the database health checks supported by the current permissions and tier. |
-
-Recommended exploration path: `list_databases` → `check_capabilities` → `list_schemas` → `list_objects` → `get_object_details` → `get_dependencies` or `get_table_stats`.
-
-Recommended single-query path: `tune_query` → inspect its plan, waits, Query Store, statistics, and index evidence → use `benchmark_query_rewrite` when a candidate rewrite exists. Explicit `parameter_values` are preferred for reproducible query comparisons.
-
-### `performance` — diagnostics and tuning (35 tools)
-
-**Query analysis and plan health**
-
-`analyze_query_indexes`, `analyze_workload_indexes`, `optimize_indexes`, `compare_query_plans`, `detect_regressed_queries`, `detect_parameter_sniffing`, `get_query_parameter_buckets`, `get_forced_plans`, `plan_health_review`, `review_plan_enforcement`, `dry_run_plan_action`, and `plan_enforcer_tick`.
-
-**Waits, blocking, tempdb, and memory**
-
-`get_wait_stats`, `get_query_wait_stats`, `get_currently_waiting_tasks`, `get_active_sessions`, `get_lock_details`, `get_open_transactions`, `get_deadlock_history`, `get_tempdb_usage`, `get_tempdb_space_breakdown`, and `get_memory_grants`.
-
-**Resource, storage, connection, cache, and statistics diagnostics**
-
-`get_io_stats`, `get_resource_limits`, `get_resource_stats_history`, `get_connection_pool_stats`, `get_database_configuration`, `get_storage_diagnostics`, `get_connection_diagnostics`, `get_top_cached_queries`, `get_cached_routine_stats`, `get_object_index_diagnostics`, `get_plan_cache_analysis`, `get_query_compilation_stats`, and `check_statistics_health`.
-
-Recommended performance path:
-
-1. `analyze_db_health` and `get_top_queries` for broad evidence.
-2. `explain_query` or `tune_query` for the highest-impact statements.
-3. `get_active_sessions`, wait, lock, tempdb, resource, or cache tools for the suspected bottleneck.
-4. `analyze_workload_indexes`, `analyze_query_indexes`, or statistics tools for a candidate remediation.
-5. `plan_health_review` → `review_plan_enforcement` → `dry_run_plan_action` for Query Store plan decisions.
-6. Keep `plan_enforcer_tick` in dry-run mode until the proposed actions have been reviewed.
-
-Some diagnostic queries depend on Azure SQL Database tier or permission visibility. `check_capabilities` is the first check when a DMV-backed tool is unavailable.
-
-### `schema` — comparison and migration-script generation (3 tools)
-
-- `capture_schema_snapshot` — capture a point-in-time snapshot of tables, views, procedures, functions, indexes, and foreign keys.
-- `compare_schemas` — compare two allowlisted databases and group the differences.
-- `generate_migration_script` — generate T-SQL from a source schema to a target schema; it does not execute the script.
-
-Recommended schema path: confirm both databases with `list_databases` → `capture_schema_snapshot` or `compare_schemas` → review dependencies and destructive changes → `generate_migration_script` → apply through a separately reviewed deployment process.
-
-### `admin` — audited maintenance and destructive operations (10 tools)
-
-These tools are registered only in unrestricted mode and are also hidden from remote transports unless remote admin is explicitly enabled.
-
-- `execute_tsql_unrestricted` — audited raw SQL path that still accepts only read-only SELECT-style batches.
-- `rebuild_index` — rebuild or reorganize an index.
-- `update_statistics` — update statistics with an optional sample percentage.
-- `force_query_plan` — force or unforce a Query Store plan through the supported stored procedures.
-- `set_query_store_hints` — set an allowlisted Query Store hint.
-- `clear_query_store_hints` — clear Query Store hints.
-- `create_test_index` — create only an `IX_Testing_`-prefixed disposable index on an explicitly allowlisted test database.
-- `drop_test_index` — drop only an `IX_Testing_`-prefixed test index.
-- `apply_plan_action` — apply a reviewed Query Store force/unforce action.
-- `kill_session` — kill a non-system session; system SPIDs are refused.
-
-Recommended admin path: inspect read-only evidence → call the relevant admin tool with `dry_run=true` → review the returned SQL, rollback SQL, and audit ID → set `dry_run=false` only with an explicit `AZURE_SQL_WRITE_POLICY=apply` decision.
-
-### Resources and prompts
-
-Resource templates:
-
-- `azuresql://{database}/schemas`
-- `azuresql://{database}/{schema}/tables`
-- `azuresql://{database}/{schema}/views`
-- `azuresql://{database}/{schema}/procedures`
-- `azuresql://{database}/{schema}/{table}`
-- `azuresql-artifact://{artifact_id}` for token-safe artifacts created during the process
-
-Guided prompts:
-
-- `analyze-slow-queries`
-- `review-index-health`
-- `explore-schema`
-- `compare-schemas`
-- `troubleshoot-performance`
-
-## Examples
-
-### Execute a safe catalog query
-
-An MCP client can call `execute_sql` with a database in the allowlist:
-
-```json
-{
-  "database_name": "appdb",
-  "sql": "SELECT TOP (20) name FROM sys.tables ORDER BY name"
-}
-```
-
-The result is bounded by `AZURE_SQL_ROW_LIMIT`. If more rows are available, the response reports truncation rather than returning an unbounded result.
-
-### Tune a parameterized query
-
-Prefer explicit parameter values when comparing evidence across runs:
-
-```json
-{
-  "database_name": "appdb",
-  "sql": "SELECT OrderId, CustomerId, TotalAmount FROM dbo.Orders WHERE CustomerId = @CustomerId",
-  "parameter_values": {
-    "CustomerId": 42
-  },
-  "analyze": true,
-  "include_raw_xml": false
-}
-```
-
-Use these arguments with `tune_query`. The query must still satisfy the read-only validator. `include_raw_xml=false` keeps the plan in the artifact resource path.
-
-### Compare a rewrite
-
-Call `benchmark_query_rewrite` with the original and candidate read-only queries, set `runs` to a value such as `3`, and supply the same `parameter_values` to both sides. A matching bounded sample is evidence for the tested inputs, not proof of full semantic equivalence across all parameters or result-order contracts.
-
-### Preview an administrative action
-
-Use unrestricted mode only in an explicitly controlled environment:
+Normal checks require no database credentials:
 
 ```bash
-export AZURE_SQL_ACCESS_MODE="unrestricted"
-export AZURE_SQL_WRITE_POLICY="review"
-export AZURE_SQL_TEST_INDEX_DATABASES="sandboxdb"
-```
-
-Call an admin tool with `dry_run=true`. Review its `sql_preview`, `sql_hash`, `audit_id`, and any `rollback_sql`. A preview does not execute the action. Applying it requires the separate policy and tool-call gates in [Safety model](#safety-model).
-
-## Testing
-
-Run the local checks from this directory:
-
-```bash
+uv sync --dev --locked
 uv run ruff check src tests
 uv run pyright
 uv run python -m compileall -q src tests
@@ -516,70 +340,34 @@ uv run pytest -q
 uv build
 ```
 
-The unit suite uses mocks and does not require Azure SQL Database credentials. Integration tests are skipped unless `AZURE_SQL_SERVER` is set. They require a valid target configuration and may create and remove an `mcp_integration` schema in the selected test database; use a disposable or explicitly approved database.
-
-For an Azure SQL Database integration run, export the required connection settings and a valid auth mode before running only the integration tests:
-
-```bash
-export AZURE_SQL_SERVER="your-server.database.windows.net"
-export AZURE_SQL_DEFAULT_DATABASE="appdb"
-export AZURE_SQL_ALLOWED_DATABASES="appdb"
-export AZURE_SQL_AUTH_MODE="entra-default"
-uv run pytest tests/integration -q
-```
-
-The integration suite includes stdio end-to-end coverage, schema/resource/prompt checks, query and diagnostic paths, schema comparison, and guarded admin behavior. Do not point it at a production database without reviewing the fixture setup and cleanup first.
+Live validation is opt-in. Use only an allowlisted dedicated non-production Azure SQL database. Start with the `optimizer` profile for read-only validation. Use `sandbox` only for leased test indexes and `enforcer-apply` only for one explicitly authorized prepared intent. Production remains read-only.
 
 ## Troubleshooting
 
-### `AZURE_SQL_SERVER is required` or allowlist validation fails
+### A profile tool is missing
 
-Export all three required connection variables. `AZURE_SQL_DEFAULT_DATABASE` must be listed in `AZURE_SQL_ALLOWED_DATABASES`; tool calls are also restricted to that allowlist.
+Check both `AZURE_SQL_PROFILE` and `AZURE_SQL_TOOL_GROUPS`. Restricted access also removes admin-group tools. Restart the MCP process after changing environment values.
 
-### HTTP/SSE startup fails because a bearer token is missing
+### A benchmark is denied
 
-Set `AZURE_SQL_MCP_BEARER_TOKEN` before using `--transport sse` or `--transport streamable-http`. Clients must send the same token in the `Authorization` header.
+Confirm the database policy file exists, the database key matches the configured allowlist, `allow_benchmark=true`, and the requested execution count is within both policy and session budgets.
 
-### Remote admin tools are missing
+### An equivalence check is inconclusive
 
-Admin tools require `AZURE_SQL_ACCESS_MODE=unrestricted`. For SSE or Streamable HTTP they also require `AZURE_SQL_ENABLE_REMOTE_ADMIN=1`; otherwise the server removes them before advertising its tool list. `AZURE_SQL_TOOL_GROUPS` can remove them as well.
+Narrow the result safely so the complete set fits inside the row bound, confirm snapshot isolation is available, and retry the same parameter case. Do not relabel a bounded or failed comparison as proven.
 
-### Remote apply configuration is rejected
+### An index lease requires cleanup
 
-For a remote transport, `AZURE_SQL_WRITE_POLICY=apply` requires `AZURE_SQL_ENABLE_REMOTE_ADMIN=1`. Keep remote admin disabled unless the network boundary, authentication, audit retention, and approval process are explicit.
+Stop further index tests. Restart the approved sandbox profile to retry expired-lease cleanup. If it remains `cleanup_required`, use the returned rollback DDL through the approved database change process and retain the lease as evidence until removal is confirmed.
 
-### Entra authentication cannot obtain a token
+### Plan apply is blocked
 
-Check that the selected credential source is available to `DefaultAzureCredential`, or select `service-principal`/`interactive` with the required values. Database permissions are separate from token acquisition; use `check_capabilities` after connecting.
+Check the prepared intent, current prior-state match, ownership, `enforcer-apply` profile, local stdio transport, unrestricted access, write policy, database policy, authorization reference, and kill switch. Do not fall back to a direct force or hint tool.
 
-### SQL password authentication fails at startup
+### A diagnostic is partial
 
-Set both `AZURE_SQL_USERNAME` and `AZURE_SQL_PASSWORD` when `AZURE_SQL_AUTH_MODE=sql-password`. Keep `AZURE_SQL_TRUST_SERVER_CERTIFICATE=false` for Azure SQL Database and verify firewall, networking, login, and database access independently.
+Treat unavailable permissions, missing Query Store history, truncation, mismatched windows, or missing parameter buckets as evidence gaps. Recollect only the missing section against the same case instead of starting a new conclusion.
 
-### A diagnostic tool reports an unavailable DMV or permission error
+## Repository handoff
 
-Run `check_capabilities` for the database. Azure SQL Database DMVs and columns vary by service tier, and visibility varies by principal. A capability failure is not evidence that the MCP transport is unhealthy.
-
-### Results are truncated
-
-This is expected when a result exceeds `AZURE_SQL_ROW_LIMIT` (default `200`). Add a narrower predicate, request an aggregate, or raise the limit deliberately while considering client context and memory.
-
-### A plan response contains a resource URI instead of raw XML
-
-Read the returned `azuresql-artifact://...` resource from the same running MCP process. Artifacts are bounded, in-memory, expire, and disappear when the process exits. Set `include_raw_xml=true` only for a client that needs inline XML.
-
-### The first Azure SQL Database connection times out
-
-A serverless or auto-paused database may need time to wake. Retry after the database is available, keep the query timeout and outer tool timeout consistent, and use a small warm-up query before a test run if the environment requires it.
-
-### Docker starts but the client cannot connect
-
-Confirm that the container is listening on port `8000`, the client uses `/mcp` for Streamable HTTP or `/sse` for SSE, and the bearer header is present. The Compose file's SQL Server service is a local test fixture; it is not the supported Azure SQL Database target.
-
-## Repository location and history
-
-This directory is the monorepo copy at `azure-sql-mcp/` in AkaalHoldings SQL. It is not a standalone checkout. Run package, test, and build commands from this directory, or point the MCP client's `uv --directory` argument at this directory.
-
-The imported source came from `akaalholdings/azure-sql-mcp` at commit `4e590e2`. The monorepo copy is the documentation and integration surface for this checkout; repository-wide navigation and CI are maintained outside this README.
-
-See [SECURITY.md](SECURITY.md), [CONTRIBUTING.md](CONTRIBUTING.md), [CHANGELOG.md](CHANGELOG.md), and [LICENSE](LICENSE) for the package-local policies and history.
+This package is part of the SQL monorepo. Repository-wide setup, skills, integrity checks, and CI are documented in [`../README.md`](../README.md). Package operations are in [`docs/09-operations.md`](docs/09-operations.md); release history is in [`CHANGELOG.md`](CHANGELOG.md); security reporting is in [`SECURITY.md`](SECURITY.md).

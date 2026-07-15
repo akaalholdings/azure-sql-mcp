@@ -103,6 +103,11 @@ class PlanEnforcementService:
         plan_id: int,
         dry_run: bool = True,
     ) -> dict[str, Any]:
+        if not dry_run:
+            raise PermissionError(
+                "Direct plan actions are preview-only; use prepare_plan_action and "
+                "apply_prepared_plan_action."
+            )
         admin_action = self._build_action(
             database_name,
             action,
@@ -130,6 +135,10 @@ class PlanEnforcementService:
     ) -> dict[str, Any]:
         if max_actions <= 0:
             raise ValueError("max_actions must be greater than 0.")
+        if not dry_run:
+            raise PermissionError(
+                "plan_enforcer_tick is permanently preview-only; use the prepared workflow."
+            )
 
         review = await self.review(
             database_name,
@@ -149,14 +158,7 @@ class PlanEnforcementService:
                 plan_id,
                 tool_name="plan_enforcer_tick",
             )
-            if dry_run:
-                result = self.admin_policy.preview(admin_action)
-            else:
-                result = await self.admin_policy.execute(
-                    admin_action,
-                    self.executor,
-                    dry_run=False,
-                )
+            result = self.admin_policy.preview(admin_action)
             result["query_id"] = query_id
             result["plan_id"] = plan_id
             result["plan_action"] = self._normalize_action(action)
@@ -165,8 +167,8 @@ class PlanEnforcementService:
 
         return {
             "database_name": database_name,
-            "mode": "dry_run" if dry_run else "apply",
-            "dry_run": dry_run,
+            "mode": "preview",
+            "dry_run": True,
             "window_minutes": window_minutes,
             "max_actions": max_actions,
             "candidate_count": len(candidates),

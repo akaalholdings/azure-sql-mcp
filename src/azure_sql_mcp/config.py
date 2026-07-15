@@ -32,6 +32,14 @@ class ToolGroup(str, Enum):
     ALL = "all"
 
 
+class McpProfile(str, Enum):
+    TRIAGE = "triage"
+    OPTIMIZER = "optimizer"
+    SANDBOX = "sandbox"
+    ENFORCER_REVIEW = "enforcer-review"
+    ENFORCER_APPLY = "enforcer-apply"
+
+
 # Tool name → group mapping.  Tools not listed here are always registered.
 TOOL_GROUPS: dict[str, ToolGroup] = {
     # core: essential query & introspection (always in "all", registered by default)
@@ -47,6 +55,16 @@ TOOL_GROUPS: dict[str, ToolGroup] = {
     "explain_query": ToolGroup.CORE,
     "tune_query": ToolGroup.CORE,
     "benchmark_query_rewrite": ToolGroup.CORE,
+    "start_performance_case": ToolGroup.CORE,
+    "collect_performance_evidence": ToolGroup.CORE,
+    "get_performance_case": ToolGroup.CORE,
+    "start_tuning_session": ToolGroup.CORE,
+    "add_tuning_candidate": ToolGroup.CORE,
+    "benchmark_tuning_candidate": ToolGroup.CORE,
+    "benchmark_index_candidate": ToolGroup.CORE,
+    "finalize_tuning_session": ToolGroup.CORE,
+    "compare_query_results": ToolGroup.CORE,
+    "compare_plan_summaries": ToolGroup.CORE,
     "analyze_db_health": ToolGroup.CORE,
     "get_top_queries": ToolGroup.CORE,
     "analyze_index_recommendations": ToolGroup.CORE,
@@ -100,8 +118,49 @@ TOOL_GROUPS: dict[str, ToolGroup] = {
     "create_test_index": ToolGroup.ADMIN,
     "drop_test_index": ToolGroup.ADMIN,
     "apply_plan_action": ToolGroup.ADMIN,
+    "prepare_plan_action": ToolGroup.PERFORMANCE,
+    "apply_prepared_plan_action": ToolGroup.ADMIN,
+    "verify_plan_action": ToolGroup.ADMIN,
+    "rollback_plan_action": ToolGroup.ADMIN,
     "kill_session": ToolGroup.ADMIN,
 }
+
+
+_TUNING_TOOLS = frozenset(
+    {
+        "tune_query",
+        "benchmark_query_rewrite",
+        "start_tuning_session",
+        "add_tuning_candidate",
+        "benchmark_tuning_candidate",
+        "finalize_tuning_session",
+        "compare_query_results",
+        "compare_plan_summaries",
+    }
+)
+_INDEX_WORKFLOW_TOOLS = frozenset({"benchmark_index_candidate"})
+_ENFORCER_REVIEW_TOOLS = frozenset(
+    {
+        "plan_health_review",
+        "plan_enforcer_tick",
+        "review_plan_enforcement",
+        "dry_run_plan_action",
+        "prepare_plan_action",
+    }
+)
+_ENFORCER_APPLY_TOOLS = frozenset(
+    {"apply_prepared_plan_action", "verify_plan_action", "rollback_plan_action"}
+)
+_DIRECT_ADMIN_TOOLS = frozenset(
+    {
+        "apply_plan_action",
+        "force_query_plan",
+        "set_query_store_hints",
+        "clear_query_store_hints",
+        "create_test_index",
+        "drop_test_index",
+    }
+)
 
 
 class TransportMode(str, Enum):
@@ -144,7 +203,10 @@ class ServerConfig:
     audit_dir: str
     audit_full_sql: bool
     remote_admin_enabled: bool
-    test_index_databases: tuple[str, ...] = ()
+    profile: McpProfile | None = None
+    database_policy_file: str | None = None
+    performance_state_dir: str = "~/.azure-sql-mcp/state"
+    plan_apply_kill_switch: bool = True
 
     def validate_database_name(self, database_name: str | None) -> str:
         """Resolve a database against the allowlist, case-insensitively.
@@ -163,9 +225,36 @@ class ServerConfig:
     def is_tool_enabled(self, tool_name: str) -> bool:
         """Check whether a tool should be registered based on configured tool_groups."""
         group = TOOL_GROUPS.get(tool_name)
+        if self.profile is not None:
+            if tool_name in _DIRECT_ADMIN_TOOLS:
+                return False
+            if tool_name in _TUNING_TOOLS and self.profile not in {
+                McpProfile.OPTIMIZER,
+                McpProfile.SANDBOX,
+            }:
+                return False
+            if (
+                tool_name in _INDEX_WORKFLOW_TOOLS
+                and self.profile != McpProfile.SANDBOX
+            ):
+                return False
+            if tool_name in _ENFORCER_REVIEW_TOOLS and self.profile not in {
+                McpProfile.ENFORCER_REVIEW,
+                McpProfile.ENFORCER_APPLY,
+            }:
+                return False
+            if (
+                tool_name in _ENFORCER_APPLY_TOOLS
+                and self.profile != McpProfile.ENFORCER_APPLY
+            ):
+                return False
+            if group == ToolGroup.ADMIN and tool_name not in _ENFORCER_APPLY_TOOLS:
+                return False
         if group is None:
             # Unknown tools are always registered
             return True
+        if group == ToolGroup.ADMIN and self.access_mode != AccessMode.UNRESTRICTED:
+            return False
         if (
             group == ToolGroup.ADMIN
             and self.transport.mode != TransportMode.STDIO
@@ -266,6 +355,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--azure-sql-tool-groups",
         dest="azure_sql_tool_groups",
         help="Comma-separated tool groups to expose: core,performance,schema,admin,all (default: all)",
+    )
+    parser.add_argument(
+        "--azure-sql-profile",
+        dest="azure_sql_profile",
+        choices=[profile.value for profile in McpProfile],
+    )
+    parser.add_argument(
+        "--azure-sql-database-policy-file",
+        dest="azure_sql_database_policy_file",
+    )
+    parser.add_argument(
+        "--azure-sql-performance-state-dir",
+        dest="azure_sql_performance_state_dir",
+    )
+    parser.add_argument(
+        "--azure-sql-plan-apply-kill-switch",
+        dest="azure_sql_plan_apply_kill_switch",
     )
     return parser
 
@@ -377,7 +483,40 @@ def load_server_config(argv: list[str] | None = None) -> ServerConfig:
     )
     audit_full_sql = parse_bool(env_or_arg(args, "azure_sql_audit_full_sql"))
     remote_admin_enabled = parse_bool(env_or_arg(args, "azure_sql_enable_remote_admin"))
-    test_index_databases = parse_csv(os.getenv("AZURE_SQL_TEST_INDEX_DATABASES"))
+    profile_raw = env_or_arg(args, "azure_sql_profile")
+    profile = McpProfile(profile_raw) if profile_raw else None
+    database_policy_file = env_or_arg(args, "azure_sql_database_policy_file")
+    performance_state_dir = (
+        env_or_arg(
+            args,
+            "azure_sql_performance_state_dir",
+            "~/.azure-sql-mcp/state",
+        )
+        or "~/.azure-sql-mcp/state"
+    )
+    plan_apply_kill_switch = parse_bool(
+        env_or_arg(args, "azure_sql_plan_apply_kill_switch"),
+        default=True,
+    )
+    read_only_profiles = {
+        McpProfile.TRIAGE,
+        McpProfile.OPTIMIZER,
+        McpProfile.ENFORCER_REVIEW,
+    }
+    write_profiles = {McpProfile.SANDBOX, McpProfile.ENFORCER_APPLY}
+    if (
+        profile is not None
+        and profile in read_only_profiles
+        and access_mode != AccessMode.RESTRICTED
+    ):
+        raise ValueError(f"AZURE_SQL_PROFILE={profile.value} requires restricted access mode.")
+    if profile is not None and profile in write_profiles:
+        if transport.mode != TransportMode.STDIO:
+            raise ValueError(f"AZURE_SQL_PROFILE={profile.value} is local stdio only.")
+        if access_mode != AccessMode.UNRESTRICTED:
+            raise ValueError(f"AZURE_SQL_PROFILE={profile.value} requires unrestricted access mode.")
+        if write_policy != WritePolicy.APPLY:
+            raise ValueError(f"AZURE_SQL_PROFILE={profile.value} requires write policy apply.")
     if (
         transport.mode != TransportMode.STDIO
         and not remote_admin_enabled
@@ -414,5 +553,8 @@ def load_server_config(argv: list[str] | None = None) -> ServerConfig:
         audit_dir=audit_dir,
         audit_full_sql=audit_full_sql,
         remote_admin_enabled=remote_admin_enabled,
-        test_index_databases=test_index_databases,
+        profile=profile,
+        database_policy_file=database_policy_file,
+        performance_state_dir=performance_state_dir,
+        plan_apply_kill_switch=plan_apply_kill_switch,
     )
