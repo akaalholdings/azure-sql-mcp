@@ -27,9 +27,9 @@ dependencies = [
 ]
 
 [project.urls]
-Changelog = "https://github.com/AkaalHoldings/SQL/blob/main/azure-sql-mcp/CHANGELOG.md"
-Issues = "https://github.com/AkaalHoldings/SQL/issues"
-Source = "https://github.com/AkaalHoldings/SQL/tree/main/azure-sql-mcp"
+Changelog = "https://github.com/akaalholdings/azure-sql-mcp/blob/main/CHANGELOG.md"
+Issues = "https://github.com/akaalholdings/azure-sql-mcp/issues"
+Source = "https://github.com/akaalholdings/azure-sql-mcp"
 
 [project.scripts]
 azure-sql-mcp = "azure_sql_mcp:main"

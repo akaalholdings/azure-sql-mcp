@@ -13,12 +13,17 @@ You need:
 - a database principal with only the permissions required for the selected profile;
 - a local database-policy file for repeated benchmarks, temporary indexes, or plan apply.
 
-Install the package and skills:
+Install the package:
 
 ```bash
-cd /absolute/path/to/SQL/azure-sql-mcp
+cd /absolute/path/to/azure-sql-mcp
 uv sync --dev --locked
+```
 
+The optional companion skills remain in the
+[`akaalholdings/SQL`](https://github.com/akaalholdings/SQL) repository:
+
+```bash
 cd /absolute/path/to/SQL
 python3 skills/install_all.py --dest "$HOME/.copilot/skills"
 python3 skills/check_installed_parity.py --dest "$HOME/.copilot/skills"
@@ -40,7 +45,7 @@ Read-only triage example:
       "command": "uv",
       "args": [
         "--directory",
-        "/absolute/path/to/SQL/azure-sql-mcp",
+        "/absolute/path/to/azure-sql-mcp",
         "run",
         "azure-sql-mcp"
       ],

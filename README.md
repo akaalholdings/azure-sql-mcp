@@ -16,7 +16,7 @@ The supported tuning path is evidence-first but rewrite-active: a missing plan l
 - Prepared Query Store plan actions with prior-state capture, policy checks, verification, and exact rollback.
 - Audited general DBA T-SQL execution that rejects direct or statically recoverable `DROP DATABASE` statements.
 
-The Copilot operating instructions live in [`../skills/`](../skills/). The skills decide what to investigate and how to present the result; this package owns database execution, policy, durable state, and deterministic workflow transitions.
+The Copilot operating instructions live in the [`akaalholdings/SQL` skills](https://github.com/akaalholdings/SQL/tree/main/skills). The skills decide what to investigate and how to present the result; this package owns database execution, policy, durable state, and deterministic workflow transitions.
 
 ## Support boundary
 
@@ -105,7 +105,7 @@ Create a local `.vscode/mcp.json` in the workspace. Do not commit machine paths 
       "command": "uv",
       "args": [
         "--directory",
-        "/absolute/path/to/SQL/azure-sql-mcp",
+        "/absolute/path/to/azure-sql-mcp",
         "run",
         "azure-sql-mcp"
       ],
@@ -404,4 +404,4 @@ Treat unavailable permissions, missing Query Store history, truncation, mismatch
 
 ## Repository handoff
 
-This package is part of the SQL monorepo. Repository-wide setup, skills, integrity checks, and CI are documented in [`../README.md`](../README.md). Package operations are in [`docs/09-operations.md`](docs/09-operations.md); release history is in [`CHANGELOG.md`](CHANGELOG.md); security reporting is in [`SECURITY.md`](SECURITY.md).
+This is the canonical standalone repository for the Azure SQL MCP server. Companion SQL skills and broader assessment tooling remain in [`akaalholdings/SQL`](https://github.com/akaalholdings/SQL). Package operations are in [`docs/09-operations.md`](docs/09-operations.md); release history is in [`CHANGELOG.md`](CHANGELOG.md); security reporting is in [`SECURITY.md`](SECURITY.md).

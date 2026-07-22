@@ -1,15 +1,21 @@
-name: CI
+name: Azure SQL MCP CI
 
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
+    name: MCP checks (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.12", "3.13"]
 
@@ -20,12 +26,13 @@ jobs:
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
           cache-suffix: ${{ matrix.python-version }}
+          cache-dependency-glob: uv.lock
 
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
-      - name: Install dependencies
-        run: uv sync
+      - name: Install locked dependencies
+        run: uv sync --dev --locked
 
       - name: Ruff
         run: uv run ruff check src tests
