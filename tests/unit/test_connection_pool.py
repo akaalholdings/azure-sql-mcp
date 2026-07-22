@@ -239,6 +239,63 @@ async def test_discard_releases_pool_slot(sample_server_config) -> None:
     assert pool._pool_sizes["appdb"] == 0
 
 
+@pytest.mark.asyncio
+async def test_discard_decrements_active_leased_connection(
+    sample_server_config,
+) -> None:
+    authenticator = MagicMock()
+    authenticator.build_connection_arguments.return_value = ConnectionArguments(
+        "Driver=test;"
+    )
+    connection = _make_connection("leased_connection")
+
+    with patch(
+        "azure_sql_mcp.connection_pool._import_mssql_python"
+    ) as import_mssql_python:
+        import_mssql_python.return_value.connect.return_value = connection
+        pool = ConnectionPool(sample_server_config, authenticator)
+
+        leased = await pool.acquire("appdb")
+        await pool.discard("appdb", leased)
+
+    metrics = pool.get_metrics("appdb")["appdb"]
+    assert metrics["active_connections"] == 0
+    assert metrics["discard_count"] == 1
+    assert id(connection) not in pool._leases
+
+
+@pytest.mark.asyncio
+async def test_release_then_discard_decrements_active_connection_once(
+    sample_server_config,
+) -> None:
+    authenticator = MagicMock()
+    authenticator.build_connection_arguments.return_value = ConnectionArguments(
+        "Driver=test;"
+    )
+    released_connection = _make_connection("released_connection")
+    remaining_connection = _make_connection("remaining_connection")
+
+    with patch(
+        "azure_sql_mcp.connection_pool._import_mssql_python"
+    ) as import_mssql_python:
+        import_mssql_python.return_value.connect.side_effect = [
+            released_connection,
+            remaining_connection,
+        ]
+        pool = ConnectionPool(sample_server_config, authenticator)
+
+        first = await pool.acquire("appdb")
+        second = await pool.acquire("appdb")
+        pool._closed = True
+        await pool.release("appdb", first)
+
+    metrics = pool.get_metrics("appdb")["appdb"]
+    assert metrics["active_connections"] == 1
+    assert metrics["release_count"] == 1
+    assert metrics["discard_count"] == 1
+    assert id(second) in pool._leases
+
+
 # --- Phase 19: Circuit Breaker Tests ---
 
 

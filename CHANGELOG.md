@@ -6,6 +6,17 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+### Changed
+
+- `execute_tsql_unrestricted` now supports general DBA T-SQL instead of limiting raw execution to read-only statements. Direct and statically recoverable `DROP DATABASE` commands remain blocked.
+- Applied DBA batches use a single non-retried submission on an isolated connection, drain all result sets, and discard the connection after every outcome.
+- Operator guidance now documents the exact unprofiled DBA startup posture and distinguishes Azure control-plane delete protection from T-SQL permissions.
+
+### Security
+
+- The `DROP DATABASE` guard is documented as defense in depth: runtime-assembled SQL and behavior hidden behind existing modules cannot be proven by static inspection. Database permissions, Azure RBAC/resource locks, and alternate client access remain independent controls.
+- DBA audit previews, rollback text, and error details redact SQL literals by default; uncertain post-submission failures are recorded as outcome unknown.
+
 ## [2.0.0] - 2026-07-15
 
 ### Added

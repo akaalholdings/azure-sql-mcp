@@ -312,9 +312,13 @@ class ConnectionPool:
 
     async def discard(self, database_name: str, connection) -> None:
         """Close a broken connection and release its pool slot."""
+        was_leased = id(connection) in self._leases
         self._release_lease(connection)
         self._idle_since.pop(id(connection), None)
-        self._metrics[database_name].discard_count += 1
+        metrics = self._metrics[database_name]
+        metrics.discard_count += 1
+        if was_leased:
+            metrics.active_connections = max(0, metrics.active_connections - 1)
         await asyncio.to_thread(self._close_connection, connection)
         async with self._lock:
             if self._pool_sizes[database_name] > 0:

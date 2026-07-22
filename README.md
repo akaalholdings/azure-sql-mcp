@@ -1,6 +1,6 @@
 # Azure SQL MCP
 
-`azure-sql-mcp` is the typed execution and evidence layer for Azure SQL Database performance work. It gives MCP clients bounded read access, durable performance cases, iterative query benchmarks, leased sandbox index tests, and reviewed Query Store plan actions.
+`azure-sql-mcp` is the typed execution and evidence layer for Azure SQL Database performance and administration work. It gives MCP clients bounded read access, durable performance cases, iterative query benchmarks, leased sandbox index tests, reviewed Query Store plan actions, and an explicitly gated general DBA execution path.
 
 The supported tuning path is evidence-first but rewrite-active: a missing plan lowers confidence; it does not prevent a concrete static rewrite. A failed or slower experiment rejects only that candidate and does not end the session.
 
@@ -14,6 +14,7 @@ The supported tuning path is evidence-first but rewrite-active: a missing plan l
 - Snapshot-consistent, shape-, duplicate-, and order-aware result comparison where a complete bounded comparison is possible.
 - Durable temporary-index leases, automatic cleanup, and startup recovery of expired leases.
 - Prepared Query Store plan actions with prior-state capture, policy checks, verification, and exact rollback.
+- Audited general DBA T-SQL execution that rejects direct or statically recoverable `DROP DATABASE` statements.
 
 The Copilot operating instructions live in [`../skills/`](../skills/). The skills decide what to investigate and how to present the result; this package owns database execution, policy, durable state, and deterministic workflow transitions.
 
@@ -23,7 +24,7 @@ Supported:
 
 - Azure SQL Database PaaS.
 - Local MCP clients over stdio.
-- Streamable HTTP or SSE for read-only private-service use when bearer authentication and network controls are configured.
+- Streamable HTTP or SSE for private-service use when bearer authentication and network controls are configured; admin tools require a separate remote-admin opt-in.
 - Microsoft Entra authentication through `DefaultAzureCredential`, service principal, or interactive browser credentials.
 - SQL password authentication when supplied from protected local secret storage.
 - Read-only SELECT-shaped active benchmarks. DML and side-effecting procedures are not executed by the tuning workflow.
@@ -64,6 +65,33 @@ uv run azure-sql-mcp
 ```
 
 The default transport is stdio. This configuration can inspect only databases in `AZURE_SQL_ALLOWED_DATABASES`; Azure SQL permissions remain the final authority.
+
+## General DBA start
+
+Use a separate unprofiled local process for authorized DBA work. Do not set `AZURE_SQL_PROFILE`: every named profile deliberately hides `execute_tsql_unrestricted`.
+
+```bash
+export AZURE_SQL_SERVER="your-server.database.windows.net"
+export AZURE_SQL_DEFAULT_DATABASE="master"
+export AZURE_SQL_ALLOWED_DATABASES="master,appdb,reportingdb"
+export AZURE_SQL_AUTH_MODE="entra-default"
+export AZURE_SQL_TRANSPORT="stdio"
+export AZURE_SQL_ACCESS_MODE="unrestricted"
+export AZURE_SQL_WRITE_POLICY="apply"
+export AZURE_SQL_TOOL_GROUPS="all"
+export AZURE_SQL_ENABLE_REMOTE_ADMIN="0"
+unset AZURE_SQL_PROFILE
+
+uv run azure-sql-mcp
+```
+
+Call `execute_tsql_unrestricted` with `dry_run=true` to review the audit preview, then use `dry_run=false` for the authorized execution. The selected `database_name` must be in `AZURE_SQL_ALLOWED_DATABASES`; that allowlist controls the initial connection database, not every object an authorized T-SQL batch might reference.
+
+This path accepts DBA T-SQL, including DDL, DML, maintenance commands, permission changes, module creation, and stored procedure execution. Its one command-level exclusion is `DROP DATABASE` when the statement appears directly or can be recovered statically from literal `EXEC` / `sp_executesql` text and simple constant variables. It does not reject runtime-opaque construction from non-literal data or behavior hidden inside an existing stored procedure. The scanner is defense in depth, not an authoritative database permission boundary.
+
+Each applied DBA batch is submitted once with no retry, runs on an isolated connection that is discarded afterward, and drains every result set while returning only the configured row bound. If the connection fails or the tool is cancelled after submission, treat the outcome as unknown and reconcile database state before another attempt. Submit one T-SQL batch per call; `GO` is a client command used by tools such as SSMS and sqlcmd, not T-SQL understood by the server.
+
+Azure control-plane deletion and T-SQL deletion are separate authorization surfaces. Azure RBAC or a resource lock governs deletion through Azure Resource Manager; SQL permissions govern `DROP DATABASE` submitted over a database connection. Configure both where deletion protection matters. The MCP scanner cannot replace least-privilege SQL credentials, Azure RBAC, resource locks, or restrictions on alternate database clients.
 
 ## VS Code Copilot
 
@@ -298,7 +326,7 @@ Keep credentials in the operating-system credential store, managed identity, or 
 | `AZURE_SQL_QUERY_TIMEOUT_SECONDS` | `30` | Per-query timeout |
 | `AZURE_SQL_TOOL_TIMEOUT_SECONDS` | query timeout + 15 | Outer tool timeout; cannot be lower than query timeout |
 | `AZURE_SQL_POOL_SIZE` | `5` | Connections per database pool |
-| `AZURE_SQL_MAX_RETRIES` | `3` | Retry count for retry-safe connection operations; profiled samples are not retried |
+| `AZURE_SQL_MAX_RETRIES` | `3` | Retry count for retry-safe connection operations; profiled samples and `execute_tsql_unrestricted` are not retried |
 | `AZURE_SQL_TRANSPORT` | `stdio` | `stdio`, `sse`, or `streamable-http` |
 | `AZURE_SQL_HOST` | `127.0.0.1` | HTTP/SSE bind host |
 | `AZURE_SQL_PORT` | `8000` | HTTP/SSE port |
@@ -323,7 +351,7 @@ Equivalent `--azure-sql-*` flags are available in `uv run azure-sql-mcp --help`.
 - `core`: bounded query execution, introspection, performance cases, tuning sessions, result/plan comparison, Query Store top queries, and operational health.
 - `performance`: waits, blocking, resource history, statistics, query/index analysis, plan regression, and plan review.
 - `schema`: schema capture, comparison, and migration-script generation. Generated scripts are not executed.
-- `admin`: guarded maintenance and prepared apply tools. Named profiles prune unrelated direct mutation tools.
+- `admin`: guarded maintenance, prepared apply, and unprofiled general DBA execution. Named profiles prune unrelated direct mutation tools.
 
 Resources include schema views and token-safe plan artifacts under `azuresql-artifact://{artifact_id}`. Artifact content is process-local and expires with the server.
 
@@ -340,13 +368,19 @@ uv run pytest -q
 uv build
 ```
 
-Live validation is opt-in. Use only an allowlisted dedicated non-production Azure SQL database. Start with the `optimizer` profile for read-only validation. Use `sandbox` only for leased test indexes and `enforcer-apply` only for one explicitly authorized prepared intent. Production remains read-only.
+Live validation is opt-in. Use only an allowlisted dedicated non-production Azure SQL database. Start with the `optimizer` profile for read-only validation. Use `sandbox` only for leased test indexes and `enforcer-apply` only for one explicitly authorized prepared intent. Do not use the general DBA path as a production smoke test.
 
 ## Troubleshooting
 
 ### A profile tool is missing
 
 Check both `AZURE_SQL_PROFILE` and `AZURE_SQL_TOOL_GROUPS`. Restricted access also removes admin-group tools. Restart the MCP process after changing environment values.
+
+For general DBA work, leave `AZURE_SQL_PROFILE` unset, use `AZURE_SQL_ACCESS_MODE=unrestricted`, include `admin` or `all` in `AZURE_SQL_TOOL_GROUPS`, and use local stdio. Applied execution additionally requires `AZURE_SQL_WRITE_POLICY=apply` and `dry_run=false`. Remote transports require bearer authentication, private TLS termination, and `AZURE_SQL_ENABLE_REMOTE_ADMIN=1` before admin tools are exposed.
+
+### A DBA batch has an unknown outcome
+
+Do not resubmit automatically. Inspect the audit id and reconcile the intended database state using a separate read-only query. DBA batches are never retried by the server, because a disconnect or cancellation after submission does not prove that SQL Server did not execute the batch.
 
 ### A benchmark is denied
 

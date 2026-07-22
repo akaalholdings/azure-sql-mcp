@@ -108,6 +108,23 @@ def test_unrestricted_defaults_to_review_write_policy(monkeypatch):
     assert config.write_policy == WritePolicy.REVIEW
 
 
+def test_unprofiled_local_dba_configuration_exposes_unrestricted_tool(monkeypatch):
+    monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
+    monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "master")
+    monkeypatch.setenv("AZURE_SQL_ALLOWED_DATABASES", "master,appdb")
+    monkeypatch.setenv("AZURE_SQL_TRANSPORT", "stdio")
+    monkeypatch.setenv("AZURE_SQL_ACCESS_MODE", "unrestricted")
+    monkeypatch.setenv("AZURE_SQL_WRITE_POLICY", "apply")
+    monkeypatch.setenv("AZURE_SQL_TOOL_GROUPS", "all")
+    monkeypatch.delenv("AZURE_SQL_PROFILE", raising=False)
+
+    config = load_server_config([])
+
+    assert config.profile is None
+    assert config.write_policy == WritePolicy.APPLY
+    assert config.is_tool_enabled("execute_tsql_unrestricted") is True
+
+
 def test_restricted_ignores_apply_write_policy(monkeypatch):
     monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
     monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "appdb")

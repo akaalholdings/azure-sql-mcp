@@ -1,6 +1,6 @@
 # Operations guide
 
-This guide covers local VS Code Copilot setup and the five enforced MCP profiles. Keep one MCP process per profile so the advertised tool surface and write posture are obvious.
+This guide covers local VS Code Copilot setup, the five enforced MCP profiles, and the separate unprofiled general DBA posture. Keep one MCP process per posture so the advertised tool surface and write authority are obvious.
 
 ## Before you start
 
@@ -100,8 +100,46 @@ Set its absolute path with `AZURE_SQL_DATABASE_POLICY_FILE`. Missing files, inva
 | `sandbox` | `sql-optimizer`, temporary index | unrestricted, local stdio | apply | core,performance,admin | benchmark and test-index permission, non-production environment |
 | `enforcer-review` | `sql-plan-enforcer`, review | restricted | disabled | core,performance | shared state path required for intent preparation |
 | `enforcer-apply` | `sql-plan-enforcer`, one apply | unrestricted, local stdio | apply | core,performance,admin | plan-apply permission and open kill switch |
+| unset (general DBA) | explicitly authorized DBA work | unrestricted, local stdio | apply | all | normal database allowlist; SQL permissions remain authoritative |
 
 The profile is a server-side tool filter. Access mode, tool groups, Azure SQL permissions, database policy, and workflow state are independent gates.
+
+## General DBA runbook
+
+Run general DBA work in a separate local stdio process with no named profile. Every named profile hides the direct DBA tool.
+
+```bash
+export AZURE_SQL_SERVER="your-server.database.windows.net"
+export AZURE_SQL_DEFAULT_DATABASE="master"
+export AZURE_SQL_ALLOWED_DATABASES="master,appdb,reportingdb"
+export AZURE_SQL_AUTH_MODE="entra-default"
+export AZURE_SQL_TRANSPORT="stdio"
+export AZURE_SQL_ACCESS_MODE="unrestricted"
+export AZURE_SQL_WRITE_POLICY="apply"
+export AZURE_SQL_TOOL_GROUPS="all"
+export AZURE_SQL_ENABLE_REMOTE_ADMIN="0"
+unset AZURE_SQL_PROFILE
+
+uv run azure-sql-mcp
+```
+
+Operational sequence:
+
+1. Confirm the intended initial database is in `AZURE_SQL_ALLOWED_DATABASES`. Include `master` only when the task genuinely needs a connection to `master`.
+2. Call `execute_tsql_unrestricted` with `dry_run=true`; retain the audit id and review the redacted SQL preview.
+3. Submit one T-SQL batch without `GO` and call the tool with `dry_run=false`.
+4. Review every returned result set and the completion audit record.
+5. If the call times out, is cancelled, or loses its connection after submission, treat the result as unknown. Reconcile database state before considering another call.
+
+The tool permits DDL, DML, maintenance, permissions, module creation, and stored procedure execution. It rejects direct `DROP DATABASE` and statically recoverable occurrences inside literal `EXEC` / `sp_executesql` text and simple constant variables. It intentionally does not claim to understand SQL assembled from runtime data or behavior inside an existing module. An authorized batch is submitted once with no retry, runs on an isolated connection that is discarded, and drains all result sets while bounding returned rows.
+
+This guard is an application-layer safety check, not a SQL permission boundary. The database principal still determines what SQL Server accepts, and the principal can act outside MCP if another client is available. Use the least-privileged principal that supports the required task and keep alternate access under the normal DBA controls.
+
+Azure control-plane deletion is separate from T-SQL execution. An Azure RBAC role or resource lock controls deletion through Azure Resource Manager; SQL permissions control `DROP DATABASE` over a database connection. Protect and audit both surfaces. A custom Azure role that omits database resource delete does not, by itself, remove a SQL principal's T-SQL permission, and overlapping role assignments can restore control-plane delete authority.
+
+Azure's subscription-level [Block T-SQL CRUD](https://learn.microsoft.com/azure/azure-sql/database/block-crud-tsql) feature also blocks `CREATE DATABASE` and several `ALTER DATABASE` operations, so it is not compatible with this exact broad-DBA-except-drop posture.
+
+For a remote transport, `AZURE_SQL_MCP_BEARER_TOKEN`, private TLS termination, and `AZURE_SQL_ENABLE_REMOTE_ADMIN=1` are additional mandatory server gates. Prefer local stdio because enabling remote admin exposes a destructive, non-idempotent tool across a network boundary.
 
 ## Triage runbook
 
@@ -289,6 +327,12 @@ Validate `.vscode/mcp.json`, confirm VS Code can resolve `uv`, verify the absolu
 
 Check profile, tool group, access mode, transport, and remote-admin settings. A tool must pass every filter.
 
+For `execute_tsql_unrestricted`, leave `AZURE_SQL_PROFILE` unset, select unrestricted access, include `admin` or `all`, and restart the process. Write policy `apply` and `dry_run=false` are execution gates; they do not make a hidden tool appear.
+
+### General DBA execution outcome is unknown
+
+Do not repeat the batch. Locate the audit id, inspect database state with a separate read-only query, and decide whether the intended change completed, partially completed, or rolled back. The server deliberately does not retry DBA batches after a timeout, cancellation, or post-submission connection failure.
+
 ### Authentication succeeds but a DMV fails
 
 Run `check_capabilities`. Azure SQL tier and database permissions can make individual evidence sections unavailable. Preserve that section as an evidence gap.
@@ -322,4 +366,5 @@ Read the per-section availability and truncation fields. Fix the narrow permissi
 - Any temporary-index lease is `cleaned`.
 - Plan action is verified, held with owner, or rolled back exactly.
 - Kill switch is re-engaged.
+- Every general DBA audit with an unknown outcome has been reconciled before another mutation.
 - No credential, environment value, raw production SQL, host, database name, or result data was committed.

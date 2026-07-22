@@ -6,6 +6,7 @@ import logging
 import sys
 import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 from typing import Sequence
 
@@ -32,6 +33,15 @@ class ProfiledExecution:
     elapsed_wall_ms: float
     user_query_executions: int = 1
     metric_provenance: str = "client_wall_clock_and_statistics_xml"
+
+
+class BatchExecutionMode(str, Enum):
+    DEFAULT = "default"
+    ADMIN = "admin"
+
+
+class AdminBatchOutcomeUnknownError(RuntimeError):
+    """The admin batch was dispatched, so its final database state is unknown."""
 
 
 class AzureSqlExecutor:
@@ -68,8 +78,11 @@ class AzureSqlExecutor:
         params: Sequence[Any] | None = None,
         *,
         max_rows: int | None = None,
+        execution_mode: BatchExecutionMode = BatchExecutionMode.DEFAULT,
     ) -> list[QueryResult]:
         validated_database = self.config.validate_database_name(database_name)
+        execution_mode = BatchExecutionMode(execution_mode)
+        is_admin_batch = execution_mode is BatchExecutionMode.ADMIN
 
         async def _attempt() -> list[QueryResult]:
             connection = await self.pool.acquire(validated_database)
@@ -85,6 +98,8 @@ class AzureSqlExecutor:
                         query,
                         tuple(params or ()),
                         max_rows,
+                        drain_all_result_sets=is_admin_batch,
+                        outcome_unknown_after_dispatch=is_admin_batch,
                     )
                 )
                 result = await asyncio.shield(execution_task)
@@ -103,13 +118,15 @@ class AzureSqlExecutor:
                     )
                 raise
             finally:
-                if succeeded:
+                if succeeded and not is_admin_batch:
                     await self.pool.release(validated_database, connection)
                 elif not deferred_cleanup:
-                    # On error, don't return connection to pool — it may be in a bad state.
+                    # Failed and arbitrary admin batches may leave transaction,
+                    # database, or SET state behind. Never return them to a pool.
                     await self.pool.discard(validated_database, connection)
 
-        return await with_retry(_attempt, max_retries=self.config.max_retries)
+        max_retries = 0 if is_admin_batch else self.config.max_retries
+        return await with_retry(_attempt, max_retries=max_retries)
 
     async def execute_session(
         self,
@@ -337,6 +354,9 @@ class AzureSqlExecutor:
         query: str,
         params: Sequence[Any],
         max_rows: int | None = None,
+        *,
+        drain_all_result_sets: bool = False,
+        outcome_unknown_after_dispatch: bool = False,
     ) -> list[QueryResult]:
         logger.debug(
             "Executing query",
@@ -349,8 +369,17 @@ class AzureSqlExecutor:
         try:
             self._configure_cursor(cursor)
             self._set_lock_timeout(cursor)
-            cursor.execute(query, params)
-            return self._consume_batches(cursor, max_rows=max_rows)
+            try:
+                cursor.execute(query, params)
+                return self._consume_batches(
+                    cursor,
+                    max_rows=max_rows,
+                    stop_on_cap=not drain_all_result_sets,
+                )
+            except Exception as exc:
+                if outcome_unknown_after_dispatch:
+                    raise AdminBatchOutcomeUnknownError(str(exc)) from exc
+                raise
         finally:
             with contextlib.suppress(Exception):
                 cursor.close()

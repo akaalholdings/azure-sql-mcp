@@ -3,6 +3,7 @@ from __future__ import annotations
 from azure_sql_mcp.observability import (
     compute_query_hash,
     extract_sql_error_info,
+    redact_sql_literals,
     sanitize_error_message,
 )
 
@@ -79,3 +80,29 @@ class TestSanitizeErrorMessage:
     def test_preserves_generic_messages(self):
         msg = "Timeout expired while waiting for query"
         assert sanitize_error_message(msg) == msg
+
+    def test_preserves_apostrophes_in_generic_message(self):
+        msg = "Can't connect because the session isn't available"
+        assert sanitize_error_message(msg) == msg
+
+    def test_strips_sql_literals(self):
+        sanitized = sanitize_error_message("Incorrect syntax near N'SuperSecret-123!'")
+        assert "SuperSecret-123!" not in sanitized
+        assert "N'[REDACTED]'" in sanitized
+
+
+class TestRedactSqlLiterals:
+    def test_redacts_quoted_values_and_preserves_identifiers(self):
+        sql = 'EXEC "dbo"."RecordValues" @one = N\'private\', @two = \'it\'\'s secret\''
+        assert redact_sql_literals(sql) == (
+            'EXEC "dbo"."RecordValues" @one = N\'[REDACTED]\', @two = \'[REDACTED]\''
+        )
+
+    def test_redacts_line_and_nested_block_comments(self):
+        sql = "SELECT 1 -- token=private\n/* outer /* inner */ secret */ SELECT 2"
+        assert redact_sql_literals(sql) == (
+            "SELECT 1 --[REDACTED]\n/*[REDACTED]*/ SELECT 2"
+        )
+
+    def test_redacts_unterminated_literal(self):
+        assert redact_sql_literals("SELECT 'never closed") == "SELECT '[REDACTED]'"

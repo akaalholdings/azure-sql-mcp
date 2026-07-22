@@ -294,6 +294,32 @@ def test_remote_transport_hides_admin_tools_without_remote_admin_opt_in() -> Non
     assert "rebuild_index" not in tools
 
 
+def test_unrestricted_dba_tool_advertises_execution_contract() -> None:
+    config = replace(
+        make_config(access_mode=AccessMode.UNRESTRICTED),
+        write_policy=WritePolicy.APPLY,
+    )
+    app = AzureSqlMcpApplication(config)
+
+    tool = app.mcp._tool_manager._tools["execute_tsql_unrestricted"]
+    description = tool.description
+    input_schema = tool.fn_metadata.arg_model.model_json_schema()
+
+    assert "statically recoverable DROP DATABASE" in description
+    assert "assembled only at runtime cannot be proven or blocked" in description
+    assert "one submission with no retry" in description
+    assert "isolated connection that is discarded" in description
+    assert "drains every result set" in description
+    assert "GO is a client batch separator" in description
+    assert "Do not include the client-side GO separator" in (
+        input_schema["properties"]["sql"]["description"]
+    )
+    assert tool.annotations.readOnlyHint is False
+    assert tool.annotations.destructiveHint is True
+    assert tool.annotations.idempotentHint is False
+    assert tool.annotations.openWorldHint is True
+
+
 @pytest.mark.asyncio
 async def test_run_tool_formats_errors_from_callback(app: AzureSqlMcpApplication) -> None:
     async def boom(_: str) -> dict[str, str]:

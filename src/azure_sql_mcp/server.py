@@ -2458,7 +2458,14 @@ class AzureSqlMcpApplication:
                 )
 
             @self.mcp.tool(
-                description="Execute unrestricted T-SQL. This can be destructive.",
+                description=(
+                    "Run DBA T-SQL against an allowlisted initial database. Direct or "
+                    "statically recoverable DROP DATABASE statements are rejected, but SQL "
+                    "assembled only at runtime cannot be proven or blocked. Each call makes "
+                    "one submission with no retry, uses an isolated connection that is discarded, "
+                    "and drains every result set. GO is a client batch separator, not T-SQL, "
+                    "and is unsupported."
+                ),
                 annotations=ToolAnnotations(
                     title="Execute Unrestricted T-SQL",
                     readOnlyHint=False,
@@ -2468,7 +2475,12 @@ class AzureSqlMcpApplication:
                 ),
             )
             async def execute_tsql_unrestricted(
-                sql: str = Field(description="T-SQL to execute."),
+                sql: str = Field(
+                    description=(
+                        "One T-SQL batch to execute. Do not include the client-side GO separator. "
+                        "DROP DATABASE is rejected when directly or statically recoverable."
+                    )
+                ),
                 dry_run: bool = Field(
                     default=True,
                     description=(
