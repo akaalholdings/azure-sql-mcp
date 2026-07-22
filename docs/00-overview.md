@@ -7,14 +7,15 @@ Transform the Azure SQL MCP server from a functional implementation into a best-
 ## Current State
 
 The server is a Python 3.12+ FastMCP application providing:
-- 63 MCP tools in unrestricted mode; 53 tools in restricted mode
+- Profile-specific MCP tool surfaces for read-only triage, iterative optimization, sandbox index testing, plan review, and prepared apply
 - Restricted (read-only) and unrestricted execution modes
+- Unprofiled, audited general DBA execution for arbitrary T-SQL except direct or statically recoverable `DROP DATABASE`
 - 4 auth modes (Entra default, service principal, interactive, SQL password)
 - 3 transports (STDIO, SSE, Streamable HTTP) with bearer auth required for HTTP/SSE and explicit remote-admin opt-in for apply-capable admin behavior
-- SQL validation via sqlglot AST walking
+- Read-only SQL validation via sqlglot AST walking plus a narrow token-based `DROP DATABASE` guard for general DBA batches
 - Database allowlist enforcement
 - Structured tool output, prompt/resources support, and token-safe artifact resources
-- Audited admin write policy with dry-run defaults, read-only raw SQL apply, and generated Query Store force/unforce workflows
+- Audited admin write policy with dry-run defaults, non-retried isolated DBA batches, and generated Query Store force/unforce workflows
 
 ## Feature Gap Analysis
 
@@ -31,7 +32,7 @@ The server is a Python 3.12+ FastMCP application providing:
 | Resource-blended top queries | Done | Maintain |
 | Connection pooling | Done | Maintain |
 | Retry for transient errors | Done | Maintain |
-| SQL validation approach | Hardened | Maintain |
+| SQL validation approach | Hardened | Keep restricted-query validation separate from the narrow DBA drop guard |
 | MCP Resources | Done | Includes artifact resources |
 | MCP Prompts | Done | Maintain |
 | Schema comparison | Done | Maintain |
@@ -92,7 +93,7 @@ src/azure_sql_mcp/
   server.py                  # MCP app, tool/resource/prompt registration
   config.py                  # CLI + env var configuration
   transport_auth.py          # HTTP/SSE bearer token verifier
-  admin_policy.py            # write policy, hard denylist, JSONL audit
+  admin_policy.py            # write policy, DROP DATABASE guard, JSONL audit
   artifact_store.py          # token-safe artifact resources
   auth.py                    # Azure credential management
   connection.py              # Query executor (uses pool)

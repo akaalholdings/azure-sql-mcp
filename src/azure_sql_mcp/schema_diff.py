@@ -614,4 +614,3 @@ def _serialize_value(value: Any) -> Any:
     if isinstance(value, list):
         return [_serialize_value(item) for item in value]
     return value
-

@@ -1,7 +1,7 @@
 [project]
 name = "azure-sql-mcp"
-version = "1.0.0"
-description = "Azure SQL Database MCP server with safe query execution and diagnostics"
+version = "2.0.0"
+description = "Typed Azure SQL performance tuning, triage, and reviewed plan enforcement over MCP"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
@@ -27,9 +27,9 @@ dependencies = [
 ]
 
 [project.urls]
-Changelog = "https://github.com/AkaalHoldings/azure-sql-mcp/blob/main/CHANGELOG.md"
-Issues = "https://github.com/AkaalHoldings/azure-sql-mcp/issues"
-Source = "https://github.com/AkaalHoldings/azure-sql-mcp"
+Changelog = "https://github.com/AkaalHoldings/SQL/blob/main/azure-sql-mcp/CHANGELOG.md"
+Issues = "https://github.com/AkaalHoldings/SQL/issues"
+Source = "https://github.com/AkaalHoldings/SQL/tree/main/azure-sql-mcp"
 
 [project.scripts]
 azure-sql-mcp = "azure_sql_mcp:main"

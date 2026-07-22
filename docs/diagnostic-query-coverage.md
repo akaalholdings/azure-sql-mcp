@@ -62,4 +62,3 @@ The MCP implementation ports Azure SQL Database-safe diagnostics and skips serve
 | 54 | Automatic Tuning Options | Covered by `analyze_db_health` and added in `get_database_configuration` |
 | 55 | Geo-Replication Link Status | Covered by `analyze_db_health` and added in `get_database_configuration` |
 | 56 | Azure SQL DB Properties | Added in `get_database_configuration` |
-

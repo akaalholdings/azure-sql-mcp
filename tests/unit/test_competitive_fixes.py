@@ -194,26 +194,22 @@ class TestExecutionToolImplementation:
             await app._update_statistics("appdb", "dbo", "T", None, 0, False)
 
     @pytest.mark.asyncio
-    async def test_force_query_plan_force(self) -> None:
+    async def test_direct_force_query_plan_is_preview_only(self) -> None:
         app = _make_app(access_mode=AccessMode.UNRESTRICTED)
         app.executor.execute_non_query = AsyncMock(return_value=0)
 
-        result = await app._force_query_plan("appdb", 42, 7, False, False)
-
-        sql = app.executor.execute_non_query.call_args[0][1]
-        assert "sp_query_store_force_plan" in sql
-        assert result["action"] == "forced"
+        with pytest.raises(PermissionError, match="prepared plan-action"):
+            await app._force_query_plan("appdb", 42, 7, False, False)
+        app.executor.execute_non_query.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_force_query_plan_unforce(self) -> None:
+    async def test_direct_unforce_query_plan_is_preview_only(self) -> None:
         app = _make_app(access_mode=AccessMode.UNRESTRICTED)
         app.executor.execute_non_query = AsyncMock(return_value=0)
 
-        result = await app._force_query_plan("appdb", 42, 7, True, False)
-
-        sql = app.executor.execute_non_query.call_args[0][1]
-        assert "sp_query_store_unforce_plan" in sql
-        assert result["action"] == "unforced"
+        with pytest.raises(PermissionError, match="prepared plan-action"):
+            await app._force_query_plan("appdb", 42, 7, True, False)
+        app.executor.execute_non_query.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_kill_session_issues_kill(self) -> None:

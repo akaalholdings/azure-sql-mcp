@@ -10,9 +10,10 @@ services:
       AZURE_SQL_ALLOWED_DATABASES: ${AZURE_SQL_ALLOWED_DATABASES:-master}
       AZURE_SQL_AUTH_MODE: ${AZURE_SQL_AUTH_MODE:-sql-password}
       AZURE_SQL_USERNAME: ${AZURE_SQL_USERNAME:-sa}
-      AZURE_SQL_PASSWORD: ${AZURE_SQL_PASSWORD:-YourStrong!Passw0rd}
+      AZURE_SQL_PASSWORD: "${MSSQL_SA_PASSWORD:?Set MSSQL_SA_PASSWORD for the local test fixture}"
+      AZURE_SQL_TRUST_SERVER_CERTIFICATE: "true"
       AZURE_SQL_ACCESS_MODE: ${AZURE_SQL_ACCESS_MODE:-restricted}
-      AZURE_SQL_MCP_BEARER_TOKEN: ${AZURE_SQL_MCP_BEARER_TOKEN:?Set AZURE_SQL_MCP_BEARER_TOKEN for HTTP transport}
+      AZURE_SQL_MCP_BEARER_TOKEN: "${AZURE_SQL_MCP_BEARER_TOKEN:?Set AZURE_SQL_MCP_BEARER_TOKEN for HTTP transport}"
       AZURE_SQL_WRITE_POLICY: ${AZURE_SQL_WRITE_POLICY:-review}
       AZURE_SQL_ENABLE_REMOTE_ADMIN: ${AZURE_SQL_ENABLE_REMOTE_ADMIN:-0}
       AZURE_SQL_AUDIT_DIR: ${AZURE_SQL_AUDIT_DIR:-/audit}
@@ -26,7 +27,7 @@ services:
     image: mcr.microsoft.com/mssql/server:2022-latest
     environment:
       ACCEPT_EULA: "Y"
-      MSSQL_SA_PASSWORD: "YourStrong!Passw0rd"
+      MSSQL_SA_PASSWORD: "${MSSQL_SA_PASSWORD:?Set MSSQL_SA_PASSWORD for the local test fixture}"
       MSSQL_PID: "Developer"
     ports:
       - "1433:1433"

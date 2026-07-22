@@ -55,6 +55,7 @@ def make_config(
         audit_dir="/tmp/azure-sql-mcp-test-audit",
         audit_full_sql=False,
         remote_admin_enabled=False,
+        performance_state_dir=":memory:",
     )
 
 
@@ -83,6 +84,16 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
         "explain_query",
         "tune_query",
         "benchmark_query_rewrite",
+        "start_performance_case",
+        "collect_performance_evidence",
+        "get_performance_case",
+        "start_tuning_session",
+        "add_tuning_candidate",
+        "benchmark_tuning_candidate",
+        "benchmark_index_candidate",
+        "finalize_tuning_session",
+        "compare_query_results",
+        "compare_plan_summaries",
         "get_top_queries",
         "analyze_query_indexes",
         "analyze_workload_indexes",
@@ -126,6 +137,7 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
         "plan_enforcer_tick",
         "review_plan_enforcement",
         "dry_run_plan_action",
+        "prepare_plan_action",
         "analyze_db_health",
     }
 
@@ -280,6 +292,32 @@ def test_remote_transport_hides_admin_tools_without_remote_admin_opt_in() -> Non
     assert "execute_tsql_unrestricted" not in tools
     assert "apply_plan_action" not in tools
     assert "rebuild_index" not in tools
+
+
+def test_unrestricted_dba_tool_advertises_execution_contract() -> None:
+    config = replace(
+        make_config(access_mode=AccessMode.UNRESTRICTED),
+        write_policy=WritePolicy.APPLY,
+    )
+    app = AzureSqlMcpApplication(config)
+
+    tool = app.mcp._tool_manager._tools["execute_tsql_unrestricted"]
+    description = tool.description
+    input_schema = tool.fn_metadata.arg_model.model_json_schema()
+
+    assert "statically recoverable DROP DATABASE" in description
+    assert "assembled only at runtime cannot be proven or blocked" in description
+    assert "one submission with no retry" in description
+    assert "isolated connection that is discarded" in description
+    assert "drains every result set" in description
+    assert "GO is a client batch separator" in description
+    assert "Do not include the client-side GO separator" in (
+        input_schema["properties"]["sql"]["description"]
+    )
+    assert tool.annotations.readOnlyHint is False
+    assert tool.annotations.destructiveHint is True
+    assert tool.annotations.idempotentHint is False
+    assert tool.annotations.openWorldHint is True
 
 
 @pytest.mark.asyncio
@@ -466,15 +504,15 @@ async def test_explain_query_can_include_raw_xml_when_requested(app: AzureSqlMcp
 
 @pytest.mark.asyncio
 async def test_tune_query_returns_structured_evidence_pack(app: AzureSqlMcpApplication) -> None:
-    app._explain_query = AsyncMock(return_value={"summary": {"statement_count": 1}})  # type: ignore[method-assign]
-    app._execute_safe_sql = AsyncMock(  # type: ignore[method-assign]
-        return_value={"rows": [{"id": 1}], "row_count": 1, "truncated": False}
+    app.performance_workflows.start_case = Mock(
+        return_value=Mock(case_id="case-1")
     )
-    app._analyze_query_indexes = AsyncMock(return_value={"recommendations": []})  # type: ignore[method-assign]
-    app.query_store.get_query_history_by_text = AsyncMock(return_value={"matches": []})
-    app.wait_stats.get_wait_stats = AsyncMock(return_value={"top_waits": []})
-    app.plan_cache.check_statistics_health = AsyncMock(return_value={"total_stats": 0})
-    app._metadata_inventory = AsyncMock(return_value={"table_references": []})  # type: ignore[method-assign]
+    app._collect_performance_evidence = AsyncMock(  # type: ignore[method-assign]
+        return_value={"outcome": "healthy", "evidence": {"evidence_id": "ev-1"}}
+    )
+    app.performance_workflows.start_session = Mock(
+        return_value={"session_id": "session-1"}
+    )
 
     payload = await app._tune_query(
         "appdb",
@@ -487,13 +525,10 @@ async def test_tune_query_returns_structured_evidence_pack(app: AzureSqlMcpAppli
 
     assert payload["database_name"] == "appdb"
     assert payload["query_hash"]
-    assert payload["evidence"]["plan"]["summary"]["statement_count"] == 1
-    assert payload["evidence"]["execution_sample"]["row_count"] == 1
-    assert payload["evidence"]["query_store_history"] == {
-        "matches": [],
-        "matched_by": "text",
-    }
-    assert payload["evidence"]["metadata_inventory"] == {"table_references": []}
+    assert payload["performance_case_id"] == "case-1"
+    assert payload["tuning_session_id"] == "session-1"
+    assert payload["evidence"]["outcome"] == "healthy"
+    assert "concrete rewrites" in payload["next_step"]
     assert "No database changes" in payload["scripts"]["rollback"]
 
 
@@ -513,22 +548,11 @@ async def test_tune_query_binds_explicit_parameters_once(app: AzureSqlMcpApplica
             ],
         }
     )
-    app.plans.explain_query = AsyncMock(
-        return_value=ExplainPlanArtifact(
-            database_name="appdb",
-            analyze=False,
-            summary={"statement_count": 1},
-            raw_xml="<ShowPlanXML />",
-        )
+    app.performance_workflows.start_case = Mock(return_value=Mock(case_id="case-2"))
+    app._collect_performance_evidence = AsyncMock(return_value={"outcome": "partial"})  # type: ignore[method-assign]
+    app.performance_workflows.start_session = Mock(
+        return_value={"session_id": "session-2"}
     )
-    app._execute_safe_sql = AsyncMock(  # type: ignore[method-assign]
-        return_value={"rows": [{"OrderId": 42}], "row_count": 1, "truncated": False}
-    )
-    app._analyze_query_indexes = AsyncMock(return_value={"recommendations": []})  # type: ignore[method-assign]
-    app.query_store.get_query_history_by_text = AsyncMock(return_value={"matches": []})
-    app.wait_stats.get_wait_stats = AsyncMock(return_value={"top_waits": []})
-    app.plan_cache.check_statistics_health = AsyncMock(return_value={"total_stats": 0})
-    app._metadata_inventory = AsyncMock(return_value={"table_references": []})  # type: ignore[method-assign]
 
     payload = await app._tune_query(
         "appdb",
@@ -553,52 +577,34 @@ async def test_tune_query_auto_bind_params_survives_validation(app: AzureSqlMcpA
     """Regression: auto-bound DECLARE/SET + SELECT batches must pass the read-only
     validator end-to-end. Only the executor is mocked; param binding, the
     validator, and the plans service run for real."""
-    from azure_sql_mcp.connection import QueryResult
-
-    plan_xml = (
-        '<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">'
-        "</ShowPlanXML>"
-    )
     app.executor.fetch_all = AsyncMock(return_value=[])  # type: ignore[method-assign]
-    app.executor.execute_session = AsyncMock(  # type: ignore[method-assign]
-        return_value=[
-            [],
-            [QueryResult(columns=("plan",), rows=[{"plan": plan_xml}])],
-            [],
-        ]
-    )
-
-    payload = await app._tune_query(
+    effective_sql, binding = await app._prepare_query(
         "appdb",
         "SELECT * FROM dbo.Users WHERE UserId = @UserId",
-        analyze=True,
-        auto_bind_params=True,
-        include_raw_xml=False,
-        window_minutes=60,
+        True,
     )
 
-    binding = payload["parameter_binding"]
     assert binding is not None
     assert binding["parameters"][0]["name"] == "@UserId"
-    assert payload["evidence"]["plan"]["summary"]["statement_count"] == 0
-    # The bound batch reached execution (validator accepted the DECLARE prefix).
-    assert "DECLARE" in payload["evidence"]["execution_sample"]["normalized_sql"].upper()
+    assert "DECLARE" in effective_sql.upper()
+    assert app.validator.validate_read_only(effective_sql).normalized_sql
 
 
 @pytest.mark.asyncio
 async def test_benchmark_query_rewrite_reports_sample_equivalence(app: AzureSqlMcpApplication) -> None:
-    app._explain_query = AsyncMock(  # type: ignore[method-assign]
-        return_value={
-            "summary": {
-                "actual_metrics": {"actual_cpu_ms": 1, "actual_logical_reads": 2},
-                "memory_grants": [],
-                "warnings": [],
-                "missing_indexes": [],
-            }
-        }
+    app.performance_workflows.start_case = Mock(return_value=Mock(case_id="case-b1"))
+    app.performance_workflows.start_session = Mock(
+        return_value={"session_id": "session-b1"}
     )
-    app._execute_safe_sql = AsyncMock(  # type: ignore[method-assign]
-        return_value={"rows": [{"id": 1}], "row_count": 1, "truncated": False}
+    app.performance_workflows.add_candidate = Mock(
+        return_value={"candidate_id": "candidate-b1"}
+    )
+    app.performance_workflows.benchmark_candidate = AsyncMock(
+        return_value={
+            "classification": "improved",
+            "equivalence": [{"status": "match", "proven_for_parameter_case": True}],
+            "executions": 4,
+        }
     )
 
     payload = await app._benchmark_query_rewrite(
@@ -610,39 +616,25 @@ async def test_benchmark_query_rewrite_reports_sample_equivalence(app: AzureSqlM
         include_raw_xml=False,
     )
 
-    assert payload["equivalence"]["status"] == "sample_match"
-    assert payload["equivalence"]["complete_result_match"] is True
-    assert payload["equivalence"]["sample_equivalence_proven"] is True
-    assert payload["equivalence"]["full_equivalence_proven"] is False
-    assert payload["scenarios"]["baseline"]["metrics"]["actual_cpu_ms"] == 1
-    assert payload["scenarios"]["rewrite"]["metrics"]["actual_logical_reads"] == 2
-    # single-run default keeps the historical payload shape (no spread/run_metrics)
-    assert payload["runs"] == 1
-    assert "spread" not in payload["scenarios"]["baseline"]["metrics"]
-    assert "run_metrics" not in payload["scenarios"]["baseline"]
+    assert payload["classification"] == "improved"
+    assert payload["equivalence"][0]["status"] == "match"
+    assert payload["winning_sql"] == "SELECT id FROM dbo.Orders"
+    assert payload["performance_case_id"] == "case-b1"
 
 
 @pytest.mark.asyncio
 async def test_benchmark_query_rewrite_runs_k_reports_median_and_spread(
     app: AzureSqlMcpApplication,
 ) -> None:
-    # 3 interleaved runs per side, 6 explains total: cpu varies so medians are unambiguous.
-    cpu_sequence = [90, 10, 20, 300, 100, 200]
-    app._explain_query = AsyncMock(  # type: ignore[method-assign]
-        side_effect=[
-            {
-                "summary": {
-                    "actual_metrics": {"actual_cpu_ms": cpu, "actual_logical_reads": cpu * 10},
-                    "memory_grants": [],
-                    "warnings": [],
-                    "missing_indexes": [],
-                }
-            }
-            for cpu in cpu_sequence
-        ]
+    app.performance_workflows.start_case = Mock(return_value=Mock(case_id="case-b2"))
+    app.performance_workflows.start_session = Mock(
+        return_value={"session_id": "session-b2"}
     )
-    app._execute_safe_sql = AsyncMock(  # type: ignore[method-assign]
-        return_value={"rows": [{"id": 1}], "row_count": 1, "truncated": False}
+    app.performance_workflows.add_candidate = Mock(
+        return_value={"candidate_id": "candidate-b2"}
+    )
+    app.performance_workflows.benchmark_candidate = AsyncMock(
+        return_value={"classification": "neutral", "executions": 8, "equivalence": []}
     )
 
     payload = await app._benchmark_query_rewrite(
@@ -655,28 +647,31 @@ async def test_benchmark_query_rewrite_runs_k_reports_median_and_spread(
         runs=3,
     )
 
-    baseline = payload["scenarios"]["baseline"]
-    rewrite = payload["scenarios"]["rewrite"]
-    assert payload["runs"] == 3
-    assert baseline["metrics"]["actual_cpu_ms"] == 100         # baseline: 90,300,100
-    assert baseline["metrics"]["spread"]["actual_cpu_ms"] == {"min": 90, "max": 300}
-    assert rewrite["metrics"]["actual_cpu_ms"] == 20           # rewrite: 10,20,200
-    assert len(baseline["run_metrics"]) == 3
-    assert "interleaved" in baseline["metrics_note"]
+    assert payload["classification"] == "neutral"
+    assert (
+        app.performance_workflows.benchmark_candidate.await_args.kwargs[
+            "runs_override"
+        ]
+        == 3
+    )
 
 
 @pytest.mark.asyncio
 async def test_benchmark_can_compare_unordered_result_samples(
     app: AzureSqlMcpApplication,
 ) -> None:
-    app._explain_query = AsyncMock(  # type: ignore[method-assign]
-        return_value={"summary": {"actual_metrics": {}, "memory_grants": [], "warnings": [], "missing_indexes": []}}
+    app.performance_workflows.start_case = Mock(return_value=Mock(case_id="case-b3"))
+    app.performance_workflows.start_session = Mock(
+        return_value={"session_id": "session-b3"}
     )
-    app._execute_safe_sql = AsyncMock(  # type: ignore[method-assign]
-        side_effect=[
-            {"rows": [{"id": 2}, {"id": 1}], "row_count": 2, "truncated": False},
-            {"rows": [{"id": 1}, {"id": 2}], "row_count": 2, "truncated": False},
-        ]
+    app.performance_workflows.add_candidate = Mock(
+        return_value={"candidate_id": "candidate-b3"}
+    )
+    app.performance_workflows.benchmark_candidate = AsyncMock(
+        return_value={
+            "classification": "neutral",
+            "equivalence": [{"status": "match", "order_compared": False}],
+        }
     )
 
     payload = await app._benchmark_query_rewrite(
@@ -689,36 +684,13 @@ async def test_benchmark_can_compare_unordered_result_samples(
         compare_order=False,
     )
 
-    assert payload["equivalence"]["status"] == "sample_match"
-    assert payload["equivalence"]["order_compared"] is False
-
-
-def test_result_equivalence_fails_closed_when_sample_is_missing() -> None:
-    result = AzureSqlMcpApplication._compare_result_samples(
-        {"row_count": None},
-        {"row_count": None},
+    assert payload["equivalence"][0]["status"] == "match"
+    assert (
+        app.performance_workflows.benchmark_candidate.await_args.kwargs[
+            "compare_order"
+        ]
+        is False
     )
-    assert result["status"] == "sample_unavailable"
-    assert result["row_counts_match"] is False
-    assert result["full_equivalence_proven"] is False
-
-
-def test_result_equivalence_rejects_nonfinite_row_counts() -> None:
-    result = AzureSqlMcpApplication._compare_result_samples(
-        {"rows": [], "row_count": float("nan")},
-        {"rows": [], "row_count": float("nan")},
-    )
-    assert result["status"] == "sample_unavailable"
-    assert result["row_counts_match"] is False
-
-
-def test_result_equivalence_rejects_non_integer_row_counts() -> None:
-    result = AzureSqlMcpApplication._compare_result_samples(
-        {"rows": [], "row_count": 0.5},
-        {"rows": [], "row_count": 0.5},
-    )
-    assert result["status"] == "sample_unavailable"
-    assert result["complete_result_match"] is False
 
 
 @pytest.mark.asyncio
@@ -755,7 +727,7 @@ async def test_analyze_query_indexes_scopes_explicit_values_per_query(
 async def test_benchmark_query_rewrite_rejects_out_of_range_runs(
     app: AzureSqlMcpApplication,
 ) -> None:
-    for bad in (0, 11, -1):
+    for bad in (0, 4, -1):
         with pytest.raises(ValueError, match="runs"):
             await app._benchmark_query_rewrite(
                 "appdb", "SELECT 1", "SELECT 1",

@@ -46,6 +46,7 @@ def server_config_factory() -> Callable[..., ServerConfig]:
             "audit_dir": "/tmp/azure-sql-mcp-test-audit",
             "audit_full_sql": False,
             "remote_admin_enabled": False,
+            "performance_state_dir": ":memory:",
         }
         config.update(overrides)
         return ServerConfig(**config)

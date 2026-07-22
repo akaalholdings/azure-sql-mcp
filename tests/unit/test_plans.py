@@ -142,9 +142,14 @@ def test_summarize_showplan_xml_extracts_actual_plan_evidence():
     assert summary["statements"][0]["query_hash"] == "0x90FC7E5399EA52A5"
     assert summary["statements"][0]["query_plan_hash"] == "0x36B85B3A4F4A25A6"
     assert summary["actual_metrics"]["actual_rows"] == 34
-    assert summary["actual_metrics"]["actual_cpu_ms"] == 8
-    assert summary["actual_metrics"]["actual_elapsed_ms"] == 11
-    assert summary["actual_metrics"]["actual_logical_reads"] == 120
+    # Operator/thread counters are not valid query totals. This fixture has no
+    # statement-level QueryTimeStats, so totals stay explicitly unavailable.
+    assert summary["actual_metrics"]["actual_cpu_ms"] is None
+    assert summary["actual_metrics"]["actual_elapsed_ms"] is None
+    assert summary["actual_metrics"]["actual_logical_reads"] is None
+    assert summary["actual_metrics"]["read_metric_source"] == (
+        "not_available_as_reliable_query_total"
+    )
     assert summary["memory_grants"][0]["granted_memory_kb"] == 2048
     assert summary["missing_indexes"][0]["impact_pct"] == 87.5
     assert summary["missing_indexes"][0]["equality_columns"] == ["CustomerId"]

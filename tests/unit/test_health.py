@@ -284,12 +284,10 @@ async def test_analyze_all_includes_phase_two_checks_and_threshold_payloads():
     assert payload["database_name"] == "appdb"
     checks = payload["checks"]
     expected_checks = {
-        "index",
         "query_store",
         "tuning",
         "resource",
         "storage",
-        "buffer",
         "connection",
         "constraint",
         "replication",
@@ -323,7 +321,7 @@ async def test_fetch_optional_rows_sanitizes_driver_errors():
 
 
 @pytest.mark.asyncio
-async def test_threshold_evaluation_for_buffer_and_connection_checks():
+async def test_threshold_evaluation_for_connection_check():
     service, _, _ = build_service(
         responses=[
             (
@@ -359,73 +357,20 @@ async def test_threshold_evaluation_for_buffer_and_connection_checks():
         ]
     )
 
-    buffer_payload = await service.analyze("appdb", "buffer")
     connection_payload = await service.analyze("appdb", "connection")
 
-    buffer_check = buffer_payload["checks"]["buffer"]
     connection_check = connection_payload["checks"]["connection"]
-
-    assert buffer_check["status"] == "critical"
-    assert any("buffer cache hit ratio" in finding.lower() for finding in buffer_check["findings"])
-    assert any("page life expectancy" in finding.lower() for finding in buffer_check["findings"])
 
     assert connection_check["status"] == "warning"
     assert any("session" in finding.lower() for finding in connection_check["findings"])
 
 
-@pytest.mark.asyncio
-async def test_duplicate_indexes_are_reported_as_a_warning():
-    service, _, _ = build_service(
-        responses=[
-            (
-                "IndexKeyCols",
-                [
-                    {
-                        "schema_name": "dbo",
-                        "table_name": "Orders",
-                        "index_a": "IX_Orders_CustomerId",
-                        "type_a": "NONCLUSTERED",
-                        "index_b": "IX_Orders_CustomerId_Alt",
-                        "type_b": "NONCLUSTERED",
-                        "key_columns": "CustomerId",
-                    }
-                ],
-            ),
-            (
-                "sys.dm_db_index_physical_stats",
-                [],
-            ),
-            (
-                "sys.dm_db_index_usage_stats",
-                [],
-            ),
-        ]
-    )
+@pytest.mark.parametrize("retired_check", ["index", "buffer"])
+def test_legacy_query_health_classifiers_are_rejected(retired_check: str):
+    service, _, _ = build_service()
 
-    payload = await service.analyze("appdb", "index")
-    index_check = payload["checks"]["index"]
-
-    assert index_check["status"] == "warning"
-    assert any("duplicate" in finding.lower() for finding in index_check["findings"])
-
-
-@pytest.mark.asyncio
-async def test_unavailable_dmv_degrades_gracefully():
-    service, _, _ = build_service(
-        errors=[
-            (
-                "Buffer cache hit ratio",
-                RuntimeError("The requested DMV is not available in this tier."),
-            ),
-        ]
-    )
-
-    payload = await service.analyze("appdb", "buffer")
-    buffer_check = payload["checks"]["buffer"]
-
-    assert buffer_check["status"] == "warning"
-    assert buffer_check["findings"]
-    assert "unavailable" in " ".join(str(item).lower() for item in buffer_check["findings"])
+    with pytest.raises(ValueError, match="collect_performance_evidence"):
+        service._parse_requested_checks(retired_check)
 
 
 @pytest.mark.asyncio

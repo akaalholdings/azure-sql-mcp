@@ -97,9 +97,9 @@ class FakeExecutor:
 def test_build_create_index_statement():
     service = IndexRecommendationService(executor=None)  # type: ignore[arg-type]
     statement = service._build_create_index_statement(  # noqa: SLF001
-        {
-            "schema_name": "dbo",
-            "table_name": "Orders",
+                {
+                    "schema_name": "dbo",
+                    "table_name": "Orders",
             "equality_columns": "[CustomerId]",
             "inequality_columns": "[CreatedAt]",
             "included_columns": "[Status], [TotalAmount]",
@@ -171,6 +171,16 @@ async def test_analyze_queries_filters_existing_matching_indexes():
                 "is_included_column": 0,
                 "key_ordinal": 2,
                 "column_name": "CreatedAt",
+            },
+            {
+                "schema_name": "dbo",
+                "table_name": "Orders",
+                "index_id": 2,
+                "index_name": "IX_Orders_CustomerId_CreatedAt",
+                "is_included_column": 1,
+                "index_column_id": 3,
+                "key_ordinal": 0,
+                "column_name": "Status",
             },
         ]
     )

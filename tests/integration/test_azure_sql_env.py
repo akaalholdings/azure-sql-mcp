@@ -12,4 +12,3 @@ import pytest
 def test_azure_sql_integration_environment_is_present():
     assert os.getenv("AZURE_SQL_SERVER")
     assert os.getenv("AZURE_SQL_DEFAULT_DATABASE")
-

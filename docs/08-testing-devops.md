@@ -1,5 +1,10 @@
 # Phase 8: Testing & DevOps
 
+> Historical implementation plan. For current setup and client examples, use
+> [`../README.md`](../README.md). The executable CI workflow is the monorepo-root
+> `.github/workflows/azure-sql-mcp.yml`; snippets below are design history, not files to
+> copy verbatim. Supply test credentials at runtime and never commit them.
+
 ## Problem
 
 The test suite covers only 5 modules (config, safe_sql, plans, query_store, index_recommendations). Core modules like connection.py, auth.py, server.py, health.py, and capabilities.py have zero test coverage. There is no Docker support, no CI/CD pipeline, and the README contains a hardcoded local path.
@@ -168,8 +173,8 @@ pytestmark = pytest.mark.skipif(
 ## 8C. Docker Support
 
 ### Files
-- **New:** `AzureSqlMcp/Dockerfile`
-- **New:** `AzureSqlMcp/docker-compose.yml`
+- **Current:** `azure-sql-mcp/Dockerfile`
+- **Current:** `azure-sql-mcp/docker-compose.yml`
 
 ### Dockerfile
 
@@ -220,7 +225,7 @@ services:
     image: mcr.microsoft.com/mssql/server:2022-latest
     environment:
       - ACCEPT_EULA=Y
-      - MSSQL_SA_PASSWORD=YourStrong!Passw0rd
+      - MSSQL_SA_PASSWORD=${MSSQL_SA_PASSWORD}
       - MSSQL_PID=Developer
     ports:
       - "1433:1433"
@@ -236,7 +241,7 @@ volumes:
 ## 8D. CI/CD Pipeline
 
 ### Files
-- **New:** `.github/workflows/ci.yml`
+- **Current:** monorepo-root `.github/workflows/azure-sql-mcp.yml`
 - **New:** `.github/workflows/integration.yml`
 
 ### ci.yml (runs on every push/PR)
@@ -279,7 +284,7 @@ jobs:
         image: mcr.microsoft.com/mssql/server:2022-latest
         env:
           ACCEPT_EULA: "Y"
-          MSSQL_SA_PASSWORD: "YourStrong!Passw0rd"
+          MSSQL_SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
         ports:
           - 1433:1433
     steps:
@@ -288,15 +293,15 @@ jobs:
       - run: |
           # Install runtime libraries required by mssql-python
           sudo apt-get update && sudo apt-get install -y libltdl7 libkrb5-3 libgssapi-krb5-2
-      - run: cd AzureSqlMcp && uv sync --dev
-      - run: cd AzureSqlMcp && uv run pytest tests/integration/ -v
+      - run: cd azure-sql-mcp && uv sync --dev
+      - run: cd azure-sql-mcp && uv run pytest tests/integration/ -v
         env:
           AZURE_SQL_SERVER: "localhost"
           AZURE_SQL_DEFAULT_DATABASE: "master"
           AZURE_SQL_ALLOWED_DATABASES: "master,testdb"
           AZURE_SQL_AUTH_MODE: "sql-password"
           AZURE_SQL_USERNAME: "sa"
-          AZURE_SQL_PASSWORD: "YourStrong!Passw0rd"
+          AZURE_SQL_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
 ```
 
 ### Dev Dependencies for CI
@@ -318,7 +323,7 @@ dev = [
 
 ### Changes
 
-1. **Remove hardcoded local path** (line 27): Change to relative `cd AzureSqlMcp`
+1. **Use the monorepo path:** `cd azure-sql-mcp`
 2. **Add MCP client configuration examples:**
 
 ```markdown
@@ -331,7 +336,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
   "mcpServers": {
     "azure-sql": {
       "command": "uv",
-      "args": ["--directory", "/path/to/AzureSqlMcp", "run", "azure-sql-mcp"],
+      "args": ["--directory", "/path/to/SQL/azure-sql-mcp", "run", "azure-sql-mcp"],
       "env": {
         "AZURE_SQL_SERVER": "your-server.database.windows.net",
         "AZURE_SQL_DEFAULT_DATABASE": "appdb",
@@ -351,7 +356,7 @@ Add to `.vscode/settings.json`:
   "mcp.servers": {
     "azure-sql": {
       "command": "uv",
-      "args": ["--directory", "/path/to/AzureSqlMcp", "run", "azure-sql-mcp"],
+      "args": ["--directory", "/path/to/SQL/azure-sql-mcp", "run", "azure-sql-mcp"],
       "env": { ... }
     }
   }

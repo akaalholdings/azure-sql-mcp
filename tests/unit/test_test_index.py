@@ -8,11 +8,13 @@ import pytest
 
 from azure_sql_mcp.config import AccessMode
 from azure_sql_mcp.config import AuthMode
+from azure_sql_mcp.config import McpProfile
 from azure_sql_mcp.config import ServerConfig
 from azure_sql_mcp.config import ToolGroup
 from azure_sql_mcp.config import TransportConfig
 from azure_sql_mcp.config import TransportMode
 from azure_sql_mcp.config import WritePolicy
+from azure_sql_mcp.database_policy import DatabasePolicySet
 from azure_sql_mcp.server import AzureSqlMcpApplication
 from azure_sql_mcp.server import TEST_INDEX_PREFIX
 
@@ -20,8 +22,8 @@ from azure_sql_mcp.server import TEST_INDEX_PREFIX
 def make_config(
     access_mode: AccessMode = AccessMode.RESTRICTED,
     *,
-    test_index_databases: tuple[str, ...] = (),
     write_policy: WritePolicy = WritePolicy.DISABLED,
+    profile: McpProfile | None = None,
 ) -> ServerConfig:
     return ServerConfig(
         server="server.database.windows.net",
@@ -49,7 +51,7 @@ def make_config(
         audit_dir="/tmp/azure-sql-mcp-test-audit",
         audit_full_sql=False,
         remote_admin_enabled=False,
-        test_index_databases=test_index_databases,
+        profile=profile,
     )
 
 
@@ -145,35 +147,50 @@ async def test_create_rejects_malformed_identifiers(schema, table, columns) -> N
 async def test_execution_blocked_without_apply_policy() -> None:
     app = unrestricted_app()
     assert app.config.write_policy is not WritePolicy.APPLY
-    with pytest.raises(PermissionError, match="AZURE_SQL_WRITE_POLICY"):
+    with pytest.raises(PermissionError, match="preview-only"):
         await app._create_test_index(
             "appdb", "dbo", "Orders", f"{TEST_INDEX_PREFIX}Orders_Status",
             key_columns=["Status"], include_columns=None, online=True, dry_run=False,
         )
 
 
-def test_live_test_index_database_must_be_explicitly_allowlisted() -> None:
-    app = AzureSqlMcpApplication(
-        make_config(
-            access_mode=AccessMode.UNRESTRICTED,
-            test_index_databases=("sandbox-db",),
-        )
-    )
-    app._require_test_index_database("SANDBOX-DB")
-    with pytest.raises(PermissionError, match="AZURE_SQL_TEST_INDEX_DATABASES"):
-        app._require_test_index_database("appdb")
-
-
-@pytest.mark.asyncio
-async def test_live_create_and_drop_block_before_execution_without_database_allowlist() -> None:
+def test_live_test_index_database_requires_sandbox_profile_and_policy() -> None:
     app = AzureSqlMcpApplication(
         make_config(
             access_mode=AccessMode.UNRESTRICTED,
             write_policy=WritePolicy.APPLY,
+            profile=McpProfile.SANDBOX,
+        )
+    )
+    app.database_policy = DatabasePolicySet.from_mapping(
+        {
+            "version": 1,
+            "databases": {
+                "appdb": {
+                    "environment": "test",
+                    "allow_read": True,
+                    "allow_benchmark": True,
+                    "allow_test_indexes": True,
+                    "allow_plan_apply": False,
+                    "max_benchmark_executions": 80,
+                }
+            },
+        }
+    )
+    app._require_test_index_database("appdb")
+
+
+@pytest.mark.asyncio
+async def test_live_create_and_drop_require_managed_lease_workflow() -> None:
+    app = AzureSqlMcpApplication(
+        make_config(
+            access_mode=AccessMode.UNRESTRICTED,
+            write_policy=WritePolicy.APPLY,
+            profile=McpProfile.SANDBOX,
         )
     )
 
-    with pytest.raises(PermissionError, match="AZURE_SQL_TEST_INDEX_DATABASES"):
+    with pytest.raises(PermissionError, match="preview-only"):
         await app._create_test_index(
             "appdb",
             "dbo",
@@ -184,7 +201,7 @@ async def test_live_create_and_drop_block_before_execution_without_database_allo
             online=True,
             dry_run=False,
         )
-    with pytest.raises(PermissionError, match="AZURE_SQL_TEST_INDEX_DATABASES"):
+    with pytest.raises(PermissionError, match="preview-only"):
         await app._drop_test_index(
             "appdb",
             "dbo",

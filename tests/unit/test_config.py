@@ -4,6 +4,7 @@ import pytest
 
 from azure_sql_mcp.config import AccessMode
 from azure_sql_mcp.config import AuthMode
+from azure_sql_mcp.config import McpProfile
 from azure_sql_mcp.config import TransportMode
 from azure_sql_mcp.config import WritePolicy
 from azure_sql_mcp.config import load_server_config
@@ -107,6 +108,23 @@ def test_unrestricted_defaults_to_review_write_policy(monkeypatch):
     assert config.write_policy == WritePolicy.REVIEW
 
 
+def test_unprofiled_local_dba_configuration_exposes_unrestricted_tool(monkeypatch):
+    monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
+    monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "master")
+    monkeypatch.setenv("AZURE_SQL_ALLOWED_DATABASES", "master,appdb")
+    monkeypatch.setenv("AZURE_SQL_TRANSPORT", "stdio")
+    monkeypatch.setenv("AZURE_SQL_ACCESS_MODE", "unrestricted")
+    monkeypatch.setenv("AZURE_SQL_WRITE_POLICY", "apply")
+    monkeypatch.setenv("AZURE_SQL_TOOL_GROUPS", "all")
+    monkeypatch.delenv("AZURE_SQL_PROFILE", raising=False)
+
+    config = load_server_config([])
+
+    assert config.profile is None
+    assert config.write_policy == WritePolicy.APPLY
+    assert config.is_tool_enabled("execute_tsql_unrestricted") is True
+
+
 def test_restricted_ignores_apply_write_policy(monkeypatch):
     monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
     monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "appdb")
@@ -158,3 +176,117 @@ def test_tool_timeout_must_cover_query_timeout(monkeypatch):
 
     with pytest.raises(ValueError, match="TOOL_TIMEOUT_SECONDS must be >="):
         load_server_config([])
+
+
+@pytest.mark.parametrize(
+    ("profile", "enabled", "disabled"),
+    [
+        (McpProfile.TRIAGE, "collect_performance_evidence", "benchmark_tuning_candidate"),
+        (McpProfile.OPTIMIZER, "benchmark_tuning_candidate", "benchmark_index_candidate"),
+        (McpProfile.SANDBOX, "benchmark_index_candidate", "prepare_plan_action"),
+        (McpProfile.ENFORCER_REVIEW, "prepare_plan_action", "apply_prepared_plan_action"),
+    ],
+)
+def test_named_profiles_expose_only_their_workflow_tools(
+    monkeypatch,
+    profile: McpProfile,
+    enabled: str,
+    disabled: str,
+) -> None:
+    monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
+    monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "appdb")
+    monkeypatch.setenv("AZURE_SQL_ALLOWED_DATABASES", "appdb")
+
+    args = ["--azure-sql-profile", profile.value]
+    if profile == McpProfile.SANDBOX:
+        args.extend(
+            [
+                "--azure-sql-access-mode",
+                "unrestricted",
+                "--azure-sql-write-policy",
+                "apply",
+            ]
+        )
+    config = load_server_config(args)
+
+    assert config.profile == profile
+    assert config.is_tool_enabled(enabled) is True
+    assert config.is_tool_enabled(disabled) is False
+
+
+def test_enforcer_apply_profile_exposes_only_prepared_mutation_tools(monkeypatch) -> None:
+    monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
+    monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "appdb")
+    monkeypatch.setenv("AZURE_SQL_ALLOWED_DATABASES", "appdb")
+
+    config = load_server_config(
+        [
+            "--azure-sql-access-mode",
+            "unrestricted",
+            "--azure-sql-write-policy",
+            "apply",
+            "--azure-sql-profile",
+            "enforcer-apply",
+        ]
+    )
+
+    assert config.is_tool_enabled("apply_prepared_plan_action") is True
+    assert config.is_tool_enabled("verify_plan_action") is True
+    assert config.is_tool_enabled("rollback_plan_action") is True
+    assert config.is_tool_enabled("force_query_plan") is False
+    assert config.is_tool_enabled("apply_plan_action") is False
+
+
+@pytest.mark.parametrize("profile", ["triage", "optimizer", "enforcer-review"])
+def test_read_only_profiles_reject_unrestricted_mode(monkeypatch, profile: str) -> None:
+    monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
+    monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "appdb")
+    monkeypatch.setenv("AZURE_SQL_ALLOWED_DATABASES", "appdb")
+
+    with pytest.raises(ValueError, match="requires restricted"):
+        load_server_config(
+            [
+                "--azure-sql-profile",
+                profile,
+                "--azure-sql-access-mode",
+                "unrestricted",
+            ]
+        )
+
+
+@pytest.mark.parametrize("profile", ["sandbox", "enforcer-apply"])
+def test_write_profiles_require_local_unrestricted_apply(monkeypatch, profile: str) -> None:
+    monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
+    monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "appdb")
+    monkeypatch.setenv("AZURE_SQL_ALLOWED_DATABASES", "appdb")
+
+    with pytest.raises(ValueError, match="requires unrestricted"):
+        load_server_config(["--azure-sql-profile", profile])
+
+    with pytest.raises(ValueError, match="requires write policy apply"):
+        load_server_config(
+            [
+                "--azure-sql-profile",
+                profile,
+                "--azure-sql-access-mode",
+                "unrestricted",
+                "--azure-sql-write-policy",
+                "review",
+            ]
+        )
+
+    with pytest.raises(ValueError, match="local stdio only"):
+        load_server_config(
+            [
+                "--azure-sql-profile",
+                profile,
+                "--azure-sql-access-mode",
+                "unrestricted",
+                "--azure-sql-write-policy",
+                "apply",
+                "--transport",
+                "streamable-http",
+                "--azure-sql-mcp-bearer-token",
+                "test-token",
+            ]
+        )

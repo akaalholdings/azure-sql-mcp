@@ -2,14 +2,28 @@ from __future__ import annotations
 
 import logging
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from typing import Any
 
 from .artifacts import ExplainPlanArtifact
 from .connection import AzureSqlExecutor
+from .connection import QueryResult
 from .safe_sql import SafeSqlValidator
 
 SHOWPLAN_NAMESPACE = {"sp": "http://schemas.microsoft.com/sqlserver/2004/07/showplan"}
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ProfiledPlanResult:
+    """Actual plan and bounded display rows from one user-query execution."""
+
+    plan: ExplainPlanArtifact
+    result_sets: list[QueryResult]
+    elapsed_wall_ms: float
+    user_query_executions: int
+    truncated: bool
+    metric_provenance: str
 
 
 class PlansService:
@@ -46,6 +60,60 @@ class PlansService:
             analyze=analyze,
             summary=summary,
             raw_xml=raw_xml,
+        )
+
+    async def profile_query(
+        self,
+        database_name: str,
+        sql: str,
+    ) -> ProfiledPlanResult:
+        """Capture rows and actual plan while executing the user SQL once."""
+
+        validated_query = self.validator.validate_read_only(sql)
+        row_limit = self.executor.config.row_limit
+        execution = await self.executor.execute_profiled_read_only(
+            database_name,
+            validated_query.normalized_sql,
+            max_rows=row_limit + 1,
+        )
+        raw_xml = self._extract_plan_xml(execution.result_sets)
+        summary = self.summarize_showplan_xml(raw_xml)
+        actual_metrics = summary.setdefault("actual_metrics", {})
+        actual_metrics["measured_wall_elapsed_ms"] = round(
+            execution.elapsed_wall_ms,
+            6,
+        )
+        actual_metrics["measured_wall_elapsed_source"] = "client_wall_clock"
+
+        user_results: list[QueryResult] = []
+        truncated = False
+        for result in execution.result_sets:
+            if self._result_contains_plan_xml(result):
+                continue
+            rows = result.rows
+            if len(rows) > row_limit:
+                rows = rows[:row_limit]
+                truncated = True
+            user_results.append(
+                QueryResult(
+                    columns=result.columns,
+                    rows=rows,
+                    column_type_signatures=result.column_type_signatures,
+                )
+            )
+
+        return ProfiledPlanResult(
+            plan=ExplainPlanArtifact(
+                database_name=database_name,
+                analyze=True,
+                summary=summary,
+                raw_xml=raw_xml,
+            ),
+            result_sets=user_results,
+            elapsed_wall_ms=execution.elapsed_wall_ms,
+            user_query_executions=execution.user_query_executions,
+            truncated=truncated,
+            metric_provenance=execution.metric_provenance,
         )
 
     async def _get_plan_xml(
@@ -150,32 +218,88 @@ class PlansService:
         }
 
     def _extract_actual_metrics(self, root: ET.Element) -> dict[str, Any]:
-        counters = root.findall(".//sp:RunTimeCountersPerThread", SHOWPLAN_NAMESPACE)
-        totals = {
-            "actual_rows": 0.0,
-            "actual_executions": 0,
-            "actual_logical_reads": 0,
-            "actual_physical_reads": 0,
-            "actual_cpu_ms": 0,
-            "actual_elapsed_ms": 0,
-        }
-        for counter in counters:
-            totals["actual_rows"] += self._to_float(counter.attrib.get("ActualRows"))
-            totals["actual_executions"] += self._to_int(counter.attrib.get("ActualExecutions"))
-            totals["actual_logical_reads"] += self._to_int(
-                counter.attrib.get("ActualLogicalReads")
+        """Return sourced query metrics without summing every operator/thread."""
+
+        all_counters = root.findall(
+            ".//sp:RunTimeCountersPerThread",
+            SHOWPLAN_NAMESPACE,
+        )
+        statement_metrics: list[dict[str, Any]] = []
+        root_operator_metrics: list[dict[str, Any]] = []
+
+        for ordinal, statement in enumerate(
+            root.findall(".//sp:StmtSimple", SHOWPLAN_NAMESPACE),
+            start=1,
+        ):
+            query_time = statement.find("sp:QueryTimeStats", SHOWPLAN_NAMESPACE)
+            if query_time is not None:
+                statement_metrics.append(
+                    {
+                        "statement_ordinal": ordinal,
+                        "statement_type": statement.attrib.get("StatementType"),
+                        "cpu_ms": self._optional_int(query_time.attrib.get("CpuTime")),
+                        "elapsed_ms": self._optional_int(
+                            query_time.attrib.get("ElapsedTime")
+                        ),
+                        "source": "showplan_query_time_stats",
+                    }
+                )
+
+            root_operator = statement.find(
+                "sp:QueryPlan/sp:RelOp",
+                SHOWPLAN_NAMESPACE,
             )
-            totals["actual_physical_reads"] += self._to_int(
-                counter.attrib.get("ActualPhysicalReads")
+            if root_operator is None:
+                continue
+            counters = root_operator.findall(
+                "sp:RunTimeInformation/sp:RunTimeCountersPerThread",
+                SHOWPLAN_NAMESPACE,
             )
-            totals["actual_cpu_ms"] += self._to_int(counter.attrib.get("ActualCPUms"))
-            totals["actual_elapsed_ms"] += self._to_int(
-                counter.attrib.get("ActualElapsedms")
+            root_operator_metrics.append(
+                {
+                    "statement_ordinal": ordinal,
+                    "node_id": root_operator.attrib.get("NodeId"),
+                    "physical_op": root_operator.attrib.get("PhysicalOp"),
+                    "thread_counter_count": len(counters),
+                    "actual_rows": sum(
+                        self._to_float(counter.attrib.get("ActualRows"))
+                        for counter in counters
+                    ),
+                    "actual_executions": sum(
+                        self._to_int(counter.attrib.get("ActualExecutions"))
+                        for counter in counters
+                    ),
+                    "source": "showplan_root_operator_thread_counters",
+                }
             )
 
+        single_statement = (
+            statement_metrics[0] if len(statement_metrics) == 1 else None
+        )
+        single_root = (
+            root_operator_metrics[0] if len(root_operator_metrics) == 1 else None
+        )
         return {
-            "runtime_counter_count": len(counters),
-            **totals,
+            "runtime_counter_count": len(all_counters),
+            "statement_metric_count": len(statement_metrics),
+            "statement_metrics": statement_metrics,
+            "root_operator_metrics": root_operator_metrics,
+            "actual_cpu_ms": single_statement.get("cpu_ms")
+            if single_statement
+            else None,
+            "actual_elapsed_ms": single_statement.get("elapsed_ms")
+            if single_statement
+            else None,
+            "actual_rows": single_root.get("actual_rows") if single_root else None,
+            "actual_executions": single_root.get("actual_executions")
+            if single_root
+            else None,
+            "actual_logical_reads": None,
+            "actual_physical_reads": None,
+            "query_metric_source": "showplan_query_time_stats"
+            if single_statement
+            else "unavailable_for_multi_statement_plan",
+            "read_metric_source": "not_available_as_reliable_query_total",
         }
 
     def _extract_memory_grants(self, root: ET.Element) -> list[dict[str, Any]]:
@@ -263,6 +387,23 @@ class PlansService:
             return int(float(value or 0))
         except (TypeError, ValueError):
             return 0
+
+    @staticmethod
+    def _optional_int(value: Any) -> int | None:
+        if value in {None, ""}:
+            return None
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _result_contains_plan_xml(result: QueryResult) -> bool:
+        return any(
+            isinstance(value, str) and value.lstrip().startswith("<ShowPlanXML")
+            for row in result.rows
+            for value in row.values()
+        )
 
     def _extract_plan_xml(self, results) -> str:
         xml_candidates: list[str] = []

@@ -106,7 +106,6 @@ def _group_differences(
         for category in sorted(grouped.keys())
     }
 
-
 def _summarize_differences(
     differences: Sequence[SchemaDifference],
 ) -> dict[str, Any]:
@@ -118,4 +117,3 @@ def _summarize_differences(
             key: counts_by_category[key] for key in sorted(counts_by_category)
         },
     }
-
