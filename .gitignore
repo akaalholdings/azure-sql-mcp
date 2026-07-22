@@ -8,4 +8,5 @@ build/
 .coverage
 coverage.xml
 .DS_Store
-.env
+.env*
+!.env.example

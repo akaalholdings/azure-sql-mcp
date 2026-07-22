@@ -1,17 +1,29 @@
 from __future__ import annotations
 
 import logging
-import uuid
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from typing import Any
 
 from .artifacts import ExplainPlanArtifact
 from .connection import AzureSqlExecutor
-from .observability import sanitize_error_message
+from .connection import QueryResult
 from .safe_sql import SafeSqlValidator
 
 SHOWPLAN_NAMESPACE = {"sp": "http://schemas.microsoft.com/sqlserver/2004/07/showplan"}
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ProfiledPlanResult:
+    """Actual plan and bounded display rows from one user-query execution."""
+
+    plan: ExplainPlanArtifact
+    result_sets: list[QueryResult]
+    elapsed_wall_ms: float
+    user_query_executions: int
+    truncated: bool
+    metric_provenance: str
 
 
 class PlansService:
@@ -32,11 +44,9 @@ class PlansService:
     ) -> ExplainPlanArtifact:
         validated_query = self.validator.validate_read_only(sql)
         if hypothetical_indexes:
-            return await self.explain_with_hypothetical(
-                database_name=database_name,
-                validated_sql=validated_query.normalized_sql,
-                analyze=analyze,
-                hypothetical_indexes=hypothetical_indexes,
+            raise ValueError(
+                "Hypothetical index analysis is disabled on explain_query for safety. "
+                "Use analyze_query_indexes/analyze_workload_indexes for read-only index insights."
             )
 
         raw_xml = await self._get_plan_xml(
@@ -52,64 +62,58 @@ class PlansService:
             raw_xml=raw_xml,
         )
 
-    async def explain_with_hypothetical(
+    async def profile_query(
         self,
         database_name: str,
-        validated_sql: str,
-        analyze: bool,
-        hypothetical_indexes: list[dict[str, Any]],
-    ) -> ExplainPlanArtifact:
-        if not hypothetical_indexes:
-            raise ValueError("At least one hypothetical index definition is required.")
+        sql: str,
+    ) -> ProfiledPlanResult:
+        """Capture rows and actual plan while executing the user SQL once."""
 
-        if not await self._can_create_hypothetical_indexes(database_name):
-            raise PermissionError(
-                "Hypothetical index analysis requires CREATE INDEX permission on the target database."
-            )
-
-        cleanup_statements: list[str] = []
-        created_indexes: list[dict[str, Any]] = []
-        try:
-            for definition in hypothetical_indexes:
-                normalized = self._normalize_hypothetical_index(definition)
-                create_sql, drop_sql, created_index = self._build_hypothetical_index_statements(
-                    normalized
-                )
-                await self.executor.execute_non_query(database_name, create_sql)
-                cleanup_statements.append(drop_sql)
-                created_indexes.append(created_index)
-
-            raw_xml = await self._get_plan_xml(
-                database_name=database_name,
-                sql=validated_sql,
-                analyze=analyze,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "Hypothetical index analysis failed. Statistics-only indexes may not be "
-                f"supported in this environment or the current principal lacks the required permissions: {exc}"
-            ) from exc
-        finally:
-            for statement in cleanup_statements:
-                try:
-                    await self.executor.execute_non_query(database_name, statement)
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to clean up hypothetical index",
-                        extra={
-                            "database_name": database_name,
-                            "error": sanitize_error_message(str(exc)),
-                        },
-                    )
-
+        validated_query = self.validator.validate_read_only(sql)
+        row_limit = self.executor.config.row_limit
+        execution = await self.executor.execute_profiled_read_only(
+            database_name,
+            validated_query.normalized_sql,
+            max_rows=row_limit + 1,
+        )
+        raw_xml = self._extract_plan_xml(execution.result_sets)
         summary = self.summarize_showplan_xml(raw_xml)
-        summary["hypothetical_indexes"] = created_indexes
-        summary["hypothetical_analysis"] = True
-        return ExplainPlanArtifact(
-            database_name=database_name,
-            analyze=analyze,
-            summary=summary,
-            raw_xml=raw_xml,
+        actual_metrics = summary.setdefault("actual_metrics", {})
+        actual_metrics["measured_wall_elapsed_ms"] = round(
+            execution.elapsed_wall_ms,
+            6,
+        )
+        actual_metrics["measured_wall_elapsed_source"] = "client_wall_clock"
+
+        user_results: list[QueryResult] = []
+        truncated = False
+        for result in execution.result_sets:
+            if self._result_contains_plan_xml(result):
+                continue
+            rows = result.rows
+            if len(rows) > row_limit:
+                rows = rows[:row_limit]
+                truncated = True
+            user_results.append(
+                QueryResult(
+                    columns=result.columns,
+                    rows=rows,
+                    column_type_signatures=result.column_type_signatures,
+                )
+            )
+
+        return ProfiledPlanResult(
+            plan=ExplainPlanArtifact(
+                database_name=database_name,
+                analyze=True,
+                summary=summary,
+                raw_xml=raw_xml,
+            ),
+            result_sets=user_results,
+            elapsed_wall_ms=execution.elapsed_wall_ms,
+            user_query_executions=execution.user_query_executions,
+            truncated=truncated,
+            metric_provenance=execution.metric_provenance,
         )
 
     async def _get_plan_xml(
@@ -130,9 +134,13 @@ class PlansService:
             set_on = "SET SHOWPLAN_XML ON"
             set_off = "SET SHOWPLAN_XML OFF"
 
+        # Bound each result set: with STATISTICS XML the user query actually
+        # executes and returns its rows before the plan XML result set, so an
+        # unbounded fetch here could pull an entire table into memory.
         per_statement_results = await self.executor.execute_session(
             database_name,
             [set_on, sql, set_off],
+            max_rows=self.executor.config.row_limit + 1,
         )
         # The middle entry corresponds to the user query — that's where
         # the plan XML is returned by SQL Server.
@@ -152,6 +160,16 @@ class PlansService:
                     "statement_type": node.attrib.get("StatementType"),
                     "statement_subtree_cost": node.attrib.get("StatementSubTreeCost"),
                     "statement_est_rows": node.attrib.get("StatementEstRows"),
+                    "statement_optm_level": node.attrib.get("StatementOptmLevel"),
+                    "statement_optm_early_abort_reason": node.attrib.get(
+                        "StatementOptmEarlyAbortReason"
+                    ),
+                    "cardinality_estimation_model_version": node.attrib.get(
+                        "CardinalityEstimationModelVersion"
+                    ),
+                    # Stable identifiers for Query Store correlation
+                    "query_hash": node.attrib.get("QueryHash"),
+                    "query_plan_hash": node.attrib.get("QueryPlanHash"),
                 }
             )
 
@@ -173,11 +191,17 @@ class PlansService:
             reverse=True,
         )
 
-        warnings = []
+        warnings: list[dict[str, Any]] = []
         for warning_node in root.findall(".//sp:Warnings", SHOWPLAN_NAMESPACE):
-            warning_payload = {
+            warning_payload: dict[str, Any] = {
                 key: value for key, value in warning_node.attrib.items() if value not in {None, ""}
             }
+            spills = [
+                {key: value for key, value in spill.attrib.items() if value not in {None, ""}}
+                for spill in warning_node.findall(".//sp:SpillToTempDb", SHOWPLAN_NAMESPACE)
+            ]
+            if spills:
+                warning_payload["spills_to_tempdb"] = spills
             if warning_payload:
                 warnings.append(warning_payload)
 
@@ -187,82 +211,199 @@ class PlansService:
             "statements": statements,
             "top_operators": expensive_operators[:5],
             "warnings": warnings,
+            "actual_metrics": self._extract_actual_metrics(root),
+            "memory_grants": self._extract_memory_grants(root),
+            "missing_indexes": self._extract_missing_indexes(root),
+            "parameters": self._extract_parameters(root),
         }
 
-    async def _can_create_hypothetical_indexes(self, database_name: str) -> bool:
-        rows = await self.executor.fetch_all(
-            database_name,
-            """
-            SELECT
-                HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE INDEX') AS can_create_index
-            """,
+    def _extract_actual_metrics(self, root: ET.Element) -> dict[str, Any]:
+        """Return sourced query metrics without summing every operator/thread."""
+
+        all_counters = root.findall(
+            ".//sp:RunTimeCountersPerThread",
+            SHOWPLAN_NAMESPACE,
         )
-        if not rows:
-            return False
-        return bool(rows[0].get("can_create_index"))
+        statement_metrics: list[dict[str, Any]] = []
+        root_operator_metrics: list[dict[str, Any]] = []
 
-    def _normalize_hypothetical_index(
-        self,
-        definition: dict[str, Any],
-    ) -> dict[str, Any]:
-        schema = str(definition.get("schema") or "dbo").strip()
-        table = str(definition.get("table") or "").strip()
-        columns = [
-            str(column).strip().strip("[]")
-            for column in definition.get("columns", [])
-            if str(column).strip()
-        ]
-        include_columns = [
-            str(column).strip().strip("[]")
-            for column in definition.get("include_columns", [])
-            if str(column).strip()
-        ]
+        for ordinal, statement in enumerate(
+            root.findall(".//sp:StmtSimple", SHOWPLAN_NAMESPACE),
+            start=1,
+        ):
+            query_time = statement.find("sp:QueryTimeStats", SHOWPLAN_NAMESPACE)
+            if query_time is not None:
+                statement_metrics.append(
+                    {
+                        "statement_ordinal": ordinal,
+                        "statement_type": statement.attrib.get("StatementType"),
+                        "cpu_ms": self._optional_int(query_time.attrib.get("CpuTime")),
+                        "elapsed_ms": self._optional_int(
+                            query_time.attrib.get("ElapsedTime")
+                        ),
+                        "source": "showplan_query_time_stats",
+                    }
+                )
 
-        if not table:
-            raise ValueError("Hypothetical index definitions require a table name.")
-        if not columns:
-            raise ValueError("Hypothetical index definitions require at least one key column.")
-
-        return {
-            "schema": schema.strip("[]") or "dbo",
-            "table": table.strip("[]"),
-            "columns": columns,
-            "include_columns": include_columns,
-        }
-
-    def _build_hypothetical_index_statements(
-        self,
-        definition: dict[str, Any],
-    ) -> tuple[str, str, dict[str, Any]]:
-        index_name = f"__hypo_{uuid.uuid4().hex[:8]}"
-        quoted_schema = self._quote_identifier(definition["schema"])
-        quoted_table = self._quote_identifier(definition["table"])
-        include_clause = ""
-        if definition["include_columns"]:
-            include_clause = (
-                " INCLUDE ("
-                + ", ".join(self._quote_identifier(column) for column in definition["include_columns"])
-                + ")"
+            root_operator = statement.find(
+                "sp:QueryPlan/sp:RelOp",
+                SHOWPLAN_NAMESPACE,
+            )
+            if root_operator is None:
+                continue
+            counters = root_operator.findall(
+                "sp:RunTimeInformation/sp:RunTimeCountersPerThread",
+                SHOWPLAN_NAMESPACE,
+            )
+            root_operator_metrics.append(
+                {
+                    "statement_ordinal": ordinal,
+                    "node_id": root_operator.attrib.get("NodeId"),
+                    "physical_op": root_operator.attrib.get("PhysicalOp"),
+                    "thread_counter_count": len(counters),
+                    "actual_rows": sum(
+                        self._to_float(counter.attrib.get("ActualRows"))
+                        for counter in counters
+                    ),
+                    "actual_executions": sum(
+                        self._to_int(counter.attrib.get("ActualExecutions"))
+                        for counter in counters
+                    ),
+                    "source": "showplan_root_operator_thread_counters",
+                }
             )
 
-        create_sql = (
-            f"CREATE NONCLUSTERED INDEX {self._quote_identifier(index_name)} "
-            f"ON {quoted_schema}.{quoted_table} "
-            f"({', '.join(self._quote_identifier(column) for column in definition['columns'])})"
-            f"{include_clause} "
-            "WITH (STATISTICS_ONLY = ON);"
+        single_statement = (
+            statement_metrics[0] if len(statement_metrics) == 1 else None
         )
-        drop_sql = (
-            f"DROP INDEX {self._quote_identifier(index_name)} ON {quoted_schema}.{quoted_table};"
+        single_root = (
+            root_operator_metrics[0] if len(root_operator_metrics) == 1 else None
         )
-        created_index = {
-            "name": index_name,
-            "schema": definition["schema"],
-            "table": definition["table"],
-            "columns": definition["columns"],
-            "include_columns": definition["include_columns"],
+        return {
+            "runtime_counter_count": len(all_counters),
+            "statement_metric_count": len(statement_metrics),
+            "statement_metrics": statement_metrics,
+            "root_operator_metrics": root_operator_metrics,
+            "actual_cpu_ms": single_statement.get("cpu_ms")
+            if single_statement
+            else None,
+            "actual_elapsed_ms": single_statement.get("elapsed_ms")
+            if single_statement
+            else None,
+            "actual_rows": single_root.get("actual_rows") if single_root else None,
+            "actual_executions": single_root.get("actual_executions")
+            if single_root
+            else None,
+            "actual_logical_reads": None,
+            "actual_physical_reads": None,
+            "query_metric_source": "showplan_query_time_stats"
+            if single_statement
+            else "unavailable_for_multi_statement_plan",
+            "read_metric_source": "not_available_as_reliable_query_total",
         }
-        return create_sql, drop_sql, created_index
+
+    def _extract_memory_grants(self, root: ET.Element) -> list[dict[str, Any]]:
+        grants = []
+        for node in root.findall(".//sp:MemoryGrantInfo", SHOWPLAN_NAMESPACE):
+            grants.append(
+                {
+                    "serial_required_memory_kb": self._to_int(
+                        node.attrib.get("SerialRequiredMemory")
+                    ),
+                    "serial_desired_memory_kb": self._to_int(
+                        node.attrib.get("SerialDesiredMemory")
+                    ),
+                    "required_memory_kb": self._to_int(node.attrib.get("RequiredMemory")),
+                    "desired_memory_kb": self._to_int(node.attrib.get("DesiredMemory")),
+                    "requested_memory_kb": self._to_int(node.attrib.get("RequestedMemory")),
+                    "grant_wait_time_ms": self._to_int(node.attrib.get("GrantWaitTime")),
+                    "granted_memory_kb": self._to_int(node.attrib.get("GrantedMemory")),
+                    "max_used_memory_kb": self._to_int(node.attrib.get("MaxUsedMemory")),
+                    "max_query_memory_kb": self._to_int(node.attrib.get("MaxQueryMemory")),
+                }
+            )
+        return grants
+
+    def _extract_missing_indexes(self, root: ET.Element) -> list[dict[str, Any]]:
+        missing = []
+        for group in root.findall(".//sp:MissingIndexGroup", SHOWPLAN_NAMESPACE):
+            impact = self._to_float(group.attrib.get("Impact"))
+            for index in group.findall("sp:MissingIndex", SHOWPLAN_NAMESPACE):
+                missing.append(
+                    {
+                        "impact_pct": impact,
+                        "database": index.attrib.get("Database"),
+                        "schema": index.attrib.get("Schema"),
+                        "table": index.attrib.get("Table"),
+                        "equality_columns": self._extract_missing_index_columns(
+                            index, "EQUALITY"
+                        ),
+                        "inequality_columns": self._extract_missing_index_columns(
+                            index, "INEQUALITY"
+                        ),
+                        "include_columns": self._extract_missing_index_columns(
+                            index, "INCLUDE"
+                        ),
+                    }
+                )
+        return missing
+
+    def _extract_missing_index_columns(self, index_node: ET.Element, usage: str) -> list[str]:
+        columns: list[str] = []
+        for group in index_node.findall("sp:ColumnGroup", SHOWPLAN_NAMESPACE):
+            if group.attrib.get("Usage") != usage:
+                continue
+            for column in group.findall("sp:Column", SHOWPLAN_NAMESPACE):
+                name = column.attrib.get("Name")
+                if name:
+                    columns.append(name.strip("[]"))
+        return columns
+
+    def _extract_parameters(self, root: ET.Element) -> list[dict[str, Any]]:
+        parameters = []
+        for node in root.findall(".//sp:ParameterList/sp:ColumnReference", SHOWPLAN_NAMESPACE):
+            name = node.attrib.get("Column")
+            if not name:
+                continue
+            parameters.append(
+                {
+                    "name": name,
+                    "compiled_value": node.attrib.get("ParameterCompiledValue"),
+                    "runtime_value": node.attrib.get("ParameterRuntimeValue"),
+                }
+            )
+        return parameters
+
+    @staticmethod
+    def _to_float(value: Any) -> float:
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _to_int(value: Any) -> int:
+        try:
+            return int(float(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _optional_int(value: Any) -> int | None:
+        if value in {None, ""}:
+            return None
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _result_contains_plan_xml(result: QueryResult) -> bool:
+        return any(
+            isinstance(value, str) and value.lstrip().startswith("<ShowPlanXML")
+            for row in result.rows
+            for value in row.values()
+        )
 
     def _extract_plan_xml(self, results) -> str:
         xml_candidates: list[str] = []

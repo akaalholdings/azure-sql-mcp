@@ -58,6 +58,49 @@ def test_detect_parameters_empty_for_no_params() -> None:
     assert params == []
 
 
+def test_detect_parameters_ignores_literals_comments_and_existing_declarations() -> None:
+    sql = """
+    DECLARE @AlreadyDeclared int;
+    SELECT '@fake', [o].[CustomerId] = @CustomerId -- @comment_param
+    FROM dbo.Orders AS o
+    WHERE @Status = o.Status AND @AlreadyDeclared = 1;
+    """
+    assert detect_parameters(sql) == ["CustomerId", "Status"]
+
+
+def test_detect_parameters_ignores_every_variable_in_multi_declare() -> None:
+    sql = """
+    DECLARE @First int, @Second nvarchar(20);
+    SELECT @First, @Second, @External;
+    """
+    assert detect_parameters(sql) == ["External"]
+
+
+def test_detect_parameters_keeps_external_initializer_references() -> None:
+    sql = """
+    DECLARE @Local int = COALESCE(@External, 0), @Other int = 1;
+    SELECT @Local + @Other;
+    """
+    assert detect_parameters(sql) == ["External"]
+
+
+def test_detect_parameters_treats_names_case_insensitively() -> None:
+    sql = "SELECT 1 FROM dbo.Orders WHERE Id = @CustomerId OR Id = @customerid"
+    assert detect_parameters(sql) == ["CustomerId"]
+
+
+def test_column_mapping_supports_brackets_and_reverse_comparison() -> None:
+    service = ParameterBindingService(executor=FakeExecutor())
+    mappings = service._extract_column_mappings(
+        "SELECT 1 FROM [dbo].[Orders] AS o WHERE [o].[CustomerId] = @CustomerId AND @Status = o.Status",
+        ["CustomerId", "Status"],
+    )
+    assert mappings == {
+        "CustomerId": ("o", "CustomerId"),
+        "Status": ("o", "Status"),
+    }
+
+
 # --- 18.3: Type fallback tests ---
 
 def test_type_fallback_int() -> None:
@@ -81,6 +124,32 @@ def test_type_fallback_unknown_returns_null() -> None:
     assert get_type_fallback("geometry") == "NULL"
 
 
+def test_format_data_type_rejects_hostile_type_names() -> None:
+    """Catalog type names are embedded in DECLARE statements; a hostile UDT name
+    must fall back to a safe type instead of being interpolated verbatim."""
+    service = ParameterBindingService(executor=FakeExecutor())
+    row = {"data_type": "int; DROP TABLE dbo.Users --", "max_length": 4}
+    assert service._format_data_type(row) == "nvarchar(256)"
+
+
+def test_format_data_type_allows_plain_types() -> None:
+    service = ParameterBindingService(executor=FakeExecutor())
+    assert service._format_data_type({"data_type": "int"}) == "int"
+    assert service._format_data_type({"data_type": "uniqueidentifier"}) == "uniqueidentifier"
+
+
+def test_binary_literal_rejects_non_hex_input() -> None:
+    service = ParameterBindingService(executor=FakeExecutor())
+    with pytest.raises(ValueError, match="not valid"):
+        service._format_literal("varbinary(16)", "00; DROP TABLE dbo.Users")
+
+
+def test_bit_literal_rejects_values_other_than_zero_or_one() -> None:
+    service = ParameterBindingService(executor=FakeExecutor())
+    with pytest.raises(ValueError, match="not valid"):
+        service._format_literal("bit", 2)
+
+
 # --- 18.2 + 18.4: Binding service tests ---
 
 @pytest.mark.asyncio
@@ -92,6 +161,52 @@ async def test_bind_parameters_no_params_returns_original() -> None:
 
     assert result["bound_sql"] == "SELECT * FROM Orders"
     assert result["parameters"] == []
+
+
+@pytest.mark.asyncio
+async def test_bind_parameters_uses_explicit_values() -> None:
+    service = ParameterBindingService(FakeExecutor())
+    result = await service.bind_parameters(
+        "testdb",
+        "SELECT * FROM Orders WHERE Name = @Name AND IsActive = @IsActive",
+        parameter_values={"Name": "O'Reilly", "@IsActive": True},
+    )
+
+    assert [p["source"] for p in result["parameters"]] == ["explicit", "explicit"]
+    assert "N'O''Reilly'" in result["bound_sql"]
+    assert "SET @IsActive = 1;" in result["bound_sql"]
+
+
+@pytest.mark.asyncio
+async def test_bind_parameters_matches_explicit_names_case_insensitively() -> None:
+    service = ParameterBindingService(FakeExecutor())
+    result = await service.bind_parameters(
+        "testdb",
+        "SELECT * FROM Orders WHERE Name = @Name",
+        parameter_values={"@name": "Alice"},
+    )
+
+    assert result["parameters"][0]["source"] == "explicit"
+    assert "SET @Name = N'Alice';" in result["bound_sql"]
+
+
+@pytest.mark.asyncio
+async def test_bind_parameters_rejects_unknown_or_duplicate_explicit_names() -> None:
+    service = ParameterBindingService(FakeExecutor())
+
+    with pytest.raises(ValueError, match="unknown parameter"):
+        await service.bind_parameters(
+            "testdb",
+            "SELECT * FROM Orders WHERE Name = @Name",
+            parameter_values={"Nmae": "Alice"},
+        )
+
+    with pytest.raises(ValueError, match="duplicate explicit parameter"):
+        await service.bind_parameters(
+            "testdb",
+            "SELECT * FROM Orders WHERE Name = @Name",
+            parameter_values={"Name": "Alice", "@name": "Bob"},
+        )
 
 
 @pytest.mark.asyncio
@@ -135,6 +250,12 @@ async def test_bind_parameters_with_histogram_value() -> None:
     assert param["value"] == "42"
     assert "DECLARE @CustomerId int;" in result["bound_sql"]
     assert "SET @CustomerId = 42;" in result["bound_sql"]
+
+    # range_high_key is sql_variant, which the driver cannot fetch; the
+    # histogram query must CONVERT it server-side or binding never works live.
+    histogram_queries = [q for _, q, _ in executor.calls if "dm_db_stats_histogram" in q]
+    assert histogram_queries
+    assert "CONVERT(NVARCHAR(4000), range_high_key, 121)" in histogram_queries[0]
 
 
 @pytest.mark.asyncio
@@ -218,3 +339,44 @@ async def test_bind_parameters_multiple_params() -> None:
     names = [p["name"] for p in result["parameters"]]
     assert "@StartDate" in names
     assert "@Cat" in names
+
+
+@pytest.mark.asyncio
+async def test_alias_table_hint_retries_without_hint() -> None:
+    """`o.CustomerId = @p` yields table hint 'o' (an alias, not a table). The
+    resolver must retry across all tables instead of silently falling back to
+    an nvarchar guess that breaks execution with a conversion error."""
+
+    class AliasAwareExecutor:
+        def __init__(self) -> None:
+            self.calls: list[list[Any]] = []
+
+        async def fetch_all(self, database_name, query, params=None):
+            self.calls.append(list(params or []))
+            if "AND t.name = ?" in query:
+                return []  # alias never matches a real table
+            if "sys.dm_db_stats_histogram" in query:
+                return []
+            return [{
+                "table_name": "Orders",
+                "schema_name": "Sales",
+                "data_type": "int",
+                "max_length": 4,
+                "precision": 10,
+                "scale": 0,
+                "stats_id": 1,
+            }]
+
+    executor = AliasAwareExecutor()
+    service = ParameterBindingService(executor)
+
+    result = await service.bind_parameters(
+        "appdb",
+        "SELECT o.OrderID FROM Sales.Orders AS o WHERE o.CustomerID = @CustomerId",
+    )
+
+    parameter = result["parameters"][0]
+    assert parameter["data_type"] == "int"
+    assert parameter["value"] == "1"  # int type fallback, not N'test'
+    assert ["CustomerID", "o"] in executor.calls  # hinted attempt happened
+    assert ["CustomerID"] in executor.calls  # unhinted retry happened

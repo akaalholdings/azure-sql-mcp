@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from azure_sql_mcp.artifact_store import ArtifactStore
 from azure_sql_mcp.resources import register_resources
 
 
@@ -118,6 +119,26 @@ def test_register_resources_exposes_expected_templates(registered_resources: tup
     assert mcp.resources["azuresql://{database}/{schema}/{table}"].description == (
         "Get columns, constraints, and indexes for a table."
     )
+
+
+@pytest.mark.asyncio
+async def test_artifact_resource_returns_stored_text(sample_server_config: Any) -> None:
+    mcp = FakeMCP()
+    introspection = FakeIntrospection()
+    store = ArtifactStore()
+    metadata = store.put_text(
+        kind="showplan-xml",
+        text="<ShowPlanXML />",
+        mime_type="application/xml",
+    )
+
+    register_resources(mcp, sample_server_config, introspection, store)  # type: ignore[arg-type]
+
+    assert "azuresql-artifact://{artifact_id}" in mcp.resources
+    text = await mcp.resources["azuresql-artifact://{artifact_id}"].func(
+        metadata["artifact_id"]
+    )
+    assert text == "<ShowPlanXML />"
 
 
 @pytest.mark.asyncio

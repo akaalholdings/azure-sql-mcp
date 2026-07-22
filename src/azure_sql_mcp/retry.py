@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 from typing import cast
-from typing import Any, Awaitable, Callable, TypeVar
+from typing import Awaitable, Callable, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,15 @@ TRANSIENT_ERROR_CODES = frozenset(
 
 T = TypeVar("T")
 
+# Digit boundaries so e.g. code 233 does not match "12330 rows" or error 12335.
+_TRANSIENT_CODE_PATTERN = re.compile(
+    r"(?<!\d)(?:" + "|".join(str(code) for code in sorted(TRANSIENT_ERROR_CODES)) + r")(?!\d)"
+)
+
+
+def _message_has_transient_code(message: str) -> bool:
+    return _TRANSIENT_CODE_PATTERN.search(message) is not None
+
 
 def _is_transient(exc: Exception) -> bool:
     """Check whether a database-driver exception carries a transient error code."""
@@ -44,19 +54,16 @@ def _is_transient(exc: Exception) -> bool:
         args = getattr(current, "args", ())
         for arg in args:
             if isinstance(arg, str):
-                for code in TRANSIENT_ERROR_CODES:
-                    if str(code) in arg:
-                        return True
+                if _message_has_transient_code(arg):
+                    return True
             elif isinstance(arg, int) and arg in TRANSIENT_ERROR_CODES:
                 return True
             elif isinstance(arg, tuple):
                 for nested in arg:
                     if isinstance(nested, int) and nested in TRANSIENT_ERROR_CODES:
                         return True
-                    if isinstance(nested, str):
-                        for code in TRANSIENT_ERROR_CODES:
-                            if str(code) in nested:
-                                return True
+                    if isinstance(nested, str) and _message_has_transient_code(nested):
+                        return True
         current = current.__cause__ or current.__context__
     return False
 

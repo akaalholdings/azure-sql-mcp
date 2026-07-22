@@ -1,7 +1,7 @@
 [project]
 name = "azure-sql-mcp"
-version = "1.0.0"
-description = "Azure SQL Database MCP server with safe query execution and diagnostics"
+version = "2.0.0"
+description = "Typed Azure SQL performance tuning, triage, and reviewed plan enforcement over MCP"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
@@ -22,14 +22,14 @@ classifiers = [
 dependencies = [
     "azure-identity>=1.23.0",
     "mcp[cli]>=1.25.0",
-    "mssql-python>=1.4.0",
+    "mssql-python>=1.10.0",
     "sqlglot>=27.17.0",
 ]
 
 [project.urls]
-Changelog = "https://github.com/AkaalHoldings/azure-sql-mcp/blob/main/CHANGELOG.md"
-Issues = "https://github.com/AkaalHoldings/azure-sql-mcp/issues"
-Source = "https://github.com/AkaalHoldings/azure-sql-mcp"
+Changelog = "https://github.com/akaalholdings/azure-sql-mcp/blob/main/CHANGELOG.md"
+Issues = "https://github.com/akaalholdings/azure-sql-mcp/issues"
+Source = "https://github.com/akaalholdings/azure-sql-mcp"
 
 [project.scripts]
 azure-sql-mcp = "azure_sql_mcp:main"
@@ -40,11 +40,18 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
+    "pyright>=1.1.407",
     "pytest>=8.4.0",
     "pytest-asyncio>=1.2.0",
+    "ruff>=0.14.0",
 ]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 asyncio_default_fixture_loop_scope = "function"
 addopts = "--import-mode=importlib"
+
+[tool.pyright]
+include = ["src"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"

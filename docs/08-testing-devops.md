@@ -1,5 +1,10 @@
 # Phase 8: Testing & DevOps
 
+> Historical implementation plan. For current setup and client examples, use
+> [`../README.md`](../README.md). The executable CI workflow is
+> `.github/workflows/ci.yml`; snippets below are design history, not files to
+> copy verbatim. Supply test credentials at runtime and never commit them.
+
 ## Problem
 
 The test suite covers only 5 modules (config, safe_sql, plans, query_store, index_recommendations). Core modules like connection.py, auth.py, server.py, health.py, and capabilities.py have zero test coverage. There is no Docker support, no CI/CD pipeline, and the README contains a hardcoded local path.
@@ -124,11 +129,12 @@ async def test_release_and_reuse(sample_config):
 
 Add to `pyproject.toml`:
 ```toml
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
+    "pyright>=1.1.407",
     "pytest>=8.4.0",
     "pytest-asyncio>=1.2.0",
-    "pytest-mock>=3.14.0",
+    "ruff>=0.14.0",
 ]
 ```
 
@@ -167,8 +173,8 @@ pytestmark = pytest.mark.skipif(
 ## 8C. Docker Support
 
 ### Files
-- **New:** `AzureSqlMcp/Dockerfile`
-- **New:** `AzureSqlMcp/docker-compose.yml`
+- **Current:** `azure-sql-mcp/Dockerfile`
+- **Current:** `azure-sql-mcp/docker-compose.yml`
 
 ### Dockerfile
 
@@ -219,7 +225,7 @@ services:
     image: mcr.microsoft.com/mssql/server:2022-latest
     environment:
       - ACCEPT_EULA=Y
-      - MSSQL_SA_PASSWORD=YourStrong!Passw0rd
+      - MSSQL_SA_PASSWORD=${MSSQL_SA_PASSWORD}
       - MSSQL_PID=Developer
     ports:
       - "1433:1433"
@@ -235,7 +241,7 @@ volumes:
 ## 8D. CI/CD Pipeline
 
 ### Files
-- **New:** `.github/workflows/ci.yml`
+- **Current:** `.github/workflows/ci.yml`
 - **New:** `.github/workflows/integration.yml`
 
 ### ci.yml (runs on every push/PR)
@@ -253,10 +259,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
-      - run: cd AzureSqlMcp && uv sync --dev
-      - run: cd AzureSqlMcp && uv run pytest tests/unit/ -v
-      - run: cd AzureSqlMcp && uv run ruff check src/
-      - run: cd AzureSqlMcp && uv run mypy src/ --ignore-missing-imports
+      - run: uv sync
+      - run: uv run ruff check src tests
+      - run: uv run pyright
+      - run: uv run python -m compileall -q src tests
+      - run: uv run pytest -q
+      - run: uv build
 ```
 
 ### integration.yml (manual dispatch or on main merge)
@@ -276,7 +284,7 @@ jobs:
         image: mcr.microsoft.com/mssql/server:2022-latest
         env:
           ACCEPT_EULA: "Y"
-          MSSQL_SA_PASSWORD: "YourStrong!Passw0rd"
+          MSSQL_SA_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
         ports:
           - 1433:1433
     steps:
@@ -285,28 +293,27 @@ jobs:
       - run: |
           # Install runtime libraries required by mssql-python
           sudo apt-get update && sudo apt-get install -y libltdl7 libkrb5-3 libgssapi-krb5-2
-      - run: cd AzureSqlMcp && uv sync --dev
-      - run: cd AzureSqlMcp && uv run pytest tests/integration/ -v
+      - run: uv sync --dev
+      - run: uv run pytest tests/integration/ -v
         env:
           AZURE_SQL_SERVER: "localhost"
           AZURE_SQL_DEFAULT_DATABASE: "master"
           AZURE_SQL_ALLOWED_DATABASES: "master,testdb"
           AZURE_SQL_AUTH_MODE: "sql-password"
           AZURE_SQL_USERNAME: "sa"
-          AZURE_SQL_PASSWORD: "YourStrong!Passw0rd"
+          AZURE_SQL_PASSWORD: ${{ secrets.MSSQL_SA_PASSWORD }}
 ```
 
 ### Dev Dependencies for CI
 
 Add to `pyproject.toml`:
 ```toml
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
+    "pyright>=1.1.407",
     "pytest>=8.4.0",
     "pytest-asyncio>=1.2.0",
-    "pytest-mock>=3.14.0",
-    "ruff>=0.8.0",
-    "mypy>=1.14.0",
+    "ruff>=0.14.0",
 ]
 ```
 
@@ -316,7 +323,7 @@ dev = [
 
 ### Changes
 
-1. **Remove hardcoded local path** (line 27): Change to relative `cd AzureSqlMcp`
+1. **Use the repository root:** `cd azure-sql-mcp`
 2. **Add MCP client configuration examples:**
 
 ```markdown
@@ -329,7 +336,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
   "mcpServers": {
     "azure-sql": {
       "command": "uv",
-      "args": ["--directory", "/path/to/AzureSqlMcp", "run", "azure-sql-mcp"],
+      "args": ["--directory", "/path/to/azure-sql-mcp", "run", "azure-sql-mcp"],
       "env": {
         "AZURE_SQL_SERVER": "your-server.database.windows.net",
         "AZURE_SQL_DEFAULT_DATABASE": "appdb",
@@ -349,7 +356,7 @@ Add to `.vscode/settings.json`:
   "mcp.servers": {
     "azure-sql": {
       "command": "uv",
-      "args": ["--directory", "/path/to/AzureSqlMcp", "run", "azure-sql-mcp"],
+      "args": ["--directory", "/path/to/azure-sql-mcp", "run", "azure-sql-mcp"],
       "env": { ... }
     }
   }
@@ -383,8 +390,9 @@ graph TD
 
 ## Verification
 
-1. `uv run pytest tests/unit/ -v` -- all tests pass
-2. `uv run ruff check src/` -- no lint errors
-3. `docker build -t azure-sql-mcp .` -- builds successfully
-4. `docker-compose up` -- server starts and connects to local SQL Server
-5. CI pipeline runs green on a test PR
+1. `uv run ruff check src tests` -- no lint errors
+2. `uv run pyright` -- source type check passes
+3. `uv run python -m compileall -q src tests` -- source and tests compile
+4. `uv run pytest -q` -- all tests pass
+5. `uv build` -- package builds successfully
+6. `docker build -t azure-sql-mcp .` -- image builds successfully

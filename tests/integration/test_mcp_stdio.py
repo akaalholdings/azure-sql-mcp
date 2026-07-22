@@ -45,6 +45,9 @@ def _server_env(app: AzureSqlMcpApplication, database_name: str) -> dict[str, st
         "AZURE_TENANT_ID": app.config.tenant_id,
         "AZURE_CLIENT_ID": app.config.client_id,
         "AZURE_CLIENT_SECRET": app.config.client_secret,
+        "AZURE_SQL_TRUST_SERVER_CERTIFICATE": (
+            "true" if app.config.trust_server_certificate else None
+        ),
     }
     for key, value in optional_values.items():
         if value:
@@ -57,6 +60,13 @@ def _tool_payload(result: Any) -> Any:
     assert result.isError is False
     assert len(result.content) == 1
     return json.loads(result.content[0].text)
+
+
+def _rows(payload: Any) -> Any:
+    """List-returning tools are wrapped by _format_response as {'result': [...]}."""
+    if isinstance(payload, dict) and set(payload) == {"result"}:
+        return payload["result"]
+    return payload
 
 
 def _resource_payload(result: Any) -> Any:
@@ -73,8 +83,12 @@ async def test_mcp_stdio_end_to_end(
     if (
         integration_app.config.auth_mode == AuthMode.SQL_PASSWORD
         and integration_app.config.server.lower() in {"localhost", "127.0.0.1", "sqlserver"}
+        and not integration_app.config.trust_server_certificate
     ):
-        pytest.skip("stdio server integration test requires Azure SQL or a TLS-enabled SQL Server.")
+        pytest.skip(
+            "stdio server integration test against local SQL Server requires "
+            "AZURE_SQL_TRUST_SERVER_CERTIFICATE=true (self-signed certificate)."
+        )
 
     project_root = Path(__file__).resolve().parents[2]
     server = StdioServerParameters(
@@ -147,7 +161,7 @@ async def test_mcp_stdio_end_to_end(
                     {"database_name": integration_database_name},
                 )
             )
-            assert any(row["schema_name"] == prepared_test_schema for row in schemas)
+            assert any(row["schema_name"] == prepared_test_schema for row in _rows(schemas))
 
             tables = _tool_payload(
                 await session.call_tool(
@@ -159,7 +173,7 @@ async def test_mcp_stdio_end_to_end(
                     },
                 )
             )
-            assert {row["object_name"] for row in tables} >= {"Customers", "Orders"}
+            assert {row["object_name"] for row in _rows(tables)} >= {"Customers", "Orders"}
 
             views = _tool_payload(
                 await session.call_tool(
@@ -171,7 +185,7 @@ async def test_mcp_stdio_end_to_end(
                     },
                 )
             )
-            assert {row["object_name"] for row in views} >= {"vw_OrderSummary"}
+            assert {row["object_name"] for row in _rows(views)} >= {"vw_OrderSummary"}
 
             procedures = _tool_payload(
                 await session.call_tool(
@@ -183,7 +197,7 @@ async def test_mcp_stdio_end_to_end(
                     },
                 )
             )
-            assert {row["object_name"] for row in procedures} >= {"usp_GetOrders"}
+            assert {row["object_name"] for row in _rows(procedures)} >= {"usp_GetOrders"}
 
             matches = _tool_payload(
                 await session.call_tool(
@@ -194,7 +208,7 @@ async def test_mcp_stdio_end_to_end(
                     },
                 )
             )
-            assert {row["object_name"] for row in matches} >= {
+            assert {row["object_name"] for row in _rows(matches)} >= {
                 "Orders",
                 "vw_OrderSummary",
                 "usp_GetOrders",
@@ -243,7 +257,7 @@ async def test_mcp_stdio_end_to_end(
                     },
                 )
             )
-            stats_by_table = {row["table_name"]: row for row in stats}
+            stats_by_table = {row["table_name"]: row for row in _rows(stats)}
             assert stats_by_table["Orders"]["approximate_row_count"] >= 2
 
             active_sessions = _tool_payload(

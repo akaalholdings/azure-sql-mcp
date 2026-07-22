@@ -10,7 +10,7 @@ class FakeExecutor:
         self._calls: list[list[dict]] = results_by_call or [[]]
         self._call_idx = 0
 
-    async def fetch_all(self, database_name: str, query: str) -> list[dict]:
+    async def fetch_all(self, database_name: str, query: str, params=None) -> list[dict]:
         if self._call_idx < len(self._calls):
             result = self._calls[self._call_idx]
             self._call_idx += 1

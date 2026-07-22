@@ -6,6 +6,17 @@ from typing import Any
 from .connection import AzureSqlExecutor
 
 
+MAX_ROW_LIMIT = 1000
+
+
+def _clamp_limit(limit: int, default: int) -> int:
+    try:
+        value = int(limit)
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(value, MAX_ROW_LIMIT))
+
+
 class LockDiagnosticsService:
     def __init__(self, executor: AzureSqlExecutor):
         self.executor = executor
@@ -13,10 +24,16 @@ class LockDiagnosticsService:
     async def get_lock_details(
         self,
         database_name: str,
+        limit: int = 200,
     ) -> dict[str, Any]:
-        """Current locks from sys.dm_tran_locks with owning session and SQL text."""
+        """Current locks from sys.dm_tran_locks with owning session and SQL text.
+
+        sys.dm_tran_locks can hold hundreds of thousands of rows on a busy
+        system; results are bounded with waiting locks sorted first.
+        """
+        bounded_limit = _clamp_limit(limit, default=200)
         query = """
-        SELECT
+        SELECT TOP (?)
             tl.resource_type,
             tl.resource_subtype,
             tl.request_mode,
@@ -51,9 +68,16 @@ class LockDiagnosticsService:
         OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) AS st
         WHERE tl.resource_database_id = DB_ID()
           AND s.is_user_process = 1
-        ORDER BY tl.request_status, tl.resource_type, tl.request_mode
+        ORDER BY
+            CASE WHEN tl.request_status = 'WAIT' THEN 0 ELSE 1 END,
+            tl.resource_type,
+            tl.request_mode
         """
-        rows = await self.executor.fetch_all(database_name, query)
+        rows = await self.executor.fetch_all(
+            database_name, query, params=[bounded_limit + 1],
+        )
+        truncated = len(rows) > bounded_limit
+        rows = rows[:bounded_limit]
 
         # Summarize by resource type
         by_type: dict[str, int] = {}
@@ -68,16 +92,23 @@ class LockDiagnosticsService:
             "total_locks": len(rows),
             "waiting_locks": len(waiting),
             "locks_by_resource_type": by_type,
+            "limit": bounded_limit,
+            "truncated": truncated,
             "locks": rows,
         }
 
     async def get_open_transactions(
         self,
         database_name: str,
+        limit: int = 100,
     ) -> dict[str, Any]:
-        """Active transactions with duration, type, and log bytes used."""
+        """Active transactions with duration, type, and log bytes used.
+
+        Bounded, oldest transactions first — those matter most when truncated.
+        """
+        bounded_limit = _clamp_limit(limit, default=100)
         query = """
-        SELECT
+        SELECT TOP (?)
             at.transaction_id,
             at.name AS transaction_name,
             CASE at.transaction_type
@@ -119,7 +150,11 @@ class LockDiagnosticsService:
         WHERE s.is_user_process = 1
         ORDER BY at.transaction_begin_time ASC
         """
-        rows = await self.executor.fetch_all(database_name, query)
+        rows = await self.executor.fetch_all(
+            database_name, query, params=[bounded_limit + 1],
+        )
+        truncated = len(rows) > bounded_limit
+        rows = rows[:bounded_limit]
 
         long_running = [
             r for r in rows if (r.get("duration_seconds") or 0) > 300
@@ -136,6 +171,8 @@ class LockDiagnosticsService:
             "open_transaction_count": len(rows),
             "long_running_count": len(long_running),
             "idle_with_open_txn_count": len(idle_with_txn),
+            "limit": bounded_limit,
+            "truncated": truncated,
             "transactions": rows,
             "warnings": (
                 [

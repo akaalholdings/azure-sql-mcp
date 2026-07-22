@@ -63,6 +63,7 @@ def test_build_connection_arguments_uses_sql_password_without_token(server_confi
     assert "DATABASE=appdb;" in arguments.connection_string
     assert "UID=sa;" in arguments.connection_string
     assert "PWD=P@ssw0rd!;" in arguments.connection_string
+    assert "TrustServerCertificate=no;" in arguments.connection_string
     assert "DRIVER=" not in arguments.connection_string
     assert "Connection Timeout=" not in arguments.connection_string
     assert arguments.attrs_before is None
@@ -121,6 +122,7 @@ def test_build_connection_arguments_packs_tokens_for_entra_modes(
     )
     assert "SERVER=tcp:server.database.windows.net,1433;" in arguments.connection_string
     assert "DATABASE=appdb;" in arguments.connection_string
+    assert "TrustServerCertificate=no;" in arguments.connection_string
     assert "DRIVER=" not in arguments.connection_string
     assert "Connection Timeout=" not in arguments.connection_string
 
@@ -135,3 +137,20 @@ def test_get_access_token_rejects_sql_password_mode(server_config_factory):
 
     with pytest.raises(ValueError, match="SQL password auth mode"):
         authenticator.get_access_token()
+
+
+def test_build_connection_arguments_can_trust_self_signed_server_certificate(
+    server_config_factory,
+):
+    authenticator = _make_authenticator(
+        server_config_factory,
+        auth_mode=AuthMode.SQL_PASSWORD,
+        username="sa",
+        password="P@ssw0rd!",
+        trust_server_certificate=True,
+    )
+
+    arguments = authenticator.build_connection_arguments("appdb")
+
+    assert "Encrypt=yes;" in arguments.connection_string
+    assert "TrustServerCertificate=yes;" in arguments.connection_string

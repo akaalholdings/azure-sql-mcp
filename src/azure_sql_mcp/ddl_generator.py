@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from typing import Any
 
 from .schema_diff import DiffCategory
 from .schema_diff import DiffType
@@ -735,7 +734,8 @@ def _get_column(table: TableSnapshot, column_name: str) -> ColumnDef:
 def _split_object_name(object_name: str) -> tuple[str, str]:
     if "." not in object_name:
         raise ValueError(f"Expected table-qualified object name, got {object_name!r}")
-    return object_name.split(".", 1)
+    schema_name, local_name = object_name.split(".", 1)
+    return schema_name, local_name
 
 
 def _is_default_constraint(constraint: ConstraintDef) -> bool:

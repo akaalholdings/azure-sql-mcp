@@ -7,8 +7,6 @@ from typing import Sequence
 
 from .connection import AzureSqlExecutor
 from .ddl_generator import generate_migration_script as build_migration_script
-from .schema_diff import DiffCategory
-from .schema_diff import DiffType
 from .schema_diff import SchemaDifference
 from .schema_diff import compare_snapshots
 from .schema_snapshot import capture_snapshot
@@ -108,7 +106,6 @@ def _group_differences(
         for category in sorted(grouped.keys())
     }
 
-
 def _summarize_differences(
     differences: Sequence[SchemaDifference],
 ) -> dict[str, Any]:
@@ -120,4 +117,3 @@ def _summarize_differences(
             key: counts_by_category[key] for key in sorted(counts_by_category)
         },
     }
-

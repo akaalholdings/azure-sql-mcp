@@ -8,10 +8,14 @@ from dataclasses import field
 from typing import Any
 
 from .connection import AzureSqlExecutor
+from .index_metadata import ExistingIndex
+from .index_metadata import coerce_existing_indexes
+from .index_metadata import collect_existing_indexes
+from .index_metadata import existing_index_covers_candidate
 from .index_recommendations import build_create_index_statement
 from .index_recommendations import split_index_columns
 from .observability import sanitize_error_message
-from .query_text import strip_query_store_parameter_declarations
+from .param_binding import ParameterBindingService
 from .safe_sql import SafeSqlValidator
 
 SHOWPLAN_NAMESPACE = {"sp": "http://schemas.microsoft.com/sqlserver/2004/07/showplan"}
@@ -62,6 +66,7 @@ class OptimizationResult:
     selected_indexes: list[ScoredCandidate]
     total_estimated_size_mb: float
     existing_indexes_count: int
+    existing_index_metadata: list[dict[str, Any]]
     budget_mb: float | None
     alpha: float
     beta: float
@@ -95,6 +100,7 @@ class OptimizationResult:
             ],
             "total_estimated_size_mb": round(self.total_estimated_size_mb, 2),
             "existing_indexes_count": self.existing_indexes_count,
+            "existing_indexes": self.existing_index_metadata,
             "budget_mb": self.budget_mb,
             "scoring": {"alpha": self.alpha, "beta": self.beta},
         }
@@ -151,6 +157,7 @@ class IndexOptimizer:
     ):
         self.executor = executor
         self.validator = validator
+        self.param_binding = ParameterBindingService(executor)
 
     async def optimize(
         self,
@@ -210,6 +217,7 @@ class IndexOptimizer:
             selected_indexes=selected,
             total_estimated_size_mb=total_size,
             existing_indexes_count=len(existing),
+            existing_index_metadata=[index.as_dict() for index in existing],
             budget_mb=budget_mb,
             alpha=alpha,
             beta=beta,
@@ -230,7 +238,9 @@ class IndexOptimizer:
             if not sql_text or not sql_text.strip():
                 continue
             try:
-                normalized_sql = strip_query_store_parameter_declarations(sql_text)
+                normalized_sql = await self.param_binding.prepare_query_store_text(
+                    database_name, sql_text,
+                )
                 validated = self.validator.validate_read_only(normalized_sql)
                 plan_xml = await self._get_estimated_plan(database_name, validated.normalized_sql)
                 subtree_cost = self._extract_statement_cost(plan_xml)
@@ -397,7 +407,7 @@ class IndexOptimizer:
         self, database_name: str, schema: str, table: str,
     ) -> int:
         query = """
-        SELECT SUM(p.rows) AS row_count
+        SELECT SUM(p.row_count) AS row_count
         FROM sys.dm_db_partition_stats p
         JOIN sys.tables t ON p.object_id = t.object_id
         JOIN sys.schemas s ON t.schema_id = s.schema_id
@@ -442,20 +452,25 @@ class IndexOptimizer:
     def _filter_existing_indexes(
         self,
         candidates: list[_RawCandidate],
-        existing: set[tuple[str, str, tuple[str, ...]]],
+        existing: (
+            list[ExistingIndex]
+            | set[tuple[str, str, tuple[str, ...]]]
+        ),
     ) -> list[_RawCandidate]:
-        """Remove candidates whose key columns match or are a prefix of an existing index."""
+        """Remove only candidates fully covered by an enabled compatible index."""
+        metadata = coerce_existing_indexes(existing)
         result: list[_RawCandidate] = []
         for rc in candidates:
-            candidate_keys = tuple(rc.key_columns)
-            covered = False
-            for ex_schema, ex_table, ex_cols in existing:
-                if rc.schema != ex_schema or rc.table != ex_table:
-                    continue
-                # Candidate is covered if its key columns are a prefix of existing
-                if _is_prefix(candidate_keys, ex_cols):
-                    covered = True
-                    break
+            covered = any(
+                existing_index_covers_candidate(
+                    index,
+                    schema=rc.schema,
+                    table=rc.table,
+                    key_columns=rc.key_columns,
+                    include_columns=rc.include_columns,
+                )
+                for index in metadata
+            )
             if not covered:
                 result.append(rc)
         return result
@@ -652,6 +667,7 @@ class IndexOptimizer:
         per_statement_results = await self.executor.execute_session(
             database_name,
             ["SET SHOWPLAN_XML ON", sql, "SET SHOWPLAN_XML OFF"],
+            max_rows=self.executor.config.row_limit + 1,
         )
         plan_results = per_statement_results[1] if len(per_statement_results) > 1 else []
         for result in plan_results:
@@ -699,47 +715,8 @@ class IndexOptimizer:
 
     async def _get_existing_indexes(
         self, database_name: str,
-    ) -> set[tuple[str, str, tuple[str, ...]]]:
-        query = """
-        SELECT
-            s.name AS schema_name,
-            t.name AS table_name,
-            i.index_id,
-            ic.is_included_column,
-            ic.key_ordinal,
-            c.name AS column_name
-        FROM sys.indexes AS i
-        INNER JOIN sys.tables AS t ON i.object_id = t.object_id
-        INNER JOIN sys.schemas AS s ON t.schema_id = s.schema_id
-        INNER JOIN sys.index_columns AS ic
-            ON i.object_id = ic.object_id AND i.index_id = ic.index_id
-        INNER JOIN sys.columns AS c
-            ON ic.object_id = c.object_id AND ic.column_id = c.column_id
-        WHERE i.is_hypothetical = 0 AND i.index_id > 0
-        ORDER BY s.name, t.name, i.index_id, ic.key_ordinal
-        """
-        rows = await self.executor.fetch_all(database_name, query)
-        by_index: dict[tuple[str, str, Any], list[tuple[int, str]]] = {}
-        for row in rows:
-            if row.get("is_included_column"):
-                continue
-            key = (
-                row.get("schema_name") or "dbo",
-                row.get("table_name") or "",
-                row.get("index_id"),
-            )
-            by_index.setdefault(key, []).append(
-                (int(row.get("key_ordinal") or 0), row.get("column_name") or ""),
-            )
-
-        signatures: set[tuple[str, str, tuple[str, ...]]] = set()
-        for (schema_name, table_name, _), columns in by_index.items():
-            ordered = tuple(
-                col for _, col in sorted(columns, key=lambda x: x[0]) if col
-            )
-            if ordered:
-                signatures.add((schema_name, table_name, ordered))
-        return signatures
+    ) -> list[ExistingIndex]:
+        return await collect_existing_indexes(self.executor, database_name)
 
     # ------------------------------------------------------------------
     # Plan XML helpers

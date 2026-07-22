@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 
 import pytest
@@ -44,3 +45,37 @@ async def test_run_check_returns_detail_on_success() -> None:
     result = await service._run_check("appdb", ok)
 
     assert result == {"available": True, "detail": {"status": "ok"}}
+
+
+@pytest.mark.asyncio
+async def test_plan_probe_targets_user_table_when_available() -> None:
+    """SQL Server exempts catalog-only statements from the SHOWPLAN permission
+    check, so probing sys.objects reports plans available even when
+    explain_query on real tables is denied (found live with db_datareader).
+    The probe must target a user table when one exists."""
+    executor = AsyncMock()
+    executor.fetch_all = AsyncMock(
+        return_value=[{"qualified_name": "[dbo].[Users]"}]
+    )
+    plans = AsyncMock()
+    service = CapabilityService(executor, AsyncMock(), plans, AsyncMock())
+
+    await service._check_estimated_plan("appdb")
+
+    plans.explain_query.assert_awaited_once_with(
+        "appdb", "SELECT TOP 1 * FROM [dbo].[Users]", analyze=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_plan_probe_falls_back_to_catalog_when_no_user_tables() -> None:
+    executor = AsyncMock()
+    executor.fetch_all = AsyncMock(return_value=[])
+    plans = AsyncMock()
+    service = CapabilityService(executor, AsyncMock(), plans, AsyncMock())
+
+    await service._check_actual_plan("appdb")
+
+    plans.explain_query.assert_awaited_once_with(
+        "appdb", "SELECT TOP 1 name FROM sys.objects ORDER BY name", analyze=True,
+    )

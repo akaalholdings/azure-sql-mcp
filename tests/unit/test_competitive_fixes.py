@@ -16,6 +16,7 @@ import pytest
 
 from azure_sql_mcp.config import AccessMode
 from azure_sql_mcp.config import ToolGroup
+from azure_sql_mcp.config import WritePolicy
 from azure_sql_mcp.connection import AzureSqlExecutor
 from azure_sql_mcp.connection import QueryResult
 from azure_sql_mcp.server import AzureSqlMcpApplication
@@ -29,12 +30,14 @@ def _make_app(
     access_mode: AccessMode = AccessMode.UNRESTRICTED,
     tool_groups: frozenset[ToolGroup] = frozenset({ToolGroup.ALL}),
     server_config_factory=None,
+    write_policy: WritePolicy = WritePolicy.APPLY,
 ) -> AzureSqlMcpApplication:
     """Build an AzureSqlMcpApplication with the given config overrides."""
     if server_config_factory is not None:
         config = server_config_factory(
             access_mode=access_mode,
             tool_groups=tool_groups,
+            write_policy=write_policy if access_mode == AccessMode.UNRESTRICTED else WritePolicy.DISABLED,
         )
     else:
         # Fallback: import and build directly
@@ -58,6 +61,7 @@ def _make_app(
             log_format="text",
             username=None,
             password=None,
+        trust_server_certificate=False,
             tenant_id=None,
             client_id=None,
             client_secret=None,
@@ -68,6 +72,11 @@ def _make_app(
             ),
             tool_groups=tool_groups,
             log_level="INFO",
+            mcp_bearer_token=None,
+            write_policy=write_policy if access_mode == AccessMode.UNRESTRICTED else WritePolicy.DISABLED,
+            audit_dir="/tmp/azure-sql-mcp-test-audit",
+            audit_full_sql=False,
+            remote_admin_enabled=False,
         )
     return AzureSqlMcpApplication(config)
 
@@ -106,12 +115,26 @@ class TestExecutionToolsRegistration:
 
 class TestExecutionToolImplementation:
     @pytest.mark.asyncio
-    async def test_rebuild_index_generates_correct_sql(self) -> None:
+    async def test_rebuild_index_defaults_to_dry_run(self) -> None:
         app = _make_app(access_mode=AccessMode.UNRESTRICTED)
         app.executor.execute_non_query = AsyncMock(return_value=0)
 
         result = await app._rebuild_index(
             "appdb", "dbo", "Orders", "IX_Orders_Date", "REBUILD", True,
+        )
+
+        app.executor.execute_non_query.assert_not_awaited()
+        assert result["status"] == "dry_run"
+        assert result["dry_run"] is True
+        assert "ALTER INDEX [IX_Orders_Date]" in result["sql_preview"]
+
+    @pytest.mark.asyncio
+    async def test_rebuild_index_generates_correct_sql(self) -> None:
+        app = _make_app(access_mode=AccessMode.UNRESTRICTED)
+        app.executor.execute_non_query = AsyncMock(return_value=0)
+
+        result = await app._rebuild_index(
+            "appdb", "dbo", "Orders", "IX_Orders_Date", "REBUILD", True, False,
         )
 
         app.executor.execute_non_query.assert_awaited_once()
@@ -126,8 +149,8 @@ class TestExecutionToolImplementation:
         app = _make_app(access_mode=AccessMode.UNRESTRICTED)
         app.executor.execute_non_query = AsyncMock(return_value=0)
 
-        result = await app._rebuild_index(
-            "appdb", "dbo", "Orders", "IX_Orders_Date", "REORGANIZE", True,
+        await app._rebuild_index(
+            "appdb", "dbo", "Orders", "IX_Orders_Date", "REORGANIZE", True, False,
         )
 
         sql = app.executor.execute_non_query.call_args[0][1]
@@ -139,7 +162,7 @@ class TestExecutionToolImplementation:
         app = _make_app(access_mode=AccessMode.UNRESTRICTED)
         with pytest.raises(ValueError, match="REBUILD or REORGANIZE"):
             await app._rebuild_index(
-                "appdb", "dbo", "Orders", "IX_1", "DROP", False,
+                "appdb", "dbo", "Orders", "IX_1", "DROP", False, False,
             )
 
     @pytest.mark.asyncio
@@ -147,7 +170,7 @@ class TestExecutionToolImplementation:
         app = _make_app(access_mode=AccessMode.UNRESTRICTED)
         app.executor.execute_non_query = AsyncMock(return_value=0)
 
-        result = await app._update_statistics("appdb", "dbo", "Orders", None, None)
+        result = await app._update_statistics("appdb", "dbo", "Orders", None, None, False)
 
         sql = app.executor.execute_non_query.call_args[0][1]
         assert sql == "UPDATE STATISTICS [dbo].[Orders]"
@@ -158,7 +181,7 @@ class TestExecutionToolImplementation:
         app = _make_app(access_mode=AccessMode.UNRESTRICTED)
         app.executor.execute_non_query = AsyncMock(return_value=0)
 
-        await app._update_statistics("appdb", "dbo", "Orders", "IX_Stat", 50)
+        await app._update_statistics("appdb", "dbo", "Orders", "IX_Stat", 50, False)
 
         sql = app.executor.execute_non_query.call_args[0][1]
         assert "[IX_Stat]" in sql
@@ -168,36 +191,32 @@ class TestExecutionToolImplementation:
     async def test_update_statistics_rejects_bad_sample(self) -> None:
         app = _make_app(access_mode=AccessMode.UNRESTRICTED)
         with pytest.raises(ValueError, match="sample_percent"):
-            await app._update_statistics("appdb", "dbo", "T", None, 0)
+            await app._update_statistics("appdb", "dbo", "T", None, 0, False)
 
     @pytest.mark.asyncio
-    async def test_force_query_plan_force(self) -> None:
+    async def test_direct_force_query_plan_is_preview_only(self) -> None:
         app = _make_app(access_mode=AccessMode.UNRESTRICTED)
         app.executor.execute_non_query = AsyncMock(return_value=0)
 
-        result = await app._force_query_plan("appdb", 42, 7, False)
-
-        sql = app.executor.execute_non_query.call_args[0][1]
-        assert "sp_query_store_force_plan" in sql
-        assert result["action"] == "forced"
+        with pytest.raises(PermissionError, match="prepared plan-action"):
+            await app._force_query_plan("appdb", 42, 7, False, False)
+        app.executor.execute_non_query.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_force_query_plan_unforce(self) -> None:
+    async def test_direct_unforce_query_plan_is_preview_only(self) -> None:
         app = _make_app(access_mode=AccessMode.UNRESTRICTED)
         app.executor.execute_non_query = AsyncMock(return_value=0)
 
-        result = await app._force_query_plan("appdb", 42, 7, True)
-
-        sql = app.executor.execute_non_query.call_args[0][1]
-        assert "sp_query_store_unforce_plan" in sql
-        assert result["action"] == "unforced"
+        with pytest.raises(PermissionError, match="prepared plan-action"):
+            await app._force_query_plan("appdb", 42, 7, True, False)
+        app.executor.execute_non_query.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_kill_session_issues_kill(self) -> None:
         app = _make_app(access_mode=AccessMode.UNRESTRICTED)
         app.executor.execute_non_query = AsyncMock(return_value=0)
 
-        result = await app._kill_session("appdb", 123)
+        result = await app._kill_session("appdb", 123, False)
 
         sql = app.executor.execute_non_query.call_args[0][1]
         assert sql == "KILL 123"
@@ -207,7 +226,7 @@ class TestExecutionToolImplementation:
     async def test_kill_session_rejects_system_spid(self) -> None:
         app = _make_app(access_mode=AccessMode.UNRESTRICTED)
         with pytest.raises(ValueError, match="system sessions"):
-            await app._kill_session("appdb", 10)
+            await app._kill_session("appdb", 10, False)
 
 
 # ===========================================================================
@@ -410,6 +429,8 @@ class TestToolGrouping:
         tools = {t.name for t in app.mcp._tool_manager.list_tools()}
         assert "get_wait_stats" in tools
         assert "detect_parameter_sniffing" in tools
+        assert "review_plan_enforcement" in tools
+        assert "dry_run_plan_action" in tools
         # Core tools should be pruned
         assert "execute_sql" not in tools
 

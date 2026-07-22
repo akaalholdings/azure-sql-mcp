@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Any
 
 from sqlglot import exp
 from sqlglot import parse
@@ -26,6 +27,10 @@ MAXRECURSION_ZERO_PATTERN = re.compile(
     r"\bMAXRECURSION\s+0\b",
     re.IGNORECASE,
 )
+_LINE_COMMENT_PATTERN = re.compile(r"--[^\r\n]*")
+_BLOCK_COMMENT_PATTERN = re.compile(r"/\*.*?\*/", re.DOTALL)
+_STRING_LITERAL_PATTERN = re.compile(r"N?'(?:''|[^'])*'", re.IGNORECASE)
+
 BLOCKED_FUNCTIONS = frozenset(
     {
         # Extended stored procedures
@@ -57,6 +62,17 @@ BLOCKED_FUNCTIONS = frozenset(
 )
 
 
+def strip_literals_and_comments(sql: str) -> str:
+    """Replace comments and string literals so text-rule scans only see code.
+
+    Keyword patterns (GO, EXEC, WAITFOR, #temp, ...) must not fire on words
+    that merely appear inside string data or comments.
+    """
+    without_block_comments = _BLOCK_COMMENT_PATTERN.sub(" ", sql)
+    without_comments = _LINE_COMMENT_PATTERN.sub(" ", without_block_comments)
+    return _STRING_LITERAL_PATTERN.sub("?", without_comments)
+
+
 @dataclass(frozen=True)
 class ValidatedQuery:
     normalized_sql: str
@@ -64,6 +80,13 @@ class ValidatedQuery:
 
 class SafeSqlValidator:
     def validate_read_only(self, sql: str) -> ValidatedQuery:
+        """Validate a read-only batch: optional DECLARE / SET @variable statements
+        followed by exactly one SELECT-style statement.
+
+        The variable prefix exists so parameterized queries can be executed with
+        bound values (T-SQL variables are batch-scoped, so the DECLARE/SET block
+        and the query must ship as a single batch).
+        """
         candidate = sql.strip()
         if not candidate:
             raise ValueError("SQL cannot be empty.")
@@ -74,15 +97,77 @@ class SafeSqlValidator:
         except ParseError as exc:
             raise ValueError(f"Invalid T-SQL: {exc}") from exc
 
-        if len(statements) != 1:
-            raise ValueError("Exactly one SQL statement is allowed.")
+        if not statements:
+            raise ValueError("Invalid T-SQL: parser returned no statements.")
 
-        statement = statements[0]
-        self._check_statement(statement)
+        *prefix, final = statements
+        for statement in prefix:
+            if statement is None:
+                raise ValueError("Invalid T-SQL: parser returned an empty statement.")
+            self._check_prefix_statement(statement)
+        if final is None:
+            raise ValueError("Invalid T-SQL: parser returned an empty statement.")
+        self._check_statement(final)
 
-        return ValidatedQuery(normalized_sql=statement.sql(dialect="tsql"))
+        normalized = ";\n".join(
+            statement.sql(dialect="tsql") for statement in statements if statement
+        )
+        return ValidatedQuery(normalized_sql=normalized)
 
-    def _check_text_rules(self, candidate: str) -> None:
+    def extract_table_references(self, sql: str) -> list[dict[str, str | None]]:
+        """Return base table references from a validated read-only statement."""
+        validated = self.validate_read_only(sql)
+        statements = [
+            statement
+            for statement in parse(validated.normalized_sql, read="tsql")
+            if statement is not None
+        ]
+        if not statements:
+            raise ValueError("Invalid T-SQL: parser returned an empty statement.")
+        cte_names = {
+            str(cte.alias_or_name).lower()
+            for statement in statements
+            for cte in statement.find_all(exp.CTE)
+            if cte.alias_or_name
+        }
+
+        seen: set[tuple[str | None, str]] = set()
+        positions: dict[tuple[str | None, str], int] = {}
+        references: list[dict[str, str | None]] = []
+        normalized_lookup = validated.normalized_sql.lower()
+        all_tables = (
+            table for statement in statements for table in statement.find_all(exp.Table)
+        )
+        for table in all_tables:
+            table_name = str(table.this).strip("[]")
+            if not table_name or table_name.lower() in cte_names:
+                continue
+            schema_name = table.args.get("db")
+            schema = str(schema_name).strip("[]") if schema_name is not None else None
+            key = (schema, table_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            needle = f"{schema}.{table_name}" if schema else table_name
+            position = normalized_lookup.find(needle.lower())
+            positions[key] = position if position >= 0 else len(normalized_lookup)
+            references.append(
+                {
+                    "schema": schema,
+                    "table": table_name,
+                }
+            )
+        return sorted(
+            references,
+            key=lambda ref: positions[(ref.get("schema"), str(ref["table"]))],
+        )
+
+    def _check_text_rules(self, sql: str) -> None:
+        # Scan with literals and comments removed: a WHERE clause comparing
+        # against 'go home' or 'item#1' is data, not a batch separator or a
+        # temp table. Actual EXEC/DML in code positions is still caught here
+        # and again by the AST walk.
+        candidate = strip_literals_and_comments(sql)
         if GO_PATTERN.search(candidate):
             raise ValueError("Batch separators such as GO are not allowed.")
         if DBCC_PATTERN.search(candidate):
@@ -108,10 +193,40 @@ class SafeSqlValidator:
                 "MAXRECURSION 0 (unlimited recursion) is not allowed in restricted mode."
             )
 
-    def _check_statement(self, statement: exp.Expression) -> None:
+    def _check_statement(self, statement: Any) -> None:
         if not isinstance(statement, (exp.Select, exp.Union, exp.Except, exp.Intersect)):
             raise ValueError("Restricted mode only supports SELECT queries.")
+        self._check_tree(statement)
 
+    def _check_prefix_statement(self, statement: Any) -> None:
+        """Allow only DECLARE and SET @variable statements before the final SELECT."""
+        if isinstance(statement, exp.Declare):
+            self._check_tree(statement)
+            return
+        if isinstance(statement, exp.Set) and self._is_variable_assignment(statement):
+            self._check_tree(statement)
+            return
+        raise ValueError(
+            "Exactly one SQL statement is allowed. Only DECLARE and SET @variable "
+            "assignments may precede the final SELECT statement."
+        )
+
+    @staticmethod
+    def _is_variable_assignment(statement: exp.Set) -> bool:
+        """True only for `SET @var = ...`; session options like SET NOCOUNT ON
+        parse with a Column (not a Parameter) on the left and are rejected."""
+        items = statement.expressions
+        if not items:
+            return False
+        for item in items:
+            assignment = item.this if isinstance(item, exp.SetItem) else None
+            if not isinstance(assignment, exp.EQ):
+                return False
+            if not isinstance(assignment.this, exp.Parameter):
+                return False
+        return True
+
+    def _check_tree(self, statement: Any) -> None:
         banned_nodes = (
             exp.Insert,
             exp.Update,

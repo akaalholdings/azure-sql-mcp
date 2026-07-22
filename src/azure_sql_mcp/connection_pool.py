@@ -6,18 +6,21 @@ import time
 import traceback
 from collections import defaultdict
 from dataclasses import dataclass
-from dataclasses import field
 from typing import Any
+from typing import cast
 
 from .auth import AzureSqlAuthenticator
-from .config import AuthMode
 from .config import ServerConfig
 
 logger = logging.getLogger(__name__)
 
-# Azure AD tokens are valid for ~60-75 minutes; refresh proactively at 45 min
-TOKEN_REFRESH_SECONDS = 45 * 60
+# Access tokens only matter at login: established connections stay
+# authenticated, and azure-identity refreshes its cached token whenever a NEW
+# connection is created. Pooled connections are therefore never recycled on a
+# token clock — only when validation fails.
 VALIDATION_TIMEOUT_SECONDS = 2
+# Skip the SELECT 1 validation round-trip for connections released recently.
+VALIDATION_IDLE_SECONDS = 60.0
 
 # Circuit breaker defaults
 CIRCUIT_BREAKER_THRESHOLD = 5
@@ -90,30 +93,21 @@ class ConnectionPool:
         )
         self._pool_sizes: dict[str, int] = defaultdict(int)
         self._lock = asyncio.Lock()
-        self._token_lock = asyncio.Lock()
-        self._token_acquired_at: float | None = None
         self._closed = False
         self._metrics: dict[str, PoolMetrics] = defaultdict(PoolMetrics)
         self._circuit_breakers: dict[str, CircuitBreakerState] = defaultdict(
             CircuitBreakerState
         )
         self._leases: dict[int, tuple[str, float, str]] = {}  # conn_id -> (db, time, stack)
-
-    def _needs_token_refresh(self) -> bool:
-        if self.config.auth_mode == AuthMode.SQL_PASSWORD:
-            return False
-        if self._token_acquired_at is None:
-            return True
-        return (time.monotonic() - self._token_acquired_at) >= TOKEN_REFRESH_SECONDS
+        self._idle_since: dict[int, float] = {}  # conn_id -> release time
 
     def _create_connection(self, database_name: str):
-        driver = _import_mssql_python()
-        if self._needs_token_refresh():
-            self._token_acquired_at = time.monotonic()
+        driver = cast(Any, _import_mssql_python())
         connect_args = self.authenticator.build_connection_arguments(database_name)
+        attrs_before: dict[int, int | str | bytes] = dict(connect_args.attrs_before or {})
         connection = driver.connect(
             connect_args.connection_string,
-            attrs_before=connect_args.attrs_before or {},
+            attrs_before=attrs_before,
             autocommit=True,
             timeout=self.config.query_timeout_seconds,
         )
@@ -232,8 +226,7 @@ class ConnectionPool:
                 connection = None
 
             if connection is not None:
-                is_valid = await asyncio.to_thread(self._validate_connection, connection)
-                if is_valid and not self._needs_token_refresh():
+                if await self._connection_is_usable(connection):
                     logger.debug(
                         "Reusing pooled connection",
                         extra={"database_name": database_name},
@@ -281,8 +274,7 @@ class ConnectionPool:
                 extra={"database_name": database_name},
             )
             connection = await pool.get()
-            is_valid = await asyncio.to_thread(self._validate_connection, connection)
-            if is_valid and not self._needs_token_refresh():
+            if await self._connection_is_usable(connection):
                 self._record_success(database_name)
                 metrics.active_connections += 1
                 metrics.peak_active = max(metrics.peak_active, metrics.active_connections)
@@ -291,9 +283,18 @@ class ConnectionPool:
                 return connection
             await self.discard(database_name, connection)
 
+    async def _connection_is_usable(self, connection) -> bool:
+        """Validate a pooled connection, skipping the SELECT 1 round-trip when
+        the connection was released within VALIDATION_IDLE_SECONDS."""
+        idle_since = self._idle_since.get(id(connection))
+        if idle_since is not None and (time.monotonic() - idle_since) < VALIDATION_IDLE_SECONDS:
+            return True
+        return await asyncio.to_thread(self._validate_connection, connection)
+
     async def release(self, database_name: str, connection) -> None:
         """Return a connection to the pool."""
         self._release_lease(connection)
+        self._idle_since[id(connection)] = time.monotonic()
         metrics = self._metrics[database_name]
         metrics.release_count += 1
         metrics.active_connections = max(0, metrics.active_connections - 1)
@@ -311,8 +312,13 @@ class ConnectionPool:
 
     async def discard(self, database_name: str, connection) -> None:
         """Close a broken connection and release its pool slot."""
+        was_leased = id(connection) in self._leases
         self._release_lease(connection)
-        self._metrics[database_name].discard_count += 1
+        self._idle_since.pop(id(connection), None)
+        metrics = self._metrics[database_name]
+        metrics.discard_count += 1
+        if was_leased:
+            metrics.active_connections = max(0, metrics.active_connections - 1)
         await asyncio.to_thread(self._close_connection, connection)
         async with self._lock:
             if self._pool_sizes[database_name] > 0:

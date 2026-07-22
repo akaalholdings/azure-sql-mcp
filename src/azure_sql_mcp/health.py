@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 from typing import Awaitable
 from typing import Callable
@@ -10,9 +11,9 @@ from .query_store import QueryStoreService
 
 HealthCheck = Callable[[str], Awaitable[dict[str, Any]]]
 
+logger = logging.getLogger(__name__)
+
 CHECK_NAMES = (
-    "index",
-    "buffer",
     "connection",
     "constraint",
     "replication",
@@ -23,6 +24,8 @@ CHECK_NAMES = (
     "storage",
     "statistics",
 )
+
+RETIRED_QUERY_HEALTH_CHECKS = frozenset({"index", "buffer"})
 
 STATUS_SEVERITY = {
     "pass": 0,
@@ -43,8 +46,6 @@ class HealthService:
     async def analyze(self, database_name: str, health_type: str) -> dict[str, Any]:
         requested = self._parse_requested_checks(health_type)
         handlers: dict[str, HealthCheck] = {
-            "index": self._index_health,
-            "buffer": self._buffer_health,
             "connection": self._connection_health,
             "constraint": self._constraint_health,
             "replication": self._replication_health,
@@ -69,13 +70,21 @@ class HealthService:
 
     def _parse_requested_checks(self, health_type: str) -> set[str]:
         normalized = health_type.lower()
-        requested = (
+        requested: set[str] = (
             set(CHECK_NAMES)
             if normalized == "all"
             else {part.strip() for part in normalized.split(",") if part.strip()}
         )
         invalid = requested - set(CHECK_NAMES)
         if invalid:
+            retired = invalid & RETIRED_QUERY_HEALTH_CHECKS
+            if retired:
+                raise ValueError(
+                    "PLE, buffer-cache ratio, and fragmentation are not query-health "
+                    "classifiers. Use collect_performance_evidence for Azure SQL "
+                    "resource, Query Store, wait, blocking, statistics, parameter "
+                    "sensitivity, and regression evidence."
+                )
             raise ValueError(
                 f"Unsupported health_type values: {', '.join(sorted(invalid))}."
             )
@@ -704,14 +713,15 @@ class HealthService:
     async def _query_store_health(self, database_name: str) -> dict[str, Any]:
         result = await self.query_store_service.get_status(database_name)
         details = dict(result)
-        status_row = result.get("status") if isinstance(result.get("status"), dict) else {}
+        raw_status = result.get("status")
+        status_row: dict[str, Any] = raw_status if isinstance(raw_status, dict) else {}
 
         storage_used_percent = None
         current_storage_size_mb = self._to_float(
             status_row.get("current_storage_size_mb")
         )
         max_storage_size_mb = self._to_float(status_row.get("max_storage_size_mb"))
-        if max_storage_size_mb:
+        if max_storage_size_mb and current_storage_size_mb is not None:
             storage_used_percent = self._round(
                 current_storage_size_mb / max_storage_size_mb * 100.0
             )
@@ -927,23 +937,25 @@ class HealthService:
             findings=findings,
         )
 
+    _GOVERNANCE_FIELDS = (
+        "primary_max_cpu_percent",
+        "primary_max_log_rate_per_db_in_bytes_per_second",
+        "primary_group_max_io",
+        "pool_max_io",
+        "max_db_memory",
+        "checkpoint_rate_mbps",
+    )
+
     async def _fetch_governance_limits(
         self, database_name: str,
     ) -> dict[str, Any]:
-        query = """
-        SELECT TOP 1
-            primary_max_cpu_percent,
-            primary_max_log_rate_per_db_in_bytes_per_second,
-            primary_group_max_io,
-            pool_max_io,
-            max_db_memory,
-            primary_max_worker_count_for_single_query AS max_workers_per_query,
-            checkpoint_rate_mbps
-        FROM sys.dm_user_db_resource_governance
-        """
+        # Column availability in sys.dm_user_db_resource_governance varies by
+        # service tier (e.g. primary_max_cpu_percent is absent on serverless
+        # General Purpose): SELECT * and project, so a missing column degrades
+        # to an absent field instead of failing the whole probe.
+        query = "SELECT TOP 1 * FROM sys.dm_user_db_resource_governance"
         try:
             rows = await self.executor.fetch_all(database_name, query)
-            return rows[0] if rows else {}
         except Exception:
             logger.warning(
                 "Failed to fetch resource governance limits for '%s'",
@@ -951,6 +963,18 @@ class HealthService:
                 exc_info=True,
             )
             return {}
+        if not rows:
+            return {}
+        row = rows[0]
+        limits = {
+            field: row.get(field)
+            for field in self._GOVERNANCE_FIELDS
+            if row.get(field) is not None
+        }
+        workers = row.get("primary_max_worker_count_for_single_query")
+        if workers is not None:
+            limits["max_workers_per_query"] = workers
+        return limits
 
     def _compare_against_governance(
         self,
@@ -1102,8 +1126,9 @@ class HealthService:
             size_mb = self._to_float(row.get("size_mb"))
             max_size_mb = self._to_float(row.get("max_size_mb"))
             used_percent = None
-            if max_size_mb:
+            if max_size_mb and size_mb is not None:
                 used_percent = self._round(size_mb / max_size_mb * 100.0)
+            if used_percent is not None:
                 if used_percent >= 95.0:
                     status = self._escalate(
                         status,

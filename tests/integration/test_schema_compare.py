@@ -49,4 +49,3 @@ async def test_capture_compare_and_generate_script_for_prepared_schema(
     assert "BEGIN TRANSACTION;" in script
     assert "No schema changes detected." in script
     assert script.rstrip().endswith("COMMIT TRANSACTION;")
-
