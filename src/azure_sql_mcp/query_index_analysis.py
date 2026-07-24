@@ -13,6 +13,7 @@ from .index_recommendations import build_create_index_statement
 from .index_recommendations import split_index_columns
 from .observability import sanitize_error_message
 from .param_binding import ParameterBindingService
+from .param_binding import ParameterExecutionContract
 from .query_text import strip_query_store_parameter_declarations
 from .safe_sql import SafeSqlValidator
 
@@ -32,20 +33,46 @@ class QueryIndexAnalysisService:
         self,
         database_name: str,
         queries: list[str],
+        *,
+        execution_contracts: list[ParameterExecutionContract] | None = None,
     ) -> dict[str, Any]:
         if len(queries) > 10:
             raise ValueError("Maximum 10 queries per analysis.")
         if not queries:
             raise ValueError("At least one query is required.")
+        if execution_contracts is not None and len(execution_contracts) != len(queries):
+            raise ValueError("execution_contracts must match the query count.")
+        if execution_contracts is not None:
+            for query, contract in zip(queries, execution_contracts):
+                if contract.sql_text != query:
+                    raise ValueError(
+                        "execution_contracts sql_text must exactly match its query."
+                    )
 
         all_recommendations: list[dict[str, Any]] = []
         query_details: list[dict[str, Any]] = []
         existing_indexes = await self._get_existing_indexes(database_name)
 
-        for sql in queries:
-            normalized_sql = strip_query_store_parameter_declarations(sql)
+        for ordinal, sql in enumerate(queries):
+            contract = (
+                execution_contracts[ordinal]
+                if execution_contracts is not None
+                else None
+            )
+            contract_sql = contract.sql_text if contract is not None else sql
+            normalized_sql = strip_query_store_parameter_declarations(contract_sql)
             validated = self.validator.validate_read_only(normalized_sql)
-            plan_xml = await self._get_estimated_plan(database_name, validated.normalized_sql)
+            if contract is not None and contract.parameters:
+                plan_xml = await self._get_estimated_plan(
+                    database_name,
+                    contract.sp_executesql_sql,
+                    params=contract.sp_executesql_values,
+                )
+            else:
+                plan_xml = await self._get_estimated_plan(
+                    database_name,
+                    validated.normalized_sql,
+                )
             missing = self._extract_missing_indexes(plan_xml)
             query_details.append({
                 "sql": validated.normalized_sql,
@@ -150,11 +177,22 @@ class QueryIndexAnalysisService:
             "existing_indexes": [index.as_dict() for index in existing_indexes],
         }
 
-    async def _get_estimated_plan(self, database_name: str, sql: str) -> str:
+    async def _get_estimated_plan(
+        self,
+        database_name: str,
+        sql: str,
+        *,
+        params: tuple[Any, ...] = (),
+    ) -> str:
+        kwargs: dict[str, Any] = {
+            "max_rows": self.executor.config.row_limit + 1,
+        }
+        if params:
+            kwargs["statement_params"] = [None, params, None]
         per_statement_results = await self.executor.execute_session(
             database_name,
             ["SET SHOWPLAN_XML ON", sql, "SET SHOWPLAN_XML OFF"],
-            max_rows=self.executor.config.row_limit + 1,
+            **kwargs,
         )
         plan_results = per_statement_results[1] if len(per_statement_results) > 1 else []
         for result in plan_results:

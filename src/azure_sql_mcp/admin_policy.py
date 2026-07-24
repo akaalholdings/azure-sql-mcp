@@ -40,7 +40,14 @@ class AdminAction:
     sql: str
     params: tuple[Any, ...] = ()
     rollback_sql: str | None = None
+    rollback_params: tuple[Any, ...] = ()
     trusted_generated: bool = False
+    reviewed_intent: bool = False
+    idempotency_key: str | None = None
+    exactly_once: bool = False
+    policy_verified: bool = False
+    non_production: bool = False
+    verification_required: bool = False
 
 
 class AdminPolicy:
@@ -67,6 +74,13 @@ class AdminPolicy:
     ) -> dict[str, Any]:
         if dry_run:
             return self.preview(action)
+        if action.exactly_once:
+            return await self.execute_exactly_once(
+                action,
+                executor,
+                dry_run=False,
+                max_rows=max_rows,
+            )
         self._validate_or_audit_block(action)
         if self.config.write_policy != WritePolicy.APPLY:
             audit_id = self.audit.record(
@@ -127,6 +141,108 @@ class AdminPolicy:
             )
             raise
 
+    async def execute_exactly_once(
+        self,
+        action: AdminAction,
+        executor,
+        *,
+        dry_run: bool,
+        max_rows: int | None = None,
+    ) -> dict[str, Any]:
+        """Execute one reviewed generated batch through the no-retry admin lane.
+
+        The executor's ADMIN batch mode deliberately disables automatic retry.
+        This method is reserved for workflows that can reconcile or roll back
+        a known statement and must never replay a dispatched DDL batch.
+        """
+
+        if not action.exactly_once:
+            action = AdminAction(
+                **{
+                    **action.__dict__,
+                    "exactly_once": True,
+                }
+            )
+        if dry_run:
+            return self.preview(action)
+        try:
+            self._validate_exactly_once_action(action)
+            self._validate_or_audit_block(action)
+        except PermissionError:
+            raise
+        if self.config.write_policy != WritePolicy.APPLY:
+            audit_id = self.audit.record(
+                action,
+                outcome="blocked",
+                error="AZURE_SQL_WRITE_POLICY=apply is required for write execution.",
+            )
+            raise PermissionError(
+                "Write execution requires AZURE_SQL_WRITE_POLICY=apply "
+                f"(audit_id={audit_id})."
+            )
+
+        audit_id = self.audit.record(action, outcome="apply_started")
+        try:
+            result = await executor.execute_batches(
+                action.database_name,
+                action.sql,
+                params=action.params,
+                max_rows=max_rows,
+                execution_mode=BatchExecutionMode.ADMIN,
+            )
+            self.audit.record(action, outcome="apply_completed", audit_id=audit_id)
+            return self._payload(
+                action,
+                status="completed",
+                audit_id=audit_id,
+                result=_serialize_result_sets(result),
+            )
+        except asyncio.CancelledError as exc:
+            self.audit.record(
+                action,
+                outcome="apply_outcome_unknown",
+                audit_id=audit_id,
+                error=str(exc) or type(exc).__name__,
+            )
+            raise
+        except Exception as exc:
+            self.audit.record(
+                action,
+                outcome=(
+                    "apply_outcome_unknown"
+                    if isinstance(exc, AdminBatchOutcomeUnknownError)
+                    or _is_timeout_error(exc)
+                    else "apply_failed"
+                ),
+                audit_id=audit_id,
+                error=str(exc),
+            )
+            raise
+
+    def _validate_exactly_once_action(self, action: AdminAction) -> None:
+        if not action.reviewed_intent:
+            raise PermissionError("exactly-once admin execution requires reviewed intent.")
+        if not action.idempotency_key or not action.idempotency_key.strip():
+            raise PermissionError(
+                "exactly-once admin execution requires an idempotency key."
+            )
+        if not action.rollback_sql and action.tool_name != "drop_test_index":
+            raise PermissionError(
+                "exactly-once admin execution requires exact rollback SQL."
+            )
+        if not action.policy_verified:
+            raise PermissionError(
+                "exactly-once admin execution requires local policy verification."
+            )
+        if action.action_type != "query_store" and not action.non_production:
+            raise PermissionError(
+                "exactly-once admin execution is restricted to non-production targets."
+            )
+        if not action.verification_required:
+            raise PermissionError(
+                "exactly-once admin execution requires post-apply verification."
+            )
+
     def _validate_or_audit_block(self, action: AdminAction) -> None:
         try:
             self.validate_sql(action.sql)
@@ -153,8 +269,12 @@ class AdminPolicy:
             "sql_preview": _preview_sql(action.sql),
             "sql_hash": _hash_sql(action.sql),
         }
+        if action.exactly_once:
+            payload["exactly_once"] = True
+            payload["idempotency_key_hash"] = _hash_sql(action.idempotency_key or "")
         if action.rollback_sql:
             payload["rollback_sql"] = redact_sql_literals(action.rollback_sql)
+            payload["rollback_param_count"] = len(action.rollback_params)
         if action.params:
             payload["param_count"] = len(action.params)
         if rowcount is not None:
@@ -194,8 +314,12 @@ class AdminAuditLog:
             "sql_preview": _preview_sql(action.sql),
             "param_count": len(action.params),
         }
+        if action.exactly_once:
+            event["exactly_once"] = True
+            event["idempotency_key_hash"] = _hash_sql(action.idempotency_key or "")
         if action.rollback_sql:
             event["rollback_sql"] = redact_sql_literals(action.rollback_sql)
+            event["rollback_param_count"] = len(action.rollback_params)
         if self.include_full_sql:
             event["sql"] = action.sql
         if error:

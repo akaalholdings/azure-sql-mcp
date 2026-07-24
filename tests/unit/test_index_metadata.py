@@ -5,6 +5,7 @@ from dataclasses import replace
 from azure_sql_mcp.index_metadata import ExistingIndex
 from azure_sql_mcp.index_metadata import IndexKeyColumn
 from azure_sql_mcp.index_metadata import existing_index_covers_candidate
+from azure_sql_mcp.index_metadata import normalize_index_definition
 from azure_sql_mcp.index_metadata import parse_existing_index_rows
 
 
@@ -139,6 +140,24 @@ def test_coverage_requires_keys_directions_includes_filter_and_enabled_state() -
     )
 
 
+def test_filter_normalization_preserves_identifier_and_literal_spelling() -> None:
+    normalized = normalize_index_definition(
+        "[STATUS] = N'MiXeD  Value' AND note = 'SELECT' /* DROP */"
+    )
+
+    assert normalized == "[STATUS] = N'MiXeD  Value' AND note = 'SELECT'"
+    assert normalize_index_definition("[STATUS] = 1") != normalize_index_definition(
+        "[status] = 1"
+    )
+    assert normalize_index_definition("Status = 1") != normalize_index_definition(
+        "status = 1"
+    )
+    assert normalize_index_definition("status = 1 /* comment */") == "status = 1"
+    assert normalize_index_definition("status = 'MiXeD'") != (
+        "status = 'mixed'"
+    )
+
+
 def test_unique_constraint_and_covering_index_remain_visible() -> None:
     [index] = parse_existing_index_rows(_rows())
     payload = index.as_dict()
@@ -169,3 +188,30 @@ def test_keyless_columnstore_index_remains_in_inventory() -> None:
     assert index.index_type == "CLUSTERED COLUMNSTORE"
     assert index.key_columns == ()
     assert index.nonkey_columns == ("Status",)
+
+
+def test_definition_and_ownership_fingerprints_are_stable_and_exposed() -> None:
+    [index] = parse_existing_index_rows(_rows())
+
+    assert index.definition_fingerprint == index.fingerprint
+    assert index.ownership_fingerprint
+    assert index.ownership["index_name"] == index.name
+    assert index.ownership["definition_fingerprint"] == index.fingerprint
+    assert index.as_dict()["ownership"]["ownership_fingerprint"] == index.ownership_fingerprint
+
+
+def test_unused_index_is_identifiable_without_treating_disabled_as_usable() -> None:
+    [index] = parse_existing_index_rows(
+        [
+            {
+                **_rows()[0],
+                "user_seeks": 0,
+                "user_scans": 0,
+                "user_lookups": 0,
+                "user_updates": 12,
+            }
+        ]
+    )
+
+    assert index.is_unused is True
+    assert replace(index, is_disabled=True).is_unused is True

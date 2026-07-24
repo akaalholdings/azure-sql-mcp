@@ -44,6 +44,16 @@ def test_loads_version_one_policy_and_looks_up_database_case_insensitively(
     assert policy.allow_plan_apply is True
     assert policy.can_benchmark(4) is True
     assert policy.can_benchmark(5) is False
+    assert policy.can_start_tuning_session(
+        candidates=10,
+        executions=4,
+        minutes=20,
+    ) is True
+    assert policy.can_start_tuning_session(
+        candidates=11,
+        executions=4,
+        minutes=20,
+    ) is False
     assert policies.allows_test_indexes("APPDB") is True
 
 
@@ -58,6 +68,9 @@ def test_missing_database_is_denied_by_default(tmp_path: Path) -> None:
     assert denied.allow_test_indexes is False
     assert denied.allow_plan_apply is False
     assert denied.max_benchmark_executions == 0
+    assert denied.max_tuning_candidates == 0
+    assert denied.max_tuning_session_executions == 0
+    assert denied.max_tuning_session_minutes == 0
     assert policies.allows_read("missing") is False
     assert policies.allows_benchmark("missing", 1) is False
     with pytest.raises(PermissionError, match="no configured database policy"):
@@ -98,6 +111,35 @@ def test_omitted_dangerous_fields_default_closed(tmp_path: Path) -> None:
     assert policy.allow_test_indexes is False
     assert policy.allow_plan_apply is False
     assert policy.max_benchmark_executions == 0
+    assert policy.max_tuning_candidates == 0
+    assert policy.max_tuning_session_executions == 0
+    assert policy.max_tuning_session_minutes == 0
+
+
+def test_policy_can_authorize_a_multi_hour_tuning_campaign(tmp_path: Path) -> None:
+    document = _document(
+        max_benchmark_executions=80,
+        max_tuning_candidates=60,
+        max_tuning_session_executions=2000,
+        max_tuning_session_minutes=360,
+    )
+    policy = load_database_policy(_write_policy(tmp_path, document)).require("appdb")
+
+    assert policy.can_start_tuning_session(
+        candidates=60,
+        executions=2000,
+        minutes=360,
+    ) is True
+    assert policy.can_start_tuning_session(
+        candidates=60,
+        executions=2001,
+        minutes=360,
+    ) is False
+    assert policy.can_start_tuning_session(
+        candidates=60,
+        executions=2000,
+        minutes=361,
+    ) is False
 
 
 @pytest.mark.parametrize(
@@ -108,6 +150,7 @@ def test_omitted_dangerous_fields_default_closed(tmp_path: Path) -> None:
         ({"version": 1, "databases": {"appdb": {}}}, "missing required"),
         ({"version": 1, "databases": {"appdb": {**_document()["databases"]["AppDb"], "extra": 1}}}, "unknown field"),
         ({"version": 1, "databases": {"appdb": {**_document()["databases"]["AppDb"], "max_benchmark_executions": -1}}}, "non-negative"),
+        ({"version": 1, "databases": {"appdb": {**_document()["databases"]["AppDb"], "max_tuning_session_minutes": -1}}}, "non-negative"),
     ],
 )
 def test_rejects_invalid_schema(tmp_path: Path, document: dict, message: str) -> None:

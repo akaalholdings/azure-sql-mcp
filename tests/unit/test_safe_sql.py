@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import pytest
 
+from azure_sql_mcp.safe_sql import AdmissionStatus
 from azure_sql_mcp.safe_sql import SafeSqlValidator
+from azure_sql_mcp.safe_sql import StaticAnalysisStatus
+from azure_sql_mcp.safe_sql import UnsupportedSqlError
 
 
 @pytest.fixture
@@ -13,6 +16,29 @@ def validator():
 def test_accepts_single_select(validator):
     validated = validator.validate_read_only("SELECT TOP 1 name FROM sys.objects;")
     assert "SELECT TOP 1 name FROM sys.objects" in validated.normalized_sql
+
+
+def test_validation_preserves_exact_sql_for_execution_and_identity(validator):
+    sql = "\nSELECT name  FROM sys.objects WHERE name = 'MiXeD  Value'  \n"
+
+    validated = validator.validate_read_only(sql)
+
+    assert validated.submitted_sql == sql
+    assert validated.execution_sql == sql
+    assert validated.normalized_sql == sql.strip()
+    assert "MiXeD  Value" in validated.execution_sql
+
+
+def test_safe_but_unanalyzable_tsql_has_distinct_admission_outcome(validator):
+    sql = "SELECT * FROM dbo.Items FOR JSON PATH, INCLUDE_NULL_VALUES"
+
+    outcome = validator.analyze_read_only(sql)
+
+    assert outcome.analysis_status is StaticAnalysisStatus.UNSUPPORTED
+    assert outcome.admission_status is AdmissionStatus.NOT_ADMITTED
+    assert outcome.submitted_sql == sql
+    with pytest.raises(UnsupportedSqlError):
+        validator.validate_read_only(sql)
 
 
 def test_accepts_cte_and_sys_catalog(validator):

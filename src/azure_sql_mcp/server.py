@@ -3,11 +3,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import re
 import time
 import uuid
 from collections.abc import Awaitable
 from collections.abc import Callable
+from collections.abc import Mapping
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -34,27 +37,42 @@ from .connection_pool import ConnectionPool
 from .database_policy import load_database_policy_or_deny
 from .diagnostics import DiagnosticQueryService
 from .health import HealthService
+from .index_optimizer import IndexCandidate
 from .index_optimizer import IndexOptimizer
+from .index_optimizer import build_index_candidate_statement
+from .index_optimizer import expected_index_definition_matches
+from .index_optimizer import verify_plan_uses_index
+from .index_metadata import collect_existing_indexes
+from .index_metadata import existing_index_covers_candidate
 from .index_recommendations import IndexRecommendationService
 from .introspection import IntrospectionService
 from .lock_diagnostics import LockDiagnosticsService
 from .logging_config import configure_logging
 from .observability import sanitize_error_message
 from .param_binding import detect_parameters
+from .param_binding import ParameterExecutionContract
 from .param_binding import ParameterBindingService
 from .performance_contracts import EvidenceEnvelopeV1
+from .performance_store import ContractNotFoundError
+from .performance_store import IdempotencyConflictError
 from .performance_store import PerformanceStore
 from .performance_workflows import PerformanceWorkflowService
 from .performance_workflows import aggregate_samples
 from .performance_workflows import classify_benchmark
 from .performance_workflows import compare_plan_summaries_payload
 from .performance_workflows import database_fingerprint
+from .performance_workflows import database_fingerprint_matches
 from .performance_workflows import extract_profile_metrics
 from .performance_workflows import fingerprint_json
+from .performance_workflows import fingerprint_text
+from .performance_workflows import fingerprint_text_matches
+from .performance_workflows import parameter_case_fingerprint
+from .performance_workflows import profile_result_fingerprint
 from .plan_action_service import PlanActionService
 from .plan_cache import PlanCacheService
 from .plan_enforcement import PlanEnforcementService
 from .plans import PlansService
+from .platform_capabilities import PlatformCapabilitiesService
 from .prompts import register_prompts
 from .query_index_analysis import QueryIndexAnalysisService
 from .query_hints import validate_query_hints
@@ -69,6 +87,13 @@ from .tempdb_memory import TempdbMemoryService
 from .tuning_sessions import TuningSessionStateMachine
 from .transport_auth import StaticBearerTokenVerifier
 from .wait_stats import WaitStatsService
+from .view_workflows import PreparedViewChange
+from .view_workflows import ViewChangeRequest
+from .view_workflows import ViewWorkflowService
+from .view_workflows import prepared_view_change_from_state
+from .view_workflows import prepared_view_change_state
+from .view_workflows import view_apply_receipt
+from .view_workflows import view_snapshot_from_receipt
 
 ResponseType = dict[str, Any]
 
@@ -77,7 +102,80 @@ logger = logging.getLogger(__name__)
 # Disposable test indexes (create_test_index / drop_test_index) are namespaced by this
 # prefix; the drop tool refuses anything outside it so real indexes are untouchable.
 TEST_INDEX_PREFIX = "IX_Testing_"
+TEST_INDEX_OWNER_PROPERTY = "AzureSqlMcpLeaseOwner"
+TEST_INDEX_DEFINITION_PROPERTY = "AzureSqlMcpDefinitionFingerprint"
 _PLAIN_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_INDEX_OWNER_PROOF = re.compile(r"^[A-Za-z0-9_.:-]{16,200}$")
+_IDEMPOTENCY_DIGEST_PATTERN = re.compile(r"^idempotency-v1:[0-9a-f]{64}$")
+_PENDING_INDEX_OWNERSHIP_SQL = """
+SELECT
+    i.index_id,
+    CONVERT(nvarchar(4000), owner_marker.value) AS owner_marker,
+    CONVERT(nvarchar(4000), definition_marker.value) AS definition_marker
+FROM sys.indexes AS i WITH (UPDLOCK, HOLDLOCK)
+INNER JOIN sys.tables AS t WITH (UPDLOCK, HOLDLOCK)
+    ON t.object_id = i.object_id
+INNER JOIN sys.schemas AS s WITH (UPDLOCK, HOLDLOCK)
+    ON s.schema_id = t.schema_id
+LEFT JOIN sys.extended_properties AS owner_marker WITH (UPDLOCK, HOLDLOCK)
+    ON owner_marker.class = 7
+    AND owner_marker.major_id = i.object_id
+    AND owner_marker.minor_id = i.index_id
+    AND owner_marker.name = ?
+LEFT JOIN sys.extended_properties AS definition_marker WITH (UPDLOCK, HOLDLOCK)
+    ON definition_marker.class = 7
+    AND definition_marker.major_id = i.object_id
+    AND definition_marker.minor_id = i.index_id
+    AND definition_marker.name = ?
+WHERE s.name = ?
+  AND t.name = ?
+  AND i.name = ?
+  AND i.index_id > 0
+"""
+_SESSION_WORKFLOW_TOOLS = frozenset(
+    {
+        "benchmark_tuning_candidate",
+        "benchmark_index_candidate",
+        "benchmark_query_rewrite",
+        "apply_prepared_view_change",
+        "verify_view_change",
+        "rollback_view_change",
+    }
+)
+_EVIDENCE_WORKFLOW_TOOLS = frozenset(
+    {"collect_performance_evidence", "tune_query"}
+)
+
+
+def _view_change_request_fingerprint(
+    database_fingerprint_value: str,
+    request: ViewChangeRequest,
+) -> str:
+    return fingerprint_json(
+        {
+            "database_fingerprint": database_fingerprint_value,
+            "database_name": request.database_name,
+            "schema_name": request.schema_name,
+            "view_name": request.view_name,
+            "definition": request.definition,
+            "operation": request.operation.casefold(),
+            "reviewed_intent": request.reviewed_intent,
+            "idempotency_key": _view_idempotency_identity(request.idempotency_key),
+            "indexed_view": request.indexed_view,
+            "schema_bound": request.schema_bound,
+        }
+    )
+
+
+def _view_idempotency_identity(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if _IDEMPOTENCY_DIGEST_PATTERN.fullmatch(value):
+        return value
+    digest = hashlib.sha256(
+        f"idempotency-v1:view-change.intent:{value}".encode("utf-8")
+    ).hexdigest()
+    return f"idempotency-v1:{digest}"
 
 
 def _auth_settings(config: ServerConfig) -> AuthSettings:
@@ -134,6 +232,7 @@ class AzureSqlMcpApplication:
         self.resource_governance = ResourceGovernanceService(executor)
         self.diagnostics = DiagnosticQueryService(executor)
         self.plan_cache = PlanCacheService(executor)
+        self.platform_capabilities = PlatformCapabilitiesService(executor)
         self.query_regression = QueryRegressionService(executor)
         self.plan_enforcement = PlanEnforcementService(
             executor,
@@ -159,6 +258,10 @@ class AzureSqlMcpApplication:
             database_policy=self.database_policy,
             row_limit=config.row_limit,
             parameter_binder=self._bind_performance_parameters,
+            collector_timeout_seconds=config.query_timeout_seconds + 5,
+            comparison_row_limit=config.comparison_row_limit,
+            server_name=config.server,
+            allow_legacy_state=bool(config.legacy_state_server_binding),
         )
         self.plan_actions = PlanActionService(
             config=config,
@@ -167,6 +270,12 @@ class AzureSqlMcpApplication:
             database_policy=self.database_policy,
             store=self.performance_store,
         )
+        self.view_workflows = ViewWorkflowService(
+            executor,
+            self.database_policy,
+            self.admin_policy,
+        )
+        self._prepared_view_changes: dict[str, PreparedViewChange] = {}
         self.capabilities = CapabilityService(
             executor,
             self.query_store,
@@ -226,7 +335,7 @@ class AzureSqlMcpApplication:
             return await self._run_tool(
                 "check_capabilities",
                 database_name,
-                self.capabilities.check,
+                self._check_database_capabilities,
             )
 
         @self.mcp.tool(
@@ -591,7 +700,15 @@ class AzureSqlMcpApplication:
                 default=None,
                 description=(
                     "Optional JSON parameter values keyed by name (for example "
-                    "{'CustomerId': 42}); values are safely rendered as T-SQL literals."
+                    "{'CustomerId': 42}). Values are passed as driver parameters "
+                    "and are not returned in the response."
+                ),
+            ),
+            parameter_types: dict[str, str] | None = Field(
+                default=None,
+                description=(
+                    "Optional declared SQL types keyed by parameter name, for example "
+                    "{'CustomerId': 'bigint'}. Supply exact types for faithful compilation."
                 ),
             ),
             include_raw_xml: bool = Field(
@@ -617,14 +734,16 @@ class AzureSqlMcpApplication:
                     auto_bind_params,
                     include_raw_xml,
                     parameter_values,
+                    parameter_types,
                 ),
             )
 
         @self.mcp.tool(
             description=(
-                "Collect a structured single-query tuning evidence pack: actual or "
-                "estimated plan summary, bounded result sample, Query Store history, "
-                "index recommendations, waits, and statistics health."
+                "Compatibility initializer only: open a performance case/session and "
+                "collect evidence. It does not generate or benchmark a rewrite and must "
+                "not be treated as a completed optimization. Named optimizer profiles "
+                "use the explicit case/session workflow instead."
             ),
             annotations=ToolAnnotations(
                 title="Tune Query",
@@ -651,6 +770,10 @@ class AzureSqlMcpApplication:
                     "over heuristic statistics/type fallback binding."
                 ),
             ),
+            parameter_types: dict[str, str] | None = Field(
+                default=None,
+                description="Optional exact SQL types for the supplied parameter values.",
+            ),
             include_raw_xml: bool = Field(
                 default=False,
                 description="Include raw SHOWPLAN XML inline. Defaults to token-safe artifact URI only.",
@@ -675,14 +798,15 @@ class AzureSqlMcpApplication:
                     include_raw_xml,
                     window_minutes,
                     parameter_values,
+                    parameter_types,
                 ),
             )
 
         @self.mcp.tool(
             description=(
                 "Benchmark a baseline query against a proposed rewrite using the same "
-                "read-only execution path, actual-plan summaries, bounded row samples, "
-                "and a sample equivalence check."
+                "typed read-only execution path, interleaved actual-plan samples, and "
+                "complete bounded snapshot equivalence."
             ),
             annotations=ToolAnnotations(
                 title="Benchmark Query Rewrite",
@@ -707,6 +831,10 @@ class AzureSqlMcpApplication:
                 default=None,
                 description="Explicit parameter values for both baseline and rewrite.",
             ),
+            parameter_types: dict[str, str] | None = Field(
+                default=None,
+                description="Optional exact SQL types shared by baseline and rewrite.",
+            ),
             compare_order: bool = Field(
                 default=True,
                 description=(
@@ -721,9 +849,9 @@ class AzureSqlMcpApplication:
             runs: int = Field(
                 default=3,
                 description=(
-                    "Screening executions per side (1-3). Metrics "
+                    "Screening executions per side (2-3). Metrics "
                     "become per-run medians with min/max spread, so a single lucky run "
-                    "cannot masquerade as a win. Run 1 is typically cold-cache."
+                    "cannot masquerade as a win. The workflow does not clear Azure SQL caches."
                 ),
             ),
             database_name: str | None = Field(
@@ -744,6 +872,7 @@ class AzureSqlMcpApplication:
                     runs,
                     parameter_values,
                     compare_order,
+                    parameter_types,
                 ),
             )
 
@@ -814,6 +943,13 @@ class AzureSqlMcpApplication:
                     "Capture one actual-plan sample. Requires database benchmark policy."
                 ),
             ),
+            parameter_case: dict[str, Any] | None = Field(
+                default=None,
+                description=(
+                    "For active evidence on parameterized SQL, one named case containing "
+                    "an exact values object and exact SQL types object."
+                ),
+            ),
             idempotency_key: str | None = Field(default=None),
             database_name: str | None = Field(default=None),
         ) -> ResponseType:
@@ -827,6 +963,7 @@ class AzureSqlMcpApplication:
                     window_minutes,
                     execute_query,
                     idempotency_key,
+                    parameter_case,
                 ),
             )
 
@@ -852,8 +989,9 @@ class AzureSqlMcpApplication:
 
         @self.mcp.tool(
             description=(
-                "Start a durable iterative tuning session with default budgets of 10 "
-                "candidates, 80 executions, and 20 minutes."
+                "Start a durable iterative tuning session. Defaults are 10 candidates, "
+                "80 executions, and 20 minutes; explicit multi-hour budgets are accepted "
+                "when the local database policy permits them."
             ),
             annotations=ToolAnnotations(
                 title="Start Tuning Session",
@@ -865,13 +1003,58 @@ class AzureSqlMcpApplication:
         )
         async def start_tuning_session(
             case_id: str = Field(description="Performance case identifier."),
+            max_candidates: int = Field(
+                default=10,
+                ge=1,
+                description="Maximum candidate experiments for this session.",
+            ),
+            execution_limit: int = Field(
+                default=80,
+                ge=1,
+                description="Maximum measured query executions across the session.",
+            ),
+            time_limit_minutes: int = Field(
+                default=20,
+                ge=1,
+                description="Wall-clock session budget in minutes; may span hours.",
+            ),
             idempotency_key: str | None = Field(default=None),
             database_name: str | None = Field(default=None),
         ) -> ResponseType:
             return await self._run_tool(
                 "start_tuning_session",
                 database_name,
-                lambda db: self._start_tuning_session(db, case_id, idempotency_key),
+                lambda db: self._start_tuning_session(
+                    db,
+                    case_id,
+                    max_candidates,
+                    execution_limit,
+                    time_limit_minutes,
+                    idempotency_key,
+                ),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Resume a durable tuning session with its complete redacted leaderboard, "
+                "evidence, events, and remaining budgets. Raw SQL is never persisted."
+            ),
+            annotations=ToolAnnotations(
+                title="Get Tuning Session",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )
+        async def get_tuning_session(
+            session_id: str = Field(description="Tuning session identifier."),
+            database_name: str | None = Field(default=None),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "get_tuning_session",
+                database_name,
+                lambda db: self._get_tuning_session(db, session_id),
             )
 
         @self.mcp.tool(
@@ -933,6 +1116,22 @@ class AzureSqlMcpApplication:
             phase: str = Field(default="screening", description="screening or finalist"),
             parameter_cases: list[dict[str, Any]] | None = Field(default=None),
             compare_order: bool = Field(default=True),
+            runs: int | None = Field(
+                default=None,
+                ge=2,
+                le=5,
+                description=(
+                    "Optional paired runs per parameter case. Screening is capped by "
+                    "the session screening limit; finalists by the finalist limit."
+                ),
+            ),
+            prove_equivalence: bool | None = Field(
+                default=None,
+                description=(
+                    "Defaults false for broad screening and true for finalists. "
+                    "Finalists cannot disable full snapshot equivalence."
+                ),
+            ),
             idempotency_key: str | None = Field(default=None),
             database_name: str | None = Field(default=None),
         ) -> ResponseType:
@@ -948,8 +1147,13 @@ class AzureSqlMcpApplication:
                     phase=phase,
                     parameter_cases=parameter_cases,
                     compare_order=compare_order,
+                    runs_override=runs,
+                    prove_equivalence=prove_equivalence,
                     idempotency_key=idempotency_key,
                 ),
+                deadline_provider=lambda: self.tuning_sessions.get_session(
+                    session_id
+                ).deadline_at_utc,
             )
 
         @self.mcp.tool(
@@ -973,14 +1177,25 @@ class AzureSqlMcpApplication:
             table_name: str = Field(description="Target table."),
             key_columns: list[str] = Field(description="Ordered key columns, optionally ASC/DESC."),
             include_columns: list[str] | None = Field(default=None),
+            filter_definition: str | None = Field(
+                default=None,
+                description="Optional filtered-index predicate; no SQL statements or comments.",
+            ),
+            is_unique: bool = Field(default=False),
             parameter_cases: list[dict[str, Any]] | None = Field(
                 default=None,
                 description="The same named parameter cases recorded on the performance case.",
             ),
             phase: str = Field(default="screening", description="screening or finalist"),
             online: bool = Field(default=True),
+            compare_order: bool = Field(
+                default=True,
+                description="Preserve ordered-result semantics during A-B-A stability checks.",
+            ),
             lease_minutes: int = Field(default=30, ge=5, le=120),
-            idempotency_key: str | None = Field(default=None),
+            idempotency_key: str = Field(
+                description="Caller-generated key used to fence retries and cleanup."
+            ),
             database_name: str | None = Field(default=None),
         ) -> ResponseType:
             return await self._run_tool(
@@ -995,12 +1210,18 @@ class AzureSqlMcpApplication:
                     table_name,
                     key_columns,
                     include_columns,
+                    filter_definition,
+                    is_unique,
                     phase,
                     online,
+                    compare_order,
                     lease_minutes,
                     idempotency_key,
                     parameter_cases,
                 ),
+                deadline_provider=lambda: self.tuning_sessions.get_session(
+                    session_id
+                ).deadline_at_utc,
             )
 
         @self.mcp.tool(
@@ -1052,6 +1273,13 @@ class AzureSqlMcpApplication:
             baseline_sql: str = Field(description="Baseline read-only SQL."),
             candidate_sql: str = Field(description="Candidate read-only SQL."),
             compare_order: bool = Field(default=True),
+            parameter_case: dict[str, Any] | None = Field(
+                default=None,
+                description=(
+                    "Required for parameterized SQL: one named case with exact values "
+                    "and declared SQL types for every parameter."
+                ),
+            ),
             database_name: str | None = Field(default=None),
         ) -> ResponseType:
             return await self._run_tool(
@@ -1062,6 +1290,7 @@ class AzureSqlMcpApplication:
                     baseline_sql,
                     candidate_sql,
                     compare_order=compare_order,
+                    parameter_case=parameter_case,
                 ),
             )
 
@@ -1088,6 +1317,127 @@ class AzureSqlMcpApplication:
                     baseline_summary,
                     candidate_summary,
                 ),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Prepare and preview a reversible CREATE VIEW or ALTER VIEW change. "
+                "Optimizer preparations are process-local previews; sandbox "
+                "preparations become restart-safe only with explicit raw-SQL state opt-in."
+            ),
+            annotations=ToolAnnotations(
+                title="Prepare View Change",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
+        async def prepare_view_change(
+            schema_name: str = Field(description="Target schema."),
+            view_name: str = Field(description="Target view."),
+            definition: str = Field(
+                description="Complete SELECT-shaped view body, without CREATE/ALTER VIEW."
+            ),
+            operation: str = Field(default="auto", description="auto, create, or alter"),
+            schema_bound: bool = Field(default=False),
+            indexed_view: bool = Field(default=False),
+            idempotency_key: str | None = Field(default=None),
+            database_name: str | None = Field(default=None),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "prepare_view_change",
+                database_name,
+                lambda db: self._prepare_view_change(
+                    db,
+                    schema_name,
+                    view_name,
+                    definition,
+                    operation,
+                    schema_bound,
+                    indexed_view,
+                    idempotency_key,
+                ),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Apply one durable prepared view change in the sandbox profile after "
+                "explicit review, raw-SQL state opt-in, and non-production policy approval."
+            ),
+            annotations=ToolAnnotations(
+                title="Apply Prepared View Change",
+                readOnlyHint=False,
+                destructiveHint=True,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )
+        async def apply_prepared_view_change(
+            change_id: str = Field(description="Prepared view change identifier."),
+            reviewed_intent: bool = Field(
+                description="Must be true to confirm this exact prepared definition."
+            ),
+            idempotency_key: str = Field(
+                description="Caller-stable key for this exact apply."
+            ),
+            database_name: str | None = Field(default=None),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "apply_prepared_view_change",
+                database_name,
+                lambda db: self._apply_prepared_view_change(
+                    db,
+                    change_id,
+                    reviewed_intent,
+                    idempotency_key,
+                ),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Verify that a prepared view change has the expected definition "
+                "and dependency set."
+            ),
+            annotations=ToolAnnotations(
+                title="Verify View Change",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
+        async def verify_view_change(
+            change_id: str = Field(description="Prepared view change identifier."),
+            database_name: str | None = Field(default=None),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "verify_view_change",
+                database_name,
+                lambda db: self._verify_view_change(db, change_id),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Restore the exact prior definition for a workflow-owned view change. "
+                "Rollback is fenced against unrelated current definitions."
+            ),
+            annotations=ToolAnnotations(
+                title="Rollback View Change",
+                readOnlyHint=False,
+                destructiveHint=True,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )
+        async def rollback_view_change(
+            change_id: str = Field(description="Prepared view change identifier."),
+            database_name: str | None = Field(default=None),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "rollback_view_change",
+                database_name,
+                lambda db: self._rollback_view_change(db, change_id),
             )
 
         @self.mcp.tool(
@@ -1157,6 +1507,13 @@ class AzureSqlMcpApplication:
                 default=None,
                 description="Explicit parameter values for the supplied queries.",
             ),
+            parameter_types: dict[str, str] | None = Field(
+                default=None,
+                description=(
+                    "Optional exact SQL types keyed by parameter name and shared "
+                    "across the supplied queries."
+                ),
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -1170,6 +1527,7 @@ class AzureSqlMcpApplication:
                     queries,
                     auto_bind_params,
                     parameter_values,
+                    parameter_types,
                 ),
             )
 
@@ -2834,19 +3192,74 @@ class AzureSqlMcpApplication:
         self,
         database_name: str,
         sql: str,
-        values: dict[str, Any] | Any,
-    ) -> str:
-        if not isinstance(values, dict):
-            values = dict(values)
-        binding = await self.param_binding.bind_parameters(
+        parameter_case: dict[str, Any] | Any,
+    ) -> ParameterExecutionContract:
+        case = (
+            parameter_case
+            if isinstance(parameter_case, dict)
+            else dict(parameter_case)
+        )
+        values = dict(case.get("values") or {})
+        types = dict(case.get("types") or {})
+        detected = {name.casefold() for name in detect_parameters(sql)}
+        value_names = {str(name).lstrip("@").casefold() for name in values}
+        type_names = {str(name).lstrip("@").casefold() for name in types}
+        if value_names != detected or type_names != detected:
+            raise ValueError(
+                "Every query parameter requires one explicit value and SQL type "
+                "in each benchmark case."
+            )
+        bucket = await self.param_binding.build_parameter_bucket(
             database_name,
             sql,
             parameter_values=values,
+            parameter_types=types,
+            bucket_id=str(case.get("name") or "default"),
+            label=str(case.get("name") or "default"),
+            provenance="explicit_performance_case",
         )
-        bound_sql = binding.get("bound_sql")
-        if not isinstance(bound_sql, str) or not bound_sql.strip():
-            raise ValueError("Parameter binding did not produce executable SQL.")
-        return bound_sql
+        return self.param_binding.build_execution_contract(
+            sql,
+            bucket,
+            provenance="typed_sp_executesql",
+        )
+
+    async def _check_database_capabilities(
+        self,
+        database_name: str,
+    ) -> dict[str, Any]:
+        checks, platform = await asyncio.gather(
+            self.capabilities.check(database_name),
+            self._optional_payload(
+                lambda: self.platform_capabilities.get_summary(database_name)
+            ),
+        )
+        policy = self.database_policy.policy_for(database_name)
+        return {
+            **checks,
+            "azure_sql_database": platform,
+            "mcp_contract": {
+                "contract_version": 1,
+                "performance_tuning": 1,
+                "durable_view_change": 1,
+                "prepared_plan_action": 1,
+            },
+            "local_tuning_policy": {
+                "configured": policy.configured,
+                "environment": policy.environment,
+                "allow_read": policy.allow_read,
+                "allow_benchmark": policy.allow_benchmark,
+                "allow_test_indexes": policy.allow_test_indexes,
+                "allow_view_apply": policy.allow_view_apply,
+                "allow_plan_apply": policy.allow_plan_apply,
+                "max_benchmark_executions": policy.max_benchmark_executions,
+                "max_tuning_candidates": policy.max_tuning_candidates,
+                "max_tuning_session_executions": (
+                    policy.max_tuning_session_executions
+                ),
+                "max_tuning_session_minutes": policy.max_tuning_session_minutes,
+            },
+        }
 
     async def _start_performance_case(
         self,
@@ -2873,7 +3286,15 @@ class AzureSqlMcpApplication:
         window_minutes: int,
         execute_query: bool,
         idempotency_key: str | None,
+        parameter_case: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        execution_contract: ParameterExecutionContract | None = None
+        if execute_query and parameter_case is not None:
+            execution_contract = await self._bind_performance_parameters(
+                database_name,
+                sql,
+                parameter_case,
+            )
         collectors: dict[str, Callable[[], Awaitable[Any]]] = {
             "resource_limits": lambda: self.resource_governance.get_resource_limits(
                 database_name
@@ -2883,11 +3304,10 @@ class AzureSqlMcpApplication:
                 window_minutes,
             ),
             "query_store_status": lambda: self.query_store.get_status(database_name),
-            "query_store_history": lambda: self.query_store.get_query_history_by_text(
+            "query_store_history": lambda: self._collect_query_store_evidence(
                 database_name,
                 sql,
-                window_minutes=window_minutes,
-                limit=20,
+                window_minutes,
             ),
             "waits": lambda: self.wait_stats.get_wait_stats(database_name, top_n=20),
             "blocking": lambda: self.lock_diagnostics.get_lock_details(
@@ -2916,8 +3336,114 @@ class AzureSqlMcpApplication:
             collectors,
             window_minutes=window_minutes,
             execute_query=execute_query,
+            execution_contract=execution_contract,
             idempotency_key=idempotency_key,
         )
+
+    async def _collect_query_store_evidence(
+        self,
+        database_name: str,
+        sql: str,
+        window_minutes: int,
+    ) -> dict[str, Any]:
+        identity = await self.query_store.resolve_query_identity(database_name, sql)
+        if identity.get("status") != "resolved":
+            return {
+                "available": False,
+                "complete": False,
+                "status": "inconclusive",
+                "reason": "exact Query Store identity was not uniquely resolved",
+                "identity": identity,
+                "fuzzy_match_used": False,
+            }
+        query_id = int(identity["query_id"])
+        history, parameter_buckets = await asyncio.gather(
+            self.query_store.get_query_history_by_id(
+                database_name,
+                query_id,
+                window_minutes=window_minutes,
+                limit=20,
+            ),
+            self.query_store.get_parameter_runtime_buckets(
+                database_name,
+                query_id=query_id,
+                window_minutes=window_minutes,
+                limit=50,
+            ),
+        )
+
+        def coverage(
+            result: Any,
+            rows_key: str,
+            limit: int,
+        ) -> dict[str, Any]:
+            rows = result.get(rows_key) if isinstance(result, Mapping) else None
+            row_count = len(rows) if isinstance(rows, list) else 0
+            available = row_count > 0 and (
+                not isinstance(result, Mapping) or result.get("available") is not False
+            )
+            complete = available and row_count < limit
+            if isinstance(result, Mapping):
+                complete = complete and result.get("complete") is not False
+                complete = complete and result.get("truncated") is not True
+            return {
+                "available": available,
+                "complete": complete,
+                "row_count": row_count,
+                "limit": limit,
+            }
+
+        history_coverage = coverage(history, "matches", 20)
+        bucket_coverage = coverage(parameter_buckets, "buckets", 50)
+        parameter_buckets_required = bool(detect_parameters(sql))
+        bucket_coverage["required"] = parameter_buckets_required
+        evidence_available = bool(
+            history_coverage["available"]
+            or (
+                parameter_buckets_required
+                and bucket_coverage["available"]
+            )
+        )
+        evidence_complete = bool(
+            history_coverage["complete"]
+            and (
+                not parameter_buckets_required
+                or bucket_coverage["complete"]
+            )
+        )
+        if evidence_complete:
+            status = "resolved"
+            reason = None
+        elif evidence_available:
+            status = "partial"
+            reason = (
+                "Query Store history or required parameter-bucket evidence is incomplete"
+            )
+        else:
+            status = "inconclusive"
+            reason = (
+                "Query Store history is empty"
+                if not parameter_buckets_required
+                else "Query Store history and parameter-bucket evidence are empty"
+            )
+        return {
+            "available": evidence_available,
+            "complete": evidence_complete,
+            "status": status,
+            "reason": reason,
+            "identity": {
+                "query_id": query_id,
+                "query_hash": identity.get("query_hash"),
+                "identity_kind": "query_id",
+            },
+            "history": history,
+            "parameter_buckets": parameter_buckets,
+            "coverage": {
+                "history": history_coverage,
+                "parameter_buckets": bucket_coverage,
+            },
+            "fuzzy_match_used": False,
+        }
 
     async def _get_performance_case(
         self,
@@ -2926,7 +3452,12 @@ class AzureSqlMcpApplication:
     ) -> dict[str, Any]:
         payload = self.performance_workflows.get_case(case_id)
         case = payload["case"]
-        if case.get("database_fingerprint") != database_fingerprint(database_name):
+        if not database_fingerprint_matches(
+            str(case.get("database_fingerprint") or ""),
+            database_name,
+            self.config.server,
+            allow_legacy=bool(self.config.legacy_state_server_binding),
+        ):
             raise PermissionError("Performance case belongs to another database.")
         return payload
 
@@ -2934,15 +3465,46 @@ class AzureSqlMcpApplication:
         self,
         database_name: str,
         case_id: str,
+        max_candidates: int,
+        execution_limit: int,
+        time_limit_minutes: int,
         idempotency_key: str | None,
     ) -> dict[str, Any]:
         case = self.performance_store.get_performance_case(case_id)
-        if case.database_fingerprint != database_fingerprint(database_name):
+        if not database_fingerprint_matches(
+            case.database_fingerprint or "",
+            database_name,
+            self.config.server,
+            allow_legacy=bool(self.config.legacy_state_server_binding),
+        ):
             raise PermissionError("Performance case belongs to another database.")
         return self.performance_workflows.start_session(
             case_id,
+            database_name,
+            max_candidates=max_candidates,
+            execution_limit=execution_limit,
+            time_limit_minutes=time_limit_minutes,
             idempotency_key=idempotency_key,
         )
+
+    async def _get_tuning_session(
+        self,
+        database_name: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        payload = self.performance_workflows.get_session(session_id)
+        session = payload["session"]
+        if not database_fingerprint_matches(
+            str(
+                session.get("metadata", {}).get("database_fingerprint")
+                or ""
+            ),
+            database_name,
+            self.config.server,
+            allow_legacy=bool(self.config.legacy_state_server_binding),
+        ):
+            raise PermissionError("Tuning session belongs to another database.")
+        return payload
 
     async def _add_tuning_candidate(
         self,
@@ -2955,7 +3517,12 @@ class AzureSqlMcpApplication:
     ) -> dict[str, Any]:
         session = self.tuning_sessions.get_session(session_id)
         case = self.performance_store.get_performance_case(session.performance_case_id)
-        if case.database_fingerprint != database_fingerprint(database_name):
+        if not database_fingerprint_matches(
+            case.database_fingerprint or "",
+            database_name,
+            self.config.server,
+            allow_legacy=bool(self.config.legacy_state_server_binding),
+        ):
             raise PermissionError("Tuning session belongs to another database.")
         return self.performance_workflows.add_candidate(
             session_id,
@@ -2975,7 +3542,12 @@ class AzureSqlMcpApplication:
     ) -> dict[str, Any]:
         session = self.tuning_sessions.get_session(session_id)
         case = self.performance_store.get_performance_case(session.performance_case_id)
-        if case.database_fingerprint != database_fingerprint(database_name):
+        if not database_fingerprint_matches(
+            case.database_fingerprint or "",
+            database_name,
+            self.config.server,
+            allow_legacy=bool(self.config.legacy_state_server_binding),
+        ):
             raise PermissionError("Tuning session belongs to another database.")
         return self.performance_workflows.finalize_session(
             session_id,
@@ -2992,6 +3564,685 @@ class AzureSqlMcpApplication:
     ) -> dict[str, Any]:
         return compare_plan_summaries_payload(baseline_summary, candidate_summary)
 
+    async def _prepare_view_change(
+        self,
+        database_name: str,
+        schema_name: str,
+        view_name: str,
+        definition: str,
+        operation: str,
+        schema_bound: bool,
+        indexed_view: bool,
+        idempotency_key: str | None,
+    ) -> dict[str, Any]:
+        request = ViewChangeRequest(
+            database_name=database_name,
+            schema_name=schema_name,
+            view_name=view_name,
+            definition=definition,
+            operation=operation,
+            idempotency_key=idempotency_key,
+            indexed_view=indexed_view,
+            schema_bound=schema_bound,
+        )
+        schema_name = request.schema_name
+        view_name = request.view_name
+        intent: dict[str, Any] | None = None
+        durable = (
+            self.config.profile == McpProfile.SANDBOX
+            and self.config.persist_view_sql_state
+            and self.config.performance_state_dir != ":memory:"
+        )
+        if durable:
+            if not idempotency_key or not idempotency_key.strip():
+                raise ValueError(
+                    "Durable sandbox view preparation requires an idempotency key."
+                )
+            normalized_idempotency_key = _view_idempotency_identity(idempotency_key)
+            assert normalized_idempotency_key is not None
+            request = replace(
+                request,
+                idempotency_key=normalized_idempotency_key,
+            )
+            database_fp = database_fingerprint(database_name, self.config.server)
+            intent = self.performance_store.get_idempotent_view_change_intent(
+                database_fingerprint=database_fp,
+                idempotency_key=normalized_idempotency_key,
+            )
+            if intent is not None:
+                prepared = prepared_view_change_from_state(intent["payload"])
+                if _view_change_request_fingerprint(database_fp, prepared.request) != (
+                    _view_change_request_fingerprint(database_fp, request)
+                ):
+                    raise IdempotencyConflictError(
+                        "View idempotency key was reused for a different request."
+                    )
+                change_id = str(intent["change_id"])
+            else:
+                prepared = await self.view_workflows.prepare_view_change(request)
+                change_id = "view-" + fingerprint_json(
+                    {
+                        "database": database_fp,
+                        "schema": schema_name,
+                        "view": view_name,
+                        "operation": prepared.operation,
+                        "target": prepared.target_fingerprint,
+                        "prior": prepared.prior.definition_fingerprint,
+                        "idempotency_key": normalized_idempotency_key,
+                    }
+                )[:32]
+                state = prepared_view_change_state(prepared)
+                intent = self.performance_store.create_view_change_intent(
+                    change_id=change_id,
+                    database_fingerprint=database_fp,
+                    request_fingerprint=fingerprint_json(state),
+                    payload=state,
+                    raw_sql_persistence_authorized=True,
+                )
+                prepared = prepared_view_change_from_state(intent["payload"])
+        else:
+            prepared = await self.view_workflows.prepare_view_change(request)
+            change_id = "view-" + fingerprint_json(
+                {
+                    "database": database_fingerprint(
+                        database_name,
+                        self.config.server,
+                    ),
+                    "schema": schema_name,
+                    "view": view_name,
+                    "operation": prepared.operation,
+                    "target": prepared.target_fingerprint,
+                    "prior": prepared.prior.definition_fingerprint,
+                    "idempotency_key": idempotency_key,
+                }
+            )[:32]
+        existing = self._prepared_view_changes.get(change_id)
+        if existing is not None and (
+            existing.target_fingerprint != prepared.target_fingerprint
+            or existing.prior.definition_fingerprint
+            != prepared.prior.definition_fingerprint
+        ):
+            raise ValueError("Prepared view change identifier conflict.")
+        self._prepared_view_changes[change_id] = prepared
+        preview = await self.view_workflows.preview_view_change(prepared)
+        return {
+            "change_id": change_id,
+            "process_local": not durable,
+            "durable": durable,
+            "restart_requires_reprepare": not durable,
+            "raw_view_sql_persisted": durable,
+            "intent_status": intent["status"] if intent is not None else None,
+            **preview,
+        }
+
+    def _prepared_view_change(
+        self,
+        database_name: str,
+        change_id: str,
+    ) -> PreparedViewChange:
+        if self.config.persist_view_sql_state:
+            try:
+                prepared, _intent = self._durable_view_change(
+                    database_name,
+                    change_id,
+                )
+            except ContractNotFoundError:
+                pass
+            else:
+                return prepared
+        prepared = self._prepared_view_changes.get(change_id)
+        if prepared is None:
+            raise ValueError(
+                "Unknown view change; prepare it in this MCP process."
+            )
+        if prepared.request.database_name.casefold() != database_name.casefold():
+            raise PermissionError("Prepared view change belongs to another database.")
+        return prepared
+
+    def _durable_view_change(
+        self,
+        database_name: str,
+        change_id: str,
+    ) -> tuple[PreparedViewChange, dict[str, Any]]:
+        intent = self.performance_store.get_view_change_intent(change_id)
+        if not database_fingerprint_matches(
+            str(intent["database_fingerprint"]),
+            database_name,
+            self.config.server,
+            allow_legacy=bool(self.config.legacy_state_server_binding),
+        ):
+            raise PermissionError("Prepared view change belongs to another database.")
+        if fingerprint_json(intent["payload"]) != intent["request_fingerprint"]:
+            raise ValueError("Durable view change payload fingerprint does not match.")
+        prepared = prepared_view_change_from_state(intent["payload"])
+        if prepared.request.database_name.casefold() != database_name.casefold():
+            raise PermissionError("Prepared view change belongs to another database.")
+        self._prepared_view_changes[change_id] = prepared
+        return prepared, intent
+
+    def _require_durable_view_change(
+        self,
+        database_name: str,
+        change_id: str,
+    ) -> tuple[PreparedViewChange, dict[str, Any]]:
+        if (
+            not self.config.persist_view_sql_state
+            or self.config.performance_state_dir == ":memory:"
+        ):
+            raise PermissionError(
+                "View apply and rollback require "
+                "AZURE_SQL_PERSIST_VIEW_SQL_STATE=true so exact rollback survives restart."
+            )
+        return self._durable_view_change(database_name, change_id)
+
+    async def _reconcile_durable_view_change(
+        self,
+        change_id: str,
+        prepared: PreparedViewChange,
+        intent: dict[str, Any],
+    ) -> dict[str, Any]:
+        verification = await self.view_workflows.verify_view_change(prepared)
+        if intent.get("receipt") is None:
+            if getattr(prepared, "operation", None) == "noop":
+                prior_restored, current = await self.view_workflows.prior_state_restored(
+                    prepared
+                )
+                if prior_restored:
+                    updated = self.performance_store.update_view_change_intent(
+                        change_id,
+                        status="already_applied",
+                        expected_version=int(intent["version"]),
+                        raw_sql_persistence_authorized=True,
+                    )
+                    return {
+                        "change_id": change_id,
+                        "status": "already_applied",
+                        "intent_status": updated["status"],
+                        "workflow_applied": False,
+                        "prior_state_restored": True,
+                        "current": current.as_dict(),
+                        "verification": verification.as_dict(),
+                        "reason": (
+                            "the unchanged prior snapshot proves this interrupted "
+                            "no-op performed no mutation"
+                        ),
+                    }
+            if verification.verified and verification.workflow_commit_proven:
+                receipt = view_apply_receipt(verification.actual)
+                self.view_workflows.register_apply_receipt(
+                    prepared,
+                    verification.actual,
+                )
+                updated = self.performance_store.update_view_change_intent(
+                    change_id,
+                    status="applied",
+                    expected_version=int(intent["version"]),
+                    raw_sql_persistence_authorized=True,
+                    receipt=receipt,
+                )
+                return {
+                    "change_id": change_id,
+                    "status": "reconciled_applied",
+                    "intent_status": updated["status"],
+                    "workflow_applied": True,
+                    "verification": verification.as_dict(),
+                    "reason": (
+                        "the exact workflow marker and target state prove that "
+                        "the interrupted view change committed"
+                    ),
+                }
+            updated = self.performance_store.update_view_change_intent(
+                change_id,
+                status="hold",
+                expected_version=int(intent["version"]),
+                raw_sql_persistence_authorized=True,
+            )
+            return {
+                "change_id": change_id,
+                "status": "hold",
+                "intent_status": updated["status"],
+                "workflow_applied": False,
+                "verification": verification.as_dict(),
+                "reason": (
+                    "the target definition may have been applied externally, but "
+                    "there is no durable dispatch/commit receipt for this workflow; "
+                    "rollback ownership was not adopted"
+                ),
+            }
+        if verification.verified:
+            receipt_snapshot = view_snapshot_from_receipt(intent["receipt"])
+            self.view_workflows.register_apply_receipt(prepared, receipt_snapshot)
+            updated = self.performance_store.update_view_change_intent(
+                change_id,
+                status="applied",
+                expected_version=int(intent["version"]),
+                raw_sql_persistence_authorized=True,
+            )
+            return {
+                "change_id": change_id,
+                "status": "reconciled_applied",
+                "intent_status": updated["status"],
+                "workflow_applied": True,
+                "verification": verification.as_dict(),
+            }
+        prior_restored, current = await self.view_workflows.prior_state_restored(
+            prepared
+        )
+        updated = self.performance_store.update_view_change_intent(
+            change_id,
+            status="hold",
+            expected_version=int(intent["version"]),
+            raw_sql_persistence_authorized=True,
+        )
+        return {
+            "change_id": change_id,
+            "status": "hold",
+            "intent_status": updated["status"],
+            "workflow_applied": intent.get("receipt") is not None,
+            "prior_state_restored": prior_restored,
+            "current": current.as_dict(),
+            "verification": verification.as_dict(),
+            "reason": (
+                "interrupted view apply is not at the prepared target; "
+                "the DDL was not replayed"
+            ),
+        }
+
+    async def _apply_prepared_view_change(
+        self,
+        database_name: str,
+        change_id: str,
+        reviewed_intent: bool,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        if self.config.profile != McpProfile.SANDBOX:
+            raise PermissionError("View apply requires the sandbox MCP profile.")
+        if not reviewed_intent:
+            raise PermissionError("reviewed_intent must be true for view apply.")
+        prepared, intent = self._require_durable_view_change(
+            database_name,
+            change_id,
+        )
+        if intent["status"] in {"applying", "hold"}:
+            return await self._reconcile_durable_view_change(
+                change_id,
+                prepared,
+                intent,
+            )
+        if intent["status"] == "applied":
+            receipt = intent.get("receipt")
+            if receipt is None:
+                raise ValueError("Durable applied view intent has no receipt.")
+            self.view_workflows.register_apply_receipt(
+                prepared,
+                view_snapshot_from_receipt(receipt),
+            )
+            verification = await self.view_workflows.verify_view_change(prepared)
+            if not verification.verified:
+                intent = self.performance_store.update_view_change_intent(
+                    change_id,
+                    status="hold",
+                    expected_version=int(intent["version"]),
+                    raw_sql_persistence_authorized=True,
+                )
+                return {
+                    "change_id": change_id,
+                    "status": "hold",
+                    "intent_status": intent["status"],
+                    "workflow_applied": True,
+                    "verification": verification.as_dict(),
+                    "reason": (
+                        "the workflow-owned view no longer verifies; "
+                        "the durable rollback receipt was retained"
+                    ),
+                }
+            return {
+                "change_id": change_id,
+                "status": "already_applied",
+                "intent_status": "applied",
+                "workflow_applied": True,
+                "verification": verification.as_dict(),
+            }
+        if intent["status"] == "already_applied":
+            verification = await self.view_workflows.verify_view_change(prepared)
+            if not verification.verified:
+                intent = self.performance_store.update_view_change_intent(
+                    change_id,
+                    status="hold",
+                    expected_version=int(intent["version"]),
+                    raw_sql_persistence_authorized=True,
+                )
+                return {
+                    "change_id": change_id,
+                    "status": "hold",
+                    "intent_status": intent["status"],
+                    "workflow_applied": False,
+                    "verification": verification.as_dict(),
+                    "reason": "the externally applied view no longer verifies",
+                }
+            return {
+                "change_id": change_id,
+                "status": "already_applied",
+                "intent_status": "already_applied",
+                "workflow_applied": False,
+                "verification": verification.as_dict(),
+            }
+        if intent["status"] == "rolled_back":
+            raise ValueError("Rolled-back view intent cannot be applied again.")
+        if intent["status"] != "prepared":
+            raise ValueError(f"View intent is not applyable from {intent['status']!r}.")
+        normalized_idempotency_key = _view_idempotency_identity(idempotency_key)
+        existing_key = prepared.request.idempotency_key
+        if existing_key and existing_key != normalized_idempotency_key:
+            raise ValueError(
+                "Apply idempotency key does not match the prepared change."
+            )
+        prepared = replace(
+            prepared,
+            request=replace(
+                prepared.request,
+                reviewed_intent=True,
+                idempotency_key=normalized_idempotency_key,
+            ),
+        )
+        self._prepared_view_changes[change_id] = prepared
+        intent = self.performance_store.update_view_change_intent(
+            change_id,
+            status="applying",
+            expected_version=int(intent["version"]),
+            raw_sql_persistence_authorized=True,
+        )
+        result = await self.view_workflows.apply_prepared_view_change(prepared)
+        verification = await self.view_workflows.verify_view_change(prepared)
+        workflow_applied = result.get("workflow_applied") is True
+        if workflow_applied:
+            receipt_payload = result.get("apply_receipt")
+            receipt_snapshot = view_snapshot_from_receipt(receipt_payload)
+            self.view_workflows.register_apply_receipt(
+                prepared,
+                receipt_snapshot,
+            )
+            receipt = view_apply_receipt(receipt_snapshot)
+            status = "applied" if verification.verified else "hold"
+        else:
+            receipt = None
+            status = "already_applied" if verification.verified else "hold"
+        intent = self.performance_store.update_view_change_intent(
+            change_id,
+            status=status,
+            expected_version=int(intent["version"]),
+            raw_sql_persistence_authorized=True,
+            receipt=receipt,
+        )
+        response = {
+            "change_id": change_id,
+            "intent_status": intent["status"],
+            **result,
+        }
+        if status == "hold":
+            response.update(
+                {
+                    "status": "hold",
+                    "verification": verification.as_dict(),
+                    "reason": (
+                        "post-apply verification failed; durable ownership and "
+                        "the exact rollback receipt were retained"
+                        if workflow_applied
+                        else "the target could not be verified"
+                    ),
+                }
+            )
+        return response
+
+    async def _verify_view_change(
+        self,
+        database_name: str,
+        change_id: str,
+    ) -> dict[str, Any]:
+        prepared = self._prepared_view_change(database_name, change_id)
+        try:
+            durable_prepared, intent = self._durable_view_change(
+                database_name,
+                change_id,
+            )
+        except ContractNotFoundError:
+            intent = None
+        else:
+            prepared = durable_prepared
+            if intent["status"] in {"applying", "hold"}:
+                return await self._reconcile_durable_view_change(
+                    change_id,
+                    prepared,
+                    intent,
+                )
+            if intent["status"] == "applied" and intent.get("receipt") is not None:
+                self.view_workflows.register_apply_receipt(
+                    prepared,
+                    view_snapshot_from_receipt(intent["receipt"]),
+                )
+        verification = await self.view_workflows.verify_view_change(prepared)
+        return {
+            "change_id": change_id,
+            "intent_status": intent["status"] if intent is not None else None,
+            **verification.as_dict(),
+        }
+
+    async def _rollback_view_change(
+        self,
+        database_name: str,
+        change_id: str,
+    ) -> dict[str, Any]:
+        if self.config.profile != McpProfile.SANDBOX:
+            raise PermissionError("View rollback requires the sandbox MCP profile.")
+        prepared, intent = self._require_durable_view_change(
+            database_name,
+            change_id,
+        )
+        if not prepared.request.idempotency_key:
+            raise ValueError("Apply the reviewed view change before rollback.")
+        if intent["status"] == "rolled_back":
+            restored, current = await self.view_workflows.prior_state_restored(prepared)
+            if not restored:
+                raise ValueError("Rolled-back view intent no longer matches prior state.")
+            return {
+                "change_id": change_id,
+                "status": "already_rolled_back",
+                "intent_status": "rolled_back",
+                "snapshot": current.as_dict(),
+            }
+        if intent["status"] == "applying" or (
+            intent["status"] == "hold" and intent.get("receipt") is None
+        ):
+            reconciliation = await self._reconcile_durable_view_change(
+                change_id,
+                prepared,
+                intent,
+            )
+            if reconciliation["intent_status"] != "applied":
+                raise ValueError(
+                    "Interrupted view apply is not at the prepared target; rollback is held."
+                )
+            prepared, intent = self._durable_view_change(database_name, change_id)
+        if intent["status"] not in {"applied", "hold"}:
+            raise ValueError(
+                "Only a workflow-applied durable view intent can be rolled back."
+            )
+        receipt = intent.get("receipt")
+        if receipt is None:
+            raise ValueError("Durable applied view intent has no receipt.")
+        self.view_workflows.register_apply_receipt(
+            prepared,
+            view_snapshot_from_receipt(receipt),
+        )
+        restored, current = await self.view_workflows.prior_state_restored(prepared)
+        if restored:
+            updated = self.performance_store.update_view_change_intent(
+                change_id,
+                status="rolled_back",
+                expected_version=int(intent["version"]),
+                raw_sql_persistence_authorized=True,
+            )
+            return {
+                "change_id": change_id,
+                "status": "already_rolled_back",
+                "intent_status": updated["status"],
+                "snapshot": current.as_dict(),
+            }
+        result = await self.view_workflows.rollback_view_change(prepared)
+        updated = self.performance_store.update_view_change_intent(
+            change_id,
+            status="rolled_back",
+            expected_version=int(intent["version"]),
+            raw_sql_persistence_authorized=True,
+        )
+        return {
+            "change_id": change_id,
+            "intent_status": updated["status"],
+            **result,
+        }
+
+    def _recover_index_benchmark_result(
+        self,
+        *,
+        session_id: str,
+        candidate_id: str,
+        phase: str,
+        runs: int,
+        parameter_case_count: int,
+        reservation: Mapping[str, Any],
+        reservation_owner: str,
+        request_fingerprint: str,
+        evidence_operation_key: str,
+        benchmark_operation_key: str,
+        index_ddl: str,
+        rollback_ddl: str,
+        index_definition_fingerprint: str,
+    ) -> dict[str, Any]:
+        """Finish committed index evidence without repeating DDL or query work."""
+
+        evidence = self.performance_store.get_idempotent_evidence(
+            evidence_operation_key,
+            request_fingerprint=request_fingerprint,
+        )
+        if evidence is None:
+            finalized = reservation["status"] != "reserved"
+            return {
+                "session_id": session_id,
+                "candidate_id": candidate_id,
+                "classification": "inconclusive",
+                "reason": (
+                    "This idempotent index benchmark has a durable reservation "
+                    "but no committed result. Reconcile its lease; no DDL or query "
+                    "was rerun."
+                ),
+                "failure_code": (
+                    "index_benchmark_request_already_finalized"
+                    if finalized
+                    else "index_benchmark_request_reconciliation_required"
+                ),
+                "executions": 0,
+                "execution_reservation_id": reservation["reservation_id"],
+                "reservation_status": reservation["status"],
+                "session_continues": True,
+            }
+
+        metadata = dict(evidence.metadata)
+        if (
+            metadata.get("session_id") != session_id
+            or metadata.get("candidate_id") != candidate_id
+            or metadata.get("phase") != phase
+            or metadata.get("execution_reservation_id")
+            != reservation["reservation_id"]
+        ):
+            raise RuntimeError(
+                "Committed index evidence does not match its execution reservation."
+            )
+        metrics = dict(evidence.metrics)
+        state = str(metrics.get("classification") or "")
+        if not state:
+            raise RuntimeError("Committed index evidence has no classification.")
+        measured_executions = int(evidence.observed_execution_count)
+        if phase == "screening" and state == "improved":
+            _session, updated = self.tuning_sessions.record_candidate_result(
+                session_id,
+                candidate_id,
+                state="screening",
+                screen_runs=runs,
+                parameter_cases=parameter_case_count,
+                executions=measured_executions,
+                evidence_ids=(evidence.evidence_id,),
+                idempotency_key=benchmark_operation_key,
+            )
+            durable_state = updated.state
+        else:
+            _session, updated = self.tuning_sessions.record_candidate_result(
+                session_id,
+                candidate_id,
+                state=state,
+                screen_runs=runs if phase == "screening" else 0,
+                finalist_runs=runs if phase == "finalist" else 0,
+                parameter_cases=parameter_case_count,
+                executions=measured_executions,
+                evidence_ids=(evidence.evidence_id,),
+                failure_code=(
+                    state
+                    if state
+                    in {"inconclusive", "cleanup_required", "equivalence_failed"}
+                    else None
+                ),
+                idempotency_key=benchmark_operation_key,
+            )
+            durable_state = updated.state
+
+        reservation_status = str(reservation["status"])
+        if reservation_status == "reserved":
+            reservation_update = (
+                self.performance_store.complete_execution_attempts
+                if measured_executions
+                else self.performance_store.release_execution_attempts
+            )
+            finalized_reservation = reservation_update(
+                str(reservation["reservation_id"]),
+                dispatched_attempt_count=measured_executions,
+                owner_reference=reservation_owner,
+                expected_version=int(reservation["version"]),
+            )
+            reservation_status = str(finalized_reservation["status"])
+
+        lease_id = metadata.get("lease_id")
+        if not isinstance(lease_id, str) or not lease_id:
+            raise RuntimeError("Committed index evidence has no lease identity.")
+        lease = self.performance_store.get_index_lease(lease_id)
+        public_lease = self._public_index_lease(lease)
+        parameter_results = metrics.get("parameter_results")
+        result_rows = parameter_results if isinstance(parameter_results, list) else []
+        equivalence = metadata.get("equivalence")
+        return {
+            "session_id": session_id,
+            "candidate_id": candidate_id,
+            "classification": state,
+            "objective": metrics.get("objective"),
+            "durable_state": durable_state,
+            "reason": metadata.get("reason")
+            or "Recovered committed index evidence without rerunning work.",
+            "phase": phase,
+            "executions": measured_executions,
+            "metrics": result_rows[0] if result_rows else {},
+            "parameter_results": result_rows,
+            "equivalence": equivalence if isinstance(equivalence, list) else [],
+            "lease": public_lease,
+            "index_definition_fingerprint": metadata.get(
+                "index_definition_fingerprint",
+                index_definition_fingerprint,
+            ),
+            "index_ddl": index_ddl,
+            "rollback_ddl": rollback_ddl,
+            "execution_reservation_id": reservation["reservation_id"],
+            "reservation_status": reservation_status,
+            "recovered_from_durable_evidence": True,
+            "session_continues": True,
+        }
+
     async def _benchmark_index_candidate(
         self,
         database_name: str,
@@ -3002,8 +4253,11 @@ class AzureSqlMcpApplication:
         table_name: str,
         key_columns: list[str],
         include_columns: list[str] | None,
+        filter_definition: str | None,
+        is_unique: bool,
         phase: str,
         online: bool,
+        compare_order: bool,
         lease_minutes: int,
         idempotency_key: str | None,
         parameter_cases: list[dict[str, Any]] | None = None,
@@ -3015,28 +4269,50 @@ class AzureSqlMcpApplication:
             raise PermissionError("Temporary indexes are prohibited in production policy entries.")
         if not policy.allow_test_indexes:
             raise PermissionError("Database policy does not permit temporary indexes.")
+        cleanup = await self._cleanup_expired_index_leases()
+        if cleanup["cleanup_required"]:
+            return {
+                "session_id": session_id,
+                "candidate_id": candidate_id,
+                "classification": "cleanup_required",
+                "reason": (
+                    "Expired temporary-index cleanup is unresolved; no new DDL "
+                    "or benchmark query was dispatched."
+                ),
+                "failure_code": "expired_index_cleanup_required",
+                "executions": 0,
+                "cleanup": cleanup,
+                "session_continues": False,
+            }
         if phase not in {"screening", "finalist"}:
             raise ValueError("phase must be screening or finalist.")
-        normalized_sql = self.validator.validate_read_only(sql).normalized_sql
+        normalized_sql = self.validator.validate_read_only(sql).execution_sql
         session = self.tuning_sessions.get_session(session_id)
         candidate = self.tuning_sessions.get_candidate(candidate_id)
         case = self.performance_store.get_performance_case(session.performance_case_id)
         if candidate.session_id != session_id:
             raise ValueError("Candidate does not belong to the tuning session.")
-        if candidate.is_terminal:
-            raise ValueError("Index candidate already has a terminal benchmark result.")
-        if candidate.rewrite_fingerprint != self._sql_fingerprint(normalized_sql):
+        if not fingerprint_text_matches(
+            candidate.rewrite_fingerprint,
+            normalized_sql,
+            allow_legacy=bool(self.config.legacy_state_server_binding),
+        ):
             raise ValueError("Index candidate SQL fingerprint does not match.")
-        if case.query_fingerprint != self._sql_fingerprint(normalized_sql):
+        if not fingerprint_text_matches(
+            case.query_fingerprint,
+            normalized_sql,
+            allow_legacy=bool(self.config.legacy_state_server_binding),
+        ):
             raise ValueError("Index benchmark SQL does not match the performance case.")
-        if case.database_fingerprint != database_fingerprint(database_name):
+        if not database_fingerprint_matches(
+            case.database_fingerprint or "",
+            database_name,
+            self.config.server,
+            allow_legacy=bool(self.config.legacy_state_server_binding),
+        ):
             raise PermissionError("Tuning session belongs to another database.")
         if not key_columns:
             raise ValueError("key_columns must contain at least one column.")
-        if phase == "screening" and candidate.screen_runs:
-            raise ValueError("Index candidate screening has already been measured.")
-        if phase == "finalist" and candidate.finalist_runs:
-            raise ValueError("Index candidate finalist validation has already been measured.")
 
         cases = self.performance_workflows._normalize_parameter_cases(parameter_cases)
         if len(cases) > session.parameter_case_limit:
@@ -3044,18 +4320,137 @@ class AzureSqlMcpApplication:
                 f"parameter_cases exceeds the session limit of {session.parameter_case_limit}."
             )
         supplied_case_fingerprints = tuple(
-            fingerprint_json(parameter_case["values"])
-            for parameter_case in cases
+            parameter_case_fingerprint(parameter_case) for parameter_case in cases
         )
-        if supplied_case_fingerprints != case.parameter_case_fingerprints:
-            raise ValueError(
-                "Index benchmark parameter cases do not match the performance case."
+        registered_case_fingerprints = set(case.parameter_case_fingerprints)
+        if (
+            len(set(supplied_case_fingerprints)) != len(supplied_case_fingerprints)
+            or any(
+                fingerprint not in registered_case_fingerprints
+                for fingerprint in supplied_case_fingerprints
             )
+        ):
+            raise ValueError(
+                "Index benchmark parameter cases must be an unchanged subset "
+                "of the performance case."
+            )
+        if phase == "finalist" and set(supplied_case_fingerprints) != (
+            registered_case_fingerprints
+        ):
+            raise ValueError(
+                "Finalist index validation must cover every registered parameter case."
+            )
+        runs = (
+            session.screen_runs_per_candidate
+            if phase == "screening"
+            else session.finalist_runs_per_candidate
+        )
+        requested_executions = len(cases) * runs * 3
+        if not policy.can_benchmark(requested_executions):
+            raise PermissionError("Database policy does not permit this benchmark count.")
+        if not idempotency_key or not idempotency_key.strip():
+            raise ValueError("Index benchmarking requires an idempotency key.")
+        owner_fingerprint = fingerprint_json(
+            {
+                "session_id": session_id,
+                "candidate_id": candidate_id,
+                "phase": phase,
+                "idempotency_key": idempotency_key,
+            }
+        )
+        execution_owner = f"index-execution-{owner_fingerprint[:32]}"
+        index_operation_key = fingerprint_json(
+            {"operation": "index-benchmark-result-key", "key": idempotency_key}
+        )
+        index_evidence_key = fingerprint_json(
+            {"operation": "index-benchmark-evidence-key", "key": idempotency_key}
+        )
+        create_operation_key = fingerprint_json(
+            {"operation": "index-benchmark-create-key", "key": idempotency_key}
+        )
+        cleanup_operation_key = fingerprint_json(
+            {"operation": "index-benchmark-cleanup-key", "key": idempotency_key}
+        )
+
+        schema = self._validate_plain_identifier(schema_name, "schema_name")
+        table = self._validate_plain_identifier(table_name, "table_name")
+
+        request_fingerprint = fingerprint_json(
+            {
+                "operation": "index-benchmark-v2",
+                "session_id": session_id,
+                "candidate_id": candidate_id,
+                "database_name": database_name,
+                "sql": normalized_sql,
+                "schema": schema,
+                "table": table,
+                "key_columns": list(key_columns),
+                "include_columns": list(include_columns or ()),
+                "filter_definition": filter_definition,
+                "is_unique": is_unique,
+                "phase": phase,
+                "parameter_cases": supplied_case_fingerprints,
+                "runs": runs,
+                "online": online,
+                "compare_order": compare_order,
+                "lease_minutes": lease_minutes,
+            }
+        )
+        self.performance_store.bind_index_benchmark_request(
+            session_id,
+            candidate_id,
+            phase,
+            request_fingerprint,
+            idempotency_key=idempotency_key,
+        )
+        existing_reservation = (
+            self.performance_store.get_idempotent_execution_reservation(
+                session_id,
+                candidate_id,
+                request_fingerprint,
+                idempotency_key=idempotency_key,
+                owner_reference=execution_owner,
+            )
+        )
+        if existing_reservation is None and candidate.is_terminal:
+            if candidate.executions == 0:
+                return {
+                    "session_id": session_id,
+                    "candidate_id": candidate_id,
+                    "classification": candidate.state,
+                    "durable_state": candidate.state,
+                    "reason": (
+                        "Replayed the durable zero-execution candidate result; "
+                        "no catalog lookup, DDL, or benchmark query was dispatched."
+                    ),
+                    "executions": 0,
+                    "session_continues": candidate.state != "cleanup_required",
+                    "replayed_zero_execution_result": True,
+                }
+            raise ValueError("Index candidate already has a terminal benchmark result.")
+        if (
+            existing_reservation is None
+            and not candidate.is_terminal
+            and phase == "screening"
+            and candidate.screen_runs
+        ):
+            raise ValueError("Index candidate screening has already been measured.")
+        if (
+            existing_reservation is None
+            and not candidate.is_terminal
+            and phase == "finalist"
+            and candidate.finalist_runs
+        ):
+            raise ValueError("Index candidate finalist validation has already been measured.")
+
         bound_cases = [
             {
                 "name": parameter_case["name"],
-                "values_fingerprint": fingerprint_json(parameter_case["values"]),
-                "sql": await self.performance_workflows._bind_case(
+                "parameter_case_fingerprint": parameter_case_fingerprint(
+                    parameter_case
+                ),
+                "weight": parameter_case["weight"],
+                "execution_contract": await self.performance_workflows._bind_case(
                     database_name,
                     normalized_sql,
                     parameter_case,
@@ -3063,118 +4458,376 @@ class AzureSqlMcpApplication:
             }
             for parameter_case in cases
         ]
-
-        runs = (
-            session.screen_runs_per_candidate
-            if phase == "screening"
-            else session.finalist_runs_per_candidate
+        schema, table = await self._resolve_canonical_table_identity(
+            database_name,
+            schema,
+            table,
         )
-        requested_executions = len(cases) * (runs * 2 + 2)
-        if not policy.can_benchmark(requested_executions):
-            raise PermissionError("Database policy does not permit this benchmark count.")
-        already_executed = sum(
-            item.executions for item in self.tuning_sessions.list_candidates(session_id)
+        provisional_index = IndexCandidate(
+            schema=schema,
+            table=table,
+            key_columns=tuple(key_columns),
+            include_columns=tuple(include_columns or ()),
+            filter_definition=filter_definition,
+            is_unique=is_unique,
         )
-        if already_executed + requested_executions > session.execution_limit:
-            raise ValueError("The tuning session execution budget would be exceeded.")
-        if phase == "screening":
-            self.tuning_sessions.start_screening(session_id)
-        else:
-            self.tuning_sessions.mark_candidate_finalist(session_id, candidate_id)
+        index_name = f"{TEST_INDEX_PREFIX}{provisional_index.definition_fingerprint[:16]}"
+        index_candidate = replace(provisional_index, index_name=index_name)
+        object_fingerprint = index_candidate.definition_fingerprint
+        index_ddl = build_index_candidate_statement(index_candidate, online=online)
+        rollback_ddl = f"DROP INDEX [{index_name}] ON [{schema}].[{table}];"
+        if existing_reservation is not None:
+            return self._recover_index_benchmark_result(
+                session_id=session_id,
+                candidate_id=candidate_id,
+                phase=phase,
+                runs=runs,
+                parameter_case_count=len(cases),
+                reservation=existing_reservation,
+                reservation_owner=execution_owner,
+                request_fingerprint=request_fingerprint,
+                evidence_operation_key=index_evidence_key,
+                benchmark_operation_key=index_operation_key,
+                index_ddl=index_ddl,
+                rollback_ddl=rollback_ddl,
+                index_definition_fingerprint=object_fingerprint,
+            )
 
-        schema = self._validate_plain_identifier(schema_name, "schema_name")
-        table = self._validate_plain_identifier(table_name, "table_name")
-        object_fingerprint = fingerprint_json(
-            {
-                "schema": schema.casefold(),
-                "table": table.casefold(),
-                "key_columns": key_columns,
-                "include_columns": include_columns or [],
+        existing_indexes = await collect_existing_indexes(self.executor, database_name)
+        name_conflict = next(
+            (
+                existing
+                for existing in existing_indexes
+                if existing.schema == schema
+                and existing.table == table
+                and existing.name == index_name
+            ),
+            None,
+        )
+        if name_conflict is not None:
+            if not candidate.is_terminal:
+                if phase == "screening":
+                    self.tuning_sessions.start_screening(session_id)
+                else:
+                    self.tuning_sessions.mark_candidate_finalist(
+                        session_id,
+                        candidate_id,
+                    )
+            _session, updated = self.tuning_sessions.record_candidate_result(
+                session_id,
+                candidate_id,
+                state="inconclusive",
+                parameter_cases=len(cases),
+                executions=0,
+                failure_code="name_conflict",
+                idempotency_key=index_operation_key,
+            )
+            return {
+                "session_id": session_id,
+                "candidate_id": candidate_id,
+                "classification": "inconclusive",
+                "durable_state": updated.state,
+                "reason": (
+                    "The generated temporary index name already exists with an "
+                    "unowned observed definition."
+                ),
+                "failure_code": "name_conflict",
+                "existing_index": name_conflict.as_dict(),
+                "executions": 0,
+                "index_ddl": index_ddl,
+                "rollback_ddl": rollback_ddl,
+                "session_continues": True,
             }
+        covering_indexes = [
+            existing
+            for existing in existing_indexes
+            if existing_index_covers_candidate(
+                existing,
+                schema=schema,
+                table=table,
+                key_columns=key_columns,
+                include_columns=include_columns or (),
+                filter_definition=filter_definition,
+                is_unique=is_unique,
+            )
+        ]
+        if covering_indexes:
+            if not candidate.is_terminal:
+                if phase == "screening":
+                    self.tuning_sessions.start_screening(session_id)
+                else:
+                    self.tuning_sessions.mark_candidate_finalist(
+                        session_id,
+                        candidate_id,
+                    )
+            _session, updated = self.tuning_sessions.record_candidate_result(
+                session_id,
+                candidate_id,
+                state="neutral",
+                parameter_cases=len(cases),
+                executions=0,
+                failure_code=None,
+                idempotency_key=index_operation_key,
+            )
+            return {
+                "session_id": session_id,
+                "candidate_id": candidate_id,
+                "classification": "neutral",
+                "durable_state": updated.state,
+                "reason": "an existing enabled index already covers this candidate",
+                "existing_indexes": [index.as_dict() for index in covering_indexes],
+                "executions": 0,
+                "index_ddl": index_ddl,
+                "rollback_ddl": rollback_ddl,
+                "session_continues": True,
+            }
+
+        execution_reservation = self.performance_store.reserve_execution_attempts(
+            session_id,
+            candidate_id,
+            requested_executions,
+            request_fingerprint,
+            idempotency_key=idempotency_key,
+            owner_reference=execution_owner,
         )
-        index_name = f"{TEST_INDEX_PREFIX}{object_fingerprint[:16]}"
+        if (
+            execution_reservation["status"] != "reserved"
+            or execution_reservation.get("replayed") is True
+        ):
+            return self._recover_index_benchmark_result(
+                session_id=session_id,
+                candidate_id=candidate_id,
+                phase=phase,
+                runs=runs,
+                parameter_case_count=len(cases),
+                reservation=execution_reservation,
+                reservation_owner=execution_owner,
+                request_fingerprint=request_fingerprint,
+                evidence_operation_key=index_evidence_key,
+                benchmark_operation_key=index_operation_key,
+                index_ddl=index_ddl,
+                rollback_ddl=rollback_ddl,
+                index_definition_fingerprint=object_fingerprint,
+            )
         lease_id = (
             f"lease-{fingerprint_json({'session': session_id, 'candidate': candidate_id, 'key': idempotency_key})[:32]}"
         )
+        lease_owner = f"index-lease-{owner_fingerprint[:32]}"
+        lease: dict[str, Any] | None = None
+        pre_dispatch_reservation_finalized = False
+
+        def finalize_pre_dispatch_reservation() -> None:
+            nonlocal pre_dispatch_reservation_finalized
+            if pre_dispatch_reservation_finalized:
+                return
+            self.performance_store.release_execution_attempts(
+                execution_reservation["reservation_id"],
+                owner_reference=execution_owner,
+                expected_version=execution_reservation["version"],
+            )
+            pre_dispatch_reservation_finalized = True
+
         try:
-            existing_lease = self.performance_store.get_index_lease(lease_id)
-        except KeyError:
-            existing_lease = None
-        if existing_lease is not None:
-            if existing_lease["status"] in {
-                "pending_create",
-                "active",
-                "cleanup_pending",
-                "cleanup_required",
-            }:
-                raise PermissionError(
-                    "This index benchmark lease still requires cleanup or reconciliation."
+            session_remaining_seconds = self._require_tuning_session_time(session_id)
+            effective_lease_minutes = lease_minutes
+            if math.isfinite(session_remaining_seconds):
+                effective_lease_minutes = max(
+                    lease_minutes,
+                    int(session_remaining_seconds / 60) + 2,
                 )
-            raise ValueError(
-                "This index benchmark idempotency key was already used; inspect the existing evidence."
+            expires_at = datetime.now(timezone.utc) + timedelta(
+                minutes=effective_lease_minutes
             )
-        open_leases = self.performance_store.list_open_index_leases(
-            database_fingerprint=case.database_fingerprint
-        )
-        conflicting = [
-            lease
-            for lease in open_leases
-            if lease["lease_id"] != lease_id
-        ]
-        if conflicting:
-            raise PermissionError(
-                "An earlier temporary-index lease still requires cleanup before another test."
+            lease = self.performance_store.create_index_lease(
+                lease_id=lease_id,
+                database_fingerprint=case.database_fingerprint or "",
+                session_id=session_id,
+                candidate_id=candidate_id,
+                index_name=index_name,
+                object_fingerprint=object_fingerprint,
+                expires_at_utc=expires_at.isoformat(),
+                metadata={
+                    "phase": phase,
+                    "requested_lease_minutes": lease_minutes,
+                    "protected_lease_minutes": effective_lease_minutes,
+                    "lease_owner_fence": lease_owner,
+                    "sql_persisted": False,
+                    "target_schema": schema,
+                    "target_table": table,
+                    "key_columns": list(key_columns),
+                    "include_columns": list(include_columns or ()),
+                    "filter_definition": filter_definition,
+                    "is_unique": is_unique,
+                    "definition_fingerprint": object_fingerprint,
+                    "marker_definition_fingerprint": object_fingerprint,
+                    "fingerprint_provenance": "candidate_intent",
+                    "create_dispatch_state": "pre_dispatch",
+                },
+                owner_reference=lease_owner,
+                request_fingerprint=fingerprint_json(
+                    {
+                        "lease_id": lease_id,
+                        "definition": object_fingerprint,
+                        "key": idempotency_key,
+                    }
+                ),
             )
-        expires_at = datetime.now(timezone.utc) + timedelta(minutes=lease_minutes)
-        lease = self.performance_store.create_index_lease(
-            lease_id=lease_id,
-            database_fingerprint=case.database_fingerprint or "",
-            session_id=session_id,
-            candidate_id=candidate_id,
-            index_name=index_name,
-            object_fingerprint=object_fingerprint,
-            expires_at_utc=expires_at.isoformat(),
-            metadata={
-                "phase": phase,
-                "sql_persisted": False,
-                "target_schema": schema,
-                "target_table": table,
-            },
-        )
+            if lease["status"] != "pending_create":
+                finalize_pre_dispatch_reservation()
+                return {
+                    "session_id": session_id,
+                    "candidate_id": candidate_id,
+                    "classification": (
+                        "cleanup_required"
+                        if lease["status"] == "cleanup_required"
+                        else "inconclusive"
+                    ),
+                    "reason": (
+                        "This idempotent index lease already has durable state. "
+                        "Retrieve or reconcile that lease; no DDL or query was rerun."
+                    ),
+                    "failure_code": "index_lease_already_exists",
+                    "executions": 0,
+                    "lease": {
+                        "lease_id": lease["lease_id"],
+                        "status": lease["status"],
+                        "version": lease["version"],
+                    },
+                    "session_continues": lease["status"] != "cleanup_required",
+                }
+            if phase == "screening":
+                self.tuning_sessions.start_screening(session_id)
+            else:
+                self.tuning_sessions.mark_candidate_finalist(session_id, candidate_id)
+        except BaseException:
+            finalize_pre_dispatch_reservation()
+            if lease is not None:
+                self.performance_store.update_index_lease(
+                    lease_id,
+                    status="create_failed",
+                    metadata={"failure_type": "workflow_transition_failed"},
+                    owner_reference=lease_owner,
+                    expected_version=lease["version"],
+                )
+            raise
 
         measured_executions = 0
         measurements: list[dict[str, Any]] = [
             {
                 "parameter_case": bound_case["name"],
-                "sql": bound_case["sql"],
-                "baseline_samples": [],
+                "weight": bound_case["weight"],
+                "execution_contract": bound_case["execution_contract"],
+                "baseline_before_samples": [],
+                "baseline_after_samples": [],
                 "candidate_samples": [],
-                "baseline_plan": {},
+                "baseline_before_results": [],
+                "baseline_after_results": [],
+                "candidate_results": [],
+                "baseline_before_plan": {},
+                "baseline_after_plan": {},
                 "candidate_plan": {},
+                "plan_use": [],
             }
             for bound_case in bound_cases
         ]
         cleanup_error: str | None = None
-        created = False
         create_attempted = False
+        ownership_recorded = False
         benchmark_error: str | None = None
+        cancelled = False
         equivalence: list[dict[str, Any]] = []
+
+        async def record_observed_index(
+            observed_index: Any,
+            *,
+            observation: str,
+        ) -> bool:
+            nonlocal lease, ownership_recorded
+            if observed_index is None or not expected_index_definition_matches(
+                observed_index,
+                index_candidate,
+            ):
+                return False
+            if lease is None:
+                raise RuntimeError("Temporary index lease was not created.")
+            await self._verify_pending_index_ownership(
+                database_name,
+                lease,
+                observed_index,
+                lease_owner,
+            )
+            lease = self.performance_store.update_index_lease(
+                lease_id,
+                status="active",
+                metadata={
+                    "created_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "observed_definition_fingerprint": (
+                        observed_index.definition_fingerprint
+                    ),
+                    "fingerprint_provenance": "observed_existing_index",
+                    "creation_observation": observation,
+                },
+                owner_reference=lease_owner,
+                expected_version=lease["version"],
+            )
+            ownership_recorded = True
+            return True
+
+        async def reconcile_create_outcome() -> None:
+            nonlocal lease
+            if not create_attempted or ownership_recorded or lease is None:
+                return
+            lease = self.performance_store.update_index_lease(
+                lease_id,
+                status="cleanup_required",
+                metadata={
+                    "ownership_status": "uncertain_after_create_dispatch",
+                    "ownership_proof": "none",
+                    "cleanup_policy": "do_not_adopt_or_drop",
+                },
+                owner_reference=lease_owner,
+                expected_version=lease["version"],
+            )
+
         try:
             for measurement in measurements:
                 for _ in range(runs):
+                    self._require_tuning_session_time(session_id)
                     measured_executions += 1
-                    profiled = await self.plans.profile_query(
+                    profiled = await self.performance_workflows._profile_execution_contract(
                         database_name,
-                        str(measurement["sql"]),
+                        measurement["execution_contract"],
+                        max_result_rows=self.config.comparison_row_limit,
                     )
                     if profiled.user_query_executions != 1:
                         raise RuntimeError(
                             "Profiled samples must execute the user query exactly once."
                         )
-                    measurement["baseline_samples"].append(
+                    measurement["baseline_before_samples"].append(
                         extract_profile_metrics(profiled)
                     )
-                    measurement["baseline_plan"] = profiled.plan.summary
+                    measurement["baseline_before_results"].append(
+                        profile_result_fingerprint(
+                            profiled,
+                            compare_order=compare_order,
+                        )
+                    )
+                    measurement["baseline_before_plan"] = profiled.plan.summary
+            self._require_tuning_session_time(session_id)
+            if lease is None:
+                raise RuntimeError("Temporary index lease was not created.")
+            lease = self.performance_store.update_index_lease(
+                lease_id,
+                status="pending_create",
+                metadata={
+                    "create_dispatch_state": "dispatched",
+                    "create_dispatched_at_utc": datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+                },
+                owner_reference=lease_owner,
+                expected_version=lease["version"],
+            )
             create_attempted = True
             await self._create_test_index(
                 database_name,
@@ -3186,19 +4839,40 @@ class AzureSqlMcpApplication:
                 online,
                 dry_run=False,
                 workflow_managed=True,
+                filter_definition=filter_definition,
+                is_unique=is_unique,
+                idempotency_key=create_operation_key,
+                ownership_proof=lease_owner,
             )
-            created = True
-            lease = self.performance_store.update_index_lease(
-                lease_id,
-                status="active",
-                metadata={"created_at_utc": datetime.now(timezone.utc).isoformat()},
+            observed_indexes = await collect_existing_indexes(
+                self.executor,
+                database_name,
             )
+            observed_index = next(
+                (
+                    existing
+                    for existing in observed_indexes
+                    if existing.schema == schema
+                    and existing.table == table
+                    and existing.name == index_name
+                ),
+                None,
+            )
+            if not await record_observed_index(
+                observed_index,
+                observation="post_create",
+            ):
+                raise RuntimeError(
+                    "Created index definition could not be verified exactly."
+                )
             for measurement in measurements:
                 for _ in range(runs):
+                    self._require_tuning_session_time(session_id)
                     measured_executions += 1
-                    profiled = await self.plans.profile_query(
+                    profiled = await self.performance_workflows._profile_execution_contract(
                         database_name,
-                        str(measurement["sql"]),
+                        measurement["execution_contract"],
+                        max_result_rows=self.config.comparison_row_limit,
                     )
                     if profiled.user_query_executions != 1:
                         raise RuntimeError(
@@ -3207,40 +4881,85 @@ class AzureSqlMcpApplication:
                     measurement["candidate_samples"].append(
                         extract_profile_metrics(profiled)
                     )
+                    measurement["candidate_results"].append(
+                        profile_result_fingerprint(
+                            profiled,
+                            compare_order=compare_order,
+                        )
+                    )
                     measurement["candidate_plan"] = profiled.plan.summary
-            for measurement in measurements:
-                measured_executions += 2
-                comparison = dict(
-                    await self.performance_workflows.compare_query_results(
-                        database_name,
-                        str(measurement["sql"]),
-                        str(measurement["sql"]),
-                        compare_order=True,
+                    measurement["plan_use"].append(
+                        verify_plan_uses_index(
+                            profiled.plan.raw_xml,
+                            index_name,
+                        ).as_dict()
                     )
-                )
-                if int(comparison.get("executions", 0)) != 2:
-                    raise RuntimeError(
-                        "Snapshot comparisons must reserve exactly two query executions."
-                    )
-                comparison["parameter_case"] = measurement["parameter_case"]
-                equivalence.append(comparison)
         except asyncio.CancelledError:
             benchmark_error = "timeout"
+            cancelled = True
+            try:
+                await reconcile_create_outcome()
+            except Exception:
+                logger.exception(
+                    "Unable to durably reconcile temporary index ownership",
+                    extra={"lease_id": lease_id},
+                )
         except Exception as exc:
             benchmark_error = type(exc).__name__
+            try:
+                await reconcile_create_outcome()
+            except Exception:
+                logger.exception(
+                    "Unable to durably reconcile temporary index ownership",
+                    extra={"lease_id": lease_id},
+                )
         finally:
-            if created or create_attempted:
+            if ownership_recorded:
                 try:
-                    self.performance_store.update_index_lease(
+                    lease = self.performance_store.update_index_lease(
                         lease_id,
                         status="cleanup_pending",
+                        owner_reference=lease_owner,
+                        expected_version=lease["version"],
                     )
-                    if created or await self._temporary_index_exists(
+                    current_indexes = await collect_existing_indexes(
+                        self.executor,
                         database_name,
-                        schema,
-                        table,
-                        index_name,
-                    ):
+                    )
+                    current_index = next(
+                        (
+                            existing
+                            for existing in current_indexes
+                            if existing.schema == schema
+                            and existing.table == table
+                            and existing.name == index_name
+                        ),
+                        None,
+                    )
+                    if current_index is not None:
+                        lease_metadata = lease.get("metadata") or {}
+                        observed_fingerprint = lease_metadata.get(
+                            "observed_definition_fingerprint"
+                        )
+                        verification_fingerprint = (
+                            observed_fingerprint
+                            if isinstance(observed_fingerprint, str)
+                            and observed_fingerprint
+                            else str(lease["object_fingerprint"])
+                        )
+                        owned_definition = (
+                            current_index.definition_fingerprint
+                            == verification_fingerprint
+                            and expected_index_definition_matches(
+                                current_index,
+                                index_candidate,
+                            )
+                        )
+                        if not owned_definition:
+                            raise RuntimeError(
+                                "Temporary index name now identifies an unowned definition."
+                            )
+                    if current_index is not None:
                         await self._drop_test_index(
                             database_name,
                             schema,
@@ -3248,35 +4967,170 @@ class AzureSqlMcpApplication:
                             index_name,
                             dry_run=False,
                             workflow_managed=True,
+                            idempotency_key=cleanup_operation_key,
+                            ownership_proof=lease_owner,
+                            expected_definition_fingerprint=str(
+                                lease["object_fingerprint"]
+                            ),
+                            expected_index_id=current_index.index_id,
                         )
+                    remaining_indexes = await collect_existing_indexes(
+                        self.executor,
+                        database_name,
+                    )
+                    if any(
+                        existing.schema == schema
+                        and existing.table == table
+                        and existing.name == index_name
+                        for existing in remaining_indexes
+                    ):
+                        raise RuntimeError("Temporary index removal was not verified.")
                     lease = self.performance_store.update_index_lease(
                         lease_id,
                         status="cleaned",
                         metadata={"cleaned_at_utc": datetime.now(timezone.utc).isoformat()},
+                        owner_reference=lease_owner,
+                        expected_version=lease["version"],
                     )
+                except asyncio.CancelledError:
+                    cancelled = True
+                    cleanup_error = "cancelled"
+                    try:
+                        lease = self.performance_store.update_index_lease(
+                            lease_id,
+                            status="cleanup_required",
+                            metadata={
+                                "cleanup_error_type": "cancelled",
+                                "cleanup_policy": "retry_only_with_observed_ownership",
+                            },
+                            owner_reference=lease_owner,
+                            expected_version=lease["version"],
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Unable to persist cancellation during temporary-index cleanup",
+                            extra={"lease_id": lease_id},
+                        )
                 except Exception as exc:
                     cleanup_error = type(exc).__name__
                     lease = self.performance_store.update_index_lease(
                         lease_id,
                         status="cleanup_required",
                         metadata={"cleanup_error_type": cleanup_error},
+                        owner_reference=lease_owner,
+                        expected_version=lease["version"],
                     )
             elif benchmark_error:
-                lease = self.performance_store.update_index_lease(
-                    lease_id,
-                    status="create_failed",
-                    metadata={"failure_type": benchmark_error},
+                if lease["status"] != "cleanup_required":
+                    lease = self.performance_store.update_index_lease(
+                        lease_id,
+                        status="create_failed",
+                        metadata={"failure_type": benchmark_error},
+                        owner_reference=lease_owner,
+                        expected_version=lease["version"],
+                    )
+
+        if not cleanup_error and not benchmark_error and lease["status"] == "cleaned":
+            try:
+                for measurement in measurements:
+                    for _ in range(runs):
+                        self._require_tuning_session_time(session_id)
+                        measured_executions += 1
+                        profiled = (
+                            await self.performance_workflows._profile_execution_contract(
+                                database_name,
+                                measurement["execution_contract"],
+                                max_result_rows=self.config.comparison_row_limit,
+                            )
+                        )
+                        if profiled.user_query_executions != 1:
+                            raise RuntimeError(
+                                "Profiled samples must execute the user query exactly once."
+                            )
+                        measurement["baseline_after_samples"].append(
+                            extract_profile_metrics(profiled)
+                        )
+                        measurement["baseline_after_results"].append(
+                            profile_result_fingerprint(
+                                profiled,
+                                compare_order=compare_order,
+                            )
+                        )
+                        measurement["baseline_after_plan"] = profiled.plan.summary
+            except asyncio.CancelledError:
+                benchmark_error = "timeout"
+                cancelled = True
+            except Exception as exc:
+                benchmark_error = type(exc).__name__
+
+        for measurement in measurements:
+            result_evidence = [
+                *measurement["baseline_before_results"],
+                *measurement["candidate_results"],
+                *measurement["baseline_after_results"],
+            ]
+            complete_results = all(
+                len(measurement[result_key]) == runs
+                and all(
+                    item.get("complete") is True
+                    for item in measurement[result_key]
                 )
+                for result_key in (
+                    "baseline_before_results",
+                    "candidate_results",
+                    "baseline_after_results",
+                )
+            )
+            fingerprints = {
+                str(item["fingerprint"])
+                for item in result_evidence
+                if item.get("fingerprint")
+            }
+            plan_used = bool(measurement["plan_use"]) and all(
+                item.get("used") is True for item in measurement["plan_use"]
+            )
+            stable = complete_results and len(fingerprints) == 1
+            equivalence.append(
+                {
+                    "parameter_case": measurement["parameter_case"],
+                    "status": (
+                        "match"
+                        if stable
+                        else "inconclusive"
+                        if not complete_results
+                        else "mismatch"
+                    ),
+                    "proven_for_parameter_case": stable,
+                    "same_sql": True,
+                    "same_snapshot": False,
+                    "basis": (
+                        "unchanged SQL plus complete A-B-A result stability"
+                    ),
+                    "plan_used_expected_index": plan_used,
+                    "result_evidence": result_evidence,
+                }
+            )
 
         parameter_results = [
             {
                 "parameter_case": measurement["parameter_case"],
-                "baseline": aggregate_samples(measurement["baseline_samples"]),
+                "weight": measurement["weight"],
+                "baseline": aggregate_samples(
+                    [
+                        *measurement["baseline_before_samples"],
+                        *measurement["baseline_after_samples"],
+                    ]
+                ),
                 "candidate": aggregate_samples(measurement["candidate_samples"]),
                 "plan_delta": compare_plan_summaries_payload(
-                    measurement["baseline_plan"],
+                    measurement["baseline_before_plan"],
                     measurement["candidate_plan"],
                 ),
+                "baseline_after_plan_delta": compare_plan_summaries_payload(
+                    measurement["baseline_before_plan"],
+                    measurement["baseline_after_plan"],
+                ),
+                "plan_use": measurement["plan_use"],
             }
             for measurement in measurements
         ]
@@ -3291,6 +5145,14 @@ class AzureSqlMcpApplication:
             state, reason = (
                 "inconclusive",
                 "index candidate failed; reject this candidate and continue",
+            )
+        elif not all(
+            comparison.get("plan_used_expected_index") is True
+            for comparison in equivalence
+        ):
+            state, reason = (
+                "inconclusive",
+                "the expected temporary index was not used in every measured bucket",
             )
         else:
             objective = str(case.metadata.get("objective") or "elapsed_time")
@@ -3316,7 +5178,9 @@ class AzureSqlMcpApplication:
                     [
                         {
                             "name": bound_case["name"],
-                            "values_fingerprint": bound_case["values_fingerprint"],
+                            "parameter_case_fingerprint": bound_case[
+                                "parameter_case_fingerprint"
+                            ],
                         }
                         for bound_case in bound_cases
                     ]
@@ -3335,10 +5199,17 @@ class AzureSqlMcpApplication:
                     "candidate_id": candidate_id,
                     "lease_id": lease_id,
                     "lease_status": lease["status"],
+                    "index_definition_fingerprint": object_fingerprint,
+                    "execution_reservation_id": execution_reservation[
+                        "reservation_id"
+                    ],
                     "equivalence": equivalence,
+                    "phase": phase,
+                    "reason": reason,
                 },
             ),
-            idempotency_key=(f"{idempotency_key}:evidence" if idempotency_key else None),
+            idempotency_key=index_evidence_key,
+            request_fingerprint=request_fingerprint,
         )
         durable_state = state
         if phase == "screening" and state == "improved":
@@ -3350,7 +5221,7 @@ class AzureSqlMcpApplication:
                 parameter_cases=len(cases),
                 executions=measured_executions,
                 evidence_ids=(evidence.evidence_id,),
-                idempotency_key=idempotency_key,
+                idempotency_key=index_operation_key,
             )
             durable_state = updated.state
         else:
@@ -3368,9 +5239,21 @@ class AzureSqlMcpApplication:
                     if state in {"inconclusive", "cleanup_required", "equivalence_failed"}
                     else None
                 ),
-                idempotency_key=idempotency_key,
+                idempotency_key=index_operation_key,
             )
-        return {
+        reservation_update = (
+            self.performance_store.complete_execution_attempts
+            if measured_executions
+            else self.performance_store.release_execution_attempts
+        )
+        reservation_update(
+            execution_reservation["reservation_id"],
+            dispatched_attempt_count=measured_executions,
+            owner_reference=execution_owner,
+            expected_version=execution_reservation["version"],
+        )
+        public_lease = self._public_index_lease(lease)
+        result = {
             "session_id": session_id,
             "candidate_id": candidate_id,
             "classification": state,
@@ -3382,66 +5265,47 @@ class AzureSqlMcpApplication:
             "metrics": parameter_results[0],
             "parameter_results": parameter_results,
             "equivalence": equivalence,
-            "lease": lease,
-            "index_ddl": self._test_index_ddl(
-                schema,
-                table,
-                index_name,
-                key_columns,
-                include_columns,
-                online,
-            ),
-            "rollback_ddl": f"DROP INDEX [{index_name}] ON [{schema}].[{table}]",
+            "lease": public_lease,
+            "index_definition_fingerprint": object_fingerprint,
+            "index_ddl": index_ddl,
+            "rollback_ddl": rollback_ddl,
             "session_continues": True,
         }
-
-    @staticmethod
-    def _sql_fingerprint(sql: str) -> str:
-        normalized = " ".join(sql.split()).casefold()
-        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-
-    def _test_index_ddl(
-        self,
-        schema: str,
-        table: str,
-        index_name: str,
-        key_columns: list[str],
-        include_columns: list[str] | None,
-        online: bool,
-    ) -> str:
-        key_parts: list[str] = []
-        for raw_column in key_columns:
-            name, _, direction = raw_column.strip().partition(" ")
-            name = self._validate_plain_identifier(name, "key column")
-            direction = direction.strip().upper()
-            if direction and direction not in {"ASC", "DESC"}:
-                raise ValueError("Index key direction must be ASC or DESC.")
-            key_parts.append(f"[{name}] {direction}".strip())
-        includes = [
-            f"[{self._validate_plain_identifier(column, 'include column')}]"
-            for column in (include_columns or [])
-        ]
-        ddl = (
-            f"CREATE NONCLUSTERED INDEX [{index_name}] ON [{schema}].[{table}] "
-            f"({', '.join(key_parts)})"
-        )
-        if includes:
-            ddl += f" INCLUDE ({', '.join(includes)})"
-        if online:
-            ddl += " WITH (ONLINE = ON)"
-        return ddl
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
 
     async def _run_tool(
         self,
         tool_name: str,
         database_name: str | None,
         callback,
+        *,
+        deadline_provider: Callable[[], str | None] | None = None,
     ) -> ResponseType:
         requested_database = (database_name or self.config.default_database).strip()
         correlation_id = str(uuid.uuid4())
         started_at = time.monotonic()
+        timeout_seconds = self.config.tool_timeout_seconds
         try:
             resolved_database = self.config.validate_database_name(database_name)
+            timeout_seconds = self._timeout_for_tool(
+                tool_name,
+                resolved_database,
+            )
+            if deadline_provider is not None:
+                deadline_at_utc = deadline_provider()
+                if deadline_at_utc:
+                    deadline = datetime.fromisoformat(
+                        deadline_at_utc.replace("Z", "+00:00")
+                    )
+                    if deadline.tzinfo is None:
+                        deadline = deadline.replace(tzinfo=timezone.utc)
+                    remaining = (
+                        deadline.astimezone(timezone.utc)
+                        - datetime.now(timezone.utc)
+                    ).total_seconds()
+                    timeout_seconds = min(timeout_seconds, max(0.0, remaining))
             logger.info(
                 "Running tool",
                 extra={
@@ -3452,7 +5316,7 @@ class AzureSqlMcpApplication:
             )
             payload = await asyncio.wait_for(
                 callback(resolved_database),
-                timeout=self.config.tool_timeout_seconds,
+                timeout=timeout_seconds,
             )
             duration_ms = self._duration_ms(started_at)
             row_count = self._estimate_row_count(payload)
@@ -3485,7 +5349,7 @@ class AzureSqlMcpApplication:
             )
             return self._format_error(
                 "timeout",
-                f"Tool '{tool_name}' timed out after {self.config.tool_timeout_seconds}s.",
+                f"Tool '{tool_name}' timed out after {timeout_seconds}s.",
             )
         except Exception as exc:
             duration_ms = self._duration_ms(started_at)
@@ -3502,6 +5366,92 @@ class AzureSqlMcpApplication:
                 },
             )
             return self._format_error("tool_error", sanitized_error)
+
+    def _timeout_for_tool(
+        self,
+        tool_name: str,
+        database_name: str | None = None,
+    ) -> float:
+        if tool_name in _SESSION_WORKFLOW_TOOLS:
+            per_request_executions = (
+                self.database_policy.policy_for(
+                    database_name
+                ).max_benchmark_executions
+                if database_name
+                else 0
+            )
+            benchmark_timeout = (
+                self.config.query_timeout_seconds
+                * max(1, per_request_executions)
+                + 5 * 60
+            )
+            return max(
+                self.config.tool_timeout_seconds,
+                21 * 60,
+                benchmark_timeout,
+            )
+        if tool_name in _EVIDENCE_WORKFLOW_TOOLS:
+            return max(
+                self.config.tool_timeout_seconds,
+                self.config.query_timeout_seconds + 60,
+            )
+        return self.config.tool_timeout_seconds
+
+    def _require_tuning_session_time(self, session_id: str) -> float:
+        """Fence a new benchmark dispatch against the durable session deadline."""
+
+        session = self.tuning_sessions.get_session(session_id)
+        if not session.deadline_at_utc:
+            return float("inf")
+        deadline = datetime.fromisoformat(
+            session.deadline_at_utc.replace("Z", "+00:00")
+        )
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+        remaining = (
+            deadline.astimezone(timezone.utc) - datetime.now(timezone.utc)
+        ).total_seconds()
+        if remaining <= 0:
+            raise TimeoutError("The tuning session time budget has expired.")
+        return remaining
+
+    async def _resolve_canonical_table_identity(
+        self,
+        database_name: str,
+        schema_name: str,
+        table_name: str,
+    ) -> tuple[str, str]:
+        """Resolve catalog spelling before generating any table DDL."""
+
+        rows = await self.executor.fetch_all(
+            database_name,
+            """
+            SELECT TOP (2)
+                s.name AS schema_name,
+                t.name AS table_name
+            FROM sys.tables AS t
+            INNER JOIN sys.schemas AS s ON s.schema_id = t.schema_id
+            WHERE LOWER(s.name) = LOWER(?)
+              AND LOWER(t.name) = LOWER(?)
+            ORDER BY s.name, t.name
+            """,
+            params=[schema_name, table_name],
+            max_rows=2,
+        )
+        if len(rows) != 1:
+            raise ValueError(
+                "The target table could not be resolved to one canonical Azure SQL "
+                "catalog object; no index DDL was dispatched."
+            )
+        resolved_schema = self._validate_plain_identifier(
+            str(rows[0].get("schema_name") or ""),
+            "catalog schema_name",
+        )
+        resolved_table = self._validate_plain_identifier(
+            str(rows[0].get("table_name") or ""),
+            "catalog table_name",
+        )
+        return resolved_schema, resolved_table
 
     async def _run_database_pair_tool(
         self,
@@ -3576,7 +5526,7 @@ class AzureSqlMcpApplication:
         # Fetch at most row_limit + 1 rows to detect truncation without loading entire result
         fetch_limit = self.config.row_limit + 1
         rows = await self.executor.fetch_all(
-            database_name, validated.normalized_sql, max_rows=fetch_limit,
+            database_name, validated.execution_sql, max_rows=fetch_limit,
         )
         return self._truncate_rows(
             {
@@ -3820,6 +5770,10 @@ class AzureSqlMcpApplication:
         online: bool,
         dry_run: bool = True,
         workflow_managed: bool = False,
+        filter_definition: str | None = None,
+        is_unique: bool = False,
+        idempotency_key: str | None = None,
+        ownership_proof: str | None = None,
     ) -> dict[str, Any]:
         if not dry_run and not workflow_managed:
             raise PermissionError(
@@ -3833,29 +5787,57 @@ class AzureSqlMcpApplication:
         if not key_columns:
             raise ValueError("key_columns must contain at least one column.")
 
-        key_parts = []
-        for column in key_columns:
-            name, _, direction = column.strip().partition(" ")
-            name = self._validate_plain_identifier(name, "key column")
-            direction = direction.strip().upper()
-            if direction and direction not in ("ASC", "DESC"):
-                raise ValueError(f"key column direction must be ASC or DESC, got {direction!r}.")
-            key_parts.append(f"[{name}] {direction}".strip())
-
-        include_parts = [
-            f"[{self._validate_plain_identifier(column, 'include column')}]"
-            for column in (include_columns or [])
-        ]
-
-        sql = (
-            f"CREATE NONCLUSTERED INDEX [{index}] ON [{schema}].[{table}] "
-            f"({', '.join(key_parts)})"
+        candidate = IndexCandidate(
+            schema=schema,
+            table=table,
+            key_columns=tuple(key_columns),
+            include_columns=tuple(include_columns or ()),
+            filter_definition=filter_definition,
+            is_unique=is_unique,
+            index_name=index,
         )
-        if include_parts:
-            sql += f" INCLUDE ({', '.join(include_parts)})"
-        if online:
-            sql += " WITH (ONLINE = ON)"
-        rollback_sql = f"DROP INDEX [{index}] ON [{schema}].[{table}]"
+        sql = build_index_candidate_statement(candidate, online=online)
+        rollback_sql = f"DROP INDEX [{index}] ON [{schema}].[{table}];"
+        if workflow_managed and not idempotency_key:
+            raise ValueError("Workflow-managed index creation requires an idempotency key.")
+        if workflow_managed and (
+            ownership_proof is None
+            or not _INDEX_OWNER_PROOF.fullmatch(ownership_proof)
+        ):
+            raise ValueError(
+                "Workflow-managed index creation requires a private lease-owner token."
+            )
+        params: tuple[Any, ...] = ()
+        rollback_params: tuple[Any, ...] = ()
+        if workflow_managed:
+            definition_fingerprint = candidate.definition_fingerprint
+            params = (ownership_proof, definition_fingerprint)
+            rollback_params = (ownership_proof, definition_fingerprint, None)
+            sql = (
+                "SET XACT_ABORT ON;\n"
+                "BEGIN TRANSACTION;\n"
+                f"{sql.rstrip().rstrip(';')};\n"
+                "EXEC sys.sp_addextendedproperty "
+                f"@name = N'{TEST_INDEX_OWNER_PROPERTY}', "
+                "@value = ?, "
+                "@level0type = N'SCHEMA', "
+                f"@level0name = N'{schema}', "
+                "@level1type = N'TABLE', "
+                f"@level1name = N'{table}', "
+                "@level2type = N'INDEX', "
+                f"@level2name = N'{index}';\n"
+                "EXEC sys.sp_addextendedproperty "
+                f"@name = N'{TEST_INDEX_DEFINITION_PROPERTY}', "
+                "@value = ?, "
+                "@level0type = N'SCHEMA', "
+                f"@level0name = N'{schema}', "
+                "@level1type = N'TABLE', "
+                f"@level1name = N'{table}', "
+                "@level2type = N'INDEX', "
+                f"@level2name = N'{index}';\n"
+                "COMMIT TRANSACTION;"
+            )
+            rollback_sql = self._build_guarded_index_drop_sql(schema, table, index)
 
         payload = await self.admin_policy.execute(
             AdminAction(
@@ -3863,8 +5845,16 @@ class AzureSqlMcpApplication:
                 database_name=database_name,
                 action_type="test_index",
                 sql=sql,
+                params=params,
                 rollback_sql=rollback_sql,
+                rollback_params=rollback_params,
                 trusted_generated=True,
+                reviewed_intent=workflow_managed,
+                idempotency_key=idempotency_key,
+                exactly_once=workflow_managed,
+                policy_verified=workflow_managed,
+                non_production=workflow_managed,
+                verification_required=workflow_managed,
             ),
             self.executor,
             dry_run=dry_run,
@@ -3873,6 +5863,8 @@ class AzureSqlMcpApplication:
             "index": f"[{schema}].[{table}].[{index}]",
             "key_columns": key_columns,
             "include_columns": include_columns or [],
+            "filter_definition": filter_definition,
+            "is_unique": is_unique,
             "online": online,
             "action": "test_index_created",
             "note": "Disposable test index — drop it with drop_test_index after measuring.",
@@ -3887,6 +5879,10 @@ class AzureSqlMcpApplication:
         index_name: str,
         dry_run: bool = True,
         workflow_managed: bool = False,
+        idempotency_key: str | None = None,
+        ownership_proof: str | None = None,
+        expected_definition_fingerprint: str | None = None,
+        expected_index_id: int | None = None,
     ) -> dict[str, Any]:
         if not dry_run and not workflow_managed:
             raise PermissionError(
@@ -3897,14 +5893,41 @@ class AzureSqlMcpApplication:
         index = self._validate_test_index_name(index_name)
         schema = self._validate_plain_identifier(schema_name, "schema_name")
         table = self._validate_plain_identifier(table_name, "table_name")
-        sql = f"DROP INDEX [{index}] ON [{schema}].[{table}]"
+        sql = f"DROP INDEX [{index}] ON [{schema}].[{table}];"
+        if workflow_managed and not idempotency_key:
+            raise ValueError("Workflow-managed index cleanup requires an idempotency key.")
+        params: tuple[Any, ...] = ()
+        if workflow_managed:
+            if ownership_proof is None or not _INDEX_OWNER_PROOF.fullmatch(ownership_proof):
+                raise ValueError(
+                    "Workflow-managed index cleanup requires a private lease-owner token."
+                )
+            if expected_definition_fingerprint is not None and not re.fullmatch(
+                r"[0-9a-fA-F]{64}", expected_definition_fingerprint
+            ):
+                raise ValueError("Expected index definition fingerprint is invalid.")
+            if expected_index_id is not None and expected_index_id <= 0:
+                raise ValueError("Expected index_id must be greater than 0.")
+            params = (
+                ownership_proof,
+                expected_definition_fingerprint,
+                expected_index_id,
+            )
+            sql = self._build_guarded_index_drop_sql(schema, table, index)
         payload = await self.admin_policy.execute(
             AdminAction(
                 tool_name="drop_test_index",
                 database_name=database_name,
                 action_type="test_index",
                 sql=sql,
+                params=params,
                 trusted_generated=True,
+                reviewed_intent=workflow_managed,
+                idempotency_key=idempotency_key,
+                exactly_once=workflow_managed,
+                policy_verified=workflow_managed,
+                non_production=workflow_managed,
+                verification_required=workflow_managed,
             ),
             self.executor,
             dry_run=dry_run,
@@ -3924,6 +5947,83 @@ class AzureSqlMcpApplication:
             raise PermissionError("Database policy does not permit temporary indexes.")
         if policy.environment.casefold() in {"production", "prod", "live"}:
             raise PermissionError("Temporary indexes are prohibited in production.")
+
+    @staticmethod
+    def _build_guarded_index_drop_sql(
+        schema: str,
+        table: str,
+        index: str,
+    ) -> str:
+        return (
+            "SET XACT_ABORT ON;\n"
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;\n"
+            "BEGIN TRY\n"
+            "    BEGIN TRANSACTION;\n"
+            f"    DECLARE @object_id int = OBJECT_ID(N'{schema}.{table}', N'U');\n"
+            "    IF @object_id IS NULL\n"
+            "        THROW 50002, 'Temporary index target table is missing.', 1;\n"
+            "    DECLARE @table_lock_probe bit;\n"
+            f"    SELECT TOP (1) @table_lock_probe = 1 FROM [{schema}].[{table}] WITH (TABLOCK, HOLDLOCK);\n"
+            "    DECLARE @owner_marker nvarchar(4000) = ?;\n"
+            "    DECLARE @expected_definition nvarchar(4000) = ?;\n"
+            "    DECLARE @expected_index_id int = ?;\n"
+            "    DECLARE @index_id int;\n"
+            "    SELECT @index_id = i.index_id\n"
+            "    FROM sys.indexes AS i WITH (UPDLOCK, HOLDLOCK)\n"
+            "    INNER JOIN sys.tables AS t WITH (UPDLOCK, HOLDLOCK)\n"
+            "        ON t.object_id = i.object_id\n"
+            "    INNER JOIN sys.schemas AS s WITH (UPDLOCK, HOLDLOCK)\n"
+            "        ON s.schema_id = t.schema_id\n"
+            f"    WHERE i.object_id = @object_id AND s.name = N'{schema}'\n"
+            f"      AND t.name = N'{table}' AND i.name = N'{index}';\n"
+            "    IF @index_id IS NULL\n"
+            "        THROW 50003, 'Temporary index object is missing.', 1;\n"
+            "    IF @expected_index_id IS NOT NULL AND @index_id <> @expected_index_id\n"
+            "        THROW 50004, 'Temporary index object identity mismatch.', 1;\n"
+            "    IF NOT EXISTS (\n"
+            "        SELECT 1\n"
+            "        FROM sys.extended_properties AS ep WITH (UPDLOCK, HOLDLOCK)\n"
+            "        WHERE ep.class = 7\n"
+            "          AND ep.major_id = @object_id\n"
+            "          AND ep.minor_id = @index_id\n"
+            f"          AND ep.name = N'{TEST_INDEX_OWNER_PROPERTY}'\n"
+            "          AND CONVERT(nvarchar(4000), ep.value) COLLATE Latin1_General_100_BIN2\n"
+            "              = @owner_marker COLLATE Latin1_General_100_BIN2\n"
+            "    )\n"
+            "        THROW 50001, 'Temporary index ownership marker mismatch.', 1;\n"
+            "    IF @expected_definition IS NOT NULL AND NOT EXISTS (\n"
+            "        SELECT 1\n"
+            "        FROM sys.extended_properties AS ep WITH (UPDLOCK, HOLDLOCK)\n"
+            "        WHERE ep.class = 7\n"
+            "          AND ep.major_id = @object_id\n"
+            "          AND ep.minor_id = @index_id\n"
+            f"          AND ep.name = N'{TEST_INDEX_DEFINITION_PROPERTY}'\n"
+            "          AND CONVERT(nvarchar(4000), ep.value) COLLATE Latin1_General_100_BIN2\n"
+            "              = @expected_definition COLLATE Latin1_General_100_BIN2\n"
+            "    )\n"
+            "        THROW 50005, 'Temporary index definition mismatch.', 1;\n"
+            f"    DROP INDEX [{index}] ON [{schema}].[{table}];\n"
+            "    COMMIT TRANSACTION;\n"
+            "    SET TRANSACTION ISOLATION LEVEL READ COMMITTED;\n"
+            "END TRY\n"
+            "BEGIN CATCH\n"
+            "    IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;\n"
+            "    SET TRANSACTION ISOLATION LEVEL READ COMMITTED;\n"
+            "    THROW;\n"
+            "END CATCH;"
+        )
+
+    @staticmethod
+    def _public_index_lease(lease: Mapping[str, Any]) -> dict[str, Any]:
+        public = dict(lease)
+        public.pop("owner_token", None)
+        public.pop("fencing_token", None)
+        metadata = public.get("metadata")
+        if isinstance(metadata, Mapping):
+            safe_metadata = dict(metadata)
+            safe_metadata.pop("lease_owner_fence", None)
+            public["metadata"] = safe_metadata
+        return public
 
     @staticmethod
     def _validate_plain_identifier(identifier: str, label: str) -> str:
@@ -3984,18 +6084,21 @@ class AzureSqlMcpApplication:
         include_raw_xml: bool,
         window_minutes: int,
         parameter_values: dict[str, Any] | None = None,
+        parameter_types: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         if window_minutes <= 0:
             raise ValueError("window_minutes must be greater than 0.")
-        effective_sql, binding_info = await self._prepare_query(
+        parameter_case, binding_info = await self._compatibility_parameter_case(
             database_name,
             sql,
             auto_bind_params,
             parameter_values,
+            parameter_types,
         )
         performance_case = self.performance_workflows.start_case(
             database_name,
-            effective_sql,
+            sql,
+            parameter_cases=[parameter_case] if parameter_case is not None else None,
             metadata={
                 "objective": "elapsed_time",
                 "compatibility_tool": "tune_query",
@@ -4005,23 +6108,27 @@ class AzureSqlMcpApplication:
         evidence = await self._collect_performance_evidence(
             database_name,
             performance_case.case_id,
-            effective_sql,
+            sql,
             window_minutes,
             analyze,
             None,
+            parameter_case,
         )
         session = self.performance_workflows.start_session(
             performance_case.case_id,
+            database_name,
         )
         return {
             "database_name": database_name,
             "performance_case_id": performance_case.case_id,
             "tuning_session_id": session["session_id"],
-            "query_hash": self._sql_fingerprint(effective_sql),
+            "query_hash": fingerprint_text(sql),
             "analyze": analyze,
             "parameter_binding": binding_info,
             "evidence": evidence,
             "session": session,
+            "workflow_complete": False,
+            "candidate_required": True,
             "next_step": (
                 "Produce concrete rewrites, add each with add_tuning_candidate, then "
                 "benchmark them. Missing plan evidence does not block static rewrites."
@@ -4046,49 +6153,58 @@ class AzureSqlMcpApplication:
         analyze: bool,
         auto_bind_params: bool,
         include_raw_xml: bool,
-        runs: int = 1,
+        runs: int = 3,
         parameter_values: dict[str, Any] | None = None,
         compare_order: bool = True,
+        parameter_types: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         if not analyze:
             raise ValueError("benchmark_query_rewrite requires analyze=true for measured results.")
-        if not 1 <= runs <= 3:
-            raise ValueError("Compatibility screening runs must be between 1 and 3.")
-        baseline_effective, baseline_binding = await self._prepare_query(
+        if not 2 <= runs <= 3:
+            raise ValueError("Compatibility screening runs must be between 2 and 3.")
+        parameter_case, binding_info = await self._compatibility_parameter_case(
             database_name,
             baseline_sql,
             auto_bind_params,
             parameter_values,
+            parameter_types,
         )
-        rewrite_effective, rewrite_binding = await self._prepare_query(
-            database_name,
-            rewrite_sql,
-            auto_bind_params,
-            parameter_values,
-        )
+        parameter_cases = [parameter_case] if parameter_case is not None else None
+        if parameter_case is not None:
+            await self._bind_performance_parameters(
+                database_name,
+                rewrite_sql,
+                parameter_case,
+            )
         performance_case = self.performance_workflows.start_case(
             database_name,
-            baseline_effective,
+            baseline_sql,
+            parameter_cases=parameter_cases,
             metadata={
                 "objective": "elapsed_time",
                 "compatibility_tool": "benchmark_query_rewrite",
             },
         )
-        session = self.performance_workflows.start_session(performance_case.case_id)
+        session = self.performance_workflows.start_session(
+            performance_case.case_id,
+            database_name,
+        )
         candidate = self.performance_workflows.add_candidate(
             session["session_id"],
-            rewrite_effective,
-            strategy="rewrite",
+            rewrite_sql,
+            strategy="combined",
         )
         benchmark = await self.performance_workflows.benchmark_candidate(
             session["session_id"],
             candidate["candidate_id"],
             database_name,
-            baseline_effective,
-            rewrite_effective,
+            baseline_sql,
+            rewrite_sql,
             phase="screening",
+            parameter_cases=parameter_cases,
             compare_order=compare_order,
             runs_override=runs,
+            prove_equivalence=True,
         )
         benchmark.update({
             "database_name": database_name,
@@ -4097,8 +6213,8 @@ class AzureSqlMcpApplication:
             "tuning_session_id": session["session_id"],
             "winning_sql": rewrite_sql if benchmark.get("classification") == "improved" else None,
             "parameter_binding": {
-                "baseline": baseline_binding,
-                "rewrite": rewrite_binding,
+                "baseline": binding_info,
+                "rewrite": binding_info,
             },
             "raw_xml_included": False,
             "raw_xml_note": (
@@ -4209,12 +6325,7 @@ class AzureSqlMcpApplication:
         plan: dict[str, Any],
         window_minutes: int,
     ) -> dict[str, Any]:
-        """Query Store history for tune_query evidence.
-
-        Prefer query_hash from the captured plan — it survives parameter
-        renaming (@CustomerId vs @P1). Fall back to text matching with the
-        ORIGINAL sql; the auto-bound DECLARE batch never matches stored text.
-        """
+        """Return Query Store evidence only after stable identity resolution."""
         summary = plan.get("summary")
         statements = summary.get("statements") if isinstance(summary, dict) else None
         query_hash = None
@@ -4223,44 +6334,112 @@ class AzureSqlMcpApplication:
             if isinstance(first, dict):
                 query_hash = first.get("query_hash")
 
-        if isinstance(query_hash, str) and query_hash.lower().startswith("0x"):
-            history = await self.query_store.get_query_history_by_hash(
-                database_name,
-                query_hash,
-                window_minutes=window_minutes,
-                limit=10,
-            )
-            if history.get("matches"):
-                history["matched_by"] = "query_hash"
-                return history
-
-        history = await self.query_store.get_query_history_by_text(
+        identity = await self.query_store.resolve_query_identity(
             database_name,
             original_sql,
+        )
+        if identity.get("status") != "resolved":
+            return {
+                "database_name": database_name,
+                "window_minutes": window_minutes,
+                "matches": [],
+                "status": "inconclusive",
+                "reason": "exact Query Store identity was not uniquely resolved",
+                "identity": identity,
+                "plan_query_hash": query_hash,
+                "matched_by": "none",
+                "fuzzy_match_used": False,
+            }
+        history = await self.query_store.get_query_history_by_id(
+            database_name,
+            int(identity["query_id"]),
             window_minutes=window_minutes,
             limit=10,
         )
-        history["matched_by"] = "text"
+        history["matched_by"] = "query_id"
+        history["fuzzy_match_used"] = False
+        history["plan_query_hash"] = query_hash
+        history["identity_query_hash"] = identity.get("query_hash")
+        history["query_hash_corroborated"] = (
+            str(query_hash).casefold()
+            == str(identity.get("query_hash")).casefold()
+            if query_hash is not None and identity.get("query_hash") is not None
+            else None
+        )
+        if history["query_hash_corroborated"] is False:
+            history["status"] = "inconclusive"
+            history["matches"] = []
+            history["reason"] = (
+                "the exact Query Store identity resolved to a different query hash "
+                "than the captured plan"
+            )
         return history
 
-    async def _prepare_query(
+    async def _compatibility_parameter_case(
         self,
         database_name: str,
         sql: str,
         auto_bind_params: bool,
-        parameter_values: dict[str, Any] | None = None,
-    ) -> tuple[str, dict[str, Any] | None]:
-        if not auto_bind_params and not parameter_values:
-            return sql, None
-        binding_info = await self.param_binding.bind_parameters(
-            database_name, sql, parameter_values=parameter_values,
+        parameter_values: dict[str, Any] | None,
+        parameter_types: dict[str, str] | None = None,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        detected = detect_parameters(sql)
+        detected_names = {name.casefold() for name in detected}
+        supplied_names = {
+            str(name).lstrip("@").casefold()
+            for name in (parameter_values or {})
+        }
+        if detected and not auto_bind_params and supplied_names != detected_names:
+            raise ValueError(
+                "Parameterized execution with auto_bind_params=false requires "
+                "one explicit value for every query parameter."
+            )
+        if not detected and not parameter_values and not parameter_types:
+            return None, None
+
+        bucket = await self.param_binding.build_parameter_bucket(
+            database_name,
+            sql,
+            parameter_values=parameter_values,
+            parameter_types=parameter_types,
+            bucket_id="compatibility",
+            label="compatibility",
+            provenance=(
+                "compatibility_auto_binding"
+                if auto_bind_params
+                else "compatibility_explicit_binding"
+            ),
         )
-        if binding_info.get("parameters"):
-            return str(binding_info["bound_sql"]), {
-                "original_sql": binding_info["original_sql"],
-                "parameters": binding_info["parameters"],
-            }
-        return sql, None
+        if not bucket.parameters:
+            return None, None
+
+        parameter_case = {
+            "name": "compatibility",
+            "values": {
+                parameter.name.lstrip("@"): parameter.value
+                for parameter in bucket.parameters
+            },
+            "types": {
+                parameter.name.lstrip("@"): parameter.sql_type.sql_declaration
+                for parameter in bucket.parameters
+            },
+            "weight": 1.0,
+        }
+        binding_summary = {
+            "bucket_id": bucket.bucket_id,
+            "provenance": bucket.provenance,
+            "values_redacted": True,
+            "parameters": [
+                {
+                    "name": parameter.name,
+                    "data_type": parameter.sql_type.sql_declaration,
+                    "provenance": parameter.provenance,
+                    "provenance_detail": dict(parameter.provenance_detail),
+                }
+                for parameter in bucket.parameters
+            ],
+        }
+        return parameter_case, binding_summary
 
     @staticmethod
     async def _optional_payload(callback) -> dict[str, Any]:
@@ -4295,33 +6474,45 @@ class AzureSqlMcpApplication:
         auto_bind_params: bool = False,
         include_raw_xml: bool = False,
         parameter_values: dict[str, Any] | None = None,
+        parameter_types: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         if hypothetical_indexes:
             raise ValueError(
                 "Hypothetical index analysis is disabled on explain_query for safety. "
                 "Use analyze_query_indexes/analyze_workload_indexes for read-only index insights."
             )
-        effective_sql = sql
-        binding_info: dict[str, Any] | None = None
-        if auto_bind_params or parameter_values:
-            binding_info = await self.param_binding.bind_parameters(
-                database_name, sql, parameter_values=parameter_values,
-            )
-            if binding_info.get("parameters"):
-                effective_sql = binding_info["bound_sql"]
-
-        artifact = await self.plans.explain_query(
+        parameter_case, binding_info = await self._compatibility_parameter_case(
             database_name,
-            effective_sql,
-            analyze,
-            hypothetical_indexes=hypothetical_indexes,
+            sql,
+            auto_bind_params,
+            parameter_values,
+            parameter_types,
         )
+        if parameter_case is not None:
+            contract = await self._bind_performance_parameters(
+                database_name,
+                sql,
+                parameter_case,
+            )
+            artifact = await self.plans.explain_parameterized_query(
+                database_name,
+                contract,
+                analyze=analyze,
+            )
+        else:
+            if detect_parameters(sql):
+                raise ValueError(
+                    "Parameterized SQL requires explicit values or auto_bind_params=true."
+                )
+            artifact = await self.plans.explain_query(
+                database_name,
+                sql,
+                analyze,
+                hypothetical_indexes=hypothetical_indexes,
+            )
         result = self._artifact_to_dict(artifact, include_raw_xml=include_raw_xml)
-        if binding_info and binding_info.get("parameters"):
-            result["parameter_binding"] = {
-                "original_sql": binding_info["original_sql"],
-                "parameters": binding_info["parameters"],
-            }
+        if binding_info is not None:
+            result["parameter_binding"] = binding_info
         return result
 
     @staticmethod
@@ -4337,46 +6528,110 @@ class AzureSqlMcpApplication:
         queries: list[str],
         auto_bind_params: bool = False,
         parameter_values: dict[str, Any] | None = None,
+        parameter_types: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        effective_queries = queries
-        if auto_bind_params or parameter_values:
-            normalized_values: dict[str, Any] = {}
-            for raw_name, value in (parameter_values or {}).items():
-                name = str(raw_name).lstrip("@").strip().casefold()
-                if not name:
-                    raise ValueError("explicit parameter name must not be empty")
-                if name in normalized_values:
-                    raise ValueError(f"duplicate explicit parameter name: {name}")
-                normalized_values[name] = value
-            detected_by_query = [
-                {name.casefold() for name in detect_parameters(query)}
-                for query in queries
-            ]
-            detected_any = set().union(*detected_by_query) if detected_by_query else set()
-            unknown_names = sorted(set(normalized_values) - detected_any)
-            if unknown_names:
-                raise ValueError(
-                    "explicit value supplied for unknown parameter(s): "
-                    + ", ".join(unknown_names)
-                )
-            bound_queries: list[str] = []
-            for query, detected_names in zip(queries, detected_by_query, strict=True):
-                query_values = {
-                    name: value
-                    for name, value in normalized_values.items()
-                    if name in detected_names
-                }
-                binding = await self.param_binding.bind_parameters(
-                    database_name, query, parameter_values=query_values,
-                )
-                if binding.get("parameters"):
-                    bound_queries.append(binding["bound_sql"])
-                else:
-                    bound_queries.append(query)
-            effective_queries = bound_queries
-        return await self.query_index_analysis.analyze_queries(
-            database_name, effective_queries,
+        normalized_values: dict[str, Any] = {}
+        for raw_name, value in (parameter_values or {}).items():
+            name = str(raw_name).lstrip("@").strip().casefold()
+            if not name:
+                raise ValueError("explicit parameter name must not be empty")
+            if name in normalized_values:
+                raise ValueError(f"duplicate explicit parameter name: {name}")
+            normalized_values[name] = value
+        normalized_types: dict[str, str] = {}
+        for raw_name, value in (parameter_types or {}).items():
+            name = str(raw_name).lstrip("@").strip().casefold()
+            if not name:
+                raise ValueError("explicit parameter name must not be empty")
+            if name in normalized_types:
+                raise ValueError(f"duplicate explicit parameter type: {name}")
+            normalized_types[name] = str(value)
+        detected_by_query = [
+            {name.casefold() for name in detect_parameters(query)}
+            for query in queries
+        ]
+        detected_any = set().union(*detected_by_query) if detected_by_query else set()
+        unknown_names = sorted(
+            (set(normalized_values) | set(normalized_types)) - detected_any
         )
+        if unknown_names:
+            raise ValueError(
+                "explicit value or type supplied for unknown parameter(s): "
+                + ", ".join(unknown_names)
+            )
+
+        contracts: list[ParameterExecutionContract] = []
+        binding_summaries: list[dict[str, Any] | None] = []
+        for ordinal, (query, detected_names) in enumerate(
+            zip(queries, detected_by_query, strict=True),
+            start=1,
+        ):
+            if not detected_names:
+                contracts.append(
+                    ParameterExecutionContract(
+                        sql_text=query,
+                        bucket_id=f"index-analysis-{ordinal}",
+                        parameters=(),
+                        provenance="unparameterized_index_analysis",
+                    )
+                )
+                binding_summaries.append(None)
+                continue
+            query_values = {
+                name: value
+                for name, value in normalized_values.items()
+                if name in detected_names
+            }
+            query_types = {
+                name: value
+                for name, value in normalized_types.items()
+                if name in detected_names
+            }
+            if not auto_bind_params and set(query_values) != detected_names:
+                raise ValueError(
+                    "Parameterized index analysis with auto_bind_params=false "
+                    "requires one explicit value for every query parameter."
+                )
+            bucket = await self.param_binding.build_parameter_bucket(
+                database_name,
+                query,
+                parameter_values=query_values,
+                parameter_types=query_types,
+                bucket_id=f"index-analysis-{ordinal}",
+                provenance=(
+                    "index_analysis_auto_binding"
+                    if auto_bind_params
+                    else "index_analysis_explicit_binding"
+                ),
+            )
+            contracts.append(
+                self.param_binding.build_execution_contract(
+                    query,
+                    bucket,
+                    provenance="typed_index_analysis",
+                )
+            )
+            binding_summaries.append(
+                {
+                    "bucket_id": bucket.bucket_id,
+                    "values_redacted": True,
+                    "parameters": [
+                        {
+                            "name": parameter.name,
+                            "data_type": parameter.sql_type.sql_declaration,
+                            "provenance": parameter.provenance,
+                        }
+                        for parameter in bucket.parameters
+                    ],
+                }
+            )
+        result = await self.query_index_analysis.analyze_queries(
+            database_name,
+            queries,
+            execution_contracts=contracts,
+        )
+        result["parameter_binding"] = binding_summaries
+        return result
 
     async def _get_top_queries(
         self,
@@ -4459,6 +6714,114 @@ class AzureSqlMcpApplication:
             return len(payload)
         return 0
 
+    async def _verify_pending_index_ownership(
+        self,
+        database_name: str,
+        lease: Mapping[str, Any],
+        current_index: Any,
+        ownership_proof: str,
+    ) -> None:
+        """Prove an uncertain CREATE belongs to this lease before cleanup."""
+
+        metadata = lease.get("metadata") or {}
+        key_columns = metadata.get("key_columns")
+        include_columns = metadata.get("include_columns")
+        filter_definition = metadata.get("filter_definition")
+        is_unique = metadata.get("is_unique")
+
+        schema_name = metadata.get("target_schema")
+        table_name = metadata.get("target_table")
+        index_name = lease.get("index_name")
+        object_fingerprint = str(lease.get("object_fingerprint") or "")
+        marker_fingerprint = str(
+            metadata.get("marker_definition_fingerprint") or object_fingerprint
+        )
+        if not isinstance(schema_name, str) or not schema_name:
+            raise ValueError("pending CREATE lease has no target schema")
+        if not isinstance(table_name, str) or not table_name:
+            raise ValueError("pending CREATE lease has no target table")
+        if not isinstance(index_name, str) or not index_name:
+            raise ValueError("pending CREATE lease has no resolvable target")
+        if marker_fingerprint != object_fingerprint:
+            raise ValueError("pending CREATE lease marker fingerprint is inconsistent")
+        persisted_structure = any(
+            value is not None
+            for value in (key_columns, include_columns, filter_definition, is_unique)
+        )
+        if persisted_structure:
+            if not isinstance(key_columns, (list, tuple)) or not key_columns:
+                raise ValueError("pending CREATE lease key structure is invalid")
+            if not all(isinstance(column, str) for column in key_columns):
+                raise ValueError("pending CREATE lease key structure is invalid")
+            if not isinstance(include_columns, (list, tuple)) or not all(
+                isinstance(column, str) for column in include_columns
+            ):
+                raise ValueError("pending CREATE lease include structure is invalid")
+            if filter_definition is not None and not isinstance(
+                filter_definition, str
+            ):
+                raise ValueError("pending CREATE lease filter structure is invalid")
+            if not isinstance(is_unique, bool):
+                raise ValueError("pending CREATE lease uniqueness is invalid")
+            candidate = IndexCandidate(
+                schema=schema_name,
+                table=table_name,
+                key_columns=tuple(key_columns),
+                include_columns=tuple(include_columns),
+                filter_definition=filter_definition,
+                is_unique=is_unique,
+                index_name=index_name,
+            )
+        else:
+            candidate = IndexCandidate(
+                schema=current_index.schema,
+                table=current_index.table,
+                key_columns=tuple(
+                    f"[{column.name}] {column.direction}"
+                    for column in current_index.key_columns
+                ),
+                include_columns=tuple(current_index.include_columns),
+                filter_definition=current_index.filter_definition,
+                is_unique=current_index.is_unique,
+                index_name=current_index.name,
+            )
+        if candidate.definition_fingerprint != marker_fingerprint:
+            raise ValueError("pending CREATE lease structure does not match its marker")
+        if not expected_index_definition_matches(current_index, candidate):
+            raise ValueError(
+                "pending CREATE index structure does not match its persisted candidate"
+            )
+
+        rows = await self.executor.fetch_all(
+            database_name,
+            _PENDING_INDEX_OWNERSHIP_SQL,
+            params=(
+                TEST_INDEX_OWNER_PROPERTY,
+                TEST_INDEX_DEFINITION_PROPERTY,
+                schema_name,
+                table_name,
+                index_name,
+            ),
+        )
+        if len(rows) != 1:
+            raise ValueError("pending CREATE ownership marker lookup was ambiguous")
+        row = rows[0]
+        raw_index_id = row.get("index_id")
+        if raw_index_id is None:
+            raise ValueError("pending CREATE ownership marker has no index identity")
+        try:
+            marker_index_id = int(str(raw_index_id))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("pending CREATE ownership marker has no index identity") from exc
+        if marker_index_id <= 0 or marker_index_id != current_index.index_id:
+            raise ValueError("pending CREATE ownership marker index identity mismatch")
+        if row.get("owner_marker") != ownership_proof:
+            raise ValueError("pending CREATE ownership marker is missing or mismatched")
+        if row.get("definition_marker") != marker_fingerprint:
+            raise ValueError(
+                "pending CREATE definition marker is missing or mismatched"
+            )
+
     async def _cleanup_expired_index_leases(self) -> dict[str, int]:
         """Retry expired temporary-index cleanup before a sandbox accepts work."""
 
@@ -4466,9 +6829,6 @@ class AzureSqlMcpApplication:
         if self.config.profile != McpProfile.SANDBOX:
             return summary
         now = datetime.now(timezone.utc)
-        databases_by_fingerprint = {
-            database_fingerprint(name): name for name in self.config.allowed_databases
-        }
         for lease in self.performance_store.list_open_index_leases():
             try:
                 expires_at = datetime.fromisoformat(
@@ -4480,11 +6840,28 @@ class AzureSqlMcpApplication:
                 expires_at = now
             if expires_at.astimezone(timezone.utc) > now:
                 continue
+            if self._index_lease_has_live_session(lease, now):
+                # A short/legacy lease must not let another MCP process drop an
+                # index while its durable tuning session can still dispatch work.
+                continue
             summary["examined"] += 1
-            database_name = databases_by_fingerprint.get(lease["database_fingerprint"])
+            database_name = next(
+                (
+                    name
+                    for name in self.config.allowed_databases
+                    if database_fingerprint_matches(
+                        str(lease["database_fingerprint"]),
+                        name,
+                        self.config.server,
+                        allow_legacy=bool(self.config.legacy_state_server_binding),
+                    )
+                ),
+                None,
+            )
             metadata = lease.get("metadata") or {}
             schema_name = metadata.get("target_schema")
             table_name = metadata.get("target_table")
+            ownership_proof = metadata.get("lease_owner_fence")
             try:
                 if (
                     not database_name
@@ -4492,18 +6869,69 @@ class AzureSqlMcpApplication:
                     or not isinstance(table_name, str)
                 ):
                     raise ValueError("expired lease has no resolvable cleanup target")
+                if not isinstance(ownership_proof, str) or not _INDEX_OWNER_PROOF.fullmatch(
+                    ownership_proof
+                ):
+                    raise ValueError(
+                        "expired lease has no private ownership marker token"
+                    )
                 self._require_test_index_database(database_name)
-                self.performance_store.update_index_lease(
+                updated_lease = self.performance_store.recover_index_lease(
                     lease["lease_id"],
                     status="cleanup_pending",
                     metadata={"recovery_attempted_at_utc": now.isoformat()},
+                    expected_version=lease["version"],
                 )
-                if await self._temporary_index_exists(
+                current_indexes = await collect_existing_indexes(
+                    self.executor,
                     database_name,
-                    schema_name,
-                    table_name,
-                    lease["index_name"],
-                ):
+                )
+                current_index = next(
+                    (
+                        index
+                        for index in current_indexes
+                        if index.schema == schema_name
+                        and index.table == table_name
+                        and index.name == str(lease["index_name"])
+                    ),
+                    None,
+                )
+                if current_index is not None:
+                    if lease["status"] == "pending_create" and metadata.get(
+                        "create_dispatch_state"
+                    ) != "dispatched":
+                        raise RuntimeError(
+                            "pre-dispatch temporary-index lease has an unexpected "
+                            "visible index"
+                        )
+                    if lease["status"] == "pending_create":
+                        await self._verify_pending_index_ownership(
+                            database_name,
+                            lease,
+                            current_index,
+                            ownership_proof,
+                        )
+                    else:
+                        observed_fingerprint = metadata.get(
+                            "observed_definition_fingerprint"
+                        )
+                        verification_fingerprint = (
+                            observed_fingerprint
+                            if isinstance(observed_fingerprint, str)
+                            and observed_fingerprint
+                            else str(lease["object_fingerprint"])
+                        )
+                        if (
+                            metadata.get("fingerprint_provenance")
+                            != "observed_existing_index"
+                            or current_index.definition_fingerprint
+                            != verification_fingerprint
+                            or current_index.is_disabled
+                        ):
+                            raise RuntimeError(
+                                "expired lease index definition no longer matches its "
+                                "workflow-owned fingerprint"
+                            )
                     await self._drop_test_index(
                         database_name,
                         schema_name,
@@ -4511,27 +6939,74 @@ class AzureSqlMcpApplication:
                         lease["index_name"],
                         dry_run=False,
                         workflow_managed=True,
+                        idempotency_key=(
+                            f"lease-recovery:{lease['lease_id']}:"
+                            f"{updated_lease['version']}"
+                        ),
+                        ownership_proof=ownership_proof,
+                        expected_definition_fingerprint=str(
+                            lease["object_fingerprint"]
+                        ),
+                        expected_index_id=current_index.index_id,
                     )
-                self.performance_store.update_index_lease(
+                elif lease["status"] == "pending_create":
+                    if metadata.get("create_dispatch_state") != "pre_dispatch":
+                        raise RuntimeError(
+                            "temporary-index lease has an uncertain create outcome"
+                        )
+                self.performance_store.recover_index_lease(
                     lease["lease_id"],
                     status="cleaned",
                     metadata={
                         "recovered_at_startup": True,
                         "cleaned_at_utc": datetime.now(timezone.utc).isoformat(),
                     },
+                    expected_version=updated_lease["version"],
                 )
                 summary["cleaned"] += 1
             except Exception as exc:
-                self.performance_store.update_index_lease(
-                    lease["lease_id"],
-                    status="cleanup_required",
-                    metadata={
-                        "recovery_error_type": type(exc).__name__,
-                        "recovery_attempted_at_utc": now.isoformat(),
-                    },
-                )
+                try:
+                    current_lease = self.performance_store.get_index_lease(
+                        lease["lease_id"]
+                    )
+                    self.performance_store.recover_index_lease(
+                        lease["lease_id"],
+                        status="cleanup_required",
+                        metadata={
+                            "recovery_error_type": type(exc).__name__,
+                            "recovery_attempted_at_utc": now.isoformat(),
+                        },
+                        expected_version=current_lease["version"],
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to record expired temporary-index cleanup failure",
+                        extra={"lease_id": lease["lease_id"]},
+                    )
                 summary["cleanup_required"] += 1
         return summary
+
+    def _index_lease_has_live_session(
+        self,
+        lease: Mapping[str, Any],
+        now: datetime,
+    ) -> bool:
+        if lease.get("status") not in {"pending_create", "active"}:
+            return False
+        try:
+            session = self.tuning_sessions.get_session(str(lease["session_id"]))
+            if session.status not in {"screening", "finalist_validation"}:
+                return False
+            if not session.deadline_at_utc:
+                return True
+            deadline = datetime.fromisoformat(
+                session.deadline_at_utc.replace("Z", "+00:00")
+            )
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=timezone.utc)
+            return deadline.astimezone(timezone.utc) > now
+        except (ContractNotFoundError, KeyError, TypeError, ValueError):
+            return False
 
     async def _temporary_index_exists(
         self,

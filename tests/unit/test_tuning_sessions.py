@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from azure_sql_mcp.performance_contracts import PerformanceCaseV1
-from azure_sql_mcp.performance_store import PerformanceStore
+from azure_sql_mcp.performance_store import IdempotencyConflictError, PerformanceStore
 from azure_sql_mcp.tuning_sessions import (
     TuningBudgetExceeded,
     TuningSessionStateMachine,
@@ -89,11 +89,18 @@ def test_candidate_and_result_operations_are_idempotent(tmp_path) -> None:
         )
         replay = machine.add_candidate(
             session.session_id,
-            strategy="different-strategy",
-            rewrite_fingerprint="different-rewrite",
+            strategy="predicate",
+            rewrite_fingerprint="rewrite-hash",
             idempotency_key="candidate-create",
         )
         assert replay == first
+        with pytest.raises(IdempotencyConflictError):
+            machine.add_candidate(
+                session.session_id,
+                strategy="different-strategy",
+                rewrite_fingerprint="different-rewrite",
+                idempotency_key="candidate-create",
+            )
 
         machine.start_screening(session.session_id)
         first_result = machine.record_candidate_result(
@@ -112,6 +119,97 @@ def test_candidate_and_result_operations_are_idempotent(tmp_path) -> None:
         )
         assert replay_result == first_result
         assert machine.get_candidate(first.candidate_id).screen_runs == 1
+    finally:
+        store.close()
+
+
+def test_transition_replay_is_bound_to_the_exact_candidate(tmp_path) -> None:
+    store, machine, case = _new_machine(tmp_path)
+    try:
+        session = machine.create_session(case)
+        candidate_a = machine.add_candidate(session.session_id, strategy="predicate")
+        candidate_b = machine.add_candidate(session.session_id, strategy="join-shape")
+        machine.start_screening(session.session_id)
+        machine.record_candidate_result(
+            session.session_id,
+            candidate_a.candidate_id,
+            screen_runs=1,
+            executions=1,
+            idempotency_key="candidate-a-result",
+        )
+        binding = store._connection.execute(
+            """
+            SELECT request_fingerprint
+            FROM operation_idempotency
+            WHERE scope = 'tuning.transition'
+              AND idempotency_key = 'candidate-a-result'
+            """
+        ).fetchone()
+        assert binding is not None
+
+        with pytest.raises(IdempotencyConflictError, match="candidate event"):
+            store.replay_session_and_candidate_transition(
+                session.session_id,
+                candidate_b.candidate_id,
+                idempotency_key="candidate-a-result",
+                request_fingerprint=binding["request_fingerprint"],
+            )
+    finally:
+        store.close()
+
+
+def test_legacy_transition_replay_uses_candidate_event_to_upgrade_binding(
+    tmp_path,
+) -> None:
+    store, machine, case = _new_machine(tmp_path)
+    try:
+        session = machine.create_session(case)
+        candidate = machine.add_candidate(session.session_id, strategy="predicate")
+        machine.start_screening(session.session_id)
+        expected = machine.record_candidate_result(
+            session.session_id,
+            candidate.candidate_id,
+            screen_runs=1,
+            executions=1,
+            idempotency_key="legacy-candidate-result",
+        )
+        binding = store._connection.execute(
+            """
+            SELECT request_fingerprint
+            FROM operation_idempotency
+            WHERE scope = 'tuning.transition'
+              AND idempotency_key = 'legacy-candidate-result'
+            """
+        ).fetchone()
+        assert binding is not None
+        request_fingerprint = binding["request_fingerprint"]
+        store._connection.execute(
+            """
+            UPDATE operation_idempotency
+            SET request_fingerprint = NULL
+            WHERE scope = 'tuning.transition'
+              AND idempotency_key = 'legacy-candidate-result'
+            """
+        )
+
+        replay = store.replay_session_and_candidate_transition(
+            session.session_id,
+            candidate.candidate_id,
+            idempotency_key="legacy-candidate-result",
+            request_fingerprint=request_fingerprint,
+        )
+        upgraded = store._connection.execute(
+            """
+            SELECT request_fingerprint
+            FROM operation_idempotency
+            WHERE scope = 'tuning.transition'
+              AND idempotency_key = 'legacy-candidate-result'
+            """
+        ).fetchone()
+
+        assert replay == expected
+        assert upgraded is not None
+        assert upgraded["request_fingerprint"] == request_fingerprint
     finally:
         store.close()
 
@@ -201,5 +299,29 @@ def test_finalist_reuses_screened_parameter_cases_without_double_counting(
         assert finalist.parameter_cases == 4
         assert finalist.executions == 80
         assert finalist.state == "improved"
+    finally:
+        store.close()
+
+
+def test_cancellation_persists_stopping_and_replay_metadata(tmp_path) -> None:
+    store, machine, case = _new_machine(tmp_path)
+    try:
+        session = machine.create_session(
+            case,
+            replay_metadata={"resume_marker": "resume-1"},
+            idempotency_key="session-replay",
+        )
+        cancelled = machine.cancel_session(
+            session.session_id,
+            stopping_reason="operator_requested",
+            replay_metadata={"last_attempt": 2},
+            idempotency_key="cancel-1",
+        )
+
+        assert cancelled.status == "cancelled"
+        assert cancelled.stopping_reason == "operator_requested"
+        assert cancelled.replay_metadata["resume_marker"] == "resume-1"
+        assert cancelled.replay_metadata["last_attempt"] == 2
+        assert machine.get_session(session.session_id) == cancelled
     finally:
         store.close()

@@ -11,7 +11,7 @@ You need:
 - a local checkout of this repository;
 - Azure SQL authentication supplied outside Git;
 - a database principal with only the permissions required for the selected profile;
-- a local database-policy file for repeated benchmarks, temporary indexes, or plan apply.
+- a local database-policy file for repeated benchmarks, temporary indexes, view apply, or plan apply.
 
 Install the package:
 
@@ -64,6 +64,12 @@ Read-only triage example:
 }
 ```
 
+`check_capabilities.local_tuning_policy` shows the effective limits for the
+selected database. The server derives each benchmark tool's outer timeout from
+`max_benchmark_executions` and the configured query timeout, with cleanup
+headroom. Multi-hour session budgets therefore remain usable while every
+individual SQL execution still has its own timeout.
+
 After reload:
 
 1. Open Copilot Chat.
@@ -87,8 +93,12 @@ Create an uncommitted JSON file outside the repository:
       "allow_read": true,
       "allow_benchmark": true,
       "allow_test_indexes": true,
+      "allow_view_apply": true,
       "allow_plan_apply": false,
-      "max_benchmark_executions": 80
+      "max_benchmark_executions": 80,
+      "max_tuning_candidates": 60,
+      "max_tuning_session_executions": 2000,
+      "max_tuning_session_minutes": 360
     }
   }
 }
@@ -96,13 +106,28 @@ Create an uncommitted JSON file outside the repository:
 
 Set its absolute path with `AZURE_SQL_DATABASE_POLICY_FILE`. Missing files, invalid schemas, unknown databases, and omitted dangerous permissions fail closed.
 
+### Upgrading durable state from pre-v1 releases
+
+Pre-v1 state identified a database by name only. The current identity also binds
+the Azure SQL logical server, so legacy state is rejected by default rather
+than being silently adopted on a different server.
+
+To finish an interrupted pre-v1 workflow, first verify that the protected state
+directory was created against the currently configured logical server. Then
+temporarily set `AZURE_SQL_LEGACY_STATE_SERVER_BINDING` to the exact
+`AZURE_SQL_SERVER` value and restart the MCP process. Matching records are
+accepted only for that explicitly attested server; records that can be safely
+rewritten in place, such as prepared plan intents, are upgraded when resumed.
+A different binding fails startup. Remove the temporary variable after all
+required legacy workflows have completed or been retired.
+
 ## Profile matrix
 
 | Profile | Skill/context | Access | Write policy | Tool groups | Database policy |
 | --- | --- | --- | --- | --- | --- |
 | `triage` | `sql-health-triage` | restricted | disabled | core,performance | not required for passive evidence |
-| `optimizer` | `sql-optimizer`, read-only | restricted | disabled | core,performance | benchmark permission required for measured runs |
-| `sandbox` | `sql-optimizer`, temporary index | unrestricted, local stdio | apply | core,performance,admin | benchmark and test-index permission, non-production environment |
+| `optimizer` | `sql-optimizer`, read-only | restricted | disabled | core,performance | benchmark permission required for measured runs; view preparation remains read-only |
+| `sandbox` | `sql-optimizer`, temporary index or view | unrestricted, local stdio | apply | core,performance,admin | benchmark, test-index, or view-apply permission as needed; non-production environment |
 | `enforcer-review` | `sql-plan-enforcer`, review | restricted | disabled | core,performance | shared state path required for intent preparation |
 | `enforcer-apply` | `sql-plan-enforcer`, one apply | unrestricted, local stdio | apply | core,performance,admin | plan-apply permission and open kill switch |
 | unset (general DBA) | explicitly authorized DBA work | unrestricted, local stdio | apply | all | normal database allowlist; SQL permissions remain authoritative |
@@ -142,7 +167,11 @@ This guard is an application-layer safety check, not a SQL permission boundary. 
 
 Azure control-plane deletion is separate from T-SQL execution. An Azure RBAC role or resource lock controls deletion through Azure Resource Manager; SQL permissions control `DROP DATABASE` over a database connection. Protect and audit both surfaces. A custom Azure role that omits database resource delete does not, by itself, remove a SQL principal's T-SQL permission, and overlapping role assignments can restore control-plane delete authority.
 
-Azure's subscription-level [Block T-SQL CRUD](https://learn.microsoft.com/azure/azure-sql/database/block-crud-tsql) feature also blocks `CREATE DATABASE` and several `ALTER DATABASE` operations, so it is not compatible with this exact broad-DBA-except-drop posture.
+Azure SQL Database's subscription-level Block T-SQL CRUD control also blocks
+`CREATE DATABASE` and several `ALTER DATABASE` operations. It is therefore not
+compatible with this exact broad-DBA-except-drop posture. Use a narrower MCP
+principal and explicit database allowlist instead of assuming that control can
+distinguish the allowed administration statements from the prohibited ones.
 
 For a remote transport, `AZURE_SQL_MCP_BEARER_TOKEN`, private TLS termination, and `AZURE_SQL_ENABLE_REMOTE_ADMIN=1` are additional mandatory server gates. Prefer local stdio because enabling remote admin exposes a destructive, non-idempotent tool across a network boundary.
 
@@ -199,7 +228,7 @@ Continue after losing candidates and return the winning SQL plus the complete le
 Expected sequence:
 
 1. Static semantic review and concrete candidate SQL.
-2. `start_performance_case` with up to four parameter cases.
+2. `start_performance_case` with up to four parameter cases; each case includes one exact value and SQL type for every parameter.
 3. `start_tuning_session`.
 4. `add_tuning_candidate` for one family at a time.
 5. `benchmark_tuning_candidate` for three screening runs.
@@ -207,7 +236,7 @@ Expected sequence:
 7. Re-run credible winners with five finalist runs.
 8. `finalize_tuning_session` with a winner or a documented `no_change` stopping reason.
 
-Measured candidates use exactly-once user-query samples. A full duplicate/order-aware comparison is proven only when both complete results fit the bound in one snapshot; otherwise equivalence is inconclusive.
+Measured candidates use typed `sp_executesql` and exactly-once user-query samples. Screening normally uses three baseline/candidate pairs: six executions per parameter case. Finalists use five pairs plus one two-query snapshot comparison: twelve per case and 48 for four. A full duplicate/order-aware comparison is proven only when both complete results fit `AZURE_SQL_COMPARISON_ROW_LIMIT` in one snapshot; otherwise equivalence is inconclusive.
 
 ## Sandbox index runbook
 
@@ -231,11 +260,50 @@ Safety gates:
 - the tuning case, session, candidate, and SQL fingerprints match;
 - index identifiers pass strict validation;
 - the lease is written before DDL;
+- index creation and its private ownership marker commit atomically;
 - no unresolved lease already exists for the database.
 
-Call only `benchmark_index_candidate`, supplying the same named parameter cases recorded on the performance case. It creates a namespaced disposable index, measures every bucket, performs one bounded snapshot comparison per bucket, and removes the index automatically. A slower index is classified and rejected without ending the session. Cleanup failure returns `cleanup_required` and blocks another test. Expired leases are reconciled when the sandbox process starts.
+Call only `benchmark_index_candidate`, supplying an unchanged subset of
+recorded parameter cases for screening and all recorded cases for a finalist.
+It creates a namespaced disposable index, writes a private index-level marker
+in the same transaction, measures baseline/index/post-cleanup A-B-A, verifies
+expected index use, and removes the index only when both the marker and exact
+definition match. Screening costs nine executions per case; a five-run
+finalist costs fifteen per case and 60 for four.
+
+DDL separates the phases, so the workflow does not call this same-snapshot rewrite equivalence. The SQL is unchanged, and complete non-truncated result fingerprints must remain stable across A-B-A. Data changes make the result inconclusive. A slower index is classified and rejected without ending the session. Cleanup failure returns `cleanup_required` and blocks another test. A finalized idempotent reservation is retrieved rather than rerun. Expired leases are reconciled when the sandbox process starts.
 
 Do not use direct create/drop tools for live DDL; they are preview-only.
+
+## Sandbox view runbook
+
+Prepare is read-only and is available under both `optimizer` and `sandbox`.
+An optimizer preparation is preview-only and cannot be handed to a different
+MCP process:
+
+1. Call `prepare_view_change` with the schema, view, complete SELECT-shaped body, and operation.
+2. Review legality, dependencies, exact prior definition fingerprint, apply preview, and exact rollback preview.
+
+Apply only in the local `sandbox` process:
+
+1. Confirm the target policy is non-production and sets `allow_view_apply=true`.
+2. Set `AZURE_SQL_PERSIST_VIEW_SQL_STATE=true`. This explicitly permits the exact target and prior view definitions to be stored in the owner-only state database for crash recovery.
+3. Call `prepare_view_change` again in this sandbox process with a stable idempotency key. Review the durable change id and raw-state disclosure.
+4. Call `apply_prepared_view_change` with `reviewed_intent=true` and the same idempotency key.
+5. Call `verify_view_change`.
+6. Keep the candidate only after its consumer-query/workload validation passes.
+7. Otherwise call `rollback_view_change`. The workflow restores the captured definition for an altered view or drops only a workflow-created view whose current definition still matches.
+
+Apply/rollback precondition checks, DDL, and a private view-level ownership
+marker run in one transaction. Preparation rejects a view already carrying
+another suite marker. If the process stops during apply, restart it with the
+same state directory and call `verify_view_change` for the same change id. A
+matching target is reconciled without replaying DDL only when its durable
+marker also matches. Ambiguous or externally applied state returns `hold` with
+the original rollback contract retained. Do not prepare a replacement intent
+against the changed view.
+
+This path enables controlled view testing; it does not authorize a production view deployment.
 
 ## Plan review runbook
 
@@ -308,7 +376,7 @@ CI runs unit tests, Ruff, Pyright, build, clean skill install/parity, Markdown-l
 
 ### Live validation
 
-Run only against an allowlisted dedicated non-production Azure SQL database. Validate read-only workflows first with `optimizer`; use `sandbox` only for a leased index test. Do not run plan apply as a smoke test.
+Run only against an allowlisted dedicated non-production Azure SQL database. Validate read-only workflows first with `optimizer`; use `sandbox` only for a leased index or reviewed view test. Do not run plan apply as a smoke test.
 
 ## State and audit operations
 

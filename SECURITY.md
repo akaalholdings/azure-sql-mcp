@@ -33,6 +33,7 @@ remediation guidance and release timelines when confirmed.
 - Write-capable generated tools default to dry-run review. Execution requires `dry_run=false` and `AZURE_SQL_WRITE_POLICY=apply`.
 - Unprofiled `execute_tsql_unrestricted` accepts authorized DBA T-SQL except direct or statically recoverable `DROP DATABASE`. It requires unrestricted access, the `admin` or `all` tool group, write policy `apply`, `dry_run=false`, and an allowlisted initial database.
 - Audit records are written to `AZURE_SQL_AUDIT_DIR`. By default records include SQL hash + preview, not full raw SQL; set `AZURE_SQL_AUDIT_FULL_SQL=1` only for controlled environments.
+- Exact sandbox view rollback is disabled unless `AZURE_SQL_PERSIST_VIEW_SQL_STATE=true`; that opt-in stores target and prior view definitions in the owner-only performance-state database so recovery survives a process restart.
 - Query Store apply support is limited to reversible `sp_query_store_force_plan` / `sp_query_store_unforce_plan` actions.
 
 ## General DBA execution boundary
@@ -53,4 +54,7 @@ The database login remains the authoritative data-plane identity. Give it only t
 
 Azure Resource Manager delete and T-SQL `DROP DATABASE` are separate paths. Azure RBAC and resource locks govern control-plane deletion; SQL permissions govern commands submitted over a database connection. Apply protection to both surfaces and audit overlapping Azure role assignments. Neither an Azure RBAC role that omits resource delete nor this MCP scanner, by itself, proves that T-SQL database deletion is impossible.
 
-Azure's subscription-level [Block T-SQL CRUD](https://learn.microsoft.com/azure/azure-sql/database/block-crud-tsql) feature is a stronger platform control, but it also blocks `CREATE DATABASE` and several `ALTER DATABASE` operations. It therefore does not implement this tool's broad-DBA-except-drop contract.
+Azure SQL Database's subscription-level Block T-SQL CRUD control is a stronger
+platform gate, but it also blocks `CREATE DATABASE` and several `ALTER DATABASE`
+operations. It therefore does not implement this tool's
+broad-DBA-except-drop contract.

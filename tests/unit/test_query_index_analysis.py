@@ -6,8 +6,44 @@ from unittest.mock import MagicMock
 import pytest
 
 from azure_sql_mcp.connection import QueryResult
+from azure_sql_mcp.param_binding import ParameterExecutionContract
+from azure_sql_mcp.param_binding import SqlParameterType
+from azure_sql_mcp.param_binding import TypedParameter
 from azure_sql_mcp.query_index_analysis import QueryIndexAnalysisService
 from azure_sql_mcp.safe_sql import SafeSqlValidator
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("query", "contract_sql"),
+    [
+        ("SELECT 1", "select 1"),
+        ("SELECT  1", "SELECT 1"),
+    ],
+)
+async def test_analyze_queries_rejects_nonidentical_contract_sql(
+    query: str,
+    contract_sql: str,
+) -> None:
+    executor = MagicMock()
+    executor.config.row_limit = 200
+    executor.fetch_all = AsyncMock(return_value=[])
+    service = QueryIndexAnalysisService(executor, SafeSqlValidator())
+    contract = ParameterExecutionContract(
+        sql_text=contract_sql,
+        bucket_id="common",
+        parameters=(),
+        provenance="synthetic",
+    )
+
+    with pytest.raises(ValueError, match="exactly match"):
+        await service.analyze_queries(
+            "appdb",
+            [query],
+            execution_contracts=[contract],
+        )
+
+    executor.fetch_all.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -31,6 +67,51 @@ async def test_get_estimated_plan_uses_execute_session() -> None:
         ["SET SHOWPLAN_XML ON", "SELECT 1", "SET SHOWPLAN_XML OFF"],
         max_rows=201,
     )
+
+
+@pytest.mark.asyncio
+async def test_analyze_queries_uses_typed_contract_for_estimated_plan() -> None:
+    executor = MagicMock()
+    executor.config.row_limit = 200
+    executor.fetch_all = AsyncMock(return_value=[])
+    executor.execute_session = AsyncMock(
+        return_value=[
+            [],
+            [QueryResult(columns=("plan_xml",), rows=[{"plan_xml": "<ShowPlanXML/>"}])],
+            [],
+        ]
+    )
+    service = QueryIndexAnalysisService(executor, SafeSqlValidator())
+    service._extract_missing_indexes = MagicMock(return_value=[])
+    sql = "SELECT name FROM dbo.Widgets WHERE WidgetId = @WidgetId"
+    contract = ParameterExecutionContract(
+        sql_text=sql,
+        bucket_id="common",
+        parameters=(
+            TypedParameter(
+                name="@WidgetId",
+                sql_type=SqlParameterType.from_sql("bigint"),
+                value=42,
+                provenance="synthetic",
+            ),
+        ),
+        provenance="synthetic",
+    )
+
+    result = await service.analyze_queries(
+        "appdb",
+        [sql],
+        execution_contracts=[contract],
+    )
+
+    assert result["queries_analyzed"] == 1
+    plan_call = executor.execute_session.await_args
+    assert plan_call.args[1][1] == contract.sp_executesql_sql
+    assert plan_call.kwargs["statement_params"] == [
+        None,
+        contract.sp_executesql_values,
+        None,
+    ]
 
 
 @pytest.mark.asyncio

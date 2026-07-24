@@ -10,9 +10,11 @@ from typing import Awaitable, Callable, TypeVar
 logger = logging.getLogger(__name__)
 
 # Azure SQL transient error codes that are safe to retry.
-# References:
-#   https://learn.microsoft.com/en-us/azure/azure-sql/database/troubleshoot-common-errors-issues
-#   https://learn.microsoft.com/en-us/azure/azure-sql/database/troubleshoot-common-connectivity-issues
+# Azure SQL Database can return transient throttling, failover, connection,
+# transport, deadlock, and service-busy errors.  Only the explicitly classified
+# retry-safe operations below may be retried, using bounded exponential backoff
+# with jitter.  Profiled samples and mutations are deliberately excluded because
+# replay would corrupt measurements or repeat a side effect.
 TRANSIENT_ERROR_CODES = frozenset(
     {
         233,     # Connection closed during login

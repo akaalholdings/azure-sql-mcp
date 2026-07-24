@@ -40,6 +40,21 @@ def test_contracts_round_trip_as_explicit_versioned_json() -> None:
         assert json.loads(encoded)["contract_type"] == contract.contract_type
 
 
+def test_legacy_performance_case_defaults_to_zero_state_version() -> None:
+    legacy_payload = json.dumps(
+        {
+            "contract_type": "PerformanceCaseV1",
+            "contract_version": 1,
+            "case_id": "case-legacy",
+            "query_fingerprint": "query-hash",
+        }
+    )
+
+    case = PerformanceCaseV1.from_json(legacy_payload)
+
+    assert case.version == 0
+
+
 def test_contract_metadata_drops_raw_sql_and_secret_like_fields() -> None:
     evidence = EvidenceEnvelopeV1(
         evidence_id="evidence-2",

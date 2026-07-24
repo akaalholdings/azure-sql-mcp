@@ -15,6 +15,7 @@ from azure_sql_mcp.connection import AzureSqlExecutor
 from azure_sql_mcp.connection import BatchExecutionMode
 from azure_sql_mcp.connection import ProfiledExecution
 from azure_sql_mcp.connection import QueryResult
+from azure_sql_mcp.connection import StatementDispatchPrevented
 
 
 class RowCountCursor:
@@ -229,6 +230,35 @@ async def test_execute_non_query_returns_cursor_rowcount(sample_server_config) -
     pool.discard.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_execute_non_query_does_not_retry_after_transient_failure(
+    sample_server_config,
+) -> None:
+    connection = MagicMock()
+    pool = SimpleNamespace(
+        acquire=AsyncMock(return_value=connection),
+        release=AsyncMock(),
+        discard=AsyncMock(),
+    )
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), pool)
+
+    with patch.object(
+        executor,
+        "_execute_non_query_with_connection",
+        side_effect=AdminBatchOutcomeUnknownError("40501 after dispatch"),
+    ) as execute_mock:
+        with pytest.raises(AdminBatchOutcomeUnknownError, match="40501"):
+            await executor.execute_non_query(
+                "appdb",
+                "ALTER INDEX ALL ON dbo.items REBUILD",
+            )
+
+    execute_mock.assert_called_once()
+    pool.acquire.assert_awaited_once_with("appdb")
+    pool.discard.assert_awaited_once_with("appdb", connection)
+    pool.release.assert_not_awaited()
+
+
 def test_execute_non_query_with_connection_counts_only_positive_rowcounts(
     sample_server_config,
 ) -> None:
@@ -245,6 +275,31 @@ def test_execute_non_query_with_connection_counts_only_positive_rowcounts(
     )
 
     assert rowcount == 10
+
+
+def test_execute_non_query_marks_post_dispatch_failure_as_unknown(
+    sample_server_config,
+) -> None:
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), MagicMock())
+    cursor = MagicMock()
+    cursor.rowcount = 1
+    cursor.nextset.side_effect = RuntimeError("40501 after dispatch")
+    connection = MagicMock()
+    connection.cursor.return_value = cursor
+
+    with pytest.raises(AdminBatchOutcomeUnknownError, match="40501"):
+        executor._execute_non_query_with_connection(
+            connection,
+            "appdb",
+            "UPDATE STATISTICS dbo.items",
+            (),
+        )
+
+    assert cursor.execute.call_args_list == [
+        call("SET LOCK_TIMEOUT 30000", ()),
+        call("UPDATE STATISTICS dbo.items", ()),
+    ]
+    cursor.close.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -324,6 +379,100 @@ async def test_exact_session_failure_is_not_automatically_retried(
     execute_mock.assert_called_once()
     pool.release.assert_not_awaited()
     pool.discard.assert_awaited_once_with("appdb", connection)
+
+
+@pytest.mark.asyncio
+async def test_exact_session_statement_hook_runs_in_worker(
+    sample_server_config,
+) -> None:
+    cursors = [MagicMock() for _ in range(3)]
+    for cursor in cursors:
+        cursor.description = None
+        cursor.nextset.return_value = False
+    connection = MagicMock()
+    connection.cursor.side_effect = cursors
+    pool = SimpleNamespace(
+        acquire=AsyncMock(return_value=connection),
+        release=AsyncMock(),
+        discard=AsyncMock(),
+    )
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), pool)
+    callback_indices: list[int] = []
+    callback_threads: list[int] = []
+    main_thread = threading.get_ident()
+
+    def before_dispatch(statement_index: int) -> None:
+        callback_indices.append(statement_index)
+        callback_threads.append(threading.get_ident())
+
+    await executor.execute_session_exactly_once(
+        "appdb",
+        ["BEGIN TRANSACTION", "SELECT 1", "ROLLBACK TRANSACTION"],
+        before_statement_dispatch=before_dispatch,
+    )
+
+    assert callback_indices == [0, 1, 2]
+    assert callback_threads
+    assert all(thread_id != main_thread for thread_id in callback_threads)
+    pool.release.assert_awaited_once_with("appdb", connection)
+
+
+@pytest.mark.asyncio
+async def test_exact_session_hook_prevents_selected_statement_dispatch(
+    sample_server_config,
+) -> None:
+    cursors = [MagicMock() for _ in range(3)]
+    for cursor in cursors:
+        cursor.description = None
+        cursor.nextset.return_value = False
+    connection = MagicMock()
+    connection.cursor.side_effect = cursors
+    pool = SimpleNamespace(
+        acquire=AsyncMock(return_value=connection),
+        release=AsyncMock(),
+        discard=AsyncMock(),
+    )
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), pool)
+
+    def reject_candidate(statement_index: int) -> None:
+        if statement_index == 1:
+            raise RuntimeError("deadline expired")
+
+    with pytest.raises(StatementDispatchPrevented) as exc_info:
+        await executor.execute_session_exactly_once(
+            "appdb",
+            ["BEGIN TRANSACTION", "SELECT 1", "ROLLBACK TRANSACTION"],
+            before_statement_dispatch=reject_candidate,
+        )
+
+    assert exc_info.value.statement_index == 1
+    assert isinstance(exc_info.value.cause, RuntimeError)
+    cursors[1].execute.assert_not_called()
+    pool.release.assert_not_awaited()
+    pool.discard.assert_awaited_once_with("appdb", connection)
+
+
+def test_session_execution_binds_parameters_to_the_matching_statement(
+    sample_server_config,
+) -> None:
+    cursors = [MagicMock() for _ in range(3)]
+    for cursor in cursors:
+        cursor.description = None
+        cursor.nextset.return_value = False
+    connection = MagicMock()
+    connection.cursor.side_effect = cursors
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), MagicMock())
+
+    executor._execute_session_with_connection(
+        connection,
+        "appdb",
+        ("SET SHOWPLAN_XML ON", "SELECT ?", "SET SHOWPLAN_XML OFF"),
+        max_rows=10,
+        statement_params=((), (42,), ()),
+    )
+
+    cursors[1].execute.assert_called_once_with("SELECT ?", (42,))
+    cursors[2].execute.assert_called_once_with("SET SHOWPLAN_XML OFF")
 
 
 def test_coerce_value_handles_memoryview_and_bytes(sample_server_config) -> None:
@@ -547,3 +696,20 @@ def test_consume_batches_captures_driver_type_and_nullability_metadata(
     assert results[0].column_type_signatures == (
         "builtins.int|None|8|10|0|False",
     )
+
+
+def test_consume_batches_retains_duplicate_columns_positionally(sample_server_config) -> None:
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), MagicMock())
+    cursor = MagicMock()
+    cursor.description = [
+        ("value", str, None, 20, 0, 0, True),
+        ("value", int, None, 8, 10, 0, True),
+    ]
+    cursor.fetchall.return_value = [("left", 7)]
+    cursor.nextset.return_value = False
+
+    result = executor._consume_batches(cursor)[0]
+
+    assert result.rows == [{"value": 7}]
+    assert result.positional_rows == (("left", 7),)
+    assert result.typed_rows == (("left", 7),)

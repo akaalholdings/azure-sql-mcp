@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
 from unittest.mock import AsyncMock
 from unittest.mock import Mock
 
@@ -10,13 +13,21 @@ import pytest
 from azure_sql_mcp.artifacts import ExplainPlanArtifact
 from azure_sql_mcp.config import AccessMode
 from azure_sql_mcp.config import AuthMode
+from azure_sql_mcp.config import McpProfile
 from azure_sql_mcp.config import ServerConfig
 from azure_sql_mcp.config import ToolGroup
 from azure_sql_mcp.config import TransportConfig
 from azure_sql_mcp.config import TransportMode
 from azure_sql_mcp.config import WritePolicy
+from azure_sql_mcp.database_policy import DatabasePolicySet
+from azure_sql_mcp.query_identity import legacy_database_fingerprint
+from azure_sql_mcp.performance_workflows import database_fingerprint
+from azure_sql_mcp.performance_workflows import fingerprint_json
 from azure_sql_mcp.server import async_main
 from azure_sql_mcp.server import AzureSqlMcpApplication
+from azure_sql_mcp.view_workflows import ViewChangeRequest
+from azure_sql_mcp.view_workflows import ViewSnapshot
+from azure_sql_mcp.view_workflows import prepared_view_change_state
 
 
 def make_config(
@@ -88,12 +99,14 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
         "collect_performance_evidence",
         "get_performance_case",
         "start_tuning_session",
+        "get_tuning_session",
         "add_tuning_candidate",
         "benchmark_tuning_candidate",
         "benchmark_index_candidate",
         "finalize_tuning_session",
         "compare_query_results",
         "compare_plan_summaries",
+        "prepare_view_change",
         "get_top_queries",
         "analyze_query_indexes",
         "analyze_workload_indexes",
@@ -153,6 +166,10 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
     assert tools["get_top_cached_queries"].annotations.readOnlyHint is True
     assert tools["get_cached_routine_stats"].annotations.readOnlyHint is True
     assert tools["get_object_index_diagnostics"].annotations.readOnlyHint is True
+    tuning_parameters = tools["start_tuning_session"].parameters["properties"]
+    assert tuning_parameters["max_candidates"]["default"] == 10
+    assert tuning_parameters["execution_limit"]["default"] == 80
+    assert tuning_parameters["time_limit_minutes"]["default"] == 20
 
 
 def test_registers_resources_and_prompts(app: AzureSqlMcpApplication) -> None:
@@ -171,6 +188,62 @@ def test_registers_resources_and_prompts(app: AzureSqlMcpApplication) -> None:
         "compare-schemas",
         "troubleshoot-performance",
     }
+
+
+def test_legacy_state_binding_is_opt_in_for_performance_workflows() -> None:
+    strict_app = AzureSqlMcpApplication(make_config())
+    assert strict_app.performance_workflows.allow_legacy_state is False
+
+    legacy_config = replace(
+        make_config(),
+        legacy_state_server_binding="server.database.windows.net",
+    )
+    legacy_app = AzureSqlMcpApplication(legacy_config)
+    assert legacy_app.performance_workflows.allow_legacy_state is True
+
+
+@pytest.mark.asyncio
+async def test_direct_server_fingerprint_check_honours_legacy_binding() -> None:
+    legacy_case = Mock(
+        database_fingerprint=legacy_database_fingerprint("appdb"),
+    )
+    strict_app = AzureSqlMcpApplication(make_config())
+    strict_app.performance_store.get_performance_case = Mock(  # type: ignore[method-assign]
+        return_value=legacy_case,
+    )
+    with pytest.raises(PermissionError, match="another database"):
+        await strict_app._start_tuning_session(
+            "appdb",
+            "case-legacy",
+            10,
+            80,
+            20,
+            "strict-state-test",
+        )
+
+    legacy_config = replace(
+        make_config(),
+        legacy_state_server_binding="server.database.windows.net",
+    )
+    app = AzureSqlMcpApplication(legacy_config)
+    app.performance_store.get_performance_case = Mock(  # type: ignore[method-assign]
+        return_value=legacy_case,
+    )
+    app.performance_workflows.start_session = Mock(
+        return_value={"session_id": "session-legacy"}
+    )
+
+    payload = await app._start_tuning_session(
+        "appdb",
+        "case-legacy",
+        10,
+        80,
+        20,
+        "legacy-state-test",
+    )
+
+    assert payload == {"session_id": "session-legacy"}
+    app.performance_workflows.start_session.assert_called_once()
 
 
 def test_tools_advertise_structured_output_schemas(app: AzureSqlMcpApplication) -> None:
@@ -249,7 +322,7 @@ async def test_registered_analyze_query_indexes_forwards_queries_array(
 
     assert payload == {"queries_analyzed": 1}
     app._analyze_query_indexes.assert_awaited_once_with(
-        "appdb", ["SELECT 1"], False, None
+        "appdb", ["SELECT 1"], False, None, None
     )
 
 
@@ -434,6 +507,28 @@ async def test_run_tool_uses_configured_database_when_missing(app: AzureSqlMcpAp
     assert response["database_name"] == "appdb"
 
 
+def test_benchmark_tool_timeout_scales_to_policy_execution_budget(
+    app: AzureSqlMcpApplication,
+) -> None:
+    app.database_policy = DatabasePolicySet.from_mapping(
+        {
+            "version": 1,
+            "databases": {
+                "appdb": {
+                    "environment": "test",
+                    "allow_read": True,
+                    "allow_benchmark": True,
+                    "max_benchmark_executions": 80,
+                }
+            },
+        }
+    )
+
+    assert app._timeout_for_tool("benchmark_tuning_candidate", "appdb") == (
+        80 * app.config.query_timeout_seconds + 5 * 60
+    )
+
+
 @pytest.mark.asyncio
 async def test_run_tool_returns_timeout_error() -> None:
     app = AzureSqlMcpApplication(make_config(tool_timeout_seconds=0.01))
@@ -446,6 +541,27 @@ async def test_run_tool_returns_timeout_error() -> None:
 
     assert response["code"] == "timeout"
     assert "timed out after 0.01s" in response["message"]
+
+
+@pytest.mark.asyncio
+async def test_run_tool_bounds_workflow_timeout_by_persisted_deadline(
+    app: AzureSqlMcpApplication,
+) -> None:
+    async def slow(_: str) -> dict[str, str]:
+        await asyncio.sleep(0.05)
+        return {"status": "ok"}
+
+    deadline = (
+        datetime.now(timezone.utc) + timedelta(seconds=0.01)
+    ).isoformat()
+    response = await app._run_tool(
+        "benchmark_index_candidate",
+        "appdb",
+        slow,
+        deadline_provider=lambda: deadline,
+    )
+
+    assert response["code"] == "timeout"
 
 
 @pytest.mark.asyncio
@@ -503,6 +619,40 @@ async def test_explain_query_can_include_raw_xml_when_requested(app: AzureSqlMcp
 
 
 @pytest.mark.asyncio
+async def test_explain_query_uses_typed_parameter_execution_and_redacts_values(
+    app: AzureSqlMcpApplication,
+) -> None:
+    app.plans.explain_parameterized_query = AsyncMock(
+        return_value=ExplainPlanArtifact(
+            database_name="appdb",
+            analyze=False,
+            summary={"statement_count": 1},
+            raw_xml="<ShowPlanXML />",
+        )
+    )
+
+    payload = await app._explain_query(
+        "appdb",
+        "SELECT object_id FROM sys.objects WHERE object_id = @ObjectId",
+        analyze=False,
+        parameter_values={"ObjectId": 42},
+        parameter_types={"ObjectId": "int"},
+    )
+
+    contract = app.plans.explain_parameterized_query.await_args.args[1]
+    assert contract.sp_executesql_sql == "EXEC sys.sp_executesql ?, ?, ?"
+    assert payload["parameter_binding"]["values_redacted"] is True
+    assert payload["parameter_binding"]["parameters"] == [
+        {
+            "name": "@ObjectId",
+            "data_type": "int",
+            "provenance": "explicit_value_and_type",
+            "provenance_detail": {},
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_tune_query_returns_structured_evidence_pack(app: AzureSqlMcpApplication) -> None:
     app.performance_workflows.start_case = Mock(
         return_value=Mock(case_id="case-1")
@@ -533,21 +683,86 @@ async def test_tune_query_returns_structured_evidence_pack(app: AzureSqlMcpAppli
 
 
 @pytest.mark.asyncio
-async def test_tune_query_binds_explicit_parameters_once(app: AzureSqlMcpApplication) -> None:
-    app.param_binding.bind_parameters = AsyncMock(
-        return_value={
-            "original_sql": "SELECT @OrderId",
-            "bound_sql": "DECLARE @OrderId int = 42;\nSELECT @OrderId",
-            "parameters": [
-                {
-                    "name": "@OrderId",
-                    "value": "42",
-                    "source": "explicit",
-                    "data_type": "int",
+async def test_start_tuning_session_passes_multi_hour_budget_to_durable_state(
+    app: AzureSqlMcpApplication,
+) -> None:
+    policy = DatabasePolicySet.from_mapping(
+        {
+            "version": 1,
+            "databases": {
+                "appdb": {
+                    "environment": "test",
+                    "allow_read": True,
+                    "allow_benchmark": True,
+                    "max_benchmark_executions": 80,
+                    "max_tuning_candidates": 60,
+                    "max_tuning_session_executions": 2000,
+                    "max_tuning_session_minutes": 360,
                 }
-            ],
+            },
         }
     )
+    app.database_policy = policy
+    app.performance_workflows.database_policy = policy
+    case = app.performance_workflows.start_case(
+        "appdb",
+        "SELECT object_id FROM sys.objects",
+    )
+
+    session = await app._start_tuning_session(
+        "appdb",
+        case.case_id,
+        60,
+        2000,
+        360,
+        "six-hour-session",
+    )
+
+    assert session["max_candidates"] == 60
+    assert session["execution_limit"] == 2000
+    assert session["time_limit_seconds"] == 360 * 60
+
+
+@pytest.mark.asyncio
+async def test_start_tuning_session_rejects_policy_overrun_without_shortening(
+    app: AzureSqlMcpApplication,
+) -> None:
+    policy = DatabasePolicySet.from_mapping(
+        {
+            "version": 1,
+            "databases": {
+                "appdb": {
+                    "environment": "test",
+                    "allow_read": True,
+                    "allow_benchmark": True,
+                    "max_benchmark_executions": 80,
+                    "max_tuning_candidates": 60,
+                    "max_tuning_session_executions": 2000,
+                    "max_tuning_session_minutes": 360,
+                }
+            },
+        }
+    )
+    app.database_policy = policy
+    app.performance_workflows.database_policy = policy
+    case = app.performance_workflows.start_case(
+        "appdb",
+        "SELECT object_id FROM sys.objects",
+    )
+
+    with pytest.raises(PermissionError, match=r"361 minutes.*360 minutes"):
+        await app._start_tuning_session(
+            "appdb",
+            case.case_id,
+            60,
+            2000,
+            361,
+            "over-budget-session",
+        )
+
+
+@pytest.mark.asyncio
+async def test_tune_query_binds_explicit_parameters_once(app: AzureSqlMcpApplication) -> None:
     app.performance_workflows.start_case = Mock(return_value=Mock(case_id="case-2"))
     app._collect_performance_evidence = AsyncMock(return_value={"outcome": "partial"})  # type: ignore[method-assign]
     app.performance_workflows.start_session = Mock(
@@ -562,32 +777,18 @@ async def test_tune_query_binds_explicit_parameters_once(app: AzureSqlMcpApplica
         include_raw_xml=False,
         window_minutes=60,
         parameter_values={"OrderId": 42},
+        parameter_types={"OrderId": "int"},
     )
 
-    assert payload["parameter_binding"]["parameters"][0]["source"] == "explicit"
-    app.param_binding.bind_parameters.assert_awaited_once_with(
-        "appdb",
-        "SELECT @OrderId",
-        parameter_values={"OrderId": 42},
+    assert payload["parameter_binding"]["values_redacted"] is True
+    assert (
+        payload["parameter_binding"]["parameters"][0]["provenance"]
+        == "explicit_value_and_type"
     )
-
-
-@pytest.mark.asyncio
-async def test_tune_query_auto_bind_params_survives_validation(app: AzureSqlMcpApplication) -> None:
-    """Regression: auto-bound DECLARE/SET + SELECT batches must pass the read-only
-    validator end-to-end. Only the executor is mocked; param binding, the
-    validator, and the plans service run for real."""
-    app.executor.fetch_all = AsyncMock(return_value=[])  # type: ignore[method-assign]
-    effective_sql, binding = await app._prepare_query(
-        "appdb",
-        "SELECT * FROM dbo.Users WHERE UserId = @UserId",
-        True,
-    )
-
-    assert binding is not None
-    assert binding["parameters"][0]["name"] == "@UserId"
-    assert "DECLARE" in effective_sql.upper()
-    assert app.validator.validate_read_only(effective_sql).normalized_sql
+    assert "value" not in payload["parameter_binding"]["parameters"][0]
+    start_call = app.performance_workflows.start_case.call_args
+    assert start_call.args == ("appdb", "SELECT @OrderId")
+    assert start_call.kwargs["parameter_cases"][0]["types"] == {"OrderId": "int"}
 
 
 @pytest.mark.asyncio
@@ -697,12 +898,6 @@ async def test_benchmark_can_compare_unordered_result_samples(
 async def test_analyze_query_indexes_scopes_explicit_values_per_query(
     app: AzureSqlMcpApplication,
 ) -> None:
-    app.param_binding.bind_parameters = AsyncMock(  # type: ignore[method-assign]
-        side_effect=[
-            {"parameters": [], "bound_sql": "SELECT 1"},
-            {"parameters": [], "bound_sql": "SELECT 2"},
-        ]
-    )
     app.query_index_analysis.analyze_queries = AsyncMock(  # type: ignore[method-assign]
         return_value={"queries_analyzed": 2}
     )
@@ -712,15 +907,18 @@ async def test_analyze_query_indexes_scopes_explicit_values_per_query(
         "appdb",
         queries,
         parameter_values={"First": 1, "Second": 2},
+        parameter_types={"First": "int", "Second": "bigint"},
     )
 
-    assert result == {"queries_analyzed": 2}
-    assert app.param_binding.bind_parameters.await_args_list[0].kwargs["parameter_values"] == {
-        "first": 1
-    }
-    assert app.param_binding.bind_parameters.await_args_list[1].kwargs["parameter_values"] == {
-        "second": 2
-    }
+    assert result["queries_analyzed"] == 2
+    assert all(item["values_redacted"] is True for item in result["parameter_binding"])
+    contracts = app.query_index_analysis.analyze_queries.await_args.kwargs[
+        "execution_contracts"
+    ]
+    assert contracts[0].sp_executesql_values[-1] == 1
+    assert contracts[0].parameter_definition == "@First int"
+    assert contracts[1].sp_executesql_values[-1] == 2
+    assert contracts[1].parameter_definition == "@Second bigint"
 
 
 @pytest.mark.asyncio
@@ -770,10 +968,20 @@ async def test_async_main_configures_logging(monkeypatch: pytest.MonkeyPatch) ->
 
 
 @pytest.mark.asyncio
-async def test_tune_history_prefers_query_hash(app: AzureSqlMcpApplication) -> None:
-    """History must match by plan query_hash when available — text matching
-    fails for parameterized queries because stored text uses @P1 naming."""
+async def test_tune_history_requires_exact_identity_even_for_one_hash_page_match(
+    app: AzureSqlMcpApplication,
+) -> None:
     app.query_store.get_query_history_by_hash = AsyncMock(
+        return_value={"matches": [{"query_id": 7}]}
+    )
+    app.query_store.resolve_query_identity = AsyncMock(
+        return_value={
+            "status": "resolved",
+            "query_id": 7,
+            "query_hash": "0x90FC7E5399EA52A5",
+        }
+    )
+    app.query_store.get_query_history_by_id = AsyncMock(
         return_value={"matches": [{"query_id": 7}]}
     )
     app.query_store.get_query_history_by_text = AsyncMock()
@@ -781,22 +989,437 @@ async def test_tune_history_prefers_query_hash(app: AzureSqlMcpApplication) -> N
     plan = {"summary": {"statements": [{"query_hash": "0x90FC7E5399EA52A5"}]}}
     history = await app._query_store_history_for_plan("appdb", "SELECT 1", plan, 60)
 
-    assert history["matched_by"] == "query_hash"
+    assert history["matched_by"] == "query_id"
+    assert history["query_hash_corroborated"] is True
+    assert history["fuzzy_match_used"] is False
     assert history["matches"] == [{"query_id": 7}]
+    app.query_store.get_query_history_by_hash.assert_not_awaited()
     app.query_store.get_query_history_by_text.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_tune_history_falls_back_to_original_sql_text(app: AzureSqlMcpApplication) -> None:
-    """Without a usable hash (or with no hash matches), fall back to text
-    matching using the ORIGINAL sql — the bound DECLARE batch never matches."""
-    app.query_store.get_query_history_by_hash = AsyncMock(return_value={"matches": []})
-    app.query_store.get_query_history_by_text = AsyncMock(return_value={"matches": []})
+async def test_tune_history_requires_exact_query_store_identity(app: AzureSqlMcpApplication) -> None:
+    app.query_store.resolve_query_identity = AsyncMock(
+        return_value={"status": "resolved", "query_id": 19}
+    )
+    app.query_store.get_query_history_by_id = AsyncMock(
+        return_value={"matches": [{"query_id": 19}]}
+    )
+    app.query_store.get_query_history_by_text = AsyncMock()
 
     plan = {"summary": {"statements": [{"query_hash": "0x90FC7E5399EA52A5"}]}}
     original_sql = "SELECT * FROM dbo.Users WHERE UserId = @UserId"
     history = await app._query_store_history_for_plan("appdb", original_sql, plan, 60)
 
-    assert history["matched_by"] == "text"
-    text_call = app.query_store.get_query_history_by_text.await_args
-    assert text_call.args[1] == original_sql
+    assert history["matched_by"] == "query_id"
+    assert history["fuzzy_match_used"] is False
+    assert history["matches"] == [{"query_id": 19}]
+    app.query_store.resolve_query_identity.assert_awaited_once_with(
+        "appdb", original_sql
+    )
+    app.query_store.get_query_history_by_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tune_history_is_inconclusive_when_plan_hash_disagrees(
+    app: AzureSqlMcpApplication,
+) -> None:
+    app.query_store.resolve_query_identity = AsyncMock(
+        return_value={
+            "status": "resolved",
+            "query_id": 19,
+            "query_hash": "0x1111111111111111",
+        }
+    )
+    app.query_store.get_query_history_by_id = AsyncMock(
+        return_value={"matches": [{"query_id": 19}]}
+    )
+
+    history = await app._query_store_history_for_plan(
+        "appdb",
+        "SELECT object_id FROM sys.objects",
+        {"summary": {"statements": [{"query_hash": "0x2222222222222222"}]}},
+        60,
+    )
+
+    assert history["status"] == "inconclusive"
+    assert history["matches"] == []
+    assert history["query_hash_corroborated"] is False
+    assert "different query hash" in history["reason"]
+
+
+@pytest.mark.asyncio
+async def test_view_recovery_does_not_adopt_target_without_durable_receipt(
+    app: AzureSqlMcpApplication,
+) -> None:
+    verification = Mock()
+    verification.verified = True
+    verification.workflow_commit_proven = False
+    verification.as_dict.return_value = {"verified": True}
+    app.view_workflows.verify_view_change = AsyncMock(return_value=verification)
+    app.view_workflows.register_apply_receipt = Mock()
+    app.performance_store.update_view_change_intent = Mock(
+        return_value={"status": "hold"}
+    )
+
+    result = await app._reconcile_durable_view_change(
+        "view-change-1",
+        Mock(),
+        {"version": 3, "receipt": None},
+    )
+
+    assert result["status"] == "hold"
+    assert result["workflow_applied"] is False
+    assert "no durable dispatch/commit receipt" in result["reason"]
+    app.view_workflows.register_apply_receipt.assert_not_called()
+    app.performance_store.update_view_change_intent.assert_called_once_with(
+        "view-change-1",
+        status="hold",
+        expected_version=3,
+        raw_sql_persistence_authorized=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_view_recovery_preserves_the_original_durable_receipt(
+    app: AzureSqlMcpApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = Mock()
+    original_receipt = {
+        "marker_name": "AzureSqlMcp_View_v1_" + ("a" * 48),
+        "dispatch_proof": {"dispatch_id": "original-dispatch-proof"},
+    }
+    receipt_snapshot = Mock()
+    verification = Mock()
+    verification.verified = True
+    verification.as_dict.return_value = {"verified": True}
+    app.view_workflows.verify_view_change = AsyncMock(return_value=verification)
+    app.view_workflows.register_apply_receipt = Mock()
+    app.performance_store.update_view_change_intent = Mock(
+        return_value={"status": "applied"}
+    )
+    parse_receipt = Mock(return_value=receipt_snapshot)
+    monkeypatch.setattr(
+        "azure_sql_mcp.server.view_snapshot_from_receipt",
+        parse_receipt,
+    )
+    intent = {"version": 7, "receipt": original_receipt}
+
+    result = await app._reconcile_durable_view_change(
+        "view-change-with-receipt",
+        prepared,
+        intent,
+    )
+
+    assert result["status"] == "reconciled_applied"
+    assert intent["receipt"] is original_receipt
+    parse_receipt.assert_called_once_with(original_receipt)
+    app.view_workflows.register_apply_receipt.assert_called_once_with(
+        prepared,
+        receipt_snapshot,
+    )
+    app.performance_store.update_view_change_intent.assert_called_once_with(
+        "view-change-with-receipt",
+        status="applied",
+        expected_version=7,
+        raw_sql_persistence_authorized=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_interrupted_noop_view_recovery_uses_unchanged_prior_snapshot(
+    app: AzureSqlMcpApplication,
+) -> None:
+    prepared = Mock(operation="noop")
+    verification = Mock()
+    verification.verified = False
+    verification.workflow_commit_proven = False
+    verification.as_dict.return_value = {"verified": False}
+    current = Mock()
+    current.as_dict.return_value = {"exists": True}
+    app.view_workflows.verify_view_change = AsyncMock(return_value=verification)
+    app.view_workflows.prior_state_restored = AsyncMock(
+        return_value=(True, current)
+    )
+    app.performance_store.update_view_change_intent = Mock(
+        return_value={"status": "already_applied"}
+    )
+
+    result = await app._reconcile_durable_view_change(
+        "view-noop-interrupted",
+        prepared,
+        {"version": 4, "receipt": None},
+    )
+
+    assert result["status"] == "already_applied"
+    assert result["intent_status"] == "already_applied"
+    assert result["workflow_applied"] is False
+    assert result["prior_state_restored"] is True
+    assert "performed no mutation" in result["reason"]
+    app.performance_store.update_view_change_intent.assert_called_once_with(
+        "view-noop-interrupted",
+        status="already_applied",
+        expected_version=4,
+        raw_sql_persistence_authorized=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_durable_view_prepare_replays_intent_before_generating_marker(
+    server_config_factory,
+    tmp_path,
+) -> None:
+    app = AzureSqlMcpApplication(
+        server_config_factory(
+            access_mode=AccessMode.UNRESTRICTED,
+            profile=McpProfile.SANDBOX,
+            performance_state_dir=str(tmp_path / "state"),
+            persist_view_sql_state=True,
+        )
+    )
+
+    async def capture_view(
+        database_name: str,
+        schema_name: str,
+        view_name: str,
+        *,
+        marker_name: str,
+    ) -> ViewSnapshot:
+        return ViewSnapshot(
+            database_name=database_name,
+            schema_name=schema_name,
+            view_name=view_name,
+            exists=False,
+            marker_name=marker_name,
+        )
+
+    app.view_workflows.capture_view = AsyncMock(side_effect=capture_view)  # type: ignore[method-assign]
+    request = ViewChangeRequest(
+        database_name="appdb",
+        schema_name="dbo",
+        view_name="ReplayView",
+        definition="SELECT [Id] FROM [dbo].[Source]",
+        operation="create",
+        idempotency_key="replay-view",
+    )
+    prepared = await app.view_workflows.prepare_view_change(request)
+    payload = prepared_view_change_state(prepared)
+    app.performance_store.create_view_change_intent(
+        change_id="view-existing-replay",
+        database_fingerprint=database_fingerprint("appdb", app.config.server),
+        request_fingerprint=fingerprint_json(payload),
+        payload=payload,
+        raw_sql_persistence_authorized=True,
+    )
+    app.view_workflows.prepare_view_change = AsyncMock(  # type: ignore[method-assign]
+        side_effect=AssertionError("replay must not prepare a new marker")
+    )
+
+    replay = await app._prepare_view_change(
+        "appdb",
+        "dbo",
+        "ReplayView",
+        "SELECT [Id] FROM [dbo].[Source]",
+        "create",
+        False,
+        False,
+        "replay-view",
+    )
+
+    assert replay["change_id"] == "view-existing-replay"
+    assert replay["intent_status"] == "prepared"
+    app.view_workflows.prepare_view_change.assert_not_awaited()
+    app.performance_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("history", "parameter_buckets", "available", "complete", "status"),
+    (
+        (
+            {"matches": []},
+            {"buckets": []},
+            False,
+            False,
+            "inconclusive",
+        ),
+        (
+            {"matches": [{"query_id": 19}]},
+            {"buckets": []},
+            True,
+            False,
+            "partial",
+        ),
+        (
+            {"matches": [{"query_id": 19}], "truncated": True},
+            {"buckets": [{"plan_id": 7}]},
+            True,
+            False,
+            "partial",
+        ),
+        (
+            {"matches": [{"query_id": 19}] * 20},
+            {"buckets": [{"plan_id": 7}]},
+            True,
+            False,
+            "partial",
+        ),
+        (
+            {"matches": [{"query_id": 19}]},
+            {"buckets": [{"plan_id": 7}]},
+            True,
+            True,
+            "resolved",
+        ),
+    ),
+)
+async def test_query_store_evidence_does_not_overstate_coverage(
+    app: AzureSqlMcpApplication,
+    history: dict[str, object],
+    parameter_buckets: dict[str, object],
+    available: bool,
+    complete: bool,
+    status: str,
+) -> None:
+    app.query_store.resolve_query_identity = AsyncMock(
+        return_value={
+            "status": "resolved",
+            "query_id": 19,
+            "query_hash": "0x90FC7E5399EA52A5",
+        }
+    )
+    app.query_store.get_query_history_by_id = AsyncMock(return_value=history)
+    app.query_store.get_parameter_runtime_buckets = AsyncMock(
+        return_value=parameter_buckets
+    )
+
+    evidence = await app._collect_query_store_evidence(
+        "appdb",
+        "SELECT * FROM dbo.Users WHERE UserId = @UserId",
+        60,
+    )
+
+    assert evidence["available"] is available
+    assert evidence["complete"] is complete
+    assert evidence["status"] == status
+
+
+@pytest.mark.asyncio
+async def test_unparameterized_query_store_history_does_not_require_buckets(
+    app: AzureSqlMcpApplication,
+) -> None:
+    app.query_store.resolve_query_identity = AsyncMock(
+        return_value={
+            "status": "resolved",
+            "query_id": 19,
+            "query_hash": "0x90FC7E5399EA52A5",
+        }
+    )
+    app.query_store.get_query_history_by_id = AsyncMock(
+        return_value={"matches": [{"query_id": 19}]}
+    )
+    app.query_store.get_parameter_runtime_buckets = AsyncMock(
+        return_value={"buckets": []}
+    )
+
+    evidence = await app._collect_query_store_evidence(
+        "appdb",
+        "SELECT UserId FROM dbo.Users",
+        60,
+    )
+
+    assert evidence["available"] is True
+    assert evidence["complete"] is True
+    assert evidence["status"] == "resolved"
+    assert evidence["coverage"]["parameter_buckets"]["required"] is False
+
+
+@pytest.mark.asyncio
+async def test_capability_check_publishes_tuning_contract(
+    app: AzureSqlMcpApplication,
+) -> None:
+    app.capabilities.check = AsyncMock(return_value={"query_store": True})
+    app.platform_capabilities.get_summary = AsyncMock(
+        return_value={"platform": "azure_sql_database_paas"}
+    )
+
+    result = await app._check_database_capabilities("appdb")
+
+    assert result["mcp_contract"] == {
+        "contract_version": 1,
+        "performance_tuning": 1,
+        "durable_view_change": 1,
+        "prepared_plan_action": 1,
+    }
+    assert result["local_tuning_policy"] == {
+        "configured": False,
+        "environment": "unknown",
+        "allow_read": False,
+        "allow_benchmark": False,
+        "allow_test_indexes": False,
+        "allow_view_apply": False,
+        "allow_plan_apply": False,
+        "max_benchmark_executions": 0,
+        "max_tuning_candidates": 0,
+        "max_tuning_session_executions": 0,
+        "max_tuning_session_minutes": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_tune_history_rejects_ambiguous_exact_identity_despite_plan_hash(
+    app: AzureSqlMcpApplication,
+) -> None:
+    app.query_store.get_query_history_by_hash = AsyncMock(
+        return_value={"matches": [{"query_id": 41}, {"query_id": 42}]}
+    )
+    app.query_store.resolve_query_identity = AsyncMock(
+        return_value={
+            "status": "ambiguous",
+            "matches": [{"query_id": 41}, {"query_id": 42}],
+        }
+    )
+    app.query_store.get_query_history_by_id = AsyncMock()
+
+    plan = {"summary": {"statements": [{"query_hash": "0x90FC7E5399EA52A5"}]}}
+    history = await app._query_store_history_for_plan(
+        "appdb",
+        "SELECT object_id FROM sys.objects",
+        plan,
+        60,
+    )
+
+    assert history["status"] == "inconclusive"
+    assert history["reason"] == "exact Query Store identity was not uniquely resolved"
+    assert history["plan_query_hash"] == "0x90FC7E5399EA52A5"
+    assert history["matched_by"] == "none"
+    app.query_store.get_query_history_by_hash.assert_not_awaited()
+    app.query_store.get_query_history_by_id.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tune_history_is_inconclusive_when_exact_identity_is_ambiguous(
+    app: AzureSqlMcpApplication,
+) -> None:
+    app.query_store.resolve_query_identity = AsyncMock(
+        return_value={
+            "status": "ambiguous",
+            "matches": [{"query_id": 1}, {"query_id": 2}],
+        }
+    )
+    app.query_store.get_query_history_by_id = AsyncMock()
+    app.query_store.get_query_history_by_text = AsyncMock()
+
+    history = await app._query_store_history_for_plan(
+        "appdb",
+        "SELECT object_id FROM sys.objects",
+        {"summary": {"statements": []}},
+        60,
+    )
+
+    assert history["status"] == "inconclusive"
+    assert history["matched_by"] == "none"
+    assert history["fuzzy_match_used"] is False
+    app.query_store.get_query_history_by_id.assert_not_awaited()
+    app.query_store.get_query_history_by_text.assert_not_awaited()

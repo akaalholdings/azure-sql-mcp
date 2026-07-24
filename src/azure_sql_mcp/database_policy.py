@@ -15,8 +15,12 @@ Version 1 documents a small, database-scoped allowlist::
           "allow_read": true,
           "allow_benchmark": false,
           "allow_test_indexes": false,
+          "allow_view_apply": false,
           "allow_plan_apply": false,
-          "max_benchmark_executions": 0
+          "max_benchmark_executions": 0,
+          "max_tuning_candidates": 0,
+          "max_tuning_session_executions": 0,
+          "max_tuning_session_minutes": 0
         }
       }
     }
@@ -45,8 +49,12 @@ _DATABASE_FIELDS = frozenset(
         "allow_read",
         "allow_benchmark",
         "allow_test_indexes",
+        "allow_view_apply",
         "allow_plan_apply",
         "max_benchmark_executions",
+        "max_tuning_candidates",
+        "max_tuning_session_executions",
+        "max_tuning_session_minutes",
     }
 )
 _REQUIRED_DATABASE_FIELDS = frozenset({"environment", "allow_read"})
@@ -74,8 +82,12 @@ class DatabasePolicy:
     allow_read: bool
     allow_benchmark: bool = False
     allow_test_indexes: bool = False
+    allow_view_apply: bool = False
     allow_plan_apply: bool = False
     max_benchmark_executions: int = 0
+    max_tuning_candidates: int = 0
+    max_tuning_session_executions: int = 0
+    max_tuning_session_minutes: int = 0
     configured: bool = True
 
     def __post_init__(self) -> None:
@@ -92,18 +104,26 @@ class DatabasePolicy:
             "allow_read",
             "allow_benchmark",
             "allow_test_indexes",
+            "allow_view_apply",
             "allow_plan_apply",
         ):
             if not isinstance(getattr(self, field_name), bool):
                 raise DatabasePolicyValidationError(f"{field_name} must be a boolean.")
-        if (
-            not isinstance(self.max_benchmark_executions, int)
-            or isinstance(self.max_benchmark_executions, bool)
-            or self.max_benchmark_executions < 0
+        for field_name in (
+            "max_benchmark_executions",
+            "max_tuning_candidates",
+            "max_tuning_session_executions",
+            "max_tuning_session_minutes",
         ):
-            raise DatabasePolicyValidationError(
-                "max_benchmark_executions must be a non-negative integer."
-            )
+            value = getattr(self, field_name)
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+            ):
+                raise DatabasePolicyValidationError(
+                    f"{field_name} must be a non-negative integer."
+                )
 
     @classmethod
     def from_mapping(cls, database_name: str, value: Mapping[str, Any]) -> "DatabasePolicy":
@@ -119,14 +139,29 @@ class DatabasePolicy:
             _REQUIRED_DATABASE_FIELDS,
             f"database {database_name!r}",
         )
+        allow_benchmark = value.get("allow_benchmark", False)
+        per_request_limit = value.get("max_benchmark_executions", 0)
         return cls(
             database_name=database_name,
             environment=value["environment"],
             allow_read=value["allow_read"],
-            allow_benchmark=value.get("allow_benchmark", False),
+            allow_benchmark=allow_benchmark,
             allow_test_indexes=value.get("allow_test_indexes", False),
+            allow_view_apply=value.get("allow_view_apply", False),
             allow_plan_apply=value.get("allow_plan_apply", False),
-            max_benchmark_executions=value.get("max_benchmark_executions", 0),
+            max_benchmark_executions=per_request_limit,
+            max_tuning_candidates=value.get(
+                "max_tuning_candidates",
+                10 if allow_benchmark and per_request_limit > 0 else 0,
+            ),
+            max_tuning_session_executions=value.get(
+                "max_tuning_session_executions",
+                per_request_limit,
+            ),
+            max_tuning_session_minutes=value.get(
+                "max_tuning_session_minutes",
+                20 if allow_benchmark and per_request_limit > 0 else 0,
+            ),
         )
 
     @classmethod
@@ -144,8 +179,12 @@ class DatabasePolicy:
             allow_read=False,
             allow_benchmark=False,
             allow_test_indexes=False,
+            allow_view_apply=False,
             allow_plan_apply=False,
             max_benchmark_executions=0,
+            max_tuning_candidates=0,
+            max_tuning_session_executions=0,
+            max_tuning_session_minutes=0,
             configured=False,
         )
 
@@ -158,6 +197,48 @@ class DatabasePolicy:
             and not isinstance(executions, bool)
             and 0 < executions <= self.max_benchmark_executions
         )
+
+    def can_start_tuning_session(
+        self,
+        *,
+        candidates: int,
+        executions: int,
+        minutes: int,
+    ) -> bool:
+        """Whether a complete durable tuning campaign fits local policy."""
+
+        values = (candidates, executions, minutes)
+        return (
+            self.configured
+            and self.allow_benchmark
+            and all(
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value > 0
+                for value in values
+            )
+            and candidates <= self.max_tuning_candidates
+            and executions <= self.max_tuning_session_executions
+            and minutes <= self.max_tuning_session_minutes
+        )
+
+    @property
+    def is_non_production(self) -> bool:
+        return self.environment.strip().casefold() not in {
+            "production",
+            "prod",
+            "live",
+        }
+
+    def can_apply_view(self) -> bool:
+        """Whether reviewed view DDL may target this database."""
+
+        return self.configured and self.is_non_production and self.allow_view_apply
+
+    def can_run_index_experiment(self) -> bool:
+        """Whether temporary index DDL may target this database."""
+
+        return self.configured and self.is_non_production and self.allow_test_indexes
 
 
 @dataclass(frozen=True)
@@ -251,8 +332,28 @@ class DatabasePolicySet:
     def allows_benchmark(self, database_name: str, executions: int) -> bool:
         return self.policy_for(database_name).can_benchmark(executions)
 
+    def allows_tuning_session(
+        self,
+        database_name: str,
+        *,
+        candidates: int,
+        executions: int,
+        minutes: int,
+    ) -> bool:
+        return self.policy_for(database_name).can_start_tuning_session(
+            candidates=candidates,
+            executions=executions,
+            minutes=minutes,
+        )
+
     def allows_test_indexes(self, database_name: str) -> bool:
-        return self.policy_for(database_name).allow_test_indexes
+        return self.policy_for(database_name).can_run_index_experiment()
+
+    def allows_index_experiments(self, database_name: str) -> bool:
+        return self.policy_for(database_name).can_run_index_experiment()
+
+    def allows_view_apply(self, database_name: str) -> bool:
+        return self.policy_for(database_name).can_apply_view()
 
     def allows_plan_apply(self, database_name: str) -> bool:
         return self.policy_for(database_name).allow_plan_apply
