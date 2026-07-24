@@ -12,8 +12,11 @@ from azure_sql_mcp.config import WritePolicy
 from azure_sql_mcp.connection import QueryResult
 from azure_sql_mcp.database_policy import DatabasePolicySet
 from azure_sql_mcp.performance_contracts import PerformanceCaseV1
+from azure_sql_mcp.performance_store import IdempotencyConflictError
 from azure_sql_mcp.performance_store import PerformanceStore
 from azure_sql_mcp.plan_action_service import PlanActionService
+from azure_sql_mcp.query_identity import legacy_database_fingerprint
+from azure_sql_mcp.query_identity import server_database_identity
 from azure_sql_mcp.tuning_sessions import TuningSessionStateMachine
 
 
@@ -170,6 +173,7 @@ def _candidate(*, duration: float, count: int = 40) -> dict[str, Any]:
 def _service(
     server_config_factory,
     states: list[dict[str, Any]],
+    **config_overrides: Any,
 ) -> tuple[PlanActionService, PerformanceStore, RecordingAdminPolicy, str]:
     config = server_config_factory(
         access_mode=AccessMode.UNRESTRICTED,
@@ -177,6 +181,7 @@ def _service(
         profile=McpProfile.ENFORCER_APPLY,
         plan_apply_kill_switch=False,
         performance_state_dir=":memory:",
+        **config_overrides,
     )
     store = PerformanceStore(db_path=":memory:")
     case = store.create_performance_case(
@@ -223,6 +228,9 @@ async def test_prepared_apply_verifies_and_restores_exact_prior_state(
     )
     intent_id = prepared["intent"]["intent_id"]
     assert prepared["prepared"] is True
+    assert prepared["intent"]["metadata"]["database_fingerprint"] == (
+        server_database_identity(service.config.server, "appdb")
+    )
 
     applied_result = await service.apply(
         "appdb",
@@ -248,6 +256,216 @@ async def test_prepared_apply_verifies_and_restores_exact_prior_state(
     assert "sp_query_store_set_hints" in restore.sql
     assert "sp_query_store_force_plan" in restore.sql
     assert restore.params == (42, 7, 42, "OPTION(MAXDOP 2)", 42, 42, 3)
+    for action in admin.actions:
+        assert action.exactly_once is True
+        assert action.reviewed_intent is True
+        assert action.idempotency_key
+        assert action.rollback_sql
+        assert action.policy_verified is True
+        assert action.verification_required is True
+
+
+@pytest.mark.asyncio
+async def test_plan_action_identity_rejects_same_database_on_different_server(
+    server_config_factory,
+) -> None:
+    service, store, admin, session_id = _service(
+        server_config_factory,
+        [_state(None, None)],
+    )
+    prepared = await service.prepare(
+        "appdb",
+        session_id=session_id,
+        candidate_id=None,
+        operation="force_plan",
+        query_id=42,
+        plan_id=7,
+        query_hints=None,
+        evidence=_baseline(),
+        reviewed_by="operator",
+        reason="reviewed regression",
+        idempotency_key="server-boundary",
+    )
+    intent_id = prepared["intent"]["intent_id"]
+    assert store.get_plan_action_intent(intent_id).metadata["database_fingerprint"] == (
+        server_database_identity(service.config.server, "appdb")
+    )
+
+    service.config = replace(service.config, server="other.database.windows.net")
+    with pytest.raises(PermissionError, match="database fingerprint"):
+        await service.apply(
+            "appdb",
+            intent_id,
+            authorization_reference="approved-change",
+        )
+    assert admin.actions == []
+
+
+@pytest.mark.asyncio
+async def test_plan_action_identity_accepts_mixed_case_server_and_database(
+    server_config_factory,
+) -> None:
+    service, _store, admin, session_id = _service(
+        server_config_factory,
+        [_state(None, None), _state(None, None), _state(7, None)],
+    )
+    service.config = replace(service.config, server="Server.Database.Windows.Net")
+
+    prepared = await service.prepare(
+        "AppDb",
+        session_id=session_id,
+        candidate_id=None,
+        operation="force_plan",
+        query_id=42,
+        plan_id=7,
+        query_hints=None,
+        evidence=_baseline(),
+        reviewed_by="operator",
+        reason="reviewed regression",
+        idempotency_key="mixed-case-target",
+    )
+    intent_id = prepared["intent"]["intent_id"]
+
+    assert prepared["intent"]["metadata"]["database_fingerprint"] == (
+        server_database_identity("server.database.windows.net", "appdb")
+    )
+    applied = await service.apply(
+        "aPpDb",
+        intent_id,
+        authorization_reference="approved-change",
+    )
+
+    assert applied["confirmed"] is True
+    assert len(admin.actions) == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_plan_intent_database_fingerprint_cannot_be_applied(
+    server_config_factory,
+) -> None:
+    service, store, admin, session_id = _service(
+        server_config_factory,
+        [_state(None, None)],
+    )
+    prepared = await service.prepare(
+        "appdb",
+        session_id=session_id,
+        candidate_id=None,
+        operation="force_plan",
+        query_id=42,
+        plan_id=7,
+        query_hints=None,
+        evidence=_baseline(),
+        reviewed_by="operator",
+        reason="reviewed regression",
+        idempotency_key="legacy-plan-target",
+    )
+    intent = store.get_plan_action_intent(prepared["intent"]["intent_id"])
+    legacy_intent = replace(
+        intent,
+        metadata={
+            **intent.metadata,
+            "database_fingerprint": legacy_database_fingerprint("appdb"),
+        },
+        version=intent.version + 1,
+    )
+    store.save_plan_action_intent(
+        legacy_intent,
+        expected_version=intent.version,
+    )
+
+    with pytest.raises(PermissionError, match="database fingerprint"):
+        service._validated_intent("appdb", intent.intent_id)
+
+    assert admin.actions == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_server_binding_migrates_legacy_plan_intent_identity(
+    server_config_factory,
+) -> None:
+    service, store, admin, session_id = _service(
+        server_config_factory,
+        [_state(None, None)],
+        legacy_state_server_binding="server.database.windows.net",
+    )
+    prepared = await service.prepare(
+        "appdb",
+        session_id=session_id,
+        candidate_id=None,
+        operation="force_plan",
+        query_id=42,
+        plan_id=7,
+        query_hints=None,
+        evidence=_baseline(),
+        reviewed_by="operator",
+        reason="reviewed regression",
+        idempotency_key="legacy-plan-migration",
+    )
+    intent = store.get_plan_action_intent(prepared["intent"]["intent_id"])
+    legacy_intent = replace(
+        intent,
+        metadata={
+            **intent.metadata,
+            "database_fingerprint": legacy_database_fingerprint("appdb"),
+        },
+        version=intent.version + 1,
+    )
+    store.save_plan_action_intent(
+        legacy_intent,
+        expected_version=intent.version,
+    )
+
+    migrated = service._validated_intent("appdb", intent.intent_id)
+
+    assert migrated.metadata["database_fingerprint"] == server_database_identity(
+        service.config.server,
+        "appdb",
+    )
+    assert (
+        migrated.metadata["identity_migration"]
+        == "legacy-database-to-server-bound-v1"
+    )
+    assert admin.actions == []
+
+
+@pytest.mark.asyncio
+async def test_prepare_rejects_idempotency_key_reuse_for_different_action(
+    server_config_factory,
+) -> None:
+    prior = _state(None, None)
+    service, _store, _admin, session_id = _service(
+        server_config_factory,
+        [prior, prior],
+    )
+    await service.prepare(
+        "appdb",
+        session_id=session_id,
+        candidate_id=None,
+        operation="force_plan",
+        query_id=42,
+        plan_id=7,
+        query_hints=None,
+        evidence=_baseline(),
+        reviewed_by="operator",
+        reason="reviewed regression",
+        idempotency_key="same-plan-action",
+    )
+
+    with pytest.raises(IdempotencyConflictError, match="different request"):
+        await service.prepare(
+            "appdb",
+            session_id=session_id,
+            candidate_id=None,
+            operation="force_plan",
+            query_id=42,
+            plan_id=8,
+            query_hints=None,
+            evidence=_baseline(),
+            reviewed_by="operator",
+            reason="reviewed regression",
+            idempotency_key="same-plan-action",
+        )
 
 
 @pytest.mark.asyncio

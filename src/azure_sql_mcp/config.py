@@ -59,12 +59,17 @@ TOOL_GROUPS: dict[str, ToolGroup] = {
     "collect_performance_evidence": ToolGroup.CORE,
     "get_performance_case": ToolGroup.CORE,
     "start_tuning_session": ToolGroup.CORE,
+    "get_tuning_session": ToolGroup.CORE,
     "add_tuning_candidate": ToolGroup.CORE,
     "benchmark_tuning_candidate": ToolGroup.CORE,
     "benchmark_index_candidate": ToolGroup.CORE,
     "finalize_tuning_session": ToolGroup.CORE,
     "compare_query_results": ToolGroup.CORE,
     "compare_plan_summaries": ToolGroup.CORE,
+    "prepare_view_change": ToolGroup.CORE,
+    "apply_prepared_view_change": ToolGroup.ADMIN,
+    "verify_view_change": ToolGroup.ADMIN,
+    "rollback_view_change": ToolGroup.ADMIN,
     "analyze_db_health": ToolGroup.CORE,
     "get_top_queries": ToolGroup.CORE,
     "analyze_index_recommendations": ToolGroup.CORE,
@@ -126,41 +131,179 @@ TOOL_GROUPS: dict[str, ToolGroup] = {
 }
 
 
-_TUNING_TOOLS = frozenset(
-    {
-        "tune_query",
-        "benchmark_query_rewrite",
-        "start_tuning_session",
-        "add_tuning_candidate",
-        "benchmark_tuning_candidate",
-        "finalize_tuning_session",
-        "compare_query_results",
-        "compare_plan_summaries",
-    }
-)
-_INDEX_WORKFLOW_TOOLS = frozenset({"benchmark_index_candidate"})
-_ENFORCER_REVIEW_TOOLS = frozenset(
-    {
-        "plan_health_review",
-        "plan_enforcer_tick",
-        "review_plan_enforcement",
-        "dry_run_plan_action",
-        "prepare_plan_action",
-    }
-)
-_ENFORCER_APPLY_TOOLS = frozenset(
-    {"apply_prepared_plan_action", "verify_plan_action", "rollback_plan_action"}
-)
-_DIRECT_ADMIN_TOOLS = frozenset(
-    {
-        "apply_plan_action",
-        "force_query_plan",
-        "set_query_store_hints",
-        "clear_query_store_hints",
-        "create_test_index",
-        "drop_test_index",
-    }
-)
+PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
+    McpProfile.TRIAGE: frozenset(
+        {
+            "list_databases",
+            "check_capabilities",
+            "start_performance_case",
+            "collect_performance_evidence",
+            "get_performance_case",
+            "analyze_db_health",
+            "get_top_queries",
+            "get_wait_stats",
+            "get_query_wait_stats",
+            "get_currently_waiting_tasks",
+            "get_lock_details",
+            "get_open_transactions",
+            "get_deadlock_history",
+            "get_tempdb_usage",
+            "get_tempdb_space_breakdown",
+            "get_memory_grants",
+            "get_resource_limits",
+            "get_resource_stats_history",
+            "get_database_configuration",
+            "get_storage_diagnostics",
+            "get_connection_diagnostics",
+            "get_query_parameter_buckets",
+            "detect_parameter_sniffing",
+            "detect_regressed_queries",
+            "get_forced_plans",
+            "check_statistics_health",
+            "get_plan_cache_analysis",
+            "get_query_compilation_stats",
+            "explain_query",
+        }
+    )
+    | frozenset(
+        {
+            "get_active_sessions",
+            "get_io_stats",
+            "get_top_cached_queries",
+            "get_cached_routine_stats",
+            "get_object_index_diagnostics",
+        }
+    ),
+    McpProfile.OPTIMIZER: frozenset(
+        {
+            "list_databases",
+            "check_capabilities",
+            "list_schemas",
+            "search_objects",
+            "get_object_details",
+            "get_dependencies",
+            "get_table_stats",
+            "explain_query",
+            "get_top_queries",
+            "get_query_parameter_buckets",
+            "detect_parameter_sniffing",
+            "detect_regressed_queries",
+            "get_forced_plans",
+            "analyze_query_indexes",
+            "analyze_workload_indexes",
+            "analyze_index_recommendations",
+            "start_performance_case",
+            "collect_performance_evidence",
+            "get_performance_case",
+            "start_tuning_session",
+            "get_tuning_session",
+            "add_tuning_candidate",
+            "benchmark_tuning_candidate",
+            "finalize_tuning_session",
+            "compare_query_results",
+            "compare_plan_summaries",
+            "prepare_view_change",
+            "get_active_sessions",
+            "get_io_stats",
+            "get_top_cached_queries",
+            "get_cached_routine_stats",
+            "get_object_index_diagnostics",
+        }
+    ),
+    McpProfile.SANDBOX: frozenset(
+        {
+            "list_databases",
+            "check_capabilities",
+            "list_schemas",
+            "search_objects",
+            "get_object_details",
+            "get_dependencies",
+            "get_table_stats",
+            "explain_query",
+            "get_top_queries",
+            "get_query_parameter_buckets",
+            "detect_parameter_sniffing",
+            "detect_regressed_queries",
+            "get_forced_plans",
+            "analyze_query_indexes",
+            "analyze_workload_indexes",
+            "analyze_index_recommendations",
+            "start_performance_case",
+            "collect_performance_evidence",
+            "get_performance_case",
+            "start_tuning_session",
+            "get_tuning_session",
+            "add_tuning_candidate",
+            "benchmark_tuning_candidate",
+            "benchmark_index_candidate",
+            "finalize_tuning_session",
+            "compare_query_results",
+            "compare_plan_summaries",
+            "prepare_view_change",
+            "apply_prepared_view_change",
+            "verify_view_change",
+            "rollback_view_change",
+            "get_active_sessions",
+            "get_io_stats",
+            "get_top_cached_queries",
+            "get_cached_routine_stats",
+            "get_object_index_diagnostics",
+        }
+    ),
+    McpProfile.ENFORCER_REVIEW: frozenset(
+        {
+            "list_databases",
+            "check_capabilities",
+            "start_performance_case",
+            "collect_performance_evidence",
+            "get_performance_case",
+            "get_top_queries",
+            "get_query_parameter_buckets",
+            "detect_parameter_sniffing",
+            "detect_regressed_queries",
+            "compare_query_plans",
+            "get_forced_plans",
+            "plan_health_review",
+            "plan_enforcer_tick",
+            "review_plan_enforcement",
+            "dry_run_plan_action",
+            "prepare_plan_action",
+            "get_active_sessions",
+            "get_io_stats",
+            "get_top_cached_queries",
+            "get_cached_routine_stats",
+            "get_object_index_diagnostics",
+        }
+    ),
+    McpProfile.ENFORCER_APPLY: frozenset(
+        {
+            "list_databases",
+            "check_capabilities",
+            "start_performance_case",
+            "collect_performance_evidence",
+            "get_performance_case",
+            "get_top_queries",
+            "get_query_parameter_buckets",
+            "detect_parameter_sniffing",
+            "detect_regressed_queries",
+            "compare_query_plans",
+            "get_forced_plans",
+            "plan_health_review",
+            "plan_enforcer_tick",
+            "review_plan_enforcement",
+            "dry_run_plan_action",
+            "prepare_plan_action",
+            "apply_prepared_plan_action",
+            "verify_plan_action",
+            "rollback_plan_action",
+            "get_active_sessions",
+            "get_io_stats",
+            "get_top_cached_queries",
+            "get_cached_routine_stats",
+            "get_object_index_diagnostics",
+        }
+    ),
+}
 
 
 class TransportMode(str, Enum):
@@ -207,6 +350,9 @@ class ServerConfig:
     database_policy_file: str | None = None
     performance_state_dir: str = "~/.azure-sql-mcp/state"
     plan_apply_kill_switch: bool = True
+    comparison_row_limit: int = 10_000
+    persist_view_sql_state: bool = False
+    legacy_state_server_binding: str | None = None
 
     def validate_database_name(self, database_name: str | None) -> str:
         """Resolve a database against the allowlist, case-insensitively.
@@ -226,33 +372,12 @@ class ServerConfig:
         """Check whether a tool should be registered based on configured tool_groups."""
         group = TOOL_GROUPS.get(tool_name)
         if self.profile is not None:
-            if tool_name in _DIRECT_ADMIN_TOOLS:
-                return False
-            if tool_name in _TUNING_TOOLS and self.profile not in {
-                McpProfile.OPTIMIZER,
-                McpProfile.SANDBOX,
-            }:
-                return False
-            if (
-                tool_name in _INDEX_WORKFLOW_TOOLS
-                and self.profile != McpProfile.SANDBOX
-            ):
-                return False
-            if tool_name in _ENFORCER_REVIEW_TOOLS and self.profile not in {
-                McpProfile.ENFORCER_REVIEW,
-                McpProfile.ENFORCER_APPLY,
-            }:
-                return False
-            if (
-                tool_name in _ENFORCER_APPLY_TOOLS
-                and self.profile != McpProfile.ENFORCER_APPLY
-            ):
-                return False
-            if group == ToolGroup.ADMIN and tool_name not in _ENFORCER_APPLY_TOOLS:
+            if tool_name not in PROFILE_TOOL_ALLOWLISTS[self.profile]:
                 return False
         if group is None:
-            # Unknown tools are always registered
-            return True
+            # A named profile is an explicit capability contract. New tools must
+            # be assigned to both a group and an allowlist before they are exposed.
+            return self.profile is None
         if group == ToolGroup.ADMIN and self.access_mode != AccessMode.UNRESTRICTED:
             return False
         if (
@@ -317,6 +442,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--azure-sql-query-timeout-seconds", dest="azure_sql_query_timeout_seconds")
     parser.add_argument("--azure-sql-row-limit", dest="azure_sql_row_limit")
+    parser.add_argument(
+        "--azure-sql-comparison-row-limit",
+        dest="azure_sql_comparison_row_limit",
+    )
     parser.add_argument("--azure-sql-pool-size", dest="azure_sql_pool_size")
     parser.add_argument("--azure-sql-max-retries", dest="azure_sql_max_retries")
     parser.add_argument("--azure-sql-tool-timeout-seconds", dest="azure_sql_tool_timeout_seconds")
@@ -373,6 +502,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--azure-sql-plan-apply-kill-switch",
         dest="azure_sql_plan_apply_kill_switch",
     )
+    parser.add_argument(
+        "--azure-sql-persist-view-sql-state",
+        dest="azure_sql_persist_view_sql_state",
+    )
+    parser.add_argument(
+        "--azure-sql-legacy-state-server-binding",
+        dest="azure_sql_legacy_state_server_binding",
+    )
     return parser
 
 
@@ -399,6 +536,16 @@ def load_server_config(argv: list[str] | None = None) -> ServerConfig:
         default=200,
         field_name="AZURE_SQL_ROW_LIMIT",
     )
+    comparison_row_limit = positive_int(
+        env_or_arg(args, "azure_sql_comparison_row_limit"),
+        default=10_000,
+        field_name="AZURE_SQL_COMPARISON_ROW_LIMIT",
+    )
+    if comparison_row_limit < row_limit:
+        raise ValueError(
+            "AZURE_SQL_COMPARISON_ROW_LIMIT must be greater than or equal to "
+            "AZURE_SQL_ROW_LIMIT."
+        )
     pool_size = positive_int(
         env_or_arg(args, "azure_sql_pool_size"),
         default=5,
@@ -498,6 +645,26 @@ def load_server_config(argv: list[str] | None = None) -> ServerConfig:
         env_or_arg(args, "azure_sql_plan_apply_kill_switch"),
         default=True,
     )
+    persist_view_sql_state = parse_bool(
+        env_or_arg(args, "azure_sql_persist_view_sql_state"),
+        default=False,
+    )
+    legacy_state_server_binding = env_or_arg(
+        args,
+        "azure_sql_legacy_state_server_binding",
+    )
+    if legacy_state_server_binding:
+        legacy_state_server_binding = legacy_state_server_binding.strip()
+        if legacy_state_server_binding.casefold() != server.strip().casefold():
+            raise ValueError(
+                "AZURE_SQL_LEGACY_STATE_SERVER_BINDING must exactly match "
+                "AZURE_SQL_SERVER. It is an explicit one-server migration attestation."
+            )
+    if persist_view_sql_state and performance_state_dir == ":memory:":
+        raise ValueError(
+            "AZURE_SQL_PERSIST_VIEW_SQL_STATE requires a durable "
+            "AZURE_SQL_PERFORMANCE_STATE_DIR."
+        )
     read_only_profiles = {
         McpProfile.TRIAGE,
         McpProfile.OPTIMIZER,
@@ -557,4 +724,7 @@ def load_server_config(argv: list[str] | None = None) -> ServerConfig:
         database_policy_file=database_policy_file,
         performance_state_dir=performance_state_dir,
         plan_apply_kill_switch=plan_apply_kill_switch,
+        comparison_row_limit=comparison_row_limit,
+        persist_view_sql_state=persist_view_sql_state,
+        legacy_state_server_binding=legacy_state_server_binding,
     )

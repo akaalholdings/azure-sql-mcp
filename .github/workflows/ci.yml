@@ -35,13 +35,19 @@ jobs:
         run: uv sync --dev --locked
 
       - name: Ruff
-        run: uv run ruff check src tests
+        run: uv run ruff check src tests scripts
 
       - name: Pyright
         run: uv run pyright
 
       - name: Compile
-        run: uv run python -m compileall -q src tests
+        run: uv run python -m compileall -q src tests scripts
+
+      - name: Scan secrets and external knowledge references
+        run: uv run python scripts/verify_repository_content.py
+
+      - name: Check local Markdown links
+        run: uv run python scripts/check_markdown_links.py
 
       - name: Run tests
         run: uv run pytest -q

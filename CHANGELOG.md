@@ -6,6 +6,20 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-07-24
+
+### Added
+
+- Published MCP protocol capabilities for durable performance cases, iterative tuning sessions, arbitrary plan comparison, leased sandbox index experiments, and restart-safe sandbox view changes.
+- Added local policy ceilings for multi-hour tuning campaigns and adaptive workflow timeouts sized to the permitted per-request execution count.
+- Added exact query identity, Azure SQL capability detection, durable idempotency fencing, and prepared Query Store mutation workflows.
+
+### Fixed
+
+- Candidate benchmarking now executes each measured sample once, uses snapshot-consistent duplicate-aware finalist comparison, and continues after losing experiments.
+- Temporary-index and view workflows now preserve exact ownership, cleanup, rollback, and interrupted-operation recovery state.
+- Triage and plan metrics no longer infer healthy state or query totals from incomplete or operator-level evidence.
+
 ### Changed
 
 - `execute_tsql_unrestricted` now supports general DBA T-SQL instead of limiting raw execution to read-only statements. Direct and statically recoverable `DROP DATABASE` commands remain blocked.

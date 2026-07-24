@@ -1,64 +1,45 @@
-# Azure SQL Diagnostic Query Coverage
+# Azure SQL Database diagnostic coverage
 
-Source reference: `/Users/balwinder/Downloads/Azure SQL Database Diagnostic Information Queries (1).sql`.
+This matrix defines the platform knowledge built into the MCP server. It is
+specific to Azure SQL Database PaaS. Server-level SQL Server checks are excluded
+when the managed service does not expose them or when they cannot lead to a
+database-scoped action.
 
-The MCP implementation ports Azure SQL Database-safe diagnostics and skips server-level SQL Server checks that are not actionable or consistently visible in Azure SQL DB PaaS.
+Every returned diagnostic should identify its collection window, units,
+availability, truncation state, and provenance. Missing or partial evidence must
+produce `partial` or `inconclusive`, never `healthy`.
 
-| Query | Script section | MCP coverage |
-|---:|---|---|
-| 1 | Version Info | Added in `get_database_configuration` |
-| 2 | Configuration Values | Added in `get_database_configuration` |
-| 3 | SQL Server NUMA Info | Skipped: server-level managed infrastructure |
-| 4 | IO Stalls by File | Covered by `get_io_stats` |
-| 5 | IO Usage By Database | Skipped: server-wide view; per-database IO is covered by `get_io_stats` |
-| 6 | Total Buffer Usage by Database | Skipped: server-wide buffer view; object buffer footprint added where visible |
-| 7 | Connection Counts by IP Address | Added in `get_connection_diagnostics` |
-| 8 | Avg Task Counts | Skipped: scheduler/server-level DMV |
-| 9 | Detect Blocking | Covered by `get_active_sessions`, `get_currently_waiting_tasks`, and `get_lock_details` |
-| 10 | PLE by NUMA Node | Skipped: NUMA-level view; buffer health already uses database-safe counters where visible |
-| 11 | Memory Grants Pending | Covered by `get_memory_grants` |
-| 12 | Memory Clerk Usage | Skipped: limited PaaS visibility; memory grants provide actionable pressure signal |
-| 13 | Ad hoc Queries | Covered by `get_plan_cache_analysis` |
-| 14 | Azure SQL DB Size | Added in `get_storage_diagnostics` |
-| 15 | File Sizes and Space | Added in `get_storage_diagnostics` |
-| 16 | Log Space Usage | Added in `get_storage_diagnostics` |
-| 17 | VLF Counts | Added in `get_storage_diagnostics` |
-| 18 | Last VLF Status | Added in `get_storage_diagnostics` |
-| 19 | Database Properties | Added in `get_database_configuration` |
-| 20 | Database-scoped Configurations | Added in `get_database_configuration` |
-| 21 | IO Stats By File | Covered by `get_io_stats` |
-| 22 | Recent Resource Usage | Covered by `get_resource_stats_history` |
-| 23 | Avg-Max Resource Usage | Covered by `get_resource_stats_history` |
-| 24 | Top DB Waits | Covered by `get_wait_stats` |
-| 25 | Query Execution Counts | Added in `get_top_cached_queries` |
-| 26 | Top Worker Time Queries | Added in `get_top_cached_queries` |
-| 27 | Top Logical Reads Queries | Added in `get_top_cached_queries` |
-| 28 | Top Avg Elapsed Time Queries | Added in `get_top_cached_queries` |
-| 29 | SP Execution Counts | Added in `get_cached_routine_stats` |
-| 30 | SP Avg Elapsed Time | Added in `get_cached_routine_stats` |
-| 31 | SP Worker Time | Added in `get_cached_routine_stats` |
-| 32 | SP Logical Reads | Added in `get_cached_routine_stats` |
-| 33 | SP Physical Reads | Added in `get_cached_routine_stats` |
-| 34 | SP Logical Writes | Added in `get_cached_routine_stats` |
-| 35 | Top IO Statements | Added in `get_top_cached_queries` |
-| 36 | Bad NC Indexes | Added in `get_object_index_diagnostics` |
-| 37 | Missing Indexes | Covered by `analyze_index_recommendations` and `optimize_indexes` |
-| 38 | Missing Index Warnings | Covered by `analyze_query_indexes` and `analyze_workload_indexes` |
-| 39 | Buffer Usage | Added in `get_object_index_diagnostics` with optional graceful fallback |
-| 40 | Table Sizes | Covered by `get_table_stats` |
-| 41 | Table Properties | Added in `get_object_index_diagnostics` through object/table filters and usage sections |
-| 42 | Statistics Update | Covered by `check_statistics_health` |
-| 43 | Volatile Indexes | Added in `get_object_index_diagnostics` |
-| 44 | Index Fragmentation | Covered by `analyze_db_health` index check |
-| 45 | Overall Index Usage - Reads | Added in `get_object_index_diagnostics` |
-| 46 | Overall Index Usage - Writes | Added in `get_object_index_diagnostics` |
-| 47 | Columnstore Index Physical Stat | Added in `get_object_index_diagnostics` |
-| 48 | Lock Waits | Added in `get_object_index_diagnostics`; session-level locks remain in `get_lock_details` |
-| 49 | UDF Statistics | Added in `get_cached_routine_stats` |
-| 50 | QueryStore Options | Covered by `check_capabilities`, `analyze_db_health`, and added in `get_database_configuration` |
-| 51 | High Aggregate Duration Queries | Covered by `get_top_queries` and plan enforcement review tools |
-| 52 | Input Buffer | Added in `get_connection_diagnostics` |
-| 53 | Resumable Index Rebuild | Added in `get_object_index_diagnostics` |
-| 54 | Automatic Tuning Options | Covered by `analyze_db_health` and added in `get_database_configuration` |
-| 55 | Geo-Replication Link Status | Covered by `analyze_db_health` and added in `get_database_configuration` |
-| 56 | Azure SQL DB Properties | Added in `get_database_configuration` |
+## Query performance
+
+| Diagnostic concern | MCP coverage | Interpretation boundary |
+|---|---|---|
+| Query Store regressions, runtime history, plans, and parameter-sensitive behavior | `get_top_queries`, `get_query_parameter_buckets`, `explain_query`, `get_performance_case`, and tuning sessions | Match a stable query identity and comparable parameter bucket; do not infer from fuzzy SQL text |
+| Current requests, waits, blocking, locks, and memory grants | `get_active_sessions`, `get_currently_waiting_tasks`, `get_lock_details`, and `get_memory_grants` | Current-state evidence is point-in-time and must not be presented as a historical trend |
+| Cached high-cost statements and routines | `get_top_cached_queries`, `get_cached_routine_stats`, and `get_plan_cache_analysis` | Cache evidence can reset or omit uncached executions; Query Store is preferred for durable history |
+| Estimated and actual plans | `explain_query`, `compare_plan_summaries`, and tuning benchmarks | Actual execution is allowed only for read-only SELECT-shaped work under the selected policy |
+| Result equivalence | `compare_query_results` and candidate benchmark workflows | Exact positional columns, types, duplicates, ordering semantics, and typed parameters are required; bounded or unstable evidence is inconclusive |
+| Index opportunities and overlap | `analyze_query_indexes`, `analyze_workload_indexes`, `analyze_index_recommendations`, and `optimize_indexes` | Preserve key order and direction, includes, filters, uniqueness, constraints, disabled state, and partition metadata |
+| Statistics health | `check_statistics_health` | Statistics age and modification evidence inform an experiment; they do not prove the root cause by themselves |
+
+## Azure SQL resource and storage health
+
+| Diagnostic concern | MCP coverage | Interpretation boundary |
+|---|---|---|
+| CPU, data IO, log write, worker, session, and storage pressure | `get_resource_stats_history` and `analyze_db_health` | Correlate resource saturation with the same time window as query evidence |
+| Per-file IO latency and volume | `get_io_stats` | Report reads, writes, bytes, stall time, and calculated latency with units; avoid server-wide database comparisons |
+| Database, file, log, VLF, and storage state | `get_storage_diagnostics` | Storage state is descriptive; changes require a separate reviewed database operation |
+| Database properties, compatibility level, scoped configuration, Query Store, Automatic Tuning, and geo-replication | `get_database_configuration` and `check_capabilities` | Capabilities control which experiments are valid; compatibility level alone is not a hint recommendation |
+| Table size, index usage, write amplification, columnstore state, and resumable operations | `get_table_stats` and `get_object_index_diagnostics` | Fragmentation and usage counters are supporting evidence, not standalone query-health verdicts |
+
+## Deliberate exclusions
+
+- NUMA, scheduler, server memory clerk, and server-wide buffer-pool analysis:
+  these describe managed infrastructure that Azure SQL Database customers
+  cannot tune directly.
+- Page life expectancy as a primary health signal: use Azure SQL resource
+  pressure, memory grants, waits, Query Store, and plan evidence instead.
+- Server-wide database rankings: diagnostics stay inside the selected logical
+  database and its visible Azure SQL resource scope.
+- Automatic remediation from a single DMV counter, missing-index suggestion,
+  fragmentation percentage, or cached-plan sample: every change requires a
+  measured candidate and the relevant safety policy.

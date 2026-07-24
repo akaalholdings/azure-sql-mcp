@@ -11,9 +11,9 @@ from azure_sql_mcp.transport_auth import StaticBearerTokenVerifier
 
 @pytest.mark.asyncio
 async def test_static_bearer_token_verifier_accepts_exact_token() -> None:
-    verifier = StaticBearerTokenVerifier("expected-token")
+    verifier = StaticBearerTokenVerifier("test-token")
 
-    token = await verifier.verify_token("expected-token")
+    token = await verifier.verify_token("test-token")
 
     assert token is not None
     assert token.client_id == "azure-sql-mcp-static-bearer"
@@ -22,7 +22,7 @@ async def test_static_bearer_token_verifier_accepts_exact_token() -> None:
 
 @pytest.mark.asyncio
 async def test_static_bearer_token_verifier_rejects_wrong_token() -> None:
-    verifier = StaticBearerTokenVerifier("expected-token")
+    verifier = StaticBearerTokenVerifier("test-token")
 
     assert await verifier.verify_token("wrong-token") is None
 
@@ -30,7 +30,7 @@ async def test_static_bearer_token_verifier_rejects_wrong_token() -> None:
 @pytest.mark.asyncio
 async def test_streamable_http_app_enforces_bearer_token(server_config_factory) -> None:
     config = server_config_factory(
-        mcp_bearer_token="expected-token",
+        mcp_bearer_token="test-token",
         transport=TransportConfig(
             mode=TransportMode.STREAMABLE_HTTP,
             host="127.0.0.1",
@@ -48,7 +48,7 @@ async def test_streamable_http_app_enforces_bearer_token(server_config_factory) 
         wrong = await client.get("/mcp", headers={"Authorization": "Bearer wrong-token"})
         valid = await client.get(
             "/mcp",
-            headers={"Authorization": "Bearer expected-token"},
+            headers={"Authorization": "Bearer test-token"},
         )
 
     assert missing.status_code == 401

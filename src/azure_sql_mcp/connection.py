@@ -8,6 +8,8 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
+from typing import Callable
+from typing import Mapping
 from typing import Sequence
 
 from .auth import AzureSqlAuthenticator
@@ -23,6 +25,57 @@ class QueryResult:
     columns: tuple[str, ...]
     rows: list[dict[str, Any]]
     column_type_signatures: tuple[str, ...] = ()
+    positional_rows: tuple[tuple[Any, ...], ...] | None = None
+    positional_rows_exact: bool | None = None
+
+    def __post_init__(self) -> None:
+        columns = tuple(self.columns)
+        object.__setattr__(self, "columns", columns)
+        supplied_rows = self.positional_rows
+        supplied_positionally = supplied_rows is not None
+        if not supplied_positionally:
+            positional_rows: list[tuple[Any, ...]] = []
+            for row in self.rows:
+                if isinstance(row, Mapping):
+                    values = tuple(row.get(column) for column in columns)
+                else:  # Compatibility for callers that supplied positional rows.
+                    values = tuple(row)
+                positional_rows.append(values)
+            exact_rows = tuple(positional_rows)
+        else:
+            exact_rows = tuple(tuple(row) for row in supplied_rows)
+        if any(len(row) != len(columns) for row in exact_rows):
+            raise ValueError("Every positional result row must match the column count.")
+        object.__setattr__(self, "positional_rows", exact_rows)
+        inferred_exact = supplied_positionally or len(set(columns)) == len(columns)
+        if self.positional_rows_exact is True and not inferred_exact:
+            raise ValueError(
+                "Duplicate output names require driver-supplied positional rows."
+            )
+        object.__setattr__(
+            self,
+            "positional_rows_exact",
+            inferred_exact
+            if self.positional_rows_exact is None
+            else self.positional_rows_exact,
+        )
+
+    @property
+    def rows_positional(self) -> tuple[tuple[Any, ...], ...]:
+        """Alias for integration code migrating from the dict-row view."""
+
+        return self.positional_rows or ()
+
+    @property
+    def typed_rows(self) -> tuple[tuple[Any, ...], ...]:
+        """Exact typed cells in driver column order."""
+
+        return self.positional_rows or ()
+
+    def comparison_rows(self) -> tuple[tuple[Any, ...], ...]:
+        """Return positional rows; inspect ``positional_rows_exact`` before proof."""
+
+        return self.positional_rows or ()
 
 
 @dataclass(frozen=True)
@@ -33,6 +86,7 @@ class ProfiledExecution:
     elapsed_wall_ms: float
     user_query_executions: int = 1
     metric_provenance: str = "client_wall_clock_and_statistics_xml"
+    statistics_io_messages: tuple[Any, ...] = ()
 
 
 class BatchExecutionMode(str, Enum):
@@ -42,6 +96,15 @@ class BatchExecutionMode(str, Enum):
 
 class AdminBatchOutcomeUnknownError(RuntimeError):
     """The admin batch was dispatched, so its final database state is unknown."""
+
+
+class StatementDispatchPrevented(RuntimeError):
+    """A statement hook rejected dispatch before the driver was called."""
+
+    def __init__(self, statement_index: int, cause: Exception) -> None:
+        super().__init__(str(cause))
+        self.statement_index = statement_index
+        self.cause = cause
 
 
 class AzureSqlExecutor:
@@ -134,6 +197,7 @@ class AzureSqlExecutor:
         statements: Sequence[str],
         *,
         max_rows: int | None = None,
+        statement_params: Sequence[Sequence[Any] | None] | None = None,
     ) -> list[list[QueryResult]]:
         """Execute several statements on the SAME pooled connection.
 
@@ -142,6 +206,13 @@ class AzureSqlExecutor:
         subsequent statements run on the same session.
         """
         validated_database = self.config.validate_database_name(database_name)
+        if statement_params is not None and len(statement_params) != len(statements):
+            raise ValueError("statement_params must match the statement count.")
+        normalized_params = (
+            tuple(tuple(params or ()) for params in statement_params)
+            if statement_params is not None
+            else None
+        )
 
         async def _attempt() -> list[list[QueryResult]]:
             connection = await self.pool.acquire(validated_database)
@@ -156,6 +227,7 @@ class AzureSqlExecutor:
                         validated_database,
                         tuple(statements),
                         max_rows,
+                        normalized_params,
                     )
                 )
                 result = await asyncio.shield(execution_task)
@@ -187,14 +259,26 @@ class AzureSqlExecutor:
         statements: Sequence[str],
         *,
         max_rows: int | None = None,
+        statement_params: Sequence[Sequence[Any] | None] | None = None,
+        before_statement_dispatch: Callable[[int], Any] | None = None,
     ) -> list[list[QueryResult]]:
         """Execute one same-connection sequence without automatic retry.
 
         This is the bounded comparison path: retrying the sequence after one
         statement ran would under-report executions and invalidate the budget.
+        ``before_statement_dispatch`` runs synchronously in the worker thread
+        immediately before the selected statement's driver dispatch. If it
+        raises, that statement is not dispatched.
         """
 
         validated_database = self.config.validate_database_name(database_name)
+        if statement_params is not None and len(statement_params) != len(statements):
+            raise ValueError("statement_params must match the statement count.")
+        normalized_params = (
+            tuple(tuple(params or ()) for params in statement_params)
+            if statement_params is not None
+            else None
+        )
         connection = await self.pool.acquire(validated_database)
         succeeded = False
         deferred_cleanup = False
@@ -207,6 +291,8 @@ class AzureSqlExecutor:
                     validated_database,
                     tuple(statements),
                     max_rows,
+                    normalized_params,
+                    before_statement_dispatch,
                 )
             )
             result = await asyncio.shield(execution_task)
@@ -274,7 +360,10 @@ class AzureSqlExecutor:
                 elif not deferred_cleanup:
                     await self.pool.discard(validated_database, connection)
 
-        return await with_retry(_attempt, max_retries=self.config.max_retries)
+        # Mutations must never be replayed after the server may have accepted
+        # the request.  A transient failure therefore has to be surfaced to
+        # the caller as an unknown outcome rather than retried transparently.
+        return await _attempt()
 
     async def execute_profiled_read_only(
         self,
@@ -390,6 +479,8 @@ class AzureSqlExecutor:
         database_name: str,
         statements: Sequence[str],
         max_rows: int | None,
+        statement_params: Sequence[Sequence[Any]] | None = None,
+        before_statement_dispatch: Callable[[int], Any] | None = None,
     ) -> list[list[QueryResult]]:
         logger.debug(
             "Executing session",
@@ -406,7 +497,16 @@ class AzureSqlExecutor:
                 self._configure_cursor(cursor)
                 if index == 0:
                     self._set_lock_timeout(cursor)
-                cursor.execute(statement)
+                params = statement_params[index] if statement_params is not None else ()
+                if before_statement_dispatch is not None:
+                    try:
+                        before_statement_dispatch(index)
+                    except Exception as exc:
+                        raise StatementDispatchPrevented(index, exc) from exc
+                if params:
+                    cursor.execute(statement, params)
+                else:
+                    cursor.execute(statement)
                 per_statement_results.append(
                     self._consume_batches(cursor, max_rows=max_rows, stop_on_cap=False)
                 )
@@ -432,14 +532,17 @@ class AzureSqlExecutor:
         try:
             self._configure_cursor(cursor)
             self._set_lock_timeout(cursor)
-            cursor.execute(query, params)
-            rowcount = 0
-            while True:
-                if cursor.rowcount and cursor.rowcount > 0:
-                    rowcount += cursor.rowcount
-                if not cursor.nextset():
-                    break
-            return rowcount
+            try:
+                cursor.execute(query, params)
+                rowcount = 0
+                while True:
+                    if cursor.rowcount and cursor.rowcount > 0:
+                        rowcount += cursor.rowcount
+                    if not cursor.nextset():
+                        break
+                return rowcount
+            except Exception as exc:
+                raise AdminBatchOutcomeUnknownError(str(exc)) from exc
         finally:
             with contextlib.suppress(Exception):
                 cursor.close()
@@ -462,6 +565,7 @@ class AzureSqlExecutor:
             self._configure_cursor(setup_cursor)
             self._set_lock_timeout(setup_cursor)
             setup_cursor.execute("SET STATISTICS XML ON", ())
+            setup_cursor.execute("SET STATISTICS IO ON", ())
         finally:
             with contextlib.suppress(Exception):
                 setup_cursor.close()
@@ -477,9 +581,18 @@ class AzureSqlExecutor:
                 stop_on_cap=False,
             )
             elapsed_wall_ms = (time.perf_counter() - started) * 1000.0
+            statistics_io_messages = tuple(
+                getattr(query_cursor, "messages", ()) or ()
+            )
             return ProfiledExecution(
                 result_sets=result_sets,
                 elapsed_wall_ms=elapsed_wall_ms,
+                metric_provenance=(
+                    "client_wall_clock_statistics_xml_and_statistics_io"
+                    if statistics_io_messages
+                    else "client_wall_clock_and_statistics_xml"
+                ),
+                statistics_io_messages=statistics_io_messages,
             )
         finally:
             active_error = sys.exc_info()[0] is not None
@@ -488,6 +601,7 @@ class AzureSqlExecutor:
             teardown_cursor = connection.cursor()
             try:
                 self._configure_cursor(teardown_cursor)
+                teardown_cursor.execute("SET STATISTICS IO OFF", ())
                 teardown_cursor.execute("SET STATISTICS XML OFF", ())
             except Exception:
                 if not active_error:
@@ -539,11 +653,16 @@ class AzureSqlExecutor:
                     }
                     for raw_row in raw_rows
                 ]
+                positional_rows = tuple(
+                    tuple(self._coerce_value(value) for value in raw_row)
+                    for raw_row in raw_rows
+                )
                 results.append(
                     QueryResult(
                         columns=columns,
                         rows=rows,
                         column_type_signatures=type_signatures,
+                        positional_rows=positional_rows,
                     )
                 )
 

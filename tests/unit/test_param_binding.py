@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 import pytest
 
 from azure_sql_mcp.param_binding import (
     ParameterBindingService,
+    ParameterExecutionContract,
+    SqlParameterType,
+    TypedParameter,
+    TypedParameterBucket,
     detect_parameters,
     get_type_fallback,
 )
@@ -89,6 +95,59 @@ def test_detect_parameters_treats_names_case_insensitively() -> None:
     assert detect_parameters(sql) == ["CustomerId"]
 
 
+def test_detect_parameters_ignores_escaped_bracketed_identifiers() -> None:
+    sql = (
+        "SELECT [not_a_param]]@Ignored] AS [@also_ignored] "
+        "FROM dbo.Orders WHERE Id = @Id"
+    )
+
+    assert detect_parameters(sql) == ["Id"]
+
+
+def test_detect_parameters_treats_comment_markers_inside_identifiers_as_data() -> None:
+    sql = (
+        "SELECT [not--a-comment], [not/*a-comment*/either] "
+        "FROM dbo.Orders WHERE Id = @Id"
+    )
+
+    assert detect_parameters(sql) == ["Id"]
+
+
+def test_detect_parameters_ignores_delimiters_inside_literals_and_identifiers() -> None:
+    sql = (
+        "SELECT N'not [an identifier] -- or @Ignored', "
+        '"also @Ignored", [still]]@Ignored] '
+        "FROM dbo.Orders WHERE Id = @Id"
+    )
+
+    assert detect_parameters(sql) == ["Id"]
+
+
+def test_parameter_replacement_ignores_nested_block_comments() -> None:
+    sql = (
+        "SELECT @p /* outer @p /* nested @p */ outer @p */ "
+        "FROM dbo.Orders"
+    )
+    contract = ParameterExecutionContract(
+        sql_text=sql,
+        bucket_id="nested-comments",
+        parameters=(
+            TypedParameter(
+                name="@p",
+                sql_type=SqlParameterType("int"),
+                value=42,
+                provenance="test",
+            ),
+        ),
+        provenance="test",
+    )
+
+    assert contract.driver_sql == (
+        "SELECT ? /* outer @p /* nested @p */ outer @p */ FROM dbo.Orders"
+    )
+    assert contract.driver_values == (42,)
+
+
 def test_column_mapping_supports_brackets_and_reverse_comparison() -> None:
     service = ParameterBindingService(executor=FakeExecutor())
     mappings = service._extract_column_mappings(
@@ -150,6 +209,34 @@ def test_bit_literal_rejects_values_other_than_zero_or_one() -> None:
         service._format_literal("bit", 2)
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (
+        (True, True),
+        (False, False),
+        ("TRUE", True),
+        ("false", False),
+        ("1", True),
+        ("0", False),
+    ),
+)
+def test_bit_coercion_accepts_recognized_representations(
+    value: Any,
+    expected: bool,
+) -> None:
+    service = ParameterBindingService(executor=FakeExecutor())
+
+    assert service._coerce_driver_value(SqlParameterType("bit"), value) is expected
+
+
+@pytest.mark.parametrize("value", ("unknown", "yes", "2", 2))
+def test_bit_coercion_rejects_unknown_representations(value: Any) -> None:
+    service = ParameterBindingService(executor=FakeExecutor())
+
+    with pytest.raises(ValueError, match="not valid"):
+        service._coerce_driver_value(SqlParameterType("bit"), value)
+
+
 # --- 18.2 + 18.4: Binding service tests ---
 
 @pytest.mark.asyncio
@@ -172,7 +259,10 @@ async def test_bind_parameters_uses_explicit_values() -> None:
         parameter_values={"Name": "O'Reilly", "@IsActive": True},
     )
 
-    assert [p["source"] for p in result["parameters"]] == ["explicit", "explicit"]
+    assert [p["source"] for p in result["parameters"]] == [
+        "explicit_value",
+        "explicit_value",
+    ]
     assert "N'O''Reilly'" in result["bound_sql"]
     assert "SET @IsActive = 1;" in result["bound_sql"]
 
@@ -186,7 +276,7 @@ async def test_bind_parameters_matches_explicit_names_case_insensitively() -> No
         parameter_values={"@name": "Alice"},
     )
 
-    assert result["parameters"][0]["source"] == "explicit"
+    assert result["parameters"][0]["source"] == "explicit_value"
     assert "SET @Name = N'Alice';" in result["bound_sql"]
 
 
@@ -380,3 +470,243 @@ async def test_alias_table_hint_retries_without_hint() -> None:
     assert parameter["value"] == "1"  # int type fallback, not N'test'
     assert ["CustomerID", "o"] in executor.calls  # hinted attempt happened
     assert ["CustomerID"] in executor.calls  # unhinted retry happened
+
+
+def test_typed_bucket_binds_baseline_and_candidate_without_local_variables() -> None:
+    bucket = TypedParameterBucket(
+        bucket_id="common-rare-null-boundary",
+        label="rare",
+        provenance="query_store_compiled_parameter",
+        parameters=(
+            TypedParameter(
+                name="@CustomerId",
+                sql_type=SqlParameterType("int"),
+                value=42,
+                provenance="query_store_compiled_parameter",
+            ),
+            TypedParameter(
+                name="@Name",
+                sql_type=SqlParameterType("nvarchar", length=50),
+                value=None,
+                provenance="explicit_null_bucket",
+            ),
+            TypedParameter(
+                name="@Amount",
+                sql_type=SqlParameterType("decimal", precision=12, scale=4),
+                value="999999.9999",
+                provenance="boundary_bucket",
+            ),
+        ),
+    )
+
+    service = ParameterBindingService(FakeExecutor())
+    contracts = service.build_comparison_contracts(
+        "SELECT 1 WHERE CustomerId = @CustomerId AND Name = @Name",
+        "SELECT 1 WHERE CustomerId = @CustomerId AND Name = @Name",
+        bucket,
+    )
+
+    baseline = contracts["baseline"]
+    assert baseline.parameter_definition == "@CustomerId int, @Name nvarchar(50)"
+    assert baseline.driver_sql.endswith("CustomerId = ? AND Name = ?")
+    assert baseline.driver_values == (42, None)
+    assert baseline.sp_executesql_values[1] == baseline.parameter_definition
+    assert baseline.parameters[1].provenance == "explicit_null_bucket"
+    assert contracts["candidate"].bucket_id == baseline.bucket_id
+    assert "DECLARE" not in baseline.driver_sql
+
+
+def test_sql_parameter_type_preserves_length_precision_and_scale() -> None:
+    assert SqlParameterType.from_sql("nvarchar(400)").to_dict() == {
+        "data_type": "nvarchar(400)",
+        "base_type": "nvarchar",
+        "length": 400,
+        "precision": None,
+        "scale": None,
+    }
+    decimal_type = SqlParameterType.from_sql("decimal(19,4)")
+    assert decimal_type.sql_declaration == "decimal(19,4)"
+    assert decimal_type.precision == 19
+    assert decimal_type.scale == 4
+
+
+@pytest.mark.parametrize(
+    "data_type",
+    (
+        "madeup_type",
+        "text",
+        "int(4)",
+        "nvarchar(4001)",
+        "varchar(8001)",
+        "char(max)",
+        "datetime2(8)",
+    ),
+)
+def test_sql_parameter_type_rejects_unsupported_or_invalid_declarations(
+    data_type: str,
+) -> None:
+    with pytest.raises(ValueError):
+        SqlParameterType.from_sql(data_type)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    (
+        lambda: SqlParameterType("varchar", length=True),
+        lambda: SqlParameterType("decimal", precision=1.5),
+        lambda: SqlParameterType("datetime2", scale=1.5),
+    ),
+)
+def test_sql_parameter_type_rejects_non_integer_metadata(factory: Any) -> None:
+    with pytest.raises(ValueError):
+        factory()
+
+
+@pytest.mark.parametrize("value", (1, 1.0, "1", "1.0", Decimal("1.0")))
+def test_integer_validation_accepts_integral_representations(value: Any) -> None:
+    service = ParameterBindingService(FakeExecutor())
+
+    service._validate_driver_value(SqlParameterType("int"), value)
+
+
+@pytest.mark.parametrize("value", (1.5, "1.5", Decimal("1.5")))
+def test_integer_validation_rejects_fractional_values(value: Any) -> None:
+    service = ParameterBindingService(FakeExecutor())
+
+    with pytest.raises(ValueError, match="not valid"):
+        service._validate_driver_value(SqlParameterType("int"), value)
+
+
+def test_typed_bucket_rejects_length_and_decimal_scale_overflows() -> None:
+    service = ParameterBindingService(FakeExecutor())
+    with pytest.raises(ValueError, match="length"):
+        service._validate_driver_value(SqlParameterType("varchar", length=3), "abcd")
+    with pytest.raises(ValueError, match="scale"):
+        service._validate_driver_value(
+            SqlParameterType("decimal", precision=6, scale=2),
+            "1.234",
+        )
+
+
+def test_typed_bucket_preserves_datetime_scale_and_raw_driver_value() -> None:
+    value = datetime(2026, 7, 24, 10, 30, 12, 345678)
+    bucket = TypedParameterBucket(
+        bucket_id="boundary-datetime",
+        parameters=(
+            TypedParameter(
+                name="@StartDate",
+                sql_type=SqlParameterType("datetime2", scale=7),
+                value=value,
+                provenance="boundary_bucket",
+            ),
+        ),
+    )
+    contract = bucket.for_sql("SELECT 1 WHERE @StartDate IS NOT NULL")
+
+    assert contract.parameter_definition == "@StartDate datetime2(7)"
+    assert contract.driver_values == (value,)
+    assert contract.parameters[0].provenance == "boundary_bucket"
+
+
+def test_sp_executesql_uses_all_positional_arguments_in_definition_order() -> None:
+    bucket = TypedParameterBucket(
+        bucket_id="typed",
+        parameters=(
+            TypedParameter(
+                name="@CustomerId",
+                sql_type=SqlParameterType.from_sql("bigint"),
+                value=42,
+                provenance="synthetic",
+            ),
+        ),
+    )
+    contract = bucket.for_sql(
+        "SELECT 1 WHERE @CustomerId = @CustomerId"
+    )
+
+    assert contract.sp_executesql_sql == "EXEC sys.sp_executesql ?, ?, ?"
+    assert contract.sp_executesql_values == (
+        "SELECT 1 WHERE @CustomerId = @CustomerId",
+        "@CustomerId bigint",
+        42,
+    )
+
+
+def test_sp_executesql_supports_query_parameters_named_stmt_and_params() -> None:
+    bucket = TypedParameterBucket(
+        bucket_id="reserved-names",
+        parameters=(
+            TypedParameter(
+                name="@stmt",
+                sql_type=SqlParameterType.from_sql("int"),
+                value=1,
+                provenance="synthetic",
+            ),
+            TypedParameter(
+                name="@params",
+                sql_type=SqlParameterType.from_sql("int"),
+                value=2,
+                provenance="synthetic",
+            ),
+        ),
+    )
+    contract = bucket.for_sql("SELECT @stmt + @params")
+
+    assert contract.sp_executesql_sql == "EXEC sys.sp_executesql ?, ?, ?, ?"
+    assert contract.parameter_definition == "@stmt int, @params int"
+
+
+def test_driver_binding_ignores_escaped_bracketed_identifier_parameters() -> None:
+    bucket = TypedParameterBucket(
+        bucket_id="escaped-identifier",
+        parameters=(
+            TypedParameter(
+                name="@Id",
+                sql_type=SqlParameterType("int"),
+                value=7,
+                provenance="synthetic",
+            ),
+        ),
+    )
+
+    contract = bucket.for_sql(
+        "SELECT [not_a_param]]@Ignored] FROM dbo.Orders WHERE Id = @Id"
+    )
+
+    assert contract.driver_sql == (
+        "SELECT [not_a_param]]@Ignored] FROM dbo.Orders WHERE Id = ?"
+    )
+    assert contract.driver_values == (7,)
+
+
+def test_parameter_execution_contract_rejects_missing_or_extra_parameters() -> None:
+    parameter = TypedParameter(
+        name="@Unexpected",
+        sql_type=SqlParameterType.from_sql("int"),
+        value=1,
+        provenance="synthetic",
+    )
+
+    with pytest.raises(ValueError, match="cover every query parameter exactly"):
+        ParameterExecutionContract(
+            sql_text="SELECT 1 WHERE @Expected = 1",
+            bucket_id="typed",
+            parameters=(parameter,),
+            provenance="synthetic",
+        )
+
+
+@pytest.mark.asyncio
+async def test_bind_parameters_exposes_typed_driver_contract_and_provenance() -> None:
+    result = await ParameterBindingService(FakeExecutor()).bind_parameters(
+        "testdb",
+        "SELECT * FROM Orders WHERE CustomerId = @CustomerId",
+        parameter_values={"CustomerId": None},
+    )
+
+    assert result["parameters"][0]["value"] == "NULL"
+    assert result["parameters"][0]["raw_value"] is None
+    contract = result["execution_contract"]
+    assert contract["driver_sql"].endswith("CustomerId = ?")
+    assert contract["driver_values"] == [None]
+    assert contract["parameters"][0]["provenance"] == "explicit_value"

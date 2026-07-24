@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 
+from dataclasses import replace
+
 import pytest
 
 from azure_sql_mcp.index_optimizer import (
+    BracketedIndexExperiment,
+    ExperimentPhase,
     IndexCandidate,
     IndexOptimizer,
     OptimizationResult,
@@ -12,7 +16,12 @@ from azure_sql_mcp.index_optimizer import (
     _is_prefix,
     _merge_unique,
     _to_float,
+    build_index_candidate_statement,
+    make_temporary_index_candidate,
+    verify_plan_uses_index,
 )
+from azure_sql_mcp.index_metadata import ExistingIndex
+from azure_sql_mcp.index_metadata import IndexKeyColumn
 
 SAMPLE_SHOWPLAN = """\
 <ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">
@@ -209,6 +218,463 @@ class TestToFloat:
 
     def test_invalid_returns_zero(self):
         assert _to_float("abc") == 0.0
+
+
+def test_filtered_candidate_ddl_and_workflow_ownership_are_explicit() -> None:
+    candidate = IndexCandidate(
+        schema="dbo",
+        table="Orders",
+        key_columns=("Status ASC", "CreatedAt DESC"),
+        include_columns=("Total",),
+        filter_definition="[Status] = 1",
+        is_unique=True,
+    )
+    temporary = make_temporary_index_candidate(candidate, "case-17")
+    sql = build_index_candidate_statement(temporary)
+
+    assert "CREATE UNIQUE NONCLUSTERED INDEX" in sql
+    assert "[Status] = 1" in sql
+    assert "[CreatedAt] DESC" in sql
+    assert temporary.index_name.startswith("IX_Tuning_case_17_")
+    assert temporary.definition_fingerprint
+
+
+def test_online_index_option_precedes_data_space_clause() -> None:
+    candidate = IndexCandidate(
+        schema="dbo",
+        table="Orders",
+        key_columns=("OrderId ASC",),
+        include_columns=(),
+        index_name="IX_Orders_OrderId",
+        data_space_name="ps_Orders",
+        partition_columns=("OrderDate",),
+        compression="page",
+    )
+
+    sql = build_index_candidate_statement(candidate, online=True)
+
+    assert (
+        "WITH (DATA_COMPRESSION = PAGE, ONLINE = ON) "
+        "ON [ps_Orders]([OrderDate]);"
+    ) in sql
+
+
+def test_index_compression_is_validated_before_ddl_interpolation() -> None:
+    candidate = IndexCandidate(
+        schema="dbo",
+        table="Orders",
+        key_columns=("OrderId",),
+        include_columns=(),
+        compression="PAGE); DROP TABLE dbo.Orders;--",
+    )
+
+    with pytest.raises(ValueError, match="unsupported rowstore index compression"):
+        build_index_candidate_statement(candidate)
+
+
+def test_filtered_predicate_validation_preserves_legal_boolean_predicates() -> None:
+    candidate = IndexCandidate(
+        schema="dbo",
+        table="Orders",
+        key_columns=("Status",),
+        include_columns=(),
+        filter_definition="[Status] = 'SELECT; DROP' AND [DeletedAt] IS NOT NULL",
+    )
+
+    sql = build_index_candidate_statement(candidate)
+
+    assert "WHERE [Status] = 'SELECT; DROP' AND [DeletedAt] IS NOT NULL" in sql
+
+
+def test_filtered_predicate_validation_accepts_in_and_rhs_conversion() -> None:
+    candidate = IndexCandidate(
+        schema="dbo",
+        table="Orders",
+        key_columns=("Status",),
+        include_columns=(),
+        filter_definition=(
+            "[Status] IN (1, 2, 3) "
+            "AND [CreatedAt] >= CONVERT(datetime2, '2026-01-01')"
+        ),
+    )
+
+    sql = build_index_candidate_statement(candidate)
+
+    assert "[Status] IN (1, 2, 3)" in sql
+    assert "CONVERT(datetime2, '2026-01-01')" in sql
+
+
+@pytest.mark.parametrize(
+    "filter_definition",
+    [
+        "[Status] = 1 /* comment */ WITH (DATA_COMPRESSION = PAGE)",
+        "[Status] = 1 -- comment\nWITH (DATA_COMPRESSION = PAGE)",
+        "[Status] = 1;",
+        "[Status] = 1; DROP TABLE dbo.Orders",
+        "[Status] = 1\nGO\nDROP TABLE dbo.Orders",
+        "[Status] = 1) WITH (DATA_COMPRESSION = PAGE)",
+        "[Status] = 1 UNION ALL SELECT 1",
+        "[Status] = 1 OR [Priority] = 2",
+        "[Status] = dbo.ResolveStatus()",
+        "[Status] = [Priority]",
+    ],
+)
+def test_filtered_predicate_validation_rejects_ddl_escape_attempts(
+    filter_definition: str,
+) -> None:
+    candidate = IndexCandidate(
+        schema="dbo",
+        table="Orders",
+        key_columns=("Status",),
+        include_columns=(),
+        filter_definition=filter_definition,
+    )
+
+    with pytest.raises(ValueError, match="filtered index predicate"):
+        build_index_candidate_statement(candidate)
+
+
+def test_expected_definition_matches_observed_candidate_shape() -> None:
+    candidate = make_temporary_index_candidate(
+        IndexCandidate(
+            schema="dbo",
+            table="Orders",
+            key_columns=("Status ASC",),
+            include_columns=("Total",),
+            filter_definition="[Status] = 1",
+        ),
+        "case-18",
+    )
+    actual = ExistingIndex(
+        schema="DBO",
+        table="ORDERS",
+        index_id=9,
+        name=f"[{candidate.index_name}]",
+        index_type="NONCLUSTERED",
+        key_columns=(IndexKeyColumn("status", "ASC"),),
+        include_columns=("total",),
+        filter_definition="(([status] = (1)))",
+    )
+    assert IndexOptimizer.verify_expected_index_definition(actual, candidate)
+
+
+def test_expected_definition_preserves_filter_literal_spelling() -> None:
+    candidate = make_temporary_index_candidate(
+        IndexCandidate(
+            schema="dbo",
+            table="Orders",
+            key_columns=("Status",),
+            include_columns=(),
+            filter_definition="[Status] = 'Open'",
+        ),
+        "case-18-literal",
+    )
+    actual = ExistingIndex(
+        schema="dbo",
+        table="Orders",
+        index_id=13,
+        name=candidate.index_name or "",
+        index_type="NONCLUSTERED",
+        key_columns=(IndexKeyColumn("status", "ASC"),),
+        filter_definition="([status] = ('open'))",
+    )
+
+    assert not IndexOptimizer.verify_expected_index_definition(actual, candidate)
+
+
+def test_expected_definition_rejects_different_catalog_identity() -> None:
+    candidate = IndexCandidate(
+        schema="dbo",
+        table="Orders",
+        key_columns=("Status ASC", "CreatedAt DESC"),
+        include_columns=(),
+        index_name="IX_Orders_Status",
+    )
+    actual = ExistingIndex(
+        schema="reporting",
+        table="OrderArchive",
+        index_id=10,
+        name="IX_Orders_Status",
+        index_type="NONCLUSTERED",
+        key_columns=(
+            IndexKeyColumn("Status", "ASC"),
+            IndexKeyColumn("CreatedAt", "DESC"),
+        ),
+    )
+
+    assert not IndexOptimizer.verify_expected_index_definition(actual, candidate)
+
+
+def test_expected_definition_requires_full_observed_ownership_metadata() -> None:
+    candidate = IndexCandidate(
+        schema="dbo",
+        table="Orders",
+        key_columns=("Status ASC",),
+        include_columns=("Total",),
+        filter_definition="[Status] = 1",
+        is_unique=True,
+        index_name="IX_Orders_Status",
+        data_space_name="ps_OrderDate",
+        partition_columns=("OrderDate",),
+        compression="PAGE",
+        partition_scheme_name="ps_OrderDate",
+        partition_function_name="pf_OrderDate",
+    )
+    actual = ExistingIndex(
+        schema="dbo",
+        table="Orders",
+        index_id=12,
+        name="IX_Orders_Status",
+        index_type="NONCLUSTERED",
+        key_columns=(IndexKeyColumn("Status", "ASC"),),
+        include_columns=("Total",),
+        filter_definition="[Status] = 1",
+        is_unique=True,
+        partition_columns=("OrderDate",),
+        data_space_name="ps_OrderDate",
+        data_space_type="PARTITION_SCHEME",
+        partition_scheme_name="ps_OrderDate",
+        partition_function_name="pf_OrderDate",
+        partition_compression=((1, "PAGE"),),
+    )
+
+    assert IndexOptimizer.verify_expected_index_definition(actual, candidate)
+    for changed in (
+        replace(actual, name="IX_Other_Status"),
+        replace(actual, index_type="CLUSTERED"),
+        replace(actual, key_columns=(IndexKeyColumn("OtherStatus", "ASC"),)),
+        replace(actual, include_columns=("OtherTotal",)),
+        replace(actual, filter_definition="[OtherStatus] = 1"),
+        replace(actual, is_unique=False),
+        replace(actual, is_primary_key=True),
+        replace(actual, is_unique_constraint=True),
+        replace(actual, constraint_name="UQ_Orders_Status"),
+        replace(actual, constraint_type="UNIQUE_CONSTRAINT"),
+        replace(actual, is_disabled=True),
+        replace(actual, fill_factor=90),
+        replace(actual, data_space_name="PRIMARY"),
+        replace(actual, partition_scheme_name="ps_OtherDate"),
+        replace(actual, partition_function_name="pf_OtherDate"),
+        replace(actual, partition_columns=("CreatedAt",)),
+        replace(actual, partition_compression=((1, "ROW"),)),
+    ):
+        assert not IndexOptimizer.verify_expected_index_definition(changed, candidate)
+
+
+@pytest.mark.parametrize(
+    ("actual_keys", "expected_keys"),
+    [
+        (
+            (IndexKeyColumn("Status", "ASC"), IndexKeyColumn("CreatedAt", "DESC")),
+            ("CreatedAt DESC", "Status ASC"),
+        ),
+        (
+            (IndexKeyColumn("Status", "DESC"), IndexKeyColumn("CreatedAt", "ASC")),
+            ("Status ASC", "CreatedAt ASC"),
+        ),
+    ],
+)
+def test_expected_definition_preserves_key_order_and_direction(
+    actual_keys: tuple[IndexKeyColumn, ...],
+    expected_keys: tuple[str, ...],
+) -> None:
+    candidate = IndexCandidate(
+        schema="dbo",
+        table="Orders",
+        key_columns=expected_keys,
+        include_columns=(),
+        index_name="IX_Orders_Status",
+    )
+    actual = ExistingIndex(
+        schema="dbo",
+        table="Orders",
+        index_id=11,
+        name="IX_Orders_Status",
+        index_type="NONCLUSTERED",
+        key_columns=actual_keys,
+    )
+
+    assert not IndexOptimizer.verify_expected_index_definition(actual, candidate)
+
+
+def test_plan_use_verification_is_name_based() -> None:
+    plan = """<ShowPlanXML xmlns=\"http://schemas.microsoft.com/sqlserver/2004/07/showplan\">
+      <BatchSequence><Batch><Statements><StmtSimple><QueryPlan>
+        <RelOp><IndexScan Index=\"[dbo].[IX_Tuning_case_18]\" /></RelOp>
+      </QueryPlan></StmtSimple></Statements></Batch></BatchSequence>
+    </ShowPlanXML>"""
+
+    evidence = verify_plan_uses_index(plan, "IX_Tuning_case_18")
+
+    assert evidence.verified is True
+    assert evidence.operator_count == 1
+
+
+def test_plan_use_verification_reads_index_from_namespaced_object_descendant() -> None:
+    plan = """<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">
+      <BatchSequence><Batch><Statements><StmtSimple><QueryPlan>
+        <RelOp>
+          <IndexSeek Ordered="true">
+            <SeekPredicates />
+            <Object Database="[appdb]" Schema="[dbo]" Table="[Orders]"
+                    Index="[dbo].[IX_Tuning_case_19]" IndexKind="NonClustered" />
+          </IndexSeek>
+        </RelOp>
+      </QueryPlan></StmtSimple></Statements></Batch></BatchSequence>
+    </ShowPlanXML>"""
+
+    evidence = verify_plan_uses_index(plan, "IX_Tuning_case_19")
+
+    assert evidence.verified is True
+    assert evidence.operator_count == 1
+    assert evidence.matched_index_names == ("[dbo].[IX_Tuning_case_19]",)
+
+
+def test_bracketed_experiment_can_continue_after_a_losing_measurement() -> None:
+    experiment = BracketedIndexExperiment(
+        IndexCandidate(
+            "dbo",
+            "Orders",
+            ("Status ASC",),
+            (),
+            index_name="IX_Orders_Status",
+        )
+    )
+    plan = (
+        '<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">'
+        '<IndexScan Index="[dbo].[IX_Orders_Status]" />'
+        "</ShowPlanXML>"
+    )
+    experiment.add_measurement(
+        ExperimentPhase.BASELINE_BEFORE,
+        elapsed_ms=100,
+        result_fingerprint="same-result",
+    )
+    experiment.add_measurement(
+        ExperimentPhase.WITH_INDEX,
+        elapsed_ms=120,
+        result_fingerprint="same-result",
+        plan_xml=plan,
+    )
+    experiment.add_measurement(
+        ExperimentPhase.WITH_INDEX,
+        elapsed_ms=40,
+        result_fingerprint="same-result",
+        plan_xml=plan,
+    )
+    experiment.add_measurement(
+        ExperimentPhase.BASELINE_AFTER,
+        elapsed_ms=100,
+        result_fingerprint="same-result",
+    )
+
+    assessment = experiment.assess(min_improvement_pct=5)
+
+    assert assessment.status == "winner"
+    assert assessment.baseline_equivalent is True
+    assert assessment.candidate_wins is True
+
+
+def test_bracketed_experiment_requires_verified_index_use_for_each_sample() -> None:
+    experiment = BracketedIndexExperiment(
+        IndexCandidate(
+            "dbo",
+            "Orders",
+            ("Status ASC",),
+            (),
+            index_name="IX_Orders_Status",
+        )
+    )
+    plan = (
+        '<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">'
+        '<IndexSeek Index="[dbo].[IX_Orders_Status]" />'
+        "</ShowPlanXML>"
+    )
+    experiment.add_measurement(
+        ExperimentPhase.BASELINE_BEFORE,
+        elapsed_ms=100,
+        result_fingerprint="same-result",
+    )
+    experiment.add_measurement(
+        ExperimentPhase.WITH_INDEX,
+        elapsed_ms=40,
+        result_fingerprint="same-result",
+        plan_xml=plan,
+    )
+    experiment.add_measurement(
+        ExperimentPhase.WITH_INDEX,
+        elapsed_ms=42,
+        result_fingerprint="same-result",
+    )
+    experiment.add_measurement(
+        ExperimentPhase.BASELINE_AFTER,
+        elapsed_ms=100,
+        result_fingerprint="same-result",
+    )
+
+    assessment = experiment.assess()
+
+    assert assessment.status == "inconclusive"
+    assert assessment.baseline_equivalent is True
+    assert assessment.candidate_wins is None
+    assert "expected index" in assessment.reason
+
+
+def test_bracketed_experiment_requires_one_fingerprint_across_all_phases() -> None:
+    experiment = BracketedIndexExperiment(
+        IndexCandidate(
+            "dbo",
+            "Orders",
+            ("Status ASC",),
+            (),
+            index_name="IX_Orders_Status",
+        )
+    )
+    plan = (
+        '<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">'
+        '<IndexScan Index="[dbo].[IX_Orders_Status]" />'
+        "</ShowPlanXML>"
+    )
+    experiment.add_measurement(
+        ExperimentPhase.BASELINE_BEFORE,
+        elapsed_ms=100,
+        result_fingerprint="same-result",
+    )
+    experiment.add_measurement(
+        ExperimentPhase.WITH_INDEX,
+        elapsed_ms=40,
+        result_fingerprint="different-result",
+        plan_xml=plan,
+    )
+    experiment.add_measurement(
+        ExperimentPhase.BASELINE_AFTER,
+        elapsed_ms=100,
+        result_fingerprint="same-result",
+    )
+
+    assessment = experiment.assess()
+
+    assert assessment.status == "inconclusive"
+    assert assessment.baseline_equivalent is False
+    assert assessment.candidate_wins is None
+    assert "stable result fingerprint" in assessment.reason
+
+
+def test_two_post_index_runs_are_not_a_bracketed_experiment() -> None:
+    experiment = BracketedIndexExperiment(
+        IndexCandidate("dbo", "Orders", ("Status ASC",), ())
+    )
+    for elapsed in (40, 42):
+        experiment.add_measurement(
+            ExperimentPhase.WITH_INDEX,
+            elapsed_ms=elapsed,
+            result_fingerprint="same-result",
+        )
+
+    assessment = experiment.assess()
+
+    assert assessment.status == "incomplete"
+    assert assessment.baseline_equivalent is None
 
 
 # ---------------------------------------------------------------------------
@@ -763,7 +1229,7 @@ class TestFullOptimizePipeline:
             assert "CustomerId" in idx.candidate.key_columns
             assert idx.estimated_size_mb > 0
             assert idx.score != 0.0
-            assert "CREATE INDEX" in idx.create_index_sql
+            assert "CREATE NONCLUSTERED INDEX" in idx.create_index_sql
 
         # as_dict should serialize
         d = result.as_dict()

@@ -20,6 +20,8 @@ from .performance_contracts import (
     new_id,
 )
 from .performance_store import PerformanceStore
+from .performance_store import ReservationError
+from .query_identity import request_fingerprint
 
 
 DEFAULT_MAX_CANDIDATES = 10
@@ -103,10 +105,28 @@ class TuningSessionStateMachine:
         execution_limit: int = DEFAULT_EXECUTIONS,
         time_limit_seconds: int = DEFAULT_TIME_LIMIT_SECONDS,
         metadata: Mapping[str, Any] | None = None,
+        replay_metadata: Mapping[str, Any] | None = None,
         idempotency_key: str | None = None,
     ) -> TuningSessionV1:
         case_id = performance_case.case_id if isinstance(performance_case, PerformanceCaseV1) else performance_case
         now = self._clock()
+        operation_fingerprint = request_fingerprint(
+            "tuning-session.create",
+            {
+                "performance_case_id": case_id,
+                "max_candidates": max_candidates,
+                "screen_runs_per_candidate": screen_runs_per_candidate,
+                "finalist_runs_per_candidate": finalist_runs_per_candidate,
+                "parameter_case_limit": parameter_case_limit,
+                "execution_limit": execution_limit,
+                "time_limit_seconds": time_limit_seconds,
+                "metadata": metadata or {},
+            },
+        )
+        durable_replay_metadata = {
+            "request_fingerprint": operation_fingerprint,
+            **dict(replay_metadata or {}),
+        }
         session = TuningSessionV1(
             session_id=session_id or new_id("session"),
             performance_case_id=case_id,
@@ -120,9 +140,14 @@ class TuningSessionStateMachine:
             parameter_case_limit=parameter_case_limit,
             execution_limit=execution_limit,
             time_limit_seconds=time_limit_seconds,
+            replay_metadata=durable_replay_metadata,
             metadata=metadata or {},
         )
-        return self.store.create_session(session, idempotency_key=idempotency_key)
+        return self.store.create_session(
+            session,
+            idempotency_key=idempotency_key,
+            request_fingerprint=operation_fingerprint,
+        )
 
     def get_session(self, session_id: str) -> TuningSessionV1:
         return self.store.get_session(session_id)
@@ -146,39 +171,96 @@ class TuningSessionStateMachine:
     ) -> TuningCandidateV1:
         session = self._active_session(session_id, allowed={"created", "screening"})
         self._check_deadline(session)
-        existing = self._candidate_for_operation(session_id, idempotency_key)
-        if existing is not None:
-            return existing
-        candidates = self.store.list_candidates(session_id)
-        if len(candidates) >= session.max_candidates:
-            raise TuningBudgetExceeded("Maximum candidate budget has been reached.")
         candidate = TuningCandidateV1(
             candidate_id=candidate_id or new_id("candidate"),
             session_id=session_id,
-            ordinal=len(candidates),
+            ordinal=0,
             strategy=strategy,
             rewrite_fingerprint=rewrite_fingerprint,
             rewrite_artifact_ref=rewrite_artifact_ref,
             metadata=metadata or {},
         )
-        candidate = self.store.create_candidate(
-            candidate,
-            idempotency_key=(f"{idempotency_key}:candidate" if idempotency_key else None),
+        operation_fingerprint = self.candidate_creation_request_fingerprint(
+            session_id,
+            strategy=strategy,
+            rewrite_fingerprint=rewrite_fingerprint,
+            rewrite_artifact_ref=rewrite_artifact_ref,
+            metadata=metadata,
+            idempotency_key=idempotency_key,
+            candidate_id=candidate.candidate_id,
         )
-        if candidate.candidate_id in session.candidate_ids:
-            return candidate
-        updated_session = self._next_session(
-            session,
-            candidate_ids=_unique_strings((*session.candidate_ids, candidate.candidate_id)),
+        try:
+            return self.store.create_candidate_and_attach(
+                session,
+                candidate,
+                expected_session_version=session.version,
+                idempotency_key=idempotency_key,
+                request_fingerprint=operation_fingerprint,
+            )
+        except ReservationError as exc:
+            raise TuningBudgetExceeded(str(exc)) from exc
+
+    def replay_candidate_creation(
+        self,
+        session_id: str,
+        *,
+        strategy: str,
+        rewrite_fingerprint: str | None,
+        rewrite_artifact_ref: str | None,
+        metadata: Mapping[str, Any] | None,
+        idempotency_key: str | None,
+    ) -> TuningCandidateV1 | None:
+        """Replay a committed candidate request before caller-side duplicate checks."""
+
+        if not idempotency_key:
+            return None
+        operation_fingerprint = self.candidate_creation_request_fingerprint(
+            session_id,
+            strategy=strategy,
+            rewrite_fingerprint=rewrite_fingerprint,
+            rewrite_artifact_ref=rewrite_artifact_ref,
+            metadata=metadata,
+            idempotency_key=idempotency_key,
+            candidate_id=None,
         )
-        self.store.save_session(
-            updated_session,
-            expected_version=session.version,
-            idempotency_key=(f"{idempotency_key}:session" if idempotency_key else None),
-            event_type="candidate.added",
-            event_payload={"candidate_id": candidate.candidate_id},
+        return self.store.get_idempotent_candidate_creation(
+            session_id,
+            idempotency_key,
+            request_fingerprint=operation_fingerprint,
         )
-        return candidate
+
+    @staticmethod
+    def candidate_creation_request_fingerprint(
+        session_id: str,
+        *,
+        strategy: str,
+        rewrite_fingerprint: str | None,
+        rewrite_artifact_ref: str | None,
+        metadata: Mapping[str, Any] | None,
+        idempotency_key: str | None,
+        candidate_id: str | None,
+    ) -> str:
+        return request_fingerprint(
+            "tuning-session.add-candidate",
+            {
+                "session_id": session_id,
+                "strategy": strategy,
+                "rewrite_fingerprint": rewrite_fingerprint,
+                "rewrite_artifact_ref": rewrite_artifact_ref,
+                "metadata": metadata or {},
+                "candidate_request_key": idempotency_key or candidate_id,
+            },
+        )
+
+    def ensure_dispatch_allowed(self, session_id: str) -> TuningSessionV1:
+        """Read durable state and reject a new SQL dispatch after the deadline."""
+
+        session = self._active_session(
+            session_id,
+            allowed={"screening", "finalist_validation"},
+        )
+        self._check_deadline(session)
+        return session
 
     def start_screening(
         self,
@@ -197,6 +279,9 @@ class TuningSessionStateMachine:
             updated,
             expected_version=session.version,
             idempotency_key=idempotency_key,
+            request_fingerprint=request_fingerprint(
+                "tuning-session.start-screening", {"session_id": session_id}
+            ),
             event_type="screening.started",
             event_payload={"candidate_count": len(session.candidate_ids)},
         )
@@ -230,6 +315,10 @@ class TuningSessionStateMachine:
             expected_session_version=session.version,
             expected_candidate_version=candidate.version,
             idempotency_key=idempotency_key,
+            request_fingerprint=request_fingerprint(
+                "tuning-session.mark-finalist",
+                {"session_id": session_id, "candidate_id": candidate_id},
+            ),
             event_type="candidate.finalist",
             event_payload={"candidate_id": candidate_id},
         )
@@ -251,17 +340,42 @@ class TuningSessionStateMachine:
     ) -> tuple[TuningSessionV1, TuningCandidateV1]:
         """Record a candidate result without allowing it to fail the session."""
 
+        if any(value < 0 for value in (screen_runs, finalist_runs, parameter_cases, executions)):
+            raise ValueError("Result counters must not be negative.")
+        evidence_values = tuple(evidence_ids)
+        if state is not None and state not in ALL_CANDIDATE_STATES:
+            raise InvalidTransitionError(f"Unsupported candidate state: {state!r}.")
+        safe_failure_code = _safe_failure_code(failure_code)
+        operation_fingerprint = request_fingerprint(
+            "tuning-session.record-candidate-result",
+            {
+                "session_id": session_id,
+                "candidate_id": candidate_id,
+                "state": state,
+                "screen_runs": screen_runs,
+                "finalist_runs": finalist_runs,
+                "parameter_cases": parameter_cases,
+                "executions": executions,
+                "evidence_ids": evidence_values,
+                "failure_code": safe_failure_code,
+            },
+        )
+        replay = self.store.replay_session_and_candidate_transition(
+            session_id,
+            candidate_id,
+            idempotency_key=idempotency_key,
+            request_fingerprint=operation_fingerprint,
+        )
+        if replay is not None:
+            return replay
+
         session = self._active_session(
             session_id,
             allowed={"screening", "finalist_validation"},
         )
         candidate = self._candidate_in_session(session, candidate_id)
-        if any(value < 0 for value in (screen_runs, finalist_runs, parameter_cases, executions)):
-            raise ValueError("Result counters must not be negative.")
         if candidate.is_terminal:
             raise InvalidTransitionError("A terminal candidate cannot receive another result.")
-        if state is not None and state not in ALL_CANDIDATE_STATES:
-            raise InvalidTransitionError(f"Unsupported candidate state: {state!r}.")
         # A late failure/equivalence result must still be durable so it cannot
         # turn into a session failure merely because the work budget expired.
         self._check_deadline(
@@ -282,7 +396,6 @@ class TuningSessionStateMachine:
         total_executions = sum(item.executions for item in self.store.list_candidates(session_id))
         if total_executions + executions > session.execution_limit:
             raise TuningBudgetExceeded("Execution budget has been reached for this session.")
-        safe_failure_code = _safe_failure_code(failure_code)
         next_state = state
         if next_state is None:
             next_state = "validating" if session.status == "finalist_validation" else "screening"
@@ -293,7 +406,7 @@ class TuningSessionStateMachine:
             finalist_runs=candidate.finalist_runs + finalist_runs,
             parameter_cases=next_parameter_case_count,
             executions=candidate.executions + executions,
-            evidence_ids=_unique_strings((*candidate.evidence_ids, *evidence_ids)),
+            evidence_ids=_unique_strings((*candidate.evidence_ids, *evidence_values)),
             failure_code=safe_failure_code or candidate.failure_code,
         )
         updated_session = self._next_session(session)
@@ -303,6 +416,7 @@ class TuningSessionStateMachine:
             expected_session_version=session.version,
             expected_candidate_version=candidate.version,
             idempotency_key=idempotency_key,
+            request_fingerprint=operation_fingerprint,
             event_type="candidate.result",
             event_payload={
                 "candidate_id": candidate_id,
@@ -341,6 +455,8 @@ class TuningSessionStateMachine:
         session_id: str,
         *,
         selected_candidate_id: str | None = None,
+        stopping_reason: str = "completed",
+        replay_metadata: Mapping[str, Any] | None = None,
         idempotency_key: str | None = None,
     ) -> TuningSessionV1:
         session = self._active_session(
@@ -356,11 +472,22 @@ class TuningSessionStateMachine:
             session,
             status="completed",
             selected_candidate_id=selected_candidate_id,
+            stopping_reason=stopping_reason,
+            replay_metadata={**session.replay_metadata, **dict(replay_metadata or {})},
         )
         return self.store.save_session(
             updated,
             expected_version=session.version,
             idempotency_key=idempotency_key,
+            request_fingerprint=request_fingerprint(
+                "tuning-session.complete",
+                {
+                    "session_id": session_id,
+                    "selected_candidate_id": selected_candidate_id,
+                    "stopping_reason": stopping_reason,
+                    "replay_metadata": replay_metadata or {},
+                },
+            ),
             event_type="session.completed",
             event_payload={"selected_candidate_id": selected_candidate_id},
         )
@@ -369,17 +496,32 @@ class TuningSessionStateMachine:
         self,
         session_id: str,
         *,
+        stopping_reason: str = "cancelled",
+        replay_metadata: Mapping[str, Any] | None = None,
         idempotency_key: str | None = None,
     ) -> TuningSessionV1:
         session = self._active_session(
             session_id,
             allowed={"created", "screening", "finalist_validation"},
         )
-        updated = self._next_session(session, status="cancelled")
+        updated = self._next_session(
+            session,
+            status="cancelled",
+            stopping_reason=stopping_reason,
+            replay_metadata={**session.replay_metadata, **dict(replay_metadata or {})},
+        )
         return self.store.save_session(
             updated,
             expected_version=session.version,
             idempotency_key=idempotency_key,
+            request_fingerprint=request_fingerprint(
+                "tuning-session.cancel",
+                {
+                    "session_id": session_id,
+                    "stopping_reason": stopping_reason,
+                    "replay_metadata": replay_metadata or {},
+                },
+            ),
             event_type="session.cancelled",
         )
 

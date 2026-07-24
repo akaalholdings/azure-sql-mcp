@@ -1,13 +1,33 @@
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 
 from azure_sql_mcp.config import AccessMode
 from azure_sql_mcp.config import AuthMode
 from azure_sql_mcp.config import McpProfile
+from azure_sql_mcp.config import PROFILE_TOOL_ALLOWLISTS
+from azure_sql_mcp.config import TOOL_GROUPS
 from azure_sql_mcp.config import TransportMode
 from azure_sql_mcp.config import WritePolicy
 from azure_sql_mcp.config import load_server_config
+
+
+def test_diagnostic_coverage_names_only_registered_tools() -> None:
+    coverage = (
+        Path(__file__).parents[2] / "docs" / "diagnostic-query-coverage.md"
+    ).read_text(encoding="utf-8")
+    documented_tools = {
+        name
+        for name in re.findall(r"`([a-z][a-z0-9_]+)`", coverage)
+        if name.startswith(
+            ("analyze_", "check_", "compare_", "explain_", "get_", "optimize_")
+        )
+    }
+
+    assert documented_tools <= TOOL_GROUPS.keys()
 
 
 def test_load_server_config_from_environment(monkeypatch):
@@ -22,9 +42,60 @@ def test_load_server_config_from_environment(monkeypatch):
     assert config.allowed_databases == ("appdb", "reportingdb")
     assert config.auth_mode == AuthMode.ENTRA_DEFAULT
     assert config.access_mode == AccessMode.RESTRICTED
+    assert config.comparison_row_limit == 10_000
     assert config.trust_server_certificate is False
     assert config.transport.mode == TransportMode.STDIO
     assert config.write_policy == WritePolicy.DISABLED
+    assert config.persist_view_sql_state is False
+
+
+def test_view_sql_state_persistence_requires_explicit_opt_in(monkeypatch) -> None:
+    monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
+    monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "appdb")
+    monkeypatch.setenv("AZURE_SQL_ALLOWED_DATABASES", "appdb")
+    monkeypatch.setenv("AZURE_SQL_PERSIST_VIEW_SQL_STATE", "true")
+
+    config = load_server_config([])
+
+    assert config.persist_view_sql_state is True
+
+
+def test_view_sql_state_persistence_rejects_memory_store(monkeypatch) -> None:
+    monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
+    monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "appdb")
+    monkeypatch.setenv("AZURE_SQL_ALLOWED_DATABASES", "appdb")
+    monkeypatch.setenv("AZURE_SQL_PERSIST_VIEW_SQL_STATE", "true")
+    monkeypatch.setenv("AZURE_SQL_PERFORMANCE_STATE_DIR", ":memory:")
+
+    with pytest.raises(ValueError, match="requires a durable"):
+        load_server_config([])
+
+
+def test_legacy_state_binding_requires_exact_configured_server(monkeypatch) -> None:
+    monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
+    monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "appdb")
+    monkeypatch.setenv("AZURE_SQL_ALLOWED_DATABASES", "appdb")
+    monkeypatch.setenv(
+        "AZURE_SQL_LEGACY_STATE_SERVER_BINDING",
+        "other.database.windows.net",
+    )
+
+    with pytest.raises(ValueError, match="must exactly match"):
+        load_server_config([])
+
+
+def test_legacy_state_binding_is_explicit_and_server_scoped(monkeypatch) -> None:
+    monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
+    monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "appdb")
+    monkeypatch.setenv("AZURE_SQL_ALLOWED_DATABASES", "appdb")
+    monkeypatch.setenv(
+        "AZURE_SQL_LEGACY_STATE_SERVER_BINDING",
+        "SERVER.database.windows.net",
+    )
+
+    config = load_server_config([])
+
+    assert config.legacy_state_server_binding == "SERVER.database.windows.net"
 
 
 def test_trust_server_certificate_can_be_enabled_for_self_hosted_sql(monkeypatch):
@@ -178,6 +249,17 @@ def test_tool_timeout_must_cover_query_timeout(monkeypatch):
         load_server_config([])
 
 
+def test_comparison_limit_must_cover_display_limit(monkeypatch) -> None:
+    monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
+    monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "appdb")
+    monkeypatch.setenv("AZURE_SQL_ALLOWED_DATABASES", "appdb")
+    monkeypatch.setenv("AZURE_SQL_ROW_LIMIT", "500")
+    monkeypatch.setenv("AZURE_SQL_COMPARISON_ROW_LIMIT", "200")
+
+    with pytest.raises(ValueError, match="COMPARISON_ROW_LIMIT"):
+        load_server_config([])
+
+
 @pytest.mark.parametrize(
     ("profile", "enabled", "disabled"),
     [
@@ -214,6 +296,64 @@ def test_named_profiles_expose_only_their_workflow_tools(
     assert config.is_tool_enabled(disabled) is False
 
 
+@pytest.mark.parametrize("profile", list(McpProfile))
+def test_named_profiles_are_exact_allowlists(
+    monkeypatch,
+    profile: McpProfile,
+) -> None:
+    monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
+    monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "appdb")
+    monkeypatch.setenv("AZURE_SQL_ALLOWED_DATABASES", "appdb")
+    args = ["--azure-sql-profile", profile.value, "--azure-sql-tool-groups", "all"]
+    if profile in {McpProfile.SANDBOX, McpProfile.ENFORCER_APPLY}:
+        args.extend(
+            [
+                "--azure-sql-access-mode",
+                "unrestricted",
+                "--azure-sql-write-policy",
+                "apply",
+            ]
+        )
+    config = load_server_config(args)
+
+    allowed = PROFILE_TOOL_ALLOWLISTS[profile]
+    for tool_name in TOOL_GROUPS:
+        assert config.is_tool_enabled(tool_name) is (tool_name in allowed)
+    assert config.is_tool_enabled("future_unclassified_tool") is False
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [McpProfile.TRIAGE, McpProfile.OPTIMIZER, McpProfile.ENFORCER_REVIEW],
+)
+def test_read_only_profiles_expose_diagnostics_without_mutation_tools(
+    monkeypatch,
+    profile: McpProfile,
+) -> None:
+    monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
+    monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "appdb")
+    monkeypatch.setenv("AZURE_SQL_ALLOWED_DATABASES", "appdb")
+
+    config = load_server_config(["--azure-sql-profile", profile.value])
+
+    diagnostic_tools = {
+        "get_active_sessions",
+        "get_io_stats",
+        "get_top_cached_queries",
+        "get_cached_routine_stats",
+        "get_object_index_diagnostics",
+    }
+    mutation_tools = {
+        "execute_tsql_unrestricted",
+        "force_query_plan",
+        "apply_plan_action",
+        "kill_session",
+    }
+
+    assert all(config.is_tool_enabled(tool_name) for tool_name in diagnostic_tools)
+    assert not any(config.is_tool_enabled(tool_name) for tool_name in mutation_tools)
+
+
 def test_enforcer_apply_profile_exposes_only_prepared_mutation_tools(monkeypatch) -> None:
     monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
     monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "appdb")
@@ -235,6 +375,22 @@ def test_enforcer_apply_profile_exposes_only_prepared_mutation_tools(monkeypatch
     assert config.is_tool_enabled("rollback_plan_action") is True
     assert config.is_tool_enabled("force_query_plan") is False
     assert config.is_tool_enabled("apply_plan_action") is False
+
+
+def test_optimizer_and_sandbox_profiles_gate_view_mutations() -> None:
+    optimizer_tools = PROFILE_TOOL_ALLOWLISTS[McpProfile.OPTIMIZER]
+    sandbox_tools = PROFILE_TOOL_ALLOWLISTS[McpProfile.SANDBOX]
+
+    assert "analyze_workload_indexes" in optimizer_tools
+    assert "analyze_workload_indexes" in sandbox_tools
+    assert "prepare_view_change" in optimizer_tools
+    assert "apply_prepared_view_change" not in optimizer_tools
+    assert {
+        "prepare_view_change",
+        "apply_prepared_view_change",
+        "verify_view_change",
+        "rollback_view_change",
+    } <= sandbox_tools
 
 
 @pytest.mark.parametrize("profile", ["triage", "optimizer", "enforcer-review"])

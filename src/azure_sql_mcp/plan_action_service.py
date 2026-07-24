@@ -15,6 +15,9 @@ from .performance_contracts import PlanActionIntentV1, redact_metadata, utc_now
 from .performance_store import ConcurrencyError, PerformanceStore
 from .plan_verification import decide_verification, hash_evidence
 from .query_hints import validate_query_hints
+from .query_identity import request_fingerprint
+from .query_identity import server_database_identity
+from .query_identity import server_database_identity_matches
 
 
 _OPERATIONS = {"force_plan", "unforce_plan", "set_hints", "clear_hints"}
@@ -24,8 +27,11 @@ def _hash_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _database_fingerprint(database_name: str) -> str:
-    return _hash_text(f"database:{database_name.casefold()}")
+def _database_fingerprint(server_name: str, database_name: str) -> str:
+    return server_database_identity(
+        server_name.strip().casefold(),
+        database_name.strip().casefold(),
+    )
 
 
 def _first_rows(results: Sequence[QueryResult]) -> list[dict[str, Any]]:
@@ -91,8 +97,9 @@ class PlanActionService:
         ownership = str(prior_state["ownership"])
         baseline_evidence = redact_metadata(evidence)
         evidence_hash = hash_evidence(baseline_evidence)
+        database_fingerprint = _database_fingerprint(self.config.server, database_name)
         intent_id = "intent-" + _hash_text(
-            f"{_database_fingerprint(database_name)}:{idempotency_key}"
+            f"{database_fingerprint}:{idempotency_key}"
         )[:32]
         status = "prepared" if ownership == "manual" else "rejected"
         intent = PlanActionIntentV1(
@@ -105,7 +112,7 @@ class PlanActionService:
             created_at_utc=utc_now(),
             updated_at_utc=utc_now(),
             metadata={
-                "database_fingerprint": _database_fingerprint(database_name),
+                "database_fingerprint": database_fingerprint,
                 "query_id": query_id,
                 "plan_id": plan_id,
                 "query_hints": normalized_hints,
@@ -126,6 +133,21 @@ class PlanActionService:
         intent = self.store.create_plan_action_intent(
             intent,
             idempotency_key=idempotency_key,
+            request_fingerprint=request_fingerprint(
+                "plan-action.prepare",
+                {
+                    "database_fingerprint": database_fingerprint,
+                    "session_id": session_id,
+                    "candidate_id": candidate_id,
+                    "operation": operation,
+                    "query_id": query_id,
+                    "plan_id": plan_id,
+                    "query_hints": normalized_hints,
+                    "evidence_hash": evidence_hash,
+                    "reviewed_by": reviewed_by,
+                    "reason": reason,
+                },
+            ),
         )
         return {
             "intent": intent.to_dict(),
@@ -207,7 +229,11 @@ class PlanActionService:
             )
             return {"intent": updated.to_dict(), "confirmed": False}
         try:
-            await self._execute_action(database_name, intent)
+            await self._execute_action(
+                database_name,
+                intent,
+                current_state=current_state,
+            )
         except asyncio.CancelledError:
             self._save_status(
                 intent,
@@ -415,6 +441,7 @@ class PlanActionService:
         try:
             await self._restore_prior_state(
                 database_name,
+                intent,
                 query_id,
                 current_state,
                 prior_state,
@@ -530,6 +557,8 @@ class PlanActionService:
         self,
         database_name: str,
         intent: PlanActionIntentV1,
+        *,
+        current_state: Mapping[str, Any],
     ) -> None:
         metadata = intent.metadata
         query_id = int(metadata["query_id"])
@@ -554,6 +583,13 @@ class PlanActionService:
         else:
             sql = "EXEC sys.sp_query_store_clear_hints @query_id = ?"
             params = (query_id,)
+        expected_state = self._expected_applied_state(intent, current_state)
+        rollback_sql, rollback_params = self._state_restore_batch(
+            query_id,
+            expected_state,
+            current_state,
+        )
+        policy = self.database_policy.require(database_name)
         await self.admin_policy.execute(
             AdminAction(
                 tool_name="apply_prepared_plan_action",
@@ -561,7 +597,15 @@ class PlanActionService:
                 action_type="query_store",
                 sql=sql,
                 params=params,
+                rollback_sql=rollback_sql,
+                rollback_params=rollback_params,
                 trusted_generated=True,
+                reviewed_intent=True,
+                idempotency_key=f"{intent.intent_id}:apply",
+                exactly_once=True,
+                policy_verified=True,
+                non_production=policy.is_non_production,
+                verification_required=True,
             ),
             self.executor,
             dry_run=False,
@@ -570,13 +614,52 @@ class PlanActionService:
     async def _restore_prior_state(
         self,
         database_name: str,
+        intent: PlanActionIntentV1,
         query_id: int,
         current_state: Mapping[str, Any],
         prior_state: Mapping[str, Any],
     ) -> None:
+        sql, params = self._state_restore_batch(
+            query_id,
+            current_state,
+            prior_state,
+        )
+        rollback_sql, rollback_params = self._state_restore_batch(
+            query_id,
+            prior_state,
+            current_state,
+        )
+        policy = self.database_policy.require(database_name)
+        await self.admin_policy.execute(
+            AdminAction(
+                tool_name="rollback_plan_action",
+                database_name=database_name,
+                action_type="query_store",
+                sql=sql,
+                params=params,
+                rollback_sql=rollback_sql,
+                rollback_params=rollback_params,
+                trusted_generated=True,
+                reviewed_intent=True,
+                idempotency_key=f"{intent.intent_id}:rollback:{intent.version}",
+                exactly_once=True,
+                policy_verified=True,
+                non_production=policy.is_non_production,
+                verification_required=True,
+            ),
+            self.executor,
+            dry_run=False,
+        )
+
+    @staticmethod
+    def _state_restore_batch(
+        query_id: int,
+        current_state: Mapping[str, Any],
+        target_state: Mapping[str, Any],
+    ) -> tuple[str, tuple[Any, ...]]:
         current_plan_id = current_state.get("force_plan_id")
-        prior_plan_id = prior_state.get("force_plan_id")
-        prior_hints = prior_state.get("query_store_hints")
+        target_plan_id = target_state.get("force_plan_id")
+        target_hints = target_state.get("query_store_hints")
         statements: list[str] = []
         params: list[Any] = []
         if current_plan_id is not None:
@@ -586,29 +669,18 @@ class PlanActionService:
             params.extend((query_id, int(current_plan_id)))
         statements.append("EXEC sys.sp_query_store_clear_hints @query_id = ?")
         params.append(query_id)
-        if prior_hints is not None:
+        if target_hints is not None:
             statements.append(
                 "DECLARE @hints nvarchar(max) = ?; "
                 "EXEC sys.sp_query_store_set_hints @query_id = ?, @query_hints = @hints"
             )
-            params.extend((str(prior_hints), query_id))
-        if prior_plan_id is not None:
+            params.extend((str(target_hints), query_id))
+        if target_plan_id is not None:
             statements.append(
                 "EXEC sys.sp_query_store_force_plan @query_id = ?, @plan_id = ?"
             )
-            params.extend((query_id, int(prior_plan_id)))
-        await self.admin_policy.execute(
-            AdminAction(
-                tool_name="rollback_plan_action",
-                database_name=database_name,
-                action_type="query_store",
-                sql="; ".join(statements),
-                params=tuple(params),
-                trusted_generated=True,
-            ),
-            self.executor,
-            dry_run=False,
-        )
+            params.extend((query_id, int(target_plan_id)))
+        return "; ".join(statements), tuple(params)
 
     def _expected_applied_state(
         self,
@@ -643,8 +715,48 @@ class PlanActionService:
         intent_id: str,
     ) -> PlanActionIntentV1:
         intent = self.store.get_plan_action_intent(intent_id)
-        if intent.metadata.get("database_fingerprint") != _database_fingerprint(database_name):
+        stored_database_fingerprint = str(
+            intent.metadata.get("database_fingerprint") or ""
+        )
+        current_database_fingerprint = _database_fingerprint(
+            self.config.server,
+            database_name,
+        )
+        allow_legacy_migration = bool(self.config.legacy_state_server_binding)
+        if not server_database_identity_matches(
+            stored_database_fingerprint,
+            self.config.server.strip().casefold(),
+            database_name.strip().casefold(),
+            allow_legacy=allow_legacy_migration,
+        ):
             raise PermissionError("Intent database fingerprint does not match.")
+        if (
+            allow_legacy_migration
+            and stored_database_fingerprint != current_database_fingerprint
+        ):
+            migrated = replace(
+                intent,
+                metadata={
+                    **intent.metadata,
+                    "database_fingerprint": current_database_fingerprint,
+                    "identity_migration": "legacy-database-to-server-bound-v1",
+                },
+                updated_at_utc=utc_now(),
+                version=intent.version + 1,
+            )
+            try:
+                intent = self.store.save_plan_action_intent(
+                    migrated,
+                    expected_version=intent.version,
+                )
+            except ConcurrencyError:
+                intent = self.store.get_plan_action_intent(intent_id)
+                if not server_database_identity_matches(
+                    str(intent.metadata.get("database_fingerprint") or ""),
+                    self.config.server.strip().casefold(),
+                    database_name.strip().casefold(),
+                ):
+                    raise
         baseline_evidence = intent.metadata.get("baseline_evidence")
         evidence_hash = intent.metadata.get("evidence_hash")
         if (

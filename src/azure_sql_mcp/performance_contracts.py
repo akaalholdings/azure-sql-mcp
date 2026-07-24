@@ -254,6 +254,7 @@ class PerformanceCaseV1(VersionedContract):
     baseline_evidence_ids: tuple[str, ...] = ()
     parameter_case_fingerprints: tuple[str, ...] = ()
     status: str = "open"
+    version: int = 0
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -267,6 +268,8 @@ class PerformanceCaseV1(VersionedContract):
         _validate_fingerprint(self.database_fingerprint, "database_fingerprint")
         if self.status not in {"open", "ready", "closed"}:
             raise ContractValidationError(f"Unsupported performance case status: {self.status!r}.")
+        if self.version < 0:
+            raise ContractValidationError("version must not be negative.")
         object.__setattr__(self, "baseline_evidence_ids", tuple(self.baseline_evidence_ids))
         object.__setattr__(
             self,
@@ -381,6 +384,8 @@ class TuningSessionV1(VersionedContract):
     candidate_ids: tuple[str, ...] = ()
     finalist_candidate_ids: tuple[str, ...] = ()
     selected_candidate_id: str | None = None
+    stopping_reason: str | None = None
+    replay_metadata: Mapping[str, Any] = field(default_factory=dict)
     version: int = 0
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -402,6 +407,11 @@ class TuningSessionV1(VersionedContract):
                 raise ContractValidationError(f"{name} must be greater than 0.")
         if self.status not in SESSION_STATUSES:
             raise ContractValidationError(f"Unsupported tuning session status: {self.status!r}.")
+        if self.stopping_reason is not None:
+            if not isinstance(self.stopping_reason, str) or not self.stopping_reason.strip():
+                raise ContractValidationError("stopping_reason must be a non-empty string when set.")
+            if len(self.stopping_reason) > 200:
+                raise ContractValidationError("stopping_reason must be at most 200 characters.")
         if self.version < 0:
             raise ContractValidationError("version must not be negative.")
         for name in ("started_at_utc", "deadline_at_utc"):
@@ -410,6 +420,7 @@ class TuningSessionV1(VersionedContract):
                 _validate_timestamp(value, name)
         object.__setattr__(self, "candidate_ids", tuple(self.candidate_ids))
         object.__setattr__(self, "finalist_candidate_ids", tuple(self.finalist_candidate_ids))
+        object.__setattr__(self, "replay_metadata", redact_metadata(self.replay_metadata))
         object.__setattr__(self, "metadata", redact_metadata(self.metadata))
 
     @classmethod

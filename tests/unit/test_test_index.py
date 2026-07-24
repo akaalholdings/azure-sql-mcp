@@ -4,6 +4,8 @@ expose as admin tools, so both are pinned test by test."""
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 from azure_sql_mcp.config import AccessMode
@@ -16,6 +18,8 @@ from azure_sql_mcp.config import TransportMode
 from azure_sql_mcp.config import WritePolicy
 from azure_sql_mcp.database_policy import DatabasePolicySet
 from azure_sql_mcp.server import AzureSqlMcpApplication
+from azure_sql_mcp.server import TEST_INDEX_DEFINITION_PROPERTY
+from azure_sql_mcp.server import TEST_INDEX_OWNER_PROPERTY
 from azure_sql_mcp.server import TEST_INDEX_PREFIX
 
 
@@ -84,11 +88,12 @@ async def test_create_dry_run_builds_ddl_with_rollback() -> None:
     assert payload["status"] == "dry_run"
     sql = payload["sql_preview"]
     assert "CREATE NONCLUSTERED INDEX" in sql
-    assert "[ShipDate], [StatusCode] DESC" in sql
+    assert "[ShipDate] ASC, [StatusCode] DESC" in sql
     assert "INCLUDE ([CustomerID], [TotalDue])" in sql
     assert "WITH (ONLINE = ON)" in sql
     assert payload["rollback_sql"] == (
-        f"DROP INDEX [{TEST_INDEX_PREFIX}Shipments_ShipDate_a1b2] ON [dbo].[Shipments]"
+        f"DROP INDEX [{TEST_INDEX_PREFIX}Shipments_ShipDate_a1b2] "
+        "ON [dbo].[Shipments];"
     )
 
 
@@ -209,3 +214,85 @@ async def test_live_create_and_drop_require_managed_lease_workflow() -> None:
             f"{TEST_INDEX_PREFIX}Orders_Status",
             dry_run=False,
         )
+
+
+@pytest.mark.asyncio
+async def test_managed_index_ddl_uses_private_atomic_ownership_marker() -> None:
+    app = AzureSqlMcpApplication(
+        make_config(
+            access_mode=AccessMode.UNRESTRICTED,
+            write_policy=WritePolicy.APPLY,
+            profile=McpProfile.SANDBOX,
+        )
+    )
+    app.database_policy = DatabasePolicySet.from_mapping(
+        {
+            "version": 1,
+            "databases": {
+                "appdb": {
+                    "environment": "test",
+                    "allow_read": True,
+                    "allow_benchmark": True,
+                    "allow_test_indexes": True,
+                    "max_benchmark_executions": 80,
+                }
+            },
+        }
+    )
+    app.admin_policy.execute = AsyncMock(  # type: ignore[method-assign]
+        return_value={"status": "completed"}
+    )
+    owner = "index-lease-private-owner-1234"
+
+    await app._create_test_index(
+        "appdb",
+        "dbo",
+        "Orders",
+        f"{TEST_INDEX_PREFIX}Orders_Status",
+        key_columns=["Status"],
+        include_columns=None,
+        online=True,
+        dry_run=False,
+        workflow_managed=True,
+        idempotency_key="create-owner-marker",
+        ownership_proof=owner,
+    )
+    create_action = app.admin_policy.execute.await_args.args[0]
+    assert "BEGIN TRANSACTION" in create_action.sql
+    assert "sp_addextendedproperty" in create_action.sql
+    assert TEST_INDEX_OWNER_PROPERTY in create_action.sql
+    assert TEST_INDEX_DEFINITION_PROPERTY in create_action.sql
+    assert owner not in create_action.sql
+    assert create_action.params[0] == owner
+    assert len(create_action.params) == 2
+    definition_fingerprint = create_action.params[1]
+    assert isinstance(definition_fingerprint, str)
+    assert create_action.rollback_params == (owner, definition_fingerprint, None)
+
+    await app._drop_test_index(
+        "appdb",
+        "dbo",
+        "Orders",
+        f"{TEST_INDEX_PREFIX}Orders_Status",
+        dry_run=False,
+        workflow_managed=True,
+        idempotency_key="drop-owner-marker",
+        ownership_proof=owner,
+        expected_definition_fingerprint=definition_fingerprint,
+        expected_index_id=2,
+    )
+    drop_action = app.admin_policy.execute.await_args.args[0]
+    assert "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE" in drop_action.sql
+    assert "WITH (TABLOCK, HOLDLOCK)" in drop_action.sql
+    assert "WITH (UPDLOCK, HOLDLOCK)" in drop_action.sql
+    assert "BEGIN TRY" in drop_action.sql
+    assert "XACT_STATE()" in drop_action.sql
+    assert "IF NOT EXISTS" in drop_action.sql
+    assert TEST_INDEX_OWNER_PROPERTY in drop_action.sql
+    assert TEST_INDEX_DEFINITION_PROPERTY in drop_action.sql
+    assert "ep.major_id = @object_id" in drop_action.sql
+    assert "ep.minor_id = @index_id" in drop_action.sql
+    assert "@expected_index_id" in drop_action.sql
+    assert "DROP INDEX" in drop_action.sql
+    assert owner not in drop_action.sql
+    assert drop_action.params == (owner, definition_fingerprint, 2)

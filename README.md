@@ -1,6 +1,6 @@
 # Azure SQL MCP
 
-`azure-sql-mcp` is the typed execution and evidence layer for Azure SQL Database performance and administration work. It gives MCP clients bounded read access, durable performance cases, iterative query benchmarks, leased sandbox index tests, reviewed Query Store plan actions, and an explicitly gated general DBA execution path.
+`azure-sql-mcp` is the typed execution and evidence layer for Azure SQL Database performance and administration work. It gives MCP clients bounded read access, durable performance cases, iterative query benchmarks, leased sandbox index tests, reversible sandbox view changes, reviewed Query Store plan actions, and an explicitly gated general DBA execution path.
 
 The supported tuning path is evidence-first but rewrite-active: a missing plan lowers confidence; it does not prevent a concrete static rewrite. A failed or slower experiment rejects only that candidate and does not end the session.
 
@@ -13,6 +13,7 @@ The supported tuning path is evidence-first but rewrite-active: a missing plan l
 - Interleaved baseline/candidate benchmarking with medians, spread, noise classification, and parameter buckets.
 - Snapshot-consistent, shape-, duplicate-, and order-aware result comparison where a complete bounded comparison is possible.
 - Durable temporary-index leases, automatic cleanup, and startup recovery of expired leases.
+- Reviewed view preparation with sandbox-only apply, durable restart recovery, verification, and exact rollback.
 - Prepared Query Store plan actions with prior-state capture, policy checks, verification, and exact rollback.
 - Audited general DBA T-SQL execution that rejects direct or statically recoverable `DROP DATABASE` statements.
 
@@ -133,8 +134,8 @@ Reload VS Code, enable the server in Copilot Chat, then call `list_databases` an
 | Profile | Purpose | Required posture | Important tools |
 | --- | --- | --- | --- |
 | `triage` | Incident and broad performance diagnosis | restricted, write disabled | performance cases, evidence collection, waits, blocking, Query Store, resources, statistics |
-| `optimizer` | Read-only rewrite benchmarking | restricted, write disabled, benchmark policy | tuning sessions, candidates, rewrite benchmark, result and plan comparison |
-| `sandbox` | Disposable non-production index tests | local stdio, unrestricted, write apply, sandbox policy | optimizer tools plus leased `benchmark_index_candidate` |
+| `optimizer` | Read-only rewrite benchmarking and view preparation | restricted, write disabled, benchmark policy | tuning sessions, candidates, rewrite benchmark, result/plan comparison, view preview |
+| `sandbox` | Disposable non-production index and view tests | local stdio, unrestricted, write apply, sandbox policy | optimizer tools plus leased index benchmark and prepared view apply/verify/rollback |
 | `enforcer-review` | Query Store review and intent preparation | restricted, write disabled | plan health, preview-only review, `prepare_plan_action` |
 | `enforcer-apply` | One authorized prepared plan action | local stdio, unrestricted, write apply, apply policy, kill switch open | apply, verify, and rollback prepared intents |
 
@@ -144,7 +145,7 @@ Profiles compose with `AZURE_SQL_TOOL_GROUPS`. A required tool must survive both
 
 ## Local database policy
 
-Repeated benchmarks, temporary indexes, and prepared plan actions fail closed unless `AZURE_SQL_DATABASE_POLICY_FILE` points to a valid local JSON document. Keep this file outside Git.
+Repeated benchmarks, temporary indexes, prepared view changes, and prepared plan actions fail closed unless `AZURE_SQL_DATABASE_POLICY_FILE` points to a valid local JSON document. Keep this file outside Git.
 
 Synthetic policy example:
 
@@ -157,16 +158,24 @@ Synthetic policy example:
       "allow_read": true,
       "allow_benchmark": true,
       "allow_test_indexes": true,
+      "allow_view_apply": true,
       "allow_plan_apply": false,
-      "max_benchmark_executions": 80
+      "max_benchmark_executions": 80,
+      "max_tuning_candidates": 60,
+      "max_tuning_session_executions": 2000,
+      "max_tuning_session_minutes": 360
     },
     "your-production-database": {
       "environment": "production",
       "allow_read": true,
       "allow_benchmark": false,
       "allow_test_indexes": false,
+      "allow_view_apply": false,
       "allow_plan_apply": false,
-      "max_benchmark_executions": 0
+      "max_benchmark_executions": 0,
+      "max_tuning_candidates": 0,
+      "max_tuning_session_executions": 0,
+      "max_tuning_session_minutes": 0
     }
   }
 }
@@ -176,8 +185,10 @@ Rules:
 
 - Unknown databases are denied.
 - `allow_read` does not imply benchmark or write permission.
-- `max_benchmark_executions` is a hard per-request database-policy ceiling; the tuning session also has its own 80-execution default budget.
+- `max_benchmark_executions` is the hard ceiling for one benchmark request.
+- `max_tuning_candidates`, `max_tuning_session_executions`, and `max_tuning_session_minutes` cap the complete campaign. Set them explicitly when a reviewed deep search may run for hours.
 - Temporary indexes are rejected when the policy environment is `production`, `prod`, or `live`, even if another field is misconfigured.
+- View apply requires `allow_view_apply=true`, a non-production environment, the sandbox profile, and explicit durable view-SQL state.
 - Plan apply requires `allow_plan_apply=true` in addition to every server and intent gate.
 
 ## Durable state and privacy
@@ -194,7 +205,7 @@ Performance state stores:
 - plan-action prior state and verification decisions;
 - temporary-index lease identifiers and cleanup targets.
 
-Performance state does not persist raw SQL. Secret-like metadata and SQL-shaped metadata fields are dropped at the persistence boundary. The separate admin audit can include full generated SQL only when `AZURE_SQL_AUDIT_FULL_SQL=1`; leave it disabled unless an approved local audit process requires it.
+Performance state does not persist raw query SQL by default. Secret-like metadata and SQL-shaped metadata fields are dropped at the normal persistence boundary. Sandbox view apply is the deliberate exception: exact crash recovery requires the target and prior view definitions, so it is disabled unless `AZURE_SQL_PERSIST_VIEW_SQL_STATE=true`. With that explicit opt-in, only durable view intents store raw view SQL in the same owner-only state directory and mode-0600 SQLite file. The separate admin audit can include full generated SQL only when `AZURE_SQL_AUDIT_FULL_SQL=1`; leave it disabled unless an approved local audit process requires it.
 
 ## Read-only triage workflow
 
@@ -213,14 +224,15 @@ Every diagnostic section carries collection window, availability, truncation, un
 1. Record result shape, NULL, duplicate, ordering, tie, isolation, and parameter semantics in the client workflow.
 2. Produce concrete static rewrites before plan access whenever safe.
 3. `start_performance_case` for the baseline and parameter cases.
-4. `start_tuning_session`.
+4. `start_tuning_session`, passing explicit candidate, execution, and time budgets when the user wants a deep search.
 5. For each single-change experiment, call `add_tuning_candidate` with one family: predicate, join, aggregation, cardinality, index, or combined.
 6. Call `benchmark_tuning_candidate` in `screening` phase.
 7. Continue after neutral, regressed, equivalence-failed, timed-out, or otherwise inconclusive candidates.
 8. Re-run credible winners in `finalist` phase.
 9. Call `finalize_tuning_session` with the winner, if any, and an explicit stopping reason.
 
-Default session limits:
+Compatibility defaults, used only when the caller does not request another
+policy-authorized budget:
 
 | Limit | Default |
 | --- | ---: |
@@ -231,7 +243,21 @@ Default session limits:
 | Measured query executions | 80 |
 | Wall-clock duration | 20 minutes |
 
-Each measured sample runs the user query once. Baseline and rewrite order alternates between runs. The result includes per-side medians, min/max spread, sourced plan deltas, equivalence status, and execution count.
+These values are not product ceilings. A local policy can authorize a
+multi-hour campaign with a larger candidate and execution budget. The session
+remains durable across client restarts and stops at its configured budget,
+after all credible candidate families and combinations have terminal evidence,
+or at a written evidence-based diminishing-return point.
+
+`check_capabilities` returns the effective `local_tuning_policy` ceilings
+without exposing the policy file or connection configuration. Benchmark tool
+timeouts scale to the allowed per-request execution count and configured query
+timeout, so a policy-authorized long campaign is not cut off by a fixed
+20-minute wrapper.
+
+Each measured sample runs the user query once. Parameterized SQL uses typed `sp_executesql`, never a local-variable compatibility batch. Baseline and rewrite order alternates between runs. The result includes per-side medians, min/max spread, sourced plan deltas, equivalence status, and execution count.
+
+Rewrite screening normally defers full equivalence and costs six executions per parameter case: three baseline/candidate pairs. Finalist validation adds one two-query snapshot comparison, so five pairs cost twelve executions per case and 48 for four cases. Screening one case and validating four costs 54; screening all four and validating four costs 72. All work shares the configured session execution limit.
 
 Candidate outcomes are `improved`, `neutral`, `regressed`, `equivalence_failed`, `inconclusive`, or `cleanup_required`. A screening winner remains open for finalist validation; finalization marks every unresolved experiment `inconclusive`, so the leaderboard has no ambiguous unfinished candidate.
 
@@ -252,7 +278,9 @@ If the result is truncated, snapshot comparison is unavailable, or execution fai
 - `tune_query` starts a performance case/session and returns an evidence pack plus the next rewrite step.
 - `benchmark_query_rewrite` wraps one screening candidate in the session engine.
 
-They remain available for existing clients, but new integrations should use the explicit case/session tools to preserve a complete leaderboard.
+They remain available only to unprofiled compatibility clients. Named profiles
+intentionally omit them; new integrations should use the explicit case/session
+tools to preserve a complete leaderboard.
 
 ## Sandbox index workflow
 
@@ -261,6 +289,7 @@ Use only `benchmark_index_candidate`; direct create/drop tools cannot perform li
 Required gates:
 
 - `AZURE_SQL_PROFILE=sandbox`;
+- `AZURE_SQL_TOOL_GROUPS=core,performance,admin`;
 - local stdio transport;
 - `AZURE_SQL_ACCESS_MODE=unrestricted`;
 - `AZURE_SQL_WRITE_POLICY=apply`;
@@ -268,9 +297,42 @@ Required gates:
 - local policy with non-production environment, benchmark permission, and temporary-index permission;
 - active tuning session and matching candidate/query fingerprints.
 
-The workflow writes a durable lease before DDL, measures the baseline and candidate for every parameter case recorded on the performance case, performs a full bounded result comparison for each case, and drops the `IX_Testing_` index in `finally`. The default four-bucket budget is 32 executions for screening and 48 for a finalist, exactly filling the 80-execution session limit. Cleanup failure produces `cleanup_required` and blocks another index experiment for that database. On the next sandbox start, expired leases are checked and cleanup is retried before the server accepts work.
+The workflow writes a durable lease before DDL. `CREATE INDEX` and a private
+index-level ownership marker commit in one transaction. Cleanup requires that
+marker and the exact observed definition, so a same-name external index is
+never adopted or dropped. The workflow then performs
+baseline/index/post-cleanup A-B-A measurements, verifies that the expected
+index was used, and drops the `IX_Testing_` index before the final baseline
+phase. Screening costs nine executions per parameter case; a five-run finalist
+costs fifteen per case and 60 for four. Screening may use an unchanged subset
+of the recorded cases; a finalist must use all of them.
+
+Because DDL separates the phases, this is not a same-snapshot rewrite-equivalence test. The SQL is unchanged, and MCP requires complete non-truncated result fingerprints to remain stable across A-B-A. Data movement makes the result inconclusive. Cleanup failure produces `cleanup_required` and blocks another index experiment for that database. A completed idempotent reservation is retrieved rather than rerun. On the next sandbox start, expired leases are checked and cleanup is retried before the server accepts work.
 
 The returned payload contains generated index DDL, rollback DDL, lease state, plan/metric deltas, classification, and the instruction to continue the tuning session.
+
+## Sandbox view workflow
+
+`prepare_view_change` is read-only under `optimizer` and `sandbox`. Under `optimizer` it is a process-local preview only. An optimizer preview cannot be applied by another MCP process.
+
+Apply only through a local `sandbox` process:
+
+1. Set a non-production policy entry with `allow_view_apply=true` and set `AZURE_SQL_PERSIST_VIEW_SQL_STATE=true`.
+2. Call `prepare_view_change` again in that sandbox process and review the target, dependency, legality, prior-state, apply, rollback, durable change id, and raw-state disclosure.
+3. Call `apply_prepared_view_change` with `reviewed_intent=true` and the same caller-stable idempotency key.
+4. Call `verify_view_change`.
+5. Call `rollback_view_change` when the candidate loses or verification fails. Existing views restore the exact prior definition; a workflow-created view is dropped only when the current definition still matches the prepared target.
+
+The view mutation, its private ownership marker, and its catalog precondition
+checks execute in one transaction. A new prepare is rejected while another
+suite marker owns the view. The sandbox intent and exact rollback state survive
+MCP restarts. If apply is interrupted, call `verify_view_change` with the same
+change id. MCP adopts rollback ownership only when the target and durable
+database-side marker both match; otherwise it returns `hold` and retains the
+original rollback contract. Do not re-prepare against a possibly changed view
+until that intent is reconciled.
+
+Production view deployment is outside this workflow and requires its normal owner-approved release path.
 
 ## Reviewed plan enforcement
 
@@ -316,6 +378,8 @@ Keep credentials in the operating-system credential store, managed identity, or 
 | `AZURE_SQL_TOOL_GROUPS` | `all` | `core`, `performance`, `schema`, `admin`, or `all` |
 | `AZURE_SQL_DATABASE_POLICY_FILE` | none | Local versioned policy; no file means benchmark and write denial |
 | `AZURE_SQL_PERFORMANCE_STATE_DIR` | `~/.azure-sql-mcp/state` | Protected durable workflow state |
+| `AZURE_SQL_PERSIST_VIEW_SQL_STATE` | `false` | Explicitly permit exact view SQL in the protected durable state store for restart-safe sandbox apply/rollback; requires a filesystem state directory |
+| `AZURE_SQL_LEGACY_STATE_SERVER_BINDING` | none | Temporary upgrade attestation for pre-v1 durable state. It must exactly match `AZURE_SQL_SERVER`; without it, server-agnostic legacy identities remain blocked. Remove it after active legacy workflows have completed or been retired. |
 | `AZURE_SQL_PLAN_APPLY_KILL_SWITCH` | `true` | `true` blocks prepared plan apply; set `false` only during authorization |
 
 ### Limits and transport
@@ -323,6 +387,7 @@ Keep credentials in the operating-system credential store, managed identity, or 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `AZURE_SQL_ROW_LIMIT` | `200` | Maximum returned rows for bounded query paths |
+| `AZURE_SQL_COMPARISON_ROW_LIMIT` | `10000` | Maximum complete rows per result set eligible for equivalence or A-B-A stability proof |
 | `AZURE_SQL_QUERY_TIMEOUT_SECONDS` | `30` | Per-query timeout |
 | `AZURE_SQL_TOOL_TIMEOUT_SECONDS` | query timeout + 15 | Outer tool timeout; cannot be lower than query timeout |
 | `AZURE_SQL_POOL_SIZE` | `5` | Connections per database pool |
@@ -361,14 +426,16 @@ Normal checks require no database credentials:
 
 ```bash
 uv sync --dev --locked
-uv run ruff check src tests
+uv run ruff check src tests scripts
 uv run pyright
-uv run python -m compileall -q src tests
+uv run python -m compileall -q src tests scripts
 uv run pytest -q
 uv build
+uv run python scripts/check_markdown_links.py
+uv run python scripts/verify_repository_content.py
 ```
 
-Live validation is opt-in. Use only an allowlisted dedicated non-production Azure SQL database. Start with the `optimizer` profile for read-only validation. Use `sandbox` only for leased test indexes and `enforcer-apply` only for one explicitly authorized prepared intent. Do not use the general DBA path as a production smoke test.
+Live validation is opt-in. Use only an allowlisted dedicated non-production Azure SQL database. Start with the `optimizer` profile for read-only validation. Use `sandbox` only for leased test indexes or reviewed view changes, and `enforcer-apply` only for one explicitly authorized prepared intent. Do not use the general DBA path as a production smoke test.
 
 ## Troubleshooting
 

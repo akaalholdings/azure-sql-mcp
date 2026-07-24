@@ -49,7 +49,7 @@ def _raw_action(sql: str) -> AdminAction:
         "CREATE TABLE dbo.NewTable (Id int NOT NULL)",
         "ALTER TABLE dbo.NewTable ADD Name nvarchar(100)",
         "DROP TABLE dbo.NewTable",
-        "CREATE LOGIN app_login WITH PASSWORD = 'local-fixture'",
+        "CREATE LOGIN app_login WITH PASSWORD = 'placeholder'",
         "ALTER LOGIN app_login DISABLE",
         "DROP LOGIN app_login",
         "CREATE USER app_user FOR LOGIN app_login",
@@ -293,13 +293,13 @@ async def test_admin_policy_audits_unknown_admin_outcome_and_redacts_error(
     executor = AsyncMock()
     executor.execute_batches = AsyncMock(
         side_effect=AdminBatchOutcomeUnknownError(
-            "Connection lost after executing N'SuperSecret-123!'"
+            "Connection lost after executing N'<redacted-a>'"
         )
     )
 
     with pytest.raises(AdminBatchOutcomeUnknownError):
         await policy.execute(
-            _raw_action("EXEC dbo.RotateCredential N'SuperSecret-123!'"),
+            _raw_action("EXEC dbo.RotateCredential N'<redacted-a>'"),
             executor,
             dry_run=False,
         )
@@ -309,7 +309,7 @@ async def test_admin_policy_audits_unknown_admin_outcome_and_redacts_error(
         "apply_started",
         "apply_outcome_unknown",
     ]
-    assert all("SuperSecret-123!" not in json.dumps(event) for event in events)
+    assert all("<redacted-a>" not in json.dumps(event) for event in events)
 
 
 @pytest.mark.asyncio
@@ -365,14 +365,14 @@ def test_admin_policy_redacts_preview_and_rollback_literals(
         tool_name="rotate_fixture",
         database_name="appdb",
         action_type="maintenance",
-        sql="EXEC dbo.RotateCredential N'SuperSecret-123!' -- private ticket",
-        rollback_sql="EXEC dbo.RotateCredential N'OldSecret-456!'",
+        sql="EXEC dbo.RotateCredential N'<redacted-a>' -- private ticket",
+        rollback_sql="EXEC dbo.RotateCredential N'<redacted-b>'",
         trusted_generated=True,
     )
 
     payload = policy.preview(action)
 
-    assert "SuperSecret-123!" not in payload["sql_preview"]
+    assert "<redacted-a>" not in payload["sql_preview"]
     assert "private ticket" not in payload["sql_preview"]
-    assert "OldSecret-456!" not in payload["rollback_sql"]
-    assert all("Secret" not in json.dumps(event) for event in _audit_events(tmp_path))
+    assert "<redacted-b>" not in payload["rollback_sql"]
+    assert all("<redacted-" not in json.dumps(event) for event in _audit_events(tmp_path))
