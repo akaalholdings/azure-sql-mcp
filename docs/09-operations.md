@@ -104,7 +104,11 @@ Create an uncommitted JSON file outside the repository:
 }
 ```
 
-Set its absolute path with `AZURE_SQL_DATABASE_POLICY_FILE`. Missing files, invalid schemas, unknown databases, and omitted dangerous permissions fail closed.
+Set its absolute path with `AZURE_SQL_DATABASE_POLICY_FILE`. Missing files,
+invalid schemas, unknown databases, and omitted permissions fail closed.
+Schema/catalog tools and schema MCP resources require `allow_read=true`;
+runtime status, database listing, and capability/policy discovery remain
+available so a denial can be diagnosed.
 
 ### Upgrading durable state from pre-v1 releases
 
@@ -125,7 +129,7 @@ required legacy workflows have completed or been retired.
 
 | Profile | Skill/context | Access | Write policy | Tool groups | Database policy |
 | --- | --- | --- | --- | --- | --- |
-| `triage` | `sql-health-triage` | restricted | disabled | core,performance | not required for passive evidence |
+| `triage` | `sql-health-triage` | restricted | disabled | core,performance | `allow_read` required for schema/catalog evidence |
 | `optimizer` | `sql-optimizer`, read-only | restricted | disabled | core,performance | benchmark permission required for measured runs; view preparation remains read-only |
 | `sandbox` | `sql-optimizer`, temporary index or view | unrestricted, local stdio | apply | core,performance,admin | benchmark, test-index, or view-apply permission as needed; non-production environment |
 | `enforcer-review` | `sql-plan-enforcer`, review | restricted | disabled | core,performance | shared state path required for intent preparation |

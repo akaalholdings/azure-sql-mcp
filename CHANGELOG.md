@@ -6,6 +6,32 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [2.2.1] - 2026-07-28
+
+### Changed
+
+- Benchmark classification now uses conservative observed-range separation
+  instead of rejecting fast candidates solely because their independent
+  range-to-median ratio is high. Existing spread and noise telemetry remains
+  available, with an additive comparison margin explaining the decision.
+- Finalization stopping reasons now accept up to 2,000 characters and publish
+  the same limit in the MCP input schema.
+- Schema and catalog tools and resources now require database-policy
+  `allow_read=true`; database-free runtime and policy discovery remain
+  available.
+
+### Fixed
+
+- Literal outer `TOP (0)` result comparisons now restore the zero-row
+  shape-and-type probe without weakening proof gates for other row limits.
+- Tuning-session retrieval now exposes committed index evidence even when a
+  crash prevented it from being attached to the candidate, while keeping such
+  evidence out of winner selection.
+- Index benchmarks now reject terminal sessions before cleanup, request
+  binding, catalog access, DDL, or query dispatch.
+- State-machine errors keep safe session and candidate enum values visible
+  without weakening SQL-literal or secret redaction.
+
 ## [2.2.0] - 2026-07-28
 
 ### Added

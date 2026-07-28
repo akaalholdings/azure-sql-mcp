@@ -77,6 +77,10 @@ _CONTRACT_TABLES: dict[str, tuple[str, type[VersionedContract], str]] = {
 _RESERVATION_TTL = timedelta(minutes=30)
 _RESERVATION_CLEANUP_GRACE_SECONDS = 60
 _IDEMPOTENCY_DIGEST_PATTERN = re.compile(r"^idempotency-v1:[0-9a-f]{64}$")
+_INDEX_BENCHMARK_REPLAY_GUIDANCE = (
+    "Index benchmark replay requires the exact original request and exact "
+    "original idempotency key. Retrieve committed results with get_tuning_session."
+)
 _VIEW_CHANGE_STATUSES = frozenset(
     {
         "prepared",
@@ -963,6 +967,45 @@ class PerformanceStore:
 
     def get_evidence(self, evidence_id: str) -> EvidenceEnvelopeV1:
         return self._get("evidence", evidence_id)  # type: ignore[return-value]
+
+    def list_evidence_for_session(
+        self,
+        session_id: str,
+    ) -> list[EvidenceEnvelopeV1]:
+        """Return durable evidence whose redacted metadata names one session."""
+
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("session_id is required.")
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT evidence_id, payload
+                FROM evidence_envelopes
+                ORDER BY evidence_id
+                """
+            ).fetchall()
+        evidence = [
+            cast(
+                EvidenceEnvelopeV1,
+                self._row_to_contract(
+                    row,
+                    EvidenceEnvelopeV1,
+                    str(row["evidence_id"]),
+                ),
+            )
+            for row in rows
+        ]
+        return sorted(
+            (
+                envelope
+                for envelope in evidence
+                if envelope.metadata.get("session_id") == session_id
+            ),
+            key=lambda envelope: (
+                envelope.captured_at_utc,
+                envelope.evidence_id,
+            ),
+        )
 
     def get_idempotent_evidence(
         self,
@@ -1878,13 +1921,19 @@ class PerformanceStore:
             if candidate.session_id != session_id:
                 raise ValueError("Candidate does not belong to this tuning session.")
 
-            existing_id = self._idempotent_aggregate_locked(
-                scope,
-                hashed_idempotency_key,
-                "candidate",
-                requested_id=candidate_id,
-                request_fingerprint=fingerprint,
-            )
+            try:
+                existing_id = self._idempotent_aggregate_locked(
+                    scope,
+                    hashed_idempotency_key,
+                    "candidate",
+                    requested_id=candidate_id,
+                    request_fingerprint=fingerprint,
+                )
+            except IdempotencyConflictError as exc:
+                raise IdempotencyConflictError(
+                    f"{_INDEX_BENCHMARK_REPLAY_GUIDANCE} "
+                    "The supplied request is a different request."
+                ) from exc
             if existing_id is not None:
                 return {"replayed": True}
 
@@ -1902,12 +1951,12 @@ class PerformanceStore:
             if conflicting_binding is not None:
                 if conflicting_binding["request_fingerprint"] != fingerprint:
                     raise IdempotencyConflictError(
-                        "Index benchmark candidate phase was replayed with a "
-                        "different request."
+                        f"{_INDEX_BENCHMARK_REPLAY_GUIDANCE} "
+                        "The supplied request is a different request."
                     )
                 raise IdempotencyConflictError(
-                    "Index benchmark candidate phase was replayed with a "
-                    "different idempotency key."
+                    f"{_INDEX_BENCHMARK_REPLAY_GUIDANCE} "
+                    "The supplied key is a different idempotency key."
                 )
 
             self._record_idempotency_locked(

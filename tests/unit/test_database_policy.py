@@ -77,6 +77,19 @@ def test_missing_database_is_denied_by_default(tmp_path: Path) -> None:
         policies.require("missing")
 
 
+def test_read_gate_requires_an_explicit_allow_read_grant(tmp_path: Path) -> None:
+    allowed = load_database_policy(_write_policy(tmp_path, _document()))
+
+    assert allowed.require_read("appdb").database_name == "AppDb"
+
+    denied_document = _document(allow_read=False)
+    denied = load_database_policy(_write_policy(tmp_path, denied_document))
+    with pytest.raises(PermissionError, match="does not permit read access"):
+        denied.require_read("appdb")
+    with pytest.raises(PermissionError, match="does not permit read access"):
+        denied.require_read("missing")
+
+
 def test_dangerous_capabilities_default_closed_when_explicitly_disabled(
     tmp_path: Path,
 ) -> None:

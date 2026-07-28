@@ -5,6 +5,7 @@ from mcp.server.fastmcp import FastMCP
 from .artifact_store import ArtifactStore
 from .artifacts import json_text
 from .config import ServerConfig
+from .database_policy import DatabasePolicySet
 from .introspection import IntrospectionService
 
 
@@ -13,8 +14,15 @@ def register_resources(
     config: ServerConfig,
     introspection: IntrospectionService,
     artifact_store: ArtifactStore | None = None,
+    *,
+    database_policy: DatabasePolicySet,
 ) -> None:
     """Register MCP resource templates for schema browsing."""
+
+    def readable_database(database: str) -> str:
+        resolved = config.validate_database_name(database)
+        database_policy.require_read(resolved)
+        return resolved
 
     @mcp.resource(
         "azuresql://{database}/schemas",
@@ -23,7 +31,7 @@ def register_resources(
     )
     async def database_schemas(database: str) -> str:
         """List all schemas in the given database."""
-        resolved = config.validate_database_name(database)
+        resolved = readable_database(database)
         result = await introspection.list_schemas(resolved)
         return json_text(result)
 
@@ -34,7 +42,7 @@ def register_resources(
     )
     async def schema_tables(database: str, schema: str) -> str:
         """List all tables in a schema."""
-        resolved = config.validate_database_name(database)
+        resolved = readable_database(database)
         result = await introspection.list_objects(resolved, schema, "table")
         return json_text(result)
 
@@ -45,7 +53,7 @@ def register_resources(
     )
     async def schema_views(database: str, schema: str) -> str:
         """List all views in a schema."""
-        resolved = config.validate_database_name(database)
+        resolved = readable_database(database)
         result = await introspection.list_objects(resolved, schema, "view")
         return json_text(result)
 
@@ -56,7 +64,7 @@ def register_resources(
     )
     async def schema_procedures(database: str, schema: str) -> str:
         """List all stored procedures in a schema."""
-        resolved = config.validate_database_name(database)
+        resolved = readable_database(database)
         result = await introspection.list_objects(resolved, schema, "procedure")
         return json_text(result)
 
@@ -69,7 +77,7 @@ def register_resources(
     )
     async def table_details(database: str, schema: str, table: str) -> str:
         """Get detailed information about a table."""
-        resolved = config.validate_database_name(database)
+        resolved = readable_database(database)
         result = await introspection.get_object_details(resolved, schema, table, "table")
         return json_text(result)
 

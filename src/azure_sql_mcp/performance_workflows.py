@@ -23,6 +23,7 @@ from .connection import QueryResult
 from .connection import StatementDispatchPrevented
 from .database_policy import DatabasePolicySet
 from .equivalence_contract import analyze_equivalence_preflight
+from .equivalence_contract import has_outer_literal_top_zero
 from .performance_contracts import (
     EvidenceEnvelopeV1,
     PerformanceCaseV1,
@@ -42,6 +43,7 @@ from .safe_sql import SafeSqlValidator
 from .tuning_sessions import DEFAULT_EXECUTIONS
 from .tuning_sessions import DEFAULT_MAX_CANDIDATES
 from .tuning_sessions import DEFAULT_TIME_LIMIT_SECONDS
+from .tuning_sessions import InvalidTransitionError
 from .tuning_sessions import TuningSessionStateMachine
 
 
@@ -70,13 +72,13 @@ OBJECTIVE_SOURCE_REQUIREMENTS = {
     "physical_reads": ("reads", "statistics_io_table_messages"),
 }
 MIN_RELATIVE_IMPROVEMENT = 0.10
-MAX_ACCEPTABLE_NOISE_RATIO = 0.25
 MIN_ABSOLUTE_IMPROVEMENT = {
     "elapsed_time": 5.0,
     "cpu": 5.0,
     "logical_reads": 100.0,
     "physical_reads": 10.0,
 }
+COMPARISON_DECISION_BASIS = "observed_range_separation_v1"
 
 
 def fingerprint_text(value: str) -> str:
@@ -708,27 +710,31 @@ def classify_benchmark(
     objective = normalize_tuning_objective(objective)
     metric_name = OBJECTIVE_METRICS[objective]
     source_key, trusted_source = OBJECTIVE_SOURCE_REQUIREMENTS[objective]
-    improvements: list[float] = []
-    absolute_improvements: list[float] = []
+    conservative_gains: list[float] = []
+    relative_conservative_gains: list[float] = []
     weights: list[float] = []
-    noise_floor = MIN_RELATIVE_IMPROVEMENT
+    material_regression_detected = False
 
-    def metric_noise_ratio(sample: Mapping[str, Any]) -> float:
-        median = sample.get(metric_name)
-        spread = sample.get("spread")
+    def observed_bounds(
+        aggregate: Mapping[str, Any],
+    ) -> tuple[float, float] | None:
+        spread = aggregate.get("spread")
         metric_spread = spread.get(metric_name) if isinstance(spread, Mapping) else None
-        observed_range = (
-            metric_spread.get("range") if isinstance(metric_spread, Mapping) else None
-        )
+        if not isinstance(metric_spread, Mapping):
+            return None
+        observed_min = metric_spread.get("min")
+        observed_max = metric_spread.get("max")
         if (
-            isinstance(median, (int, float))
-            and median > 0
-            and isinstance(observed_range, (int, float))
+            not isinstance(observed_min, (int, float))
+            or isinstance(observed_min, bool)
+            or not math.isfinite(float(observed_min))
+            or not isinstance(observed_max, (int, float))
+            or isinstance(observed_max, bool)
+            or not math.isfinite(float(observed_max))
+            or float(observed_min) > float(observed_max)
         ):
-            return float(observed_range) / float(median)
-        if metric_name == "elapsed_ms":
-            return float(sample.get("noise_ratio") or 0)
-        return 0.0
+            return None
+        return float(observed_min), float(observed_max)
 
     for result in parameter_results:
         baseline = result.get("baseline", {})
@@ -737,7 +743,16 @@ def classify_benchmark(
             return "inconclusive", "a parameter case did not return metric aggregates"
         before = baseline.get(metric_name)
         after = candidate.get(metric_name)
-        if not isinstance(before, (int, float)) or before <= 0 or not isinstance(after, (int, float)):
+        if (
+            not isinstance(before, (int, float))
+            or isinstance(before, bool)
+            or not math.isfinite(float(before))
+            or before <= 0
+            or not isinstance(after, (int, float))
+            or isinstance(after, bool)
+            or not math.isfinite(float(after))
+            or after < 0
+        ):
             return "inconclusive", f"{objective} was unavailable for at least one parameter case"
         for aggregate in (baseline, candidate):
             sources = aggregate.get("metric_sources")
@@ -766,9 +781,48 @@ def classify_benchmark(
         candidate_samples = int(candidate.get("sample_count", 0) or 0)
         if min(baseline_samples, candidate_samples) < 2:
             return "inconclusive", "at least two paired samples are required"
-        relative_improvement = (float(before) - float(after)) / float(before)
-        improvements.append(relative_improvement)
-        absolute_improvements.append(float(before) - float(after))
+        baseline_bounds = observed_bounds(baseline)
+        candidate_bounds = observed_bounds(candidate)
+        if baseline_bounds is None or candidate_bounds is None:
+            return (
+                "inconclusive",
+                f"{objective} observed ranges were missing or unusable",
+            )
+        baseline_min, baseline_max = baseline_bounds
+        candidate_min, candidate_max = candidate_bounds
+        if (
+            baseline_min < 0
+            or candidate_min < 0
+            or not baseline_min <= float(before) <= baseline_max
+            or not candidate_min <= float(after) <= candidate_max
+        ):
+            return (
+                "inconclusive",
+                f"{objective} observed ranges were inconsistent with their aggregates",
+            )
+        conservative_gain = baseline_min - candidate_max
+        conservative_regression = candidate_min - baseline_max
+        relative_conservative_gain = conservative_gain / float(before)
+        relative_conservative_regression = (
+            conservative_regression / float(before)
+        )
+        comparison_margin = {
+            "objective": objective,
+            "metric": metric_name,
+            "baseline_min": baseline_min,
+            "baseline_max": baseline_max,
+            "candidate_min": candidate_min,
+            "candidate_max": candidate_max,
+            "conservative_gain": conservative_gain,
+            "conservative_gain_ratio": relative_conservative_gain,
+            "conservative_regression": conservative_regression,
+            "conservative_regression_ratio": relative_conservative_regression,
+        }
+        if isinstance(result, dict):
+            result["comparison_margin"] = comparison_margin
+            result["decision_basis"] = COMPARISON_DECISION_BASIS
+        conservative_gains.append(conservative_gain)
+        relative_conservative_gains.append(relative_conservative_gain)
         raw_weight = result.get("weight", 1.0)
         weight = (
             float(raw_weight)
@@ -778,50 +832,46 @@ def classify_benchmark(
             else 1.0
         )
         weights.append(weight)
-        observed_noise = max(
-            metric_noise_ratio(baseline),
-            metric_noise_ratio(candidate),
+        material_regression_detected = material_regression_detected or (
+            relative_conservative_regression > MIN_RELATIVE_IMPROVEMENT
+            and conservative_regression >= MIN_ABSOLUTE_IMPROVEMENT[objective]
         )
-        if observed_noise > MAX_ACCEPTABLE_NOISE_RATIO:
-            return (
-                "inconclusive",
-                f"{objective} variance exceeded the maximum trustworthy noise ratio",
-            )
-        noise_floor = max(
-            noise_floor,
-            observed_noise,
-        )
-    if not improvements:
+    if not relative_conservative_gains:
         return "inconclusive", "no parameter cases were measured"
-    regression_tolerance = max(0.10, noise_floor)
-    if any(improvement < -regression_tolerance for improvement in improvements):
-        return "regressed", "candidate materially regressed at least one tested parameter bucket"
+    if material_regression_detected:
+        return (
+            "regressed",
+            "candidate's observed range materially regressed at least one "
+            "tested parameter bucket",
+        )
     total_weight = sum(weights)
-    weighted_improvement = sum(
-        improvement * weight for improvement, weight in zip(improvements, weights)
-    ) / total_weight
-    weighted_absolute_improvement = sum(
+    weighted_relative_gain = sum(
         improvement * weight
-        for improvement, weight in zip(absolute_improvements, weights)
+        for improvement, weight in zip(relative_conservative_gains, weights)
+    ) / total_weight
+    weighted_conservative_gain = sum(
+        improvement * weight
+        for improvement, weight in zip(conservative_gains, weights)
     ) / total_weight
     if (
-        weighted_improvement > noise_floor
-        and weighted_absolute_improvement >= MIN_ABSOLUTE_IMPROVEMENT[objective]
+        weighted_relative_gain > MIN_RELATIVE_IMPROVEMENT
+        and weighted_conservative_gain >= MIN_ABSOLUTE_IMPROVEMENT[objective]
     ):
         if require_equivalence:
             return (
                 "improved",
-                "candidate improved the weighted objective beyond noise and absolute thresholds",
+                "candidate's weighted observed-range separation exceeded "
+                "relative and absolute improvement thresholds",
             )
         return (
             "promising",
-            "screening signal improved beyond noise; finalist equivalence is still required",
+            "screening observed-range separation exceeded improvement "
+            "thresholds; finalist equivalence is still required",
         )
-    if weighted_improvement < -noise_floor:
-        return "regressed", "candidate regressed beyond observed timing noise"
     return (
         "neutral",
-        "candidate did not beat both observed noise and the absolute improvement threshold",
+        "candidate's observed ranges did not establish a material improvement "
+        "or regression",
     )
 
 
@@ -1305,20 +1355,87 @@ class PerformanceWorkflowService:
     def get_session(self, session_id: str) -> dict[str, Any]:
         session = self.sessions.get_session(session_id)
         candidates = self.sessions.list_candidates(session_id)
-        evidence_ids = tuple(
+        candidate_ids = {
+            candidate.candidate_id
+            for candidate in candidates
+        }
+        attached_evidence_ids = tuple(
             dict.fromkeys(
                 evidence_id
                 for candidate in candidates
                 for evidence_id in candidate.evidence_ids
             )
         )
+        expected_database_fingerprint = session.metadata.get(
+            "database_fingerprint"
+        )
+        if (
+            not isinstance(expected_database_fingerprint, str)
+            or not expected_database_fingerprint
+        ):
+            owning_case = self.store.get_performance_case(
+                session.performance_case_id
+            )
+            expected_database_fingerprint = (
+                owning_case.database_fingerprint
+            )
+
+        def evidence_belongs_to_session(
+            evidence: EvidenceEnvelopeV1,
+        ) -> bool:
+            return (
+                evidence.metadata.get("session_id") == session_id
+                and evidence.metadata.get("candidate_id") in candidate_ids
+                and evidence.database_fingerprint
+                == expected_database_fingerprint
+            )
+
+        attached_evidence: list[EvidenceEnvelopeV1] = []
+        for evidence_id in attached_evidence_ids:
+            evidence = self.store.get_evidence(evidence_id)
+            if not evidence_belongs_to_session(evidence):
+                raise RuntimeError(
+                    "Candidate-attached evidence does not match its tuning "
+                    "session, candidate membership, and database fingerprint."
+                )
+            attached_evidence.append(evidence)
+
+        discovered_evidence = [
+            evidence
+            for evidence in self.store.list_evidence_for_session(session_id)
+            if evidence_belongs_to_session(evidence)
+        ]
+        evidence_by_id = {
+            evidence.evidence_id: evidence
+            for evidence in (*attached_evidence, *discovered_evidence)
+        }
+        ordered_evidence = sorted(
+            evidence_by_id.values(),
+            key=lambda evidence: (
+                evidence.captured_at_utc,
+                evidence.evidence_id,
+            ),
+        )
+        attached_evidence_id_set = set(attached_evidence_ids)
+        unattached_evidence_ids = [
+            evidence.evidence_id
+            for evidence in ordered_evidence
+            if evidence.evidence_id not in attached_evidence_id_set
+        ]
         return {
             "session": session.to_dict(),
             "leaderboard": [candidate.to_dict() for candidate in candidates],
             "evidence": [
-                self.store.get_evidence(evidence_id).to_dict()
-                for evidence_id in evidence_ids
+                evidence.to_dict()
+                for evidence in ordered_evidence
             ],
+            "evidence_reconciliation": {
+                "attached_count": len(attached_evidence_ids),
+                "unattached_count": len(unattached_evidence_ids),
+                "attached_evidence_ids": list(attached_evidence_ids),
+                "unattached_evidence_ids": unattached_evidence_ids,
+                "reconciliation_required": bool(unattached_evidence_ids),
+            },
             "events": self.store.list_events(
                 aggregate_type="session",
                 aggregate_id=session_id,
@@ -1428,9 +1545,13 @@ class PerformanceWorkflowService:
             "baseline": await self._analyze_equivalence(database_name, baseline),
             "candidate": await self._analyze_equivalence(database_name, candidate),
         }
+        statically_zero_row = (
+            has_outer_literal_top_zero(baseline)
+            and has_outer_literal_top_zero(candidate)
+        )
         if any(
             not item["direct_snapshot_supported"] for item in preflight.values()
-        ):
+        ) and not statically_zero_row:
             return {
                 "status": "proof_contract_required",
                 "reason": (
@@ -1473,6 +1594,9 @@ class PerformanceWorkflowService:
             compare_order=compare_order,
         )
         result["parameter_case"] = case_name
+        if statically_zero_row:
+            result["comparison_scope"] = "statically_zero_row"
+            result["equivalence_preflight"] = preflight
         return result
 
     async def _compare_execution_contracts(
@@ -1665,6 +1789,7 @@ class PerformanceWorkflowService:
                     "objective": normalize_tuning_objective(
                         case.metadata.get("objective")
                     ),
+                    "decision_basis": COMPARISON_DECISION_BASIS,
                     "parameter_results": [],
                 },
                 metadata={
@@ -1788,6 +1913,7 @@ class PerformanceWorkflowService:
             "classification": state,
             "performance_classification": performance_classification,
             "objective": metrics.get("objective"),
+            "decision_basis": metrics.get("decision_basis"),
             "durable_state": durable_state,
             "reason": metadata.get("reason")
             or "Recovered a committed benchmark result without rerunning SQL.",
@@ -1860,6 +1986,7 @@ class PerformanceWorkflowService:
             metrics={
                 "classification": "inconclusive",
                 "objective": objective,
+                "decision_basis": COMPARISON_DECISION_BASIS,
                 "parameter_results": list(parameter_results),
             },
             metadata={
@@ -2040,7 +2167,23 @@ class PerformanceWorkflowService:
         prove_equivalence: bool | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        session = self.sessions.get_session(session_id)
+        if phase not in {"screening", "finalist"}:
+            raise ValueError("phase must be screening or finalist.")
+        allowed_session_statuses = {
+            "created",
+            "screening",
+            "finalist_validation",
+        }
+        try:
+            session = self.sessions.require_session_status(
+                session_id,
+                allowed=allowed_session_statuses,
+            )
+        except InvalidTransitionError as exc:
+            raise InvalidTransitionError(
+                f"{exc} Retrieve committed results with get_tuning_session; "
+                "terminal sessions cannot benchmark or replay."
+            ) from None
         candidate = self.sessions.get_candidate(candidate_id)
         if candidate.session_id != session_id:
             raise ValueError("Candidate does not belong to the tuning session.")
@@ -2093,8 +2236,6 @@ class PerformanceWorkflowService:
             raise ValueError(
                 "Benchmark parameter cases must be an unchanged subset of the performance case."
             )
-        if phase not in {"screening", "finalist"}:
-            raise ValueError("phase must be screening or finalist.")
         should_prove_equivalence = (
             phase == "finalist" if prove_equivalence is None else prove_equivalence
         )
@@ -2414,6 +2555,7 @@ class PerformanceWorkflowService:
                 "classification": state,
                 "performance_classification": performance_classification,
                 "objective": objective,
+                "decision_basis": COMPARISON_DECISION_BASIS,
                 "parameter_results": parameter_results,
             },
             metadata={
@@ -2485,6 +2627,7 @@ class PerformanceWorkflowService:
             "classification": state,
             "performance_classification": performance_classification,
             "objective": objective,
+            "decision_basis": COMPARISON_DECISION_BASIS,
             "durable_state": durable_state,
             "reason": reason,
             "phase": phase,

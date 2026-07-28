@@ -216,6 +216,34 @@ def analyze_equivalence_preflight(sql: str) -> EquivalencePreflight:
     )
 
 
+def has_outer_literal_top_zero(sql: str) -> bool:
+    """Return whether the final query has an outer literal ``TOP (0)``.
+
+    This is deliberately narrower than proving that an arbitrary predicate
+    returns no rows. Parameterized limits, non-zero limits, and limits that
+    occur only inside a nested query are not accepted.
+    """
+
+    try:
+        statements = [statement for statement in parse(sql, read="tsql") if statement]
+    except ParseError as exc:
+        raise ValueError("SQL could not be parsed for equivalence preflight.") from exc
+    if not statements:
+        return False
+    if any(not isinstance(statement, exp.Declare) for statement in statements[:-1]):
+        return False
+
+    outer_limit = statements[-1].args.get("limit")
+    if not isinstance(outer_limit, exp.Limit):
+        return False
+    limit_expression = outer_limit.args.get("expression")
+    return (
+        isinstance(limit_expression, exp.Literal)
+        and not limit_expression.is_string
+        and str(limit_expression.this) == "0"
+    )
+
+
 def _function_name(node: exp.Expr) -> str | None:
     if isinstance(node, exp.CurrentTimestampLTZ):
         return "SYSDATETIMEOFFSET"

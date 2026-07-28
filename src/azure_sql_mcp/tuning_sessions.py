@@ -15,6 +15,7 @@ from .candidate_lineage import validate_combined_parent_request
 from .candidate_lineage import validate_rewrite_plus_index_parent_request
 from .performance_contracts import (
     ALL_CANDIDATE_STATES,
+    SESSION_STATUSES,
     TERMINAL_CANDIDATE_STATES,
     PerformanceCaseV1,
     TuningCandidateV1,
@@ -75,6 +76,10 @@ def _unique_strings(values: Iterable[str]) -> tuple[str, ...]:
             result.append(value)
             seen.add(value)
     return tuple(result)
+
+
+def _format_state_codes(values: Iterable[str]) -> str:
+    return f"[{', '.join(sorted(values))}]"
 
 
 def _safe_failure_code(value: str | None) -> str | None:
@@ -324,6 +329,18 @@ class TuningSessionStateMachine:
         )
         self._check_deadline(session)
         return session
+
+    def require_session_status(
+        self,
+        session_id: str,
+        *,
+        allowed: set[str],
+    ) -> TuningSessionV1:
+        """Return a session only when it has one of the validated allowed statuses."""
+
+        if not allowed or not allowed.issubset(SESSION_STATUSES):
+            raise ValueError("allowed must contain only recognized session statuses.")
+        return self._active_session(session_id, allowed=allowed)
 
     def start_screening(
         self,
@@ -695,7 +712,8 @@ class TuningSessionStateMachine:
         session = self.store.get_session(session_id)
         if allowed is not None and session.status not in allowed:
             raise InvalidTransitionError(
-                f"Session {session_id} is {session.status!r}; expected one of {sorted(allowed)}."
+                f"Session {session_id} is {session.status}; "
+                f"expected one of {_format_state_codes(allowed)}."
             )
         return session
 

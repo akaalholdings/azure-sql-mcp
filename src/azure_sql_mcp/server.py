@@ -65,9 +65,11 @@ from .param_binding import ParameterExecutionContract
 from .param_binding import ParameterBindingService
 from .performance_contracts import EvidenceEnvelopeV1
 from .performance_contracts import PerformanceCaseV1
+from .performance_contracts import STOPPING_REASON_MAX_LENGTH
 from .performance_store import ContractNotFoundError
 from .performance_store import IdempotencyConflictError
 from .performance_store import PerformanceStore
+from .performance_workflows import COMPARISON_DECISION_BASIS
 from .performance_workflows import PerformanceWorkflowService
 from .performance_workflows import aggregate_samples
 from .performance_workflows import classify_benchmark
@@ -106,6 +108,7 @@ from .tool_contracts import SelectionScope
 from .tool_contracts import SessionToolOutput
 from .tool_contracts import TuningObjective
 from .tool_contracts import TuningStrategy
+from .tuning_sessions import InvalidTransitionError
 from .tuning_sessions import TuningSessionStateMachine
 from .transport_auth import StaticBearerTokenVerifier
 from .wait_stats import WaitStatsService
@@ -166,6 +169,23 @@ _SESSION_WORKFLOW_TOOLS = frozenset(
 )
 _EVIDENCE_WORKFLOW_TOOLS = frozenset(
     {"collect_performance_evidence", "tune_query"}
+)
+_CATALOG_READ_TOOLS = frozenset(
+    {
+        "list_schemas",
+        "list_objects",
+        "search_objects",
+        "get_object_details",
+        "get_dependencies",
+        "get_table_stats",
+        "capture_schema_snapshot",
+    }
+)
+_CATALOG_PAIR_TOOLS = frozenset(
+    {
+        "compare_schemas",
+        "generate_migration_script",
+    }
 )
 
 
@@ -228,6 +248,8 @@ def _validation_issue_message(code: str) -> str:
         "less_than_equal": "Value is above the permitted maximum.",
         "int_parsing": "Value must be an integer.",
         "string_type": "Value must be a string.",
+        "string_too_short": "Value is below the permitted minimum length.",
+        "string_too_long": "Value is above the permitted maximum length.",
         "bool_parsing": "Value must be a boolean.",
         "list_type": "Value must be an array.",
         "dict_type": "Value must be an object.",
@@ -386,7 +408,13 @@ class AzureSqlMcpApplication:
         self._register_tools()
         self._prune_disabled_tools()
         self._enforce_strict_tool_argument_models()
-        register_resources(self.mcp, self.config, self.introspection, self.artifacts)
+        register_resources(
+            self.mcp,
+            self.config,
+            self.introspection,
+            self.artifacts,
+            database_policy=self.database_policy,
+        )
         register_prompts(self.mcp, self.config)
 
     def _prune_disabled_tools(self) -> None:
@@ -1443,7 +1471,11 @@ class AzureSqlMcpApplication:
                     "explicit opt-in and never asserts semantic equivalence."
                 ),
             ),
-            stopping_reason: str = Field(description="Why the optimizer stopped."),
+            stopping_reason: str = Field(
+                min_length=1,
+                max_length=STOPPING_REASON_MAX_LENGTH,
+                description="Why the optimizer stopped.",
+            ),
             idempotency_key: str | None = Field(default=None),
             database_name: str | None = Field(default=None),
         ) -> SessionToolOutput:
@@ -4541,6 +4573,7 @@ class AzureSqlMcpApplication:
             "classification": state,
             "performance_classification": performance_classification,
             "objective": metrics.get("objective"),
+            "decision_basis": metrics.get("decision_basis"),
             "durable_state": durable_state,
             "reason": metadata.get("reason")
             or "Recovered committed index evidence without rerunning work.",
@@ -4592,6 +4625,23 @@ class AzureSqlMcpApplication:
             raise PermissionError("Temporary indexes are prohibited in production policy entries.")
         if not policy.allow_test_indexes:
             raise PermissionError("Database policy does not permit temporary indexes.")
+        if phase not in {"screening", "finalist"}:
+            raise ValueError("phase must be screening or finalist.")
+        allowed_session_statuses = {
+            "created",
+            "screening",
+            "finalist_validation",
+        }
+        try:
+            session = self.tuning_sessions.require_session_status(
+                session_id,
+                allowed=allowed_session_statuses,
+            )
+        except InvalidTransitionError as exc:
+            raise InvalidTransitionError(
+                f"{exc} Retrieve committed results with get_tuning_session; "
+                "terminal sessions cannot benchmark or replay."
+            ) from None
         cleanup = await self._cleanup_expired_index_leases()
         if cleanup["cleanup_required"]:
             return {
@@ -4607,10 +4657,7 @@ class AzureSqlMcpApplication:
                 "cleanup": cleanup,
                 "session_continues": False,
             }
-        if phase not in {"screening", "finalist"}:
-            raise ValueError("phase must be screening or finalist.")
         normalized_sql = self.validator.validate_read_only(sql).execution_sql
-        session = self.tuning_sessions.get_session(session_id)
         candidate = self.tuning_sessions.get_candidate(candidate_id)
         case = self.performance_store.get_performance_case(session.performance_case_id)
         if candidate.session_id != session_id:
@@ -4673,6 +4720,7 @@ class AzureSqlMcpApplication:
             raise PermissionError("Tuning session belongs to another database.")
         if not key_columns:
             raise ValueError("key_columns must contain at least one column.")
+        self._require_tuning_session_time(session_id)
         equivalence_preflight = await self._check_equivalence_preflight(
             database_name,
             normalized_sql,
@@ -4782,6 +4830,7 @@ class AzureSqlMcpApplication:
                 "lineage": lineage,
             }
         )
+        self._require_tuning_session_time(session_id)
         self.performance_store.bind_index_benchmark_request(
             session_id,
             candidate_id,
@@ -4829,6 +4878,7 @@ class AzureSqlMcpApplication:
         ):
             raise ValueError("Index candidate finalist validation has already been measured.")
 
+        self._require_tuning_session_time(session_id)
         bound_cases = [
             {
                 "name": parameter_case["name"],
@@ -4844,6 +4894,7 @@ class AzureSqlMcpApplication:
             }
             for parameter_case in cases
         ]
+        self._require_tuning_session_time(session_id)
         schema, table = await self._resolve_canonical_table_identity(
             database_name,
             schema,
@@ -4879,6 +4930,7 @@ class AzureSqlMcpApplication:
                 index_definition_fingerprint=object_fingerprint,
             )
 
+        self._require_tuning_session_time(session_id)
         existing_indexes = await collect_existing_indexes(self.executor, database_name)
         name_conflict = next(
             (
@@ -4956,6 +5008,7 @@ class AzureSqlMcpApplication:
                 "session_continues": True,
             }
 
+        self._require_tuning_session_time(session_id)
         execution_reservation = self.performance_store.reserve_execution_attempts(
             session_id,
             candidate_id,
@@ -5107,6 +5160,7 @@ class AzureSqlMcpApplication:
         create_attempted = False
         ownership_recorded = False
         benchmark_error: str | None = None
+        terminal_error: InvalidTransitionError | None = None
         cancelled = False
         equivalence: list[dict[str, Any]] = []
 
@@ -5277,6 +5331,16 @@ class AzureSqlMcpApplication:
                     "Unable to durably reconcile temporary index ownership",
                     extra={"lease_id": lease_id},
                 )
+        except InvalidTransitionError as exc:
+            benchmark_error = type(exc).__name__
+            terminal_error = exc
+            try:
+                await reconcile_create_outcome()
+            except Exception:
+                logger.exception(
+                    "Unable to durably reconcile temporary index ownership",
+                    extra={"lease_id": lease_id},
+                )
         except Exception as exc:
             benchmark_error = type(exc).__name__
             try:
@@ -5433,8 +5497,25 @@ class AzureSqlMcpApplication:
             except asyncio.CancelledError:
                 benchmark_error = "timeout"
                 cancelled = True
+            except InvalidTransitionError as exc:
+                benchmark_error = type(exc).__name__
+                terminal_error = exc
             except Exception as exc:
                 benchmark_error = type(exc).__name__
+
+        if terminal_error is not None:
+            reservation_update = (
+                self.performance_store.complete_execution_attempts
+                if measured_executions
+                else self.performance_store.release_execution_attempts
+            )
+            reservation_update(
+                execution_reservation["reservation_id"],
+                dispatched_attempt_count=measured_executions,
+                owner_reference=execution_owner,
+                expected_version=execution_reservation["version"],
+            )
+            raise terminal_error
 
         for measurement in measurements:
             result_evidence = [
@@ -5583,6 +5664,7 @@ class AzureSqlMcpApplication:
                     "classification": state,
                     "performance_classification": performance_classification,
                     "objective": str(case.metadata.get("objective") or "elapsed_time"),
+                    "decision_basis": COMPARISON_DECISION_BASIS,
                     "parameter_results": parameter_results,
                 },
                 metadata={
@@ -5660,6 +5742,7 @@ class AzureSqlMcpApplication:
             "classification": state,
             "performance_classification": performance_classification,
             "objective": str(case.metadata.get("objective") or "elapsed_time"),
+            "decision_basis": COMPARISON_DECISION_BASIS,
             "durable_state": durable_state,
             "reason": reason,
             "phase": phase,
@@ -5700,6 +5783,8 @@ class AzureSqlMcpApplication:
         timeout_seconds = self.config.tool_timeout_seconds
         try:
             resolved_database = self.config.validate_database_name(database_name)
+            if tool_name in _CATALOG_READ_TOOLS:
+                self.database_policy.require_read(resolved_database)
             timeout_seconds = self._timeout_for_tool(
                 tool_name,
                 resolved_database,
@@ -5811,9 +5896,18 @@ class AzureSqlMcpApplication:
         return self.config.tool_timeout_seconds
 
     def _require_tuning_session_time(self, session_id: str) -> float:
-        """Fence a new benchmark dispatch against the durable session deadline."""
+        """Fence benchmark work against terminal state and the durable deadline."""
 
-        session = self.tuning_sessions.get_session(session_id)
+        try:
+            session = self.tuning_sessions.require_session_status(
+                session_id,
+                allowed={"created", "screening", "finalist_validation"},
+            )
+        except InvalidTransitionError as exc:
+            raise InvalidTransitionError(
+                f"{exc} Retrieve committed results with get_tuning_session; "
+                "terminal sessions cannot benchmark or replay."
+            ) from None
         if not session.deadline_at_utc:
             return float("inf")
         deadline = datetime.fromisoformat(
@@ -5879,6 +5973,9 @@ class AzureSqlMcpApplication:
         try:
             resolved_source = self.config.validate_database_name(source_database)
             resolved_target = self.config.validate_database_name(target_database)
+            if tool_name in _CATALOG_PAIR_TOOLS:
+                self.database_policy.require_read(resolved_source)
+                self.database_policy.require_read(resolved_target)
             database_label = f"{resolved_source} -> {resolved_target}"
             logger.info(
                 "Running tool",

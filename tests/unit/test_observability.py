@@ -90,6 +90,17 @@ class TestSanitizeErrorMessage:
         assert "SuperSecret-123!" not in sanitized
         assert "N'[REDACTED]'" in sanitized
 
+    def test_preserves_unquoted_state_codes_while_redacting_sql_literals(self):
+        sanitized = sanitize_error_message(
+            "Session session-1 is cancelled; expected one of "
+            "[finalist_validation, screening]. Incorrect syntax near N'SuperSecret-123!'"
+        )
+        assert "cancelled" in sanitized
+        assert "finalist_validation" in sanitized
+        assert "screening" in sanitized
+        assert "SuperSecret-123!" not in sanitized
+        assert "N'[REDACTED]'" in sanitized
+
 
 class TestRedactSqlLiterals:
     def test_redacts_quoted_values_and_preserves_identifiers(self):

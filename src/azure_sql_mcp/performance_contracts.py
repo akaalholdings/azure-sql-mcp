@@ -17,6 +17,7 @@ from typing import Any, ClassVar, Mapping, TypeVar, cast
 
 
 CONTRACT_VERSION = 1
+STOPPING_REASON_MAX_LENGTH = 2000
 UTC = timezone.utc
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _SQL_PREFIX_PATTERN = re.compile(
@@ -420,8 +421,11 @@ class TuningSessionV1(VersionedContract):
         if self.stopping_reason is not None:
             if not isinstance(self.stopping_reason, str) or not self.stopping_reason.strip():
                 raise ContractValidationError("stopping_reason must be a non-empty string when set.")
-            if len(self.stopping_reason) > 200:
-                raise ContractValidationError("stopping_reason must be at most 200 characters.")
+            if len(self.stopping_reason) > STOPPING_REASON_MAX_LENGTH:
+                raise ContractValidationError(
+                    "stopping_reason must be at most "
+                    f"{STOPPING_REASON_MAX_LENGTH} characters."
+                )
         if self.version < 0:
             raise ContractValidationError("version must not be negative.")
         for name in ("started_at_utc", "deadline_at_utc"):
