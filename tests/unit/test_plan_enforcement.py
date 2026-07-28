@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+
 import pytest
+from mcp.server.fastmcp.exceptions import ToolError
 
 from azure_sql_mcp.plan_enforcement import PlanEnforcementService
 
@@ -154,10 +157,33 @@ async def test_direct_apply_plan_action_cannot_mutate() -> None:
     assert app.admin_policy.execute.await_args.kwargs["dry_run"] is True
 
     # Explicit direct apply is rejected and never reaches a live policy call.
-    payload = await app.mcp._tool_manager.call_tool(
-        "apply_plan_action",
-        {"action": "force", "query_id": 42, "plan_id": 7, "dry_run": False, "database_name": "appdb"},
-    )
-    assert payload["code"] == "tool_error"
-    assert "preview-only" in payload["message"]
+    with pytest.raises(ToolError, match="preview-only"):
+        await app.mcp._tool_manager.call_tool(
+            "apply_plan_action",
+            {
+                "action": "force",
+                "query_id": 42,
+                "plan_id": 7,
+                "dry_run": False,
+                "database_name": "appdb",
+            },
+        )
     assert app.admin_policy.execute.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_plan_enforcer_tick_apply_request_is_an_mcp_error() -> None:
+    from tests.unit.test_server import make_config
+    from azure_sql_mcp.config import AccessMode
+    from azure_sql_mcp.server import AzureSqlMcpApplication
+
+    app = AzureSqlMcpApplication(make_config(AccessMode.UNRESTRICTED))
+
+    with pytest.raises(ToolError) as error:
+        await app.mcp._tool_manager.call_tool(
+            "plan_enforcer_tick",
+            {"dry_run": False, "database_name": "appdb"},
+        )
+
+    payload = json.loads(str(error.value).split(": ", 1)[1])
+    assert payload["code"] == "preview_only"

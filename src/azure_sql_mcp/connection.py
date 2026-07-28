@@ -575,15 +575,14 @@ class AzureSqlExecutor:
             self._configure_cursor(query_cursor)
             started = time.perf_counter()
             query_cursor.execute(query, params)
+            statistics_io_messages: list[Any] = []
             result_sets = self._consume_batches(
                 query_cursor,
                 max_rows=max_rows,
                 stop_on_cap=False,
+                message_sink=statistics_io_messages,
             )
             elapsed_wall_ms = (time.perf_counter() - started) * 1000.0
-            statistics_io_messages = tuple(
-                getattr(query_cursor, "messages", ()) or ()
-            )
             return ProfiledExecution(
                 result_sets=result_sets,
                 elapsed_wall_ms=elapsed_wall_ms,
@@ -592,7 +591,7 @@ class AzureSqlExecutor:
                     if statistics_io_messages
                     else "client_wall_clock_and_statistics_xml"
                 ),
-                statistics_io_messages=statistics_io_messages,
+                statistics_io_messages=tuple(statistics_io_messages),
             )
         finally:
             active_error = sys.exc_info()[0] is not None
@@ -627,9 +626,15 @@ class AzureSqlExecutor:
                 return
 
     def _consume_batches(
-        self, cursor, *, max_rows: int | None = None, stop_on_cap: bool = True,
+        self,
+        cursor,
+        *,
+        max_rows: int | None = None,
+        stop_on_cap: bool = True,
+        message_sink: list[Any] | None = None,
     ) -> list[QueryResult]:
         results: list[QueryResult] = []
+        captured_messages: tuple[Any, ...] = ()
         while True:
             if cursor.description:
                 description = tuple(cursor.description)
@@ -676,10 +681,62 @@ class AzureSqlExecutor:
                     # arrives as a later result set and needs the drain.
                     break
 
+            if message_sink is not None:
+                captured_messages = self._capture_cursor_messages(
+                    cursor,
+                    message_sink,
+                    captured_messages,
+                )
             has_next = cursor.nextset()
+            if message_sink is not None:
+                captured_messages = self._capture_cursor_messages(
+                    cursor,
+                    message_sink,
+                    () if has_next else captured_messages,
+                )
             if not has_next:
                 break
         return results
+
+    @staticmethod
+    def _capture_cursor_messages(
+        cursor,
+        message_sink: list[Any],
+        previous_snapshot: tuple[Any, ...],
+    ) -> tuple[Any, ...]:
+        """Capture messages before ``nextset`` can clear the driver buffer.
+
+        Mutable DB-API message buffers are drained after each capture. Immutable
+        snapshots are prefix-deduplicated only within one result-set epoch;
+        ``nextset`` starts a new message-buffer epoch.
+        """
+
+        raw_messages = getattr(cursor, "messages", ()) or ()
+        try:
+            current_snapshot = tuple(raw_messages)
+        except TypeError:
+            return previous_snapshot
+        if not current_snapshot:
+            return current_snapshot
+
+        if (
+            previous_snapshot
+            and len(current_snapshot) >= len(previous_snapshot)
+            and current_snapshot[: len(previous_snapshot)] == previous_snapshot
+        ):
+            message_sink.extend(current_snapshot[len(previous_snapshot) :])
+        else:
+            message_sink.extend(current_snapshot)
+
+        clear_messages = getattr(raw_messages, "clear", None)
+        if callable(clear_messages):
+            try:
+                clear_messages()
+            except (AttributeError, RuntimeError, TypeError):
+                pass
+            else:
+                return ()
+        return current_snapshot
 
     @staticmethod
     def _column_type_signature(description: Sequence[Any]) -> str | None:

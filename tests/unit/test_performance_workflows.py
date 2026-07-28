@@ -813,7 +813,7 @@ async def test_losing_candidate_does_not_end_session_or_erase_next_win() -> None
     assert store.get_session(session_id).status == "screening"
 
     second_sql = "SELECT id FROM dbo.Items AS candidate WHERE 1 = 1"
-    second = service.add_candidate(session_id, second_sql, strategy="combined")
+    second = service.add_candidate(session_id, second_sql, strategy="predicate")
     plans.candidate_ms = 45
     result = await service.benchmark_candidate(
         session_id,
@@ -1243,7 +1243,176 @@ async def test_duplicate_and_order_sensitive_comparison_fails_closed() -> None:
     )
     assert ordered["status"] == "mismatch"
     assert unordered["status"] == "match"
-    assert executor.sessions[-1][-1] == "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+    assert unordered["snapshot_isolation_verified"] is True
+    statements = executor.sessions[-1]
+    assert statements[0] == "SET TRANSACTION ISOLATION LEVEL SNAPSHOT"
+    assert "@@TRANCOUNT" in statements[1]
+    assert "transaction_isolation_level = 5" in statements[1]
+    assert "THROW 51000" in statements[1]
+    assert statements[-1] == "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+
+
+@pytest.mark.asyncio
+async def test_volatile_comparison_requires_a_proof_contract_before_dispatch() -> None:
+    service, _store, _plans, executor = _service()
+
+    result = await service.compare_query_results(
+        "appdb",
+        "SELECT NEWID() AS value",
+        "SELECT NEWID() AS value",
+    )
+
+    assert result["status"] == "proof_contract_required"
+    assert result["executions"] == 0
+    assert result["equivalence_preflight"]["baseline"]["risk_codes"] == [
+        "row_volatile_function"
+    ]
+    assert executor.sessions == []
+
+
+@pytest.mark.asyncio
+async def test_volatile_finalist_stops_before_plan_or_budget_dispatch() -> None:
+    sql = "SELECT NEWID() AS value"
+    service, store, plans, executor = _service()
+    session_id, candidate_id = _start(
+        service,
+        baseline=sql,
+        candidate=sql,
+    )
+
+    result = await service.benchmark_candidate(
+        session_id,
+        candidate_id,
+        "appdb",
+        sql,
+        sql,
+        phase="finalist",
+    )
+
+    assert result["classification"] == "proof_contract_required"
+    assert result["executions"] == 0
+    assert result["proof_scope"] == "performance_only"
+    assert plans.calls == []
+    assert executor.sessions == []
+    reservation_count = store._connection.execute(
+        "SELECT COUNT(*) AS count FROM execution_reservations"
+    ).fetchone()
+    assert reservation_count is not None
+    assert reservation_count["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_volatile_screening_is_explicitly_performance_only() -> None:
+    baseline = "SELECT NEWID() AS value"
+    candidate_sql = "SELECT NEWID() AS value FROM (VALUES (1)) AS candidate(id)"
+    service, store, _plans, _executor = _service()
+    session_id, candidate_id = _start(
+        service,
+        baseline=baseline,
+        candidate=candidate_sql,
+    )
+
+    result = await service.benchmark_candidate(
+        session_id,
+        candidate_id,
+        "appdb",
+        baseline,
+        candidate_sql,
+        phase="screening",
+        prove_equivalence=False,
+        idempotency_key="volatile-performance-only",
+    )
+
+    assert result["classification"] == "proof_contract_required"
+    assert result["performance_classification"] == "promising"
+    assert result["durable_state"] == "inconclusive"
+    assert result["proof_scope"] == "performance_only"
+    assert result["equivalence_deferred"] is True
+    evidence = store.get_evidence(result["evidence_id"])
+    assert evidence.metrics["classification"] == "proof_contract_required"
+    assert evidence.metrics["performance_classification"] == "promising"
+    assert evidence.metadata["proof_scope"] == "performance_only"
+    assert evidence.metadata["equivalence_preflight"]["baseline"][
+        "direct_snapshot_supported"
+    ] is False
+    stored_candidate = service.sessions.get_candidate(candidate_id)
+    assert stored_candidate.state == "inconclusive"
+    assert stored_candidate.failure_code == "proof_contract_required"
+
+    replay = await service.benchmark_candidate(
+        session_id,
+        candidate_id,
+        "appdb",
+        baseline,
+        candidate_sql,
+        phase="screening",
+        prove_equivalence=False,
+        idempotency_key="volatile-performance-only",
+    )
+
+    assert replay["classification"] == "proof_contract_required"
+    assert replay["performance_classification"] == "promising"
+    assert replay["durable_state"] == "inconclusive"
+    assert replay["evidence_id"] == result["evidence_id"]
+    assert replay["recovered_from_durable_evidence"] is True
+    assert len(_plans.calls) == 6
+
+
+@pytest.mark.asyncio
+async def test_combined_candidate_requires_and_persists_a_proven_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_sql = "SELECT id FROM dbo.Items AS candidate"
+    service, store, _plans, _executor = _service()
+    session_id, parent_id = _start(service, candidate=parent_sql)
+
+    await service.benchmark_candidate(
+        session_id,
+        parent_id,
+        "appdb",
+        "SELECT id FROM dbo.Items",
+        parent_sql,
+        phase="screening",
+        prove_equivalence=False,
+    )
+    finalist = await service.benchmark_candidate(
+        session_id,
+        parent_id,
+        "appdb",
+        "SELECT id FROM dbo.Items",
+        parent_sql,
+        phase="finalist",
+    )
+    assert finalist["classification"] == "improved"
+
+    child = service.add_candidate(
+        session_id,
+        parent_sql,
+        strategy="combined",
+        artifact_ref=f"candidate:{parent_id}",
+        idempotency_key="combined-child",
+    )
+
+    assert child["metadata"]["lineage"]["parent_candidate_id"] == parent_id
+    assert child["metadata"]["lineage"]["parent_evidence_id"] == finalist[
+        "evidence_id"
+    ]
+    assert store.get_session(session_id).status == "finalist_validation"
+
+    monkeypatch.setattr(
+        service.sessions,
+        "get_candidate",
+        Mock(side_effect=AssertionError("parent state must not be revalidated")),
+    )
+    replay = service.add_candidate(
+        session_id,
+        parent_sql,
+        strategy="combined",
+        artifact_ref=f"candidate:{parent_id}",
+        idempotency_key="combined-child",
+    )
+
+    assert replay == child
 
 
 @pytest.mark.asyncio
@@ -1291,7 +1460,7 @@ async def test_parameterized_result_comparison_requires_a_typed_case() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("fail_at_statement", "expected_executions"),
-    [(0, 0), (2, 1), (3, 2)],
+    [(0, 0), (1, 0), (2, 1), (3, 2)],
 )
 async def test_snapshot_failure_reports_exact_hook_dispatch_count(
     fail_at_statement: int,
@@ -1307,6 +1476,9 @@ async def test_snapshot_failure_reports_exact_hook_dispatch_count(
     )
 
     assert result["status"] == "inconclusive"
+    assert result["same_snapshot"] is False
+    assert result["snapshot_isolation_verified"] is False
+    assert result["proven_for_parameter_case"] is False
     assert result["executions"] == expected_executions
     assert result["execution_count_is_conservative"] is False
 
@@ -1525,6 +1697,32 @@ async def test_nested_unavailable_or_truncated_evidence_is_partial() -> None:
 
 
 @pytest.mark.asyncio
+async def test_query_store_status_object_is_not_hashed_as_actionable_status() -> None:
+    service, _store, _plans, _executor = _service()
+    case = service.start_case("appdb", "SELECT id FROM dbo.Items")
+
+    async def query_store_status() -> dict[str, Any]:
+        return {
+            "enabled": True,
+            "status": {
+                "actual_state_desc": "READ_WRITE",
+                "desired_state_desc": "READ_WRITE",
+                "readonly_reason": 0,
+            },
+        }
+
+    result = await service.collect_case_evidence(
+        case.case_id,
+        "appdb",
+        "SELECT id FROM dbo.Items",
+        {"query_store": query_store_status},
+        window_minutes=15,
+    )
+
+    assert result["outcome"] == "healthy"
+
+
+@pytest.mark.asyncio
 async def test_active_parameterized_evidence_uses_the_typed_execution_contract() -> None:
     bound_cases: list[tuple[str, Any]] = []
     binder = _typed_binder(bound_cases)
@@ -1640,6 +1838,45 @@ def test_classification_uses_the_selected_objective() -> None:
 
     assert elapsed == "improved"
     assert cpu == "regressed"
+
+
+def test_classification_requires_runtime_snapshot_attestation_when_requested() -> None:
+    parameter_results = [
+        {
+            "baseline": {
+                "elapsed_ms": 100.0,
+                "noise_ratio": 0.0,
+                "sample_count": 3,
+                "metric_sources": {"elapsed_ms": ["client_wall_clock"]},
+            },
+            "candidate": {
+                "elapsed_ms": 50.0,
+                "noise_ratio": 0.0,
+                "sample_count": 3,
+                "metric_sources": {"elapsed_ms": ["client_wall_clock"]},
+            },
+        }
+    ]
+
+    missing, _ = classify_benchmark(
+        parameter_results,
+        [{"status": "match", "same_snapshot": True}],
+        require_snapshot_attestation=True,
+    )
+    verified, _ = classify_benchmark(
+        parameter_results,
+        [
+            {
+                "status": "match",
+                "same_snapshot": True,
+                "snapshot_isolation_verified": True,
+            }
+        ],
+        require_snapshot_attestation=True,
+    )
+
+    assert missing == "inconclusive"
+    assert verified == "improved"
 
 
 def test_classification_rejects_missing_or_mixed_metric_provenance() -> None:

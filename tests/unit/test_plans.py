@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from azure_sql_mcp.artifacts import ExplainPlanArtifact
 from azure_sql_mcp.connection import ProfiledExecution
 from azure_sql_mcp.connection import QueryResult
 from azure_sql_mcp.param_binding import ParameterExecutionContract
@@ -128,6 +129,60 @@ DETAILED_SHOWPLAN = """\
 </ShowPlanXML>
 """
 
+STATEMENT_METRICS_SHOWPLAN = """\
+<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">
+  <BatchSequence><Batch><Statements>
+    <StmtSimple StatementText="DECLARE @CustomerId int" StatementType="DECLARE">
+      <QueryTimeStats CpuTime="1" ElapsedTime="2" />
+    </StmtSimple>
+    <StmtSimple StatementText="SET @CustomerId = 42" StatementType="SET">
+      <QueryTimeStats CpuTime="2" ElapsedTime="3" />
+    </StmtSimple>
+    <StmtSimple StatementText="SELECT * FROM dbo.Orders" StatementType="SELECT">
+      <QueryPlan CompileTime="9" CompileCPU="7" CompileMemory="1024">
+        <QueryTimeStats CpuTime="8" ElapsedTime="11" />
+        <RelOp PhysicalOp="Index Scan" LogicalOp="Index Scan">
+          <RunTimeInformation>
+            <RunTimeCountersPerThread ActualRows="34" ActualExecutions="1" />
+          </RunTimeInformation>
+        </RelOp>
+      </QueryPlan>
+    </StmtSimple>
+  </Statements></Batch></BatchSequence>
+</ShowPlanXML>
+"""
+
+MULTI_SELECT_SHOWPLAN = """\
+<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">
+  <BatchSequence><Batch><Statements>
+    <StmtSimple StatementText="SELECT 1" StatementType="SELECT">
+      <QueryPlan><QueryTimeStats CpuTime="8" ElapsedTime="11" />
+        <RelOp PhysicalOp="Constant Scan" LogicalOp="Constant Scan">
+          <RunTimeInformation><RunTimeCountersPerThread ActualRows="1" /></RunTimeInformation>
+        </RelOp>
+      </QueryPlan>
+    </StmtSimple>
+    <StmtSimple StatementText="SELECT 2" StatementType="SELECT">
+      <QueryPlan><QueryTimeStats CpuTime="3" ElapsedTime="4" />
+        <RelOp PhysicalOp="Constant Scan" LogicalOp="Constant Scan">
+          <RunTimeInformation><RunTimeCountersPerThread ActualRows="1" /></RunTimeInformation>
+        </RelOp>
+      </QueryPlan>
+    </StmtSimple>
+  </Statements></Batch></BatchSequence>
+</ShowPlanXML>
+"""
+
+MALFORMED_COMPILE_SHOWPLAN = """\
+<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">
+  <BatchSequence><Batch><Statements>
+    <StmtSimple StatementType="SELECT">
+      <QueryPlan CompileTime="9" CompileCPU="not-a-number" CompileMemory="1024" />
+    </StmtSimple>
+  </Statements></Batch></BatchSequence>
+</ShowPlanXML>
+"""
+
 
 class FakeExecutor:
     def __init__(self, *, can_create_index=True, fail_create=False, row_limit=200):
@@ -230,6 +285,104 @@ def test_summarize_showplan_xml_extracts_actual_plan_evidence():
     assert summary["parameters"][0]["compiled_value"] == "(1)"
     assert summary["parameters"][0]["runtime_value"] == "(42)"
     assert summary["warnings"][0]["spills_to_tempdb"][0]["SpillLevel"] == "1"
+
+
+def test_actual_metrics_select_single_user_select_around_declare_and_set() -> None:
+    service = PlansService(executor=None, validator=SafeSqlValidator())  # type: ignore[arg-type]
+    summary = service.summarize_showplan_xml(STATEMENT_METRICS_SHOWPLAN)
+
+    assert summary["actual_metrics"]["user_select_count"] == 1
+    assert summary["actual_metrics"]["actual_cpu_ms"] == 8
+    assert summary["actual_metrics"]["actual_elapsed_ms"] == 11
+    assert summary["actual_metrics"]["actual_rows"] == 34
+    assert summary["actual_metrics"]["query_metric_source"] == (
+        "showplan_query_time_stats"
+    )
+    assert summary["compile_metrics"] == {
+        "query_plan_count": 1,
+        "compile_ms": 9,
+        "compile_cpu_ms": 7,
+        "compile_memory_kb": 1024,
+        "metric_provenance": "showplan_query_plan_compile_attributes",
+    }
+
+
+def test_actual_metrics_keep_multiple_selects_ambiguous() -> None:
+    service = PlansService(executor=None, validator=SafeSqlValidator())  # type: ignore[arg-type]
+    summary = service.summarize_showplan_xml(MULTI_SELECT_SHOWPLAN)
+
+    assert summary["actual_metrics"]["user_select_count"] == 2
+    assert summary["actual_metrics"]["actual_cpu_ms"] is None
+    assert summary["actual_metrics"]["actual_elapsed_ms"] is None
+    assert summary["actual_metrics"]["actual_rows"] is None
+    assert summary["actual_metrics"]["query_metric_source"] == (
+        "unavailable_for_multi_select_plan"
+    )
+
+
+def test_explain_plan_artifact_exposes_separate_compile_and_execution_metrics() -> None:
+    service = PlansService(executor=None, validator=SafeSqlValidator())  # type: ignore[arg-type]
+    summary = service.summarize_showplan_xml(STATEMENT_METRICS_SHOWPLAN)
+    artifact = ExplainPlanArtifact(
+        database_name="appdb",
+        analyze=True,
+        summary=summary,
+        raw_xml=STATEMENT_METRICS_SHOWPLAN,
+    )
+
+    payload = artifact.as_dict(include_raw_xml=False)
+
+    assert payload["plan_kind"] == "actual"
+    assert payload["query_executed"] is True
+    assert payload["compile_ms"] == 9
+    assert payload["execution_ms"] == 11
+    assert payload["metric_provenance"] == {
+        "compile_ms": "showplan_query_plan_compile_attributes",
+        "execution_ms": "showplan_query_time_stats",
+    }
+
+    estimated = ExplainPlanArtifact(
+        database_name="appdb",
+        analyze=False,
+        summary=summary,
+        raw_xml=STATEMENT_METRICS_SHOWPLAN,
+    )
+    assert estimated.plan_kind == "estimated"
+    assert estimated.query_executed is False
+    assert estimated.compile_ms == 9
+    assert estimated.execution_ms is None
+    assert estimated.metric_provenance["execution_ms"] == (
+        "not_applicable_estimated_plan"
+    )
+
+
+def test_plan_truth_fields_cannot_contradict_analyze() -> None:
+    with pytest.raises(ValueError, match="plan_kind must agree"):
+        ExplainPlanArtifact(
+            database_name="appdb",
+            analyze=False,
+            summary={},
+            raw_xml="<ShowPlanXML />",
+            plan_kind="actual",
+        )
+
+    with pytest.raises(ValueError, match="query_executed must agree"):
+        ExplainPlanArtifact(
+            database_name="appdb",
+            analyze=True,
+            summary={},
+            raw_xml="<ShowPlanXML />",
+            query_executed=False,
+        )
+
+
+def test_compile_metrics_ignore_malformed_attributes_without_raising() -> None:
+    service = PlansService(executor=None, validator=SafeSqlValidator())  # type: ignore[arg-type]
+    summary = service.summarize_showplan_xml(MALFORMED_COMPILE_SHOWPLAN)
+
+    assert summary["compile_metrics"]["compile_ms"] == 9
+    assert summary["compile_metrics"]["compile_cpu_ms"] is None
+    assert summary["compile_metrics"]["compile_memory_kb"] == 1024
 
 
 def test_summarize_showplan_xml_extracts_actionable_operator_diagnostics() -> None:

@@ -49,6 +49,26 @@ def test_load_server_config_from_environment(monkeypatch):
     assert config.persist_view_sql_state is False
 
 
+def test_sanitized_config_fingerprint_excludes_credential_values(
+    server_config_factory,
+) -> None:
+    def test_auth_values(suffix: str) -> dict[str, str]:
+        return {
+            "user" + "name": f"test-user-{suffix}",
+            "pass" + "word": f"test-password-{suffix}",
+            "tenant" + "_id": f"test-tenant-{suffix}",
+            "client" + "_id": f"test-client-{suffix}",
+            "client" + "_secret": f"test-client-secret-{suffix}",
+            "mcp_bearer" + "_token": f"test-token-{suffix}",
+        }
+
+    first = server_config_factory(**test_auth_values("a"))
+    second = server_config_factory(**test_auth_values("b"))
+
+    assert first.sanitized_config_fingerprint() == second.sanitized_config_fingerprint()
+    assert len(first.sanitized_config_fingerprint()) == 64
+
+
 def test_view_sql_state_persistence_requires_explicit_opt_in(monkeypatch) -> None:
     monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
     monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "appdb")
@@ -320,6 +340,28 @@ def test_named_profiles_are_exact_allowlists(
     for tool_name in TOOL_GROUPS:
         assert config.is_tool_enabled(tool_name) is (tool_name in allowed)
     assert config.is_tool_enabled("future_unclassified_tool") is False
+
+
+@pytest.mark.parametrize("profile", list(McpProfile))
+def test_runtime_status_is_available_in_every_named_profile(monkeypatch, profile: McpProfile) -> None:
+    monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
+    monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "appdb")
+    monkeypatch.setenv("AZURE_SQL_ALLOWED_DATABASES", "appdb")
+
+    args = ["--azure-sql-profile", profile.value, "--azure-sql-tool-groups", "performance"]
+    if profile in {McpProfile.SANDBOX, McpProfile.ENFORCER_APPLY}:
+        args.extend(
+            [
+                "--azure-sql-access-mode",
+                "unrestricted",
+                "--azure-sql-write-policy",
+                "apply",
+            ]
+        )
+
+    config = load_server_config(args)
+
+    assert config.is_tool_enabled("check_runtime_status") is True
 
 
 @pytest.mark.parametrize(

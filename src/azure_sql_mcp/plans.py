@@ -64,6 +64,8 @@ class PlansService:
             analyze=analyze,
             summary=summary,
             raw_xml=raw_xml,
+            plan_kind="actual" if analyze else "estimated",
+            query_executed=analyze,
         )
 
     async def profile_query(
@@ -127,6 +129,8 @@ class PlansService:
             analyze=False,
             summary=self.summarize_showplan_xml(raw_xml),
             raw_xml=raw_xml,
+            plan_kind="estimated",
+            query_executed=False,
         )
 
     async def _profile_execution(
@@ -192,6 +196,8 @@ class PlansService:
                 analyze=True,
                 summary=summary,
                 raw_xml=raw_xml,
+                plan_kind="actual",
+                query_executed=True,
             ),
             result_sets=user_results,
             elapsed_wall_ms=execution.elapsed_wall_ms,
@@ -318,6 +324,7 @@ class PlansService:
             "spills": spills,
             "implicit_conversions": implicit_conversions,
             "actual_metrics": self._extract_actual_metrics(root),
+            "compile_metrics": self._extract_compile_metrics(root),
             "memory_grants": self._extract_memory_grants(root),
             "missing_indexes": self._extract_missing_indexes(root),
             "parameters": self._extract_parameters(root),
@@ -598,7 +605,15 @@ class PlansService:
             root.findall(".//sp:StmtSimple", SHOWPLAN_NAMESPACE),
             start=1,
         ):
-            query_time = statement.find("sp:QueryTimeStats", SHOWPLAN_NAMESPACE)
+            query_time = statement.find(
+                "sp:QueryPlan/sp:QueryTimeStats",
+                SHOWPLAN_NAMESPACE,
+            )
+            if query_time is None:
+                query_time = statement.find(
+                    "sp:QueryTimeStats",
+                    SHOWPLAN_NAMESPACE,
+                )
             if query_time is not None:
                 statement_metrics.append(
                     {
@@ -640,15 +655,43 @@ class PlansService:
                 }
             )
 
-        single_statement = (
-            statement_metrics[0] if len(statement_metrics) == 1 else None
+        user_select_ordinals = {
+            ordinal
+            for ordinal, statement in enumerate(
+                root.findall(".//sp:StmtSimple", SHOWPLAN_NAMESPACE),
+                start=1,
+            )
+            if statement.attrib.get("StatementType", "").casefold() == "select"
+        }
+        single_user_select = len(user_select_ordinals) == 1
+        single_statement = next(
+            (
+                metric
+                for metric in statement_metrics
+                if single_user_select
+                and metric["statement_ordinal"] in user_select_ordinals
+            ),
+            None,
         )
-        single_root = (
-            root_operator_metrics[0] if len(root_operator_metrics) == 1 else None
+        single_root = next(
+            (
+                metric
+                for metric in root_operator_metrics
+                if single_user_select
+                and metric["statement_ordinal"] in user_select_ordinals
+            ),
+            None,
         )
+        if len(user_select_ordinals) > 1:
+            query_metric_source = "unavailable_for_multi_select_plan"
+        elif single_statement is not None:
+            query_metric_source = "showplan_query_time_stats"
+        else:
+            query_metric_source = "unavailable_for_single_select_plan"
         return {
             "runtime_counter_count": len(all_counters),
             "statement_metric_count": len(statement_metrics),
+            "user_select_count": len(user_select_ordinals),
             "statement_metrics": statement_metrics,
             "root_operator_metrics": root_operator_metrics,
             "actual_cpu_ms": single_statement.get("cpu_ms")
@@ -663,10 +706,30 @@ class PlansService:
             else None,
             "actual_logical_reads": None,
             "actual_physical_reads": None,
-            "query_metric_source": "showplan_query_time_stats"
-            if single_statement
-            else "unavailable_for_multi_statement_plan",
+            "query_metric_source": query_metric_source,
             "read_metric_source": "not_available_as_reliable_query_total",
+        }
+
+    def _extract_compile_metrics(self, root: ET.Element) -> dict[str, Any]:
+        """Extract compile metrics without treating them as execution metrics."""
+
+        query_plans = root.findall(".//sp:QueryPlan", SHOWPLAN_NAMESPACE)
+
+        def total(attribute: str) -> int | None:
+            values = [
+                self._optional_int(query_plan.attrib.get(attribute))
+                for query_plan in query_plans
+            ]
+            if not values or any(value is None for value in values):
+                return None
+            return sum(value for value in values if value is not None)
+
+        return {
+            "query_plan_count": len(query_plans),
+            "compile_ms": total("CompileTime"),
+            "compile_cpu_ms": total("CompileCPU"),
+            "compile_memory_kb": total("CompileMemory"),
+            "metric_provenance": "showplan_query_plan_compile_attributes",
         }
 
     def _extract_memory_grants(self, root: ET.Element) -> list[dict[str, Any]]:

@@ -4,9 +4,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from azure_sql_mcp.performance_contracts import PerformanceCaseV1
+from azure_sql_mcp.performance_contracts import EvidenceEnvelopeV1, PerformanceCaseV1
 from azure_sql_mcp.performance_store import IdempotencyConflictError, PerformanceStore
 from azure_sql_mcp.tuning_sessions import (
+    InvalidTransitionError,
     TuningBudgetExceeded,
     TuningSessionStateMachine,
 )
@@ -119,6 +120,97 @@ def test_candidate_and_result_operations_are_idempotent(tmp_path) -> None:
         )
         assert replay_result == first_result
         assert machine.get_candidate(first.candidate_id).screen_runs == 1
+    finally:
+        store.close()
+
+
+def test_only_explicit_lineage_work_can_add_a_candidate_during_finalist_validation(
+    tmp_path,
+) -> None:
+    store, machine, case = _new_machine(tmp_path)
+    try:
+        session = machine.create_session(case)
+        parent = machine.add_candidate(
+            session.session_id,
+            strategy="predicate",
+            rewrite_fingerprint="rewrite-hash",
+        )
+        machine.start_screening(session.session_id)
+        machine.mark_candidate_finalist(session.session_id, parent.candidate_id)
+        evidence = store.create_evidence(
+            EvidenceEnvelopeV1(
+                evidence_id="evidence-parent",
+                kind="tuning_finalist",
+                observed_execution_count=2,
+                metrics={"classification": "improved"},
+                metadata={
+                    "session_id": session.session_id,
+                    "candidate_id": parent.candidate_id,
+                    "phase": "finalist",
+                    "proof_scope": "direct_snapshot",
+                    "equivalence": [
+                        {
+                            "status": "match",
+                            "proven_for_parameter_case": True,
+                            "same_snapshot": True,
+                            "snapshot_isolation_verified": True,
+                        }
+                    ],
+                },
+            )
+        )
+        _session, parent = machine.record_candidate_result(
+            session.session_id,
+            parent.candidate_id,
+            state="improved",
+            finalist_runs=1,
+            executions=1,
+            evidence_ids=(evidence.evidence_id,),
+        )
+
+        with pytest.raises(InvalidTransitionError, match="lineage-backed combined"):
+            machine.add_candidate(
+                session.session_id,
+                strategy="combined",
+                rewrite_fingerprint="rewrite-hash",
+            )
+
+        with pytest.raises(InvalidTransitionError, match="lineage-backed combined"):
+            machine.add_candidate(
+                session.session_id,
+                strategy="predicate",
+                rewrite_fingerprint="rewrite-hash",
+            )
+
+        with pytest.raises(InvalidTransitionError, match="lineage-backed combined"):
+            machine.add_candidate(
+                session.session_id,
+                strategy="combined",
+                rewrite_fingerprint="rewrite-hash",
+                rewrite_artifact_ref=f"candidate:{parent.candidate_id}",
+            )
+
+        child = machine.add_candidate(
+            session.session_id,
+            strategy="combined",
+            rewrite_fingerprint="rewrite-hash",
+            rewrite_artifact_ref=f"candidate:{parent.candidate_id}",
+            metadata={
+                "lineage": {
+                    "lineage_contract_version": 1,
+                    "parent_candidate_id": parent.candidate_id,
+                    "parent_evidence_id": evidence.evidence_id,
+                    "parent_rewrite_fingerprint": "rewrite-hash",
+                    "parent_equivalence": "proven",
+                    "marginal_experiment": (
+                        "rewrite_without_index_with_index_after_cleanup"
+                    ),
+                }
+            },
+        )
+
+        assert child.strategy == "combined"
+        assert child.session_id == session.session_id
     finally:
         store.close()
 

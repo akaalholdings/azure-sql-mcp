@@ -328,6 +328,129 @@ async def test_profiled_execution_runs_one_user_query_without_retry(
     pool.discard.assert_not_awaited()
 
 
+def test_profiled_execution_captures_messages_before_each_nextset(
+    sample_server_config,
+) -> None:
+    setup_cursor = MagicMock()
+    query_cursor = MagicMock()
+    query_cursor.description = [("value",)]
+    query_cursor.fetchall.side_effect = [[(1,)], [(2,)]]
+    first_message = (0, "Table 'Orders'. logical reads 12.")
+    second_message = (0, "Table 'Worktable'. logical reads 3.")
+    query_cursor.messages = [first_message]
+    nextset_index = 0
+
+    def advance_result_set() -> bool:
+        nonlocal nextset_index
+        nextset_index += 1
+        if nextset_index == 1:
+            query_cursor.messages.append(second_message)
+            return True
+        query_cursor.messages = []
+        return False
+
+    query_cursor.nextset.side_effect = advance_result_set
+    teardown_cursor = MagicMock()
+    connection = MagicMock()
+    connection.cursor.side_effect = [setup_cursor, query_cursor, teardown_cursor]
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), MagicMock())
+
+    result = executor._execute_profiled_with_connection(
+        connection,
+        "appdb",
+        "SELECT 1",
+        (),
+        max_rows=None,
+    )
+
+    assert result.statistics_io_messages == (first_message, second_message)
+    assert result.metric_provenance == (
+        "client_wall_clock_statistics_xml_and_statistics_io"
+    )
+
+
+def test_profiled_execution_preserves_repeated_messages_after_buffer_reset(
+    sample_server_config,
+) -> None:
+    setup_cursor = MagicMock()
+    query_cursor = MagicMock()
+    query_cursor.description = [("value",)]
+    query_cursor.fetchall.side_effect = [[(1,)], [(2,)]]
+    repeated_message = (0, "Table 'Orders'. logical reads 12.")
+    additional_message = (0, "Table 'Worktable'. logical reads 3.")
+    query_cursor.messages = [repeated_message]
+    nextset_index = 0
+
+    def advance_result_set() -> bool:
+        nonlocal nextset_index
+        nextset_index += 1
+        if nextset_index == 1:
+            query_cursor.messages.extend([repeated_message, additional_message])
+            return True
+        query_cursor.messages.clear()
+        return False
+
+    query_cursor.nextset.side_effect = advance_result_set
+    teardown_cursor = MagicMock()
+    connection = MagicMock()
+    connection.cursor.side_effect = [setup_cursor, query_cursor, teardown_cursor]
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), MagicMock())
+
+    result = executor._execute_profiled_with_connection(
+        connection,
+        "appdb",
+        "SELECT 1",
+        (),
+        max_rows=None,
+    )
+
+    assert result.statistics_io_messages == (
+        repeated_message,
+        repeated_message,
+        additional_message,
+    )
+
+
+def test_profiled_execution_preserves_identical_immutable_messages_across_result_sets(
+    sample_server_config,
+) -> None:
+    setup_cursor = MagicMock()
+    query_cursor = MagicMock()
+    query_cursor.description = [("value",)]
+    query_cursor.fetchall.side_effect = [[(1,)], [(2,)]]
+    repeated_message = (0, "Table 'Orders'. logical reads 12.")
+    query_cursor.messages = (repeated_message,)
+    nextset_index = 0
+
+    def advance_result_set() -> bool:
+        nonlocal nextset_index
+        nextset_index += 1
+        if nextset_index == 1:
+            query_cursor.messages = tuple([repeated_message])
+            return True
+        query_cursor.messages = ()
+        return False
+
+    query_cursor.nextset.side_effect = advance_result_set
+    teardown_cursor = MagicMock()
+    connection = MagicMock()
+    connection.cursor.side_effect = [setup_cursor, query_cursor, teardown_cursor]
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), MagicMock())
+
+    result = executor._execute_profiled_with_connection(
+        connection,
+        "appdb",
+        "SELECT 1",
+        (),
+        max_rows=None,
+    )
+
+    assert result.statistics_io_messages == (
+        repeated_message,
+        repeated_message,
+    )
+
+
 @pytest.mark.asyncio
 async def test_profiled_execution_failure_is_not_automatically_retried(
     sample_server_config,
@@ -450,6 +573,44 @@ async def test_exact_session_hook_prevents_selected_statement_dispatch(
     cursors[1].execute.assert_not_called()
     pool.release.assert_not_awaited()
     pool.discard.assert_awaited_once_with("appdb", connection)
+
+
+def test_exact_session_stops_before_queries_when_snapshot_guard_fails(
+    sample_server_config,
+) -> None:
+    setup_cursor = MagicMock()
+    guard_cursor = MagicMock()
+    baseline_cursor = MagicMock()
+    candidate_cursor = MagicMock()
+    for cursor in (setup_cursor, guard_cursor, baseline_cursor, candidate_cursor):
+        cursor.description = None
+        cursor.nextset.return_value = False
+    guard_cursor.execute.side_effect = RuntimeError("snapshot guard failed")
+    connection = MagicMock()
+    connection.cursor.side_effect = [
+        setup_cursor,
+        guard_cursor,
+        baseline_cursor,
+        candidate_cursor,
+    ]
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), MagicMock())
+
+    with pytest.raises(RuntimeError, match="snapshot guard failed"):
+        executor._execute_session_with_connection(
+            connection,
+            "appdb",
+            [
+                "SET TRANSACTION ISOLATION LEVEL SNAPSHOT",
+                "BEGIN TRANSACTION; THROW 51000, 'guard', 1;",
+                "SELECT 1",
+                "SELECT 1",
+            ],
+            max_rows=2,
+        )
+
+    assert connection.cursor.call_count == 2
+    baseline_cursor.execute.assert_not_called()
+    candidate_cursor.execute.assert_not_called()
 
 
 def test_session_execution_binds_parameters_to_the_matching_statement(

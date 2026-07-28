@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
 from datetime import datetime
 from datetime import timedelta
@@ -9,6 +10,9 @@ from unittest.mock import AsyncMock
 from unittest.mock import Mock
 
 import pytest
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import CallToolRequest
+from mcp.types import CallToolRequestParams
 
 from azure_sql_mcp.artifacts import ExplainPlanArtifact
 from azure_sql_mcp.config import AccessMode
@@ -79,6 +83,7 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
     tools = app.mcp._tool_manager._tools
 
     assert set(tools) == {
+        "check_runtime_status",
         "list_databases",
         "check_capabilities",
         "list_schemas",
@@ -170,6 +175,88 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
     assert tuning_parameters["max_candidates"]["default"] == 10
     assert tuning_parameters["execution_limit"]["default"] == 80
     assert tuning_parameters["time_limit_minutes"]["default"] == 20
+
+
+@pytest.mark.asyncio
+async def test_registered_tool_arguments_are_strict_and_reject_unknown_fields(
+    app: AzureSqlMcpApplication,
+) -> None:
+    for tool in app.mcp._tool_manager.list_tools():
+        argument_model = tool.fn_metadata.arg_model
+        assert argument_model.model_config["extra"] == "forbid"
+        assert tool.parameters["additionalProperties"] is False
+        assert argument_model.model_json_schema()["additionalProperties"] is False
+
+    with pytest.raises(ToolError):
+        await app.mcp._tool_manager.call_tool(
+            "check_runtime_status",
+            {"unexpected": "value"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_mcp_handler_marks_tool_errors_as_is_error(
+    app: AzureSqlMcpApplication,
+) -> None:
+    handler = app.mcp._mcp_server.request_handlers[CallToolRequest]
+    response = await handler(
+        CallToolRequest(
+            params=CallToolRequestParams(
+                name="explain_query",
+                arguments={
+                    "sql": "SELECT 1",
+                    "analyze": False,
+                    "hypothetical_indexes": [
+                        {
+                            "schema": "dbo",
+                            "table": "Orders",
+                            "columns": ["CustomerId"],
+                        }
+                    ],
+                },
+            )
+        )
+    )
+
+    assert response.root.isError is True
+    assert "tool_error" in response.root.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_runtime_status_is_db_free_stable_and_sanitized() -> None:
+    test_auth_values = {
+        "user" + "name": "sa",
+        "pass" + "word": "test-password",
+        "client" + "_secret": "test-client-secret",
+        "mcp_bearer" + "_token": "test-token",
+    }
+    app = AzureSqlMcpApplication(
+        replace(
+            make_config(),
+            **test_auth_values,
+        )
+    )
+    first = await app.mcp._tool_manager.call_tool("check_runtime_status", {})
+    second = await app.mcp._tool_manager.call_tool("check_runtime_status", {})
+
+    assert first == second
+    assert first["startup_timestamp"] == app._startup_timestamp
+    assert first["package_version"] == "2.1.0"
+    assert first["profile"] is None
+    assert first["transport"] == "stdio"
+    assert first["tool_count"] == len(first["tool_names"])
+    assert first["tool_names"] == sorted(first["tool_names"])
+    assert first["contracts"] == {
+        "strict_arguments": True,
+        "mcp_errors": True,
+    }
+    assert first["strict_argument_models"] is True
+    assert first["mcp_tool_errors"] is True
+    assert len(first["runtime_fingerprint"]) == 64
+    assert len(first["tool_schema_fingerprint"]) == 64
+    assert len(first["sanitized_config_fingerprint"]) == 64
+    assert "server.database.windows.net" not in json.dumps(first)
+    assert "test-" not in json.dumps(first)
 
 
 def test_registers_resources_and_prompts(app: AzureSqlMcpApplication) -> None:
@@ -332,6 +419,7 @@ def test_diagnostic_tools_are_performance_group_and_available_restricted() -> No
     )
     tools = app.mcp._tool_manager._tools
 
+    assert "check_runtime_status" in tools
     for name in (
         "get_database_configuration",
         "get_storage_diagnostics",
@@ -398,10 +486,31 @@ async def test_run_tool_formats_errors_from_callback(app: AzureSqlMcpApplication
     async def boom(_: str) -> dict[str, str]:
         raise RuntimeError("boom")
 
-    response = await app._run_tool("sample_tool", None, boom)
+    with pytest.raises(ToolError) as error:
+        await app._run_tool("sample_tool", None, boom)
 
-    assert response["code"] == "tool_error"
-    assert response["message"] == "boom"
+    assert json.loads(str(error.value)) == {
+        "code": "tool_error",
+        "message": "boom",
+        "ok": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_tool_preserves_intentional_tool_error(
+    app: AzureSqlMcpApplication,
+) -> None:
+    async def reject(_: str) -> dict[str, str]:
+        app._raise_tool_error("preview_only", "Apply is disabled.")
+
+    with pytest.raises(ToolError) as error:
+        await app._run_tool("sample_tool", None, reject)
+
+    assert json.loads(str(error.value)) == {
+        "code": "preview_only",
+        "message": "Apply is disabled.",
+        "ok": False,
+    }
 
 
 @pytest.mark.asyncio
@@ -419,10 +528,12 @@ async def test_run_tool_logs_sanitized_errors(monkeypatch: pytest.MonkeyPatch, a
             "SERVER=tcp:prod.database.windows.net;DATABASE=appdb;UID=sa;PWD=secret!;"
         )
 
-    response = await app._run_tool("sample_tool", None, boom)
+    with pytest.raises(ToolError) as error:
+        await app._run_tool("sample_tool", None, boom)
 
-    assert response["code"] == "tool_error"
-    assert "secret!" not in response["message"]
+    error_payload = json.loads(str(error.value))
+    assert error_payload["code"] == "tool_error"
+    assert "secret!" not in error_payload["message"]
 
     extra = logged["extra"]
     assert isinstance(extra, dict)
@@ -450,10 +561,12 @@ async def test_run_database_pair_tool_logs_sanitized_errors(
             "SERVER=tcp:prod.database.windows.net;DATABASE=appdb;UID=sa;PWD=secret!;"
         )
 
-    response = await app._run_database_pair_tool("sample_pair_tool", "appdb", "appdb", boom)
+    with pytest.raises(ToolError) as error:
+        await app._run_database_pair_tool("sample_pair_tool", "appdb", "appdb", boom)
 
-    assert response["code"] == "tool_error"
-    assert "secret!" not in response["message"]
+    error_payload = json.loads(str(error.value))
+    assert error_payload["code"] == "tool_error"
+    assert "secret!" not in error_payload["message"]
 
     extra = logged["extra"]
     assert isinstance(extra, dict)
@@ -461,6 +574,28 @@ async def test_run_database_pair_tool_logs_sanitized_errors(
     assert "secret!" not in str(extra["error"])
     assert "UID=sa" not in str(extra["error"])
     assert "prod.database.windows.net" not in str(extra["error"])
+
+
+@pytest.mark.asyncio
+async def test_run_database_pair_tool_preserves_intentional_tool_error(
+    app: AzureSqlMcpApplication,
+) -> None:
+    async def reject(_: str, __: str) -> dict[str, str]:
+        app._raise_tool_error("preview_only", "Apply is disabled.")
+
+    with pytest.raises(ToolError) as error:
+        await app._run_database_pair_tool(
+            "sample_pair_tool",
+            "appdb",
+            "appdb",
+            reject,
+        )
+
+    assert json.loads(str(error.value)) == {
+        "code": "preview_only",
+        "message": "Apply is disabled.",
+        "ok": False,
+    }
 
 
 def test_truncate_rows_enforces_row_limit(app: AzureSqlMcpApplication) -> None:
@@ -486,9 +621,11 @@ def test_truncate_rows_enforces_row_limit(app: AzureSqlMcpApplication) -> None:
     assert payload["rows"] == [{"id": 1}, {"id": 2}]
 
 
-def test_format_error_returns_serialized_error_payload(app: AzureSqlMcpApplication) -> None:
-    response = app._format_error("bad_request", "invalid input")
+def test_raise_tool_error_serializes_error_payload(app: AzureSqlMcpApplication) -> None:
+    with pytest.raises(ToolError) as raised:
+        app._raise_tool_error("bad_request", "invalid input")
 
+    response = json.loads(str(raised.value))
     assert response["code"] == "bad_request"
     assert response["message"] == "invalid input"
 
@@ -537,10 +674,12 @@ async def test_run_tool_returns_timeout_error() -> None:
         await asyncio.sleep(0.05)
         return {"status": "ok"}
 
-    response = await app._run_tool("slow_tool", None, slow)
+    with pytest.raises(ToolError) as error:
+        await app._run_tool("slow_tool", None, slow)
 
-    assert response["code"] == "timeout"
-    assert "timed out after 0.01s" in response["message"]
+    error_payload = json.loads(str(error.value))
+    assert error_payload["code"] == "timeout"
+    assert "timed out after 0.01s" in error_payload["message"]
 
 
 @pytest.mark.asyncio
@@ -554,14 +693,31 @@ async def test_run_tool_bounds_workflow_timeout_by_persisted_deadline(
     deadline = (
         datetime.now(timezone.utc) + timedelta(seconds=0.01)
     ).isoformat()
-    response = await app._run_tool(
-        "benchmark_index_candidate",
-        "appdb",
-        slow,
-        deadline_provider=lambda: deadline,
-    )
+    with pytest.raises(ToolError) as error:
+        await app._run_tool(
+            "benchmark_index_candidate",
+            "appdb",
+            slow,
+            deadline_provider=lambda: deadline,
+        )
 
-    assert response["code"] == "timeout"
+    assert json.loads(str(error.value))["code"] == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_run_database_pair_tool_returns_mcp_timeout_error() -> None:
+    app = AzureSqlMcpApplication(make_config(tool_timeout_seconds=0.01))
+
+    async def slow(_: str, __: str) -> dict[str, str]:
+        await asyncio.sleep(0.05)
+        return {"status": "ok"}
+
+    with pytest.raises(ToolError) as error:
+        await app._run_database_pair_tool("slow_pair_tool", "appdb", "appdb", slow)
+
+    error_payload = json.loads(str(error.value))
+    assert error_payload["code"] == "timeout"
+    assert "timed out after 0.01s" in error_payload["message"]
 
 
 @pytest.mark.asyncio
@@ -821,6 +977,10 @@ async def test_benchmark_query_rewrite_reports_sample_equivalence(app: AzureSqlM
     assert payload["equivalence"][0]["status"] == "match"
     assert payload["winning_sql"] == "SELECT id FROM dbo.Orders"
     assert payload["performance_case_id"] == "case-b1"
+    assert (
+        app.performance_workflows.add_candidate.call_args.kwargs["strategy"]
+        == "predicate"
+    )
 
 
 @pytest.mark.asyncio

@@ -451,10 +451,11 @@ async def test_mcp_stdio_end_to_end(
                     },
                 )
                 if hypothetical.isError:
-                    pytest.fail("explain_query returned an MCP error for hypothetical indexes.")
+                    pytest.fail(
+                        "explain_query returned an MCP error for hypothetical indexes."
+                    )
                 hypothetical_payload = json.loads(hypothetical.content[0].text)
-                if hypothetical_payload.get("code") != "tool_error":
-                    assert hypothetical_payload["summary"]["statement_count"] >= 1
+                assert hypothetical_payload["summary"]["statement_count"] >= 1
 
             if capability_checks["actual_plan"]["available"]:
                 actual_plan = _tool_payload(

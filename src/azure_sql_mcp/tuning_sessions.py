@@ -11,6 +11,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping
 
+from .candidate_lineage import validate_combined_parent_request
 from .performance_contracts import (
     ALL_CANDIDATE_STATES,
     TERMINAL_CANDIDATE_STATES,
@@ -167,9 +168,55 @@ class TuningSessionStateMachine:
         rewrite_artifact_ref: str | None = None,
         candidate_id: str | None = None,
         metadata: Mapping[str, Any] | None = None,
+        request_fingerprint_metadata: Mapping[str, Any] | None = None,
         idempotency_key: str | None = None,
     ) -> TuningCandidateV1:
-        session = self._active_session(session_id, allowed={"created", "screening"})
+        fingerprint_metadata = (
+            metadata
+            if request_fingerprint_metadata is None
+            else request_fingerprint_metadata
+        )
+        replay = self.replay_candidate_creation(
+            session_id,
+            strategy=strategy,
+            rewrite_fingerprint=rewrite_fingerprint,
+            rewrite_artifact_ref=rewrite_artifact_ref,
+            metadata=fingerprint_metadata,
+            idempotency_key=idempotency_key,
+        )
+        if replay is not None:
+            return replay
+        session = self._active_session(
+            session_id,
+            allowed={"created", "screening", "finalist_validation"},
+        )
+        if session.status == "finalist_validation":
+            try:
+                if strategy != "combined":
+                    raise ValueError("Candidate strategy is not combined.")
+                parent_reference = str(rewrite_artifact_ref or "")
+                parent_id = parent_reference.removeprefix("candidate:")
+                parent = self.get_candidate(parent_id)
+                expected_lineage = validate_combined_parent_request(
+                    session_id=session_id,
+                    rewrite_fingerprint=rewrite_fingerprint or "",
+                    parent_reference=parent_reference,
+                    parent=parent,
+                    evidence=[
+                        self.store.get_evidence(evidence_id)
+                        for evidence_id in parent.evidence_ids
+                    ],
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise InvalidTransitionError(
+                    "Finalist-validation candidate creation requires a valid "
+                    "lineage-backed combined parent."
+                ) from exc
+            if dict((metadata or {}).get("lineage") or {}) != expected_lineage:
+                raise InvalidTransitionError(
+                    "Only a proven lineage-backed combined candidate may be "
+                    "created during finalist validation."
+                )
         self._check_deadline(session)
         candidate = TuningCandidateV1(
             candidate_id=candidate_id or new_id("candidate"),
@@ -185,7 +232,7 @@ class TuningSessionStateMachine:
             strategy=strategy,
             rewrite_fingerprint=rewrite_fingerprint,
             rewrite_artifact_ref=rewrite_artifact_ref,
-            metadata=metadata,
+            metadata=fingerprint_metadata,
             idempotency_key=idempotency_key,
             candidate_id=candidate.candidate_id,
         )

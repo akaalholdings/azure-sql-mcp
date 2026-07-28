@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 from dataclasses import dataclass
 from enum import Enum
@@ -43,6 +45,7 @@ class McpProfile(str, Enum):
 # Tool name → group mapping.  Tools not listed here are always registered.
 TOOL_GROUPS: dict[str, ToolGroup] = {
     # core: essential query & introspection (always in "all", registered by default)
+    "check_runtime_status": ToolGroup.CORE,
     "list_databases": ToolGroup.CORE,
     "check_capabilities": ToolGroup.CORE,
     "list_schemas": ToolGroup.CORE,
@@ -134,6 +137,7 @@ TOOL_GROUPS: dict[str, ToolGroup] = {
 PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
     McpProfile.TRIAGE: frozenset(
         {
+            "check_runtime_status",
             "list_databases",
             "check_capabilities",
             "start_performance_case",
@@ -176,6 +180,7 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
     ),
     McpProfile.OPTIMIZER: frozenset(
         {
+            "check_runtime_status",
             "list_databases",
             "check_capabilities",
             "list_schemas",
@@ -212,6 +217,7 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
     ),
     McpProfile.SANDBOX: frozenset(
         {
+            "check_runtime_status",
             "list_databases",
             "check_capabilities",
             "list_schemas",
@@ -252,6 +258,7 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
     ),
     McpProfile.ENFORCER_REVIEW: frozenset(
         {
+            "check_runtime_status",
             "list_databases",
             "check_capabilities",
             "start_performance_case",
@@ -277,6 +284,7 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
     ),
     McpProfile.ENFORCER_APPLY: frozenset(
         {
+            "check_runtime_status",
             "list_databases",
             "check_capabilities",
             "start_performance_case",
@@ -370,6 +378,8 @@ class ServerConfig:
 
     def is_tool_enabled(self, tool_name: str) -> bool:
         """Check whether a tool should be registered based on configured tool_groups."""
+        if tool_name == "check_runtime_status":
+            return True
         group = TOOL_GROUPS.get(tool_name)
         if self.profile is not None:
             if tool_name not in PROFILE_TOOL_ALLOWLISTS[self.profile]:
@@ -389,6 +399,63 @@ class ServerConfig:
         if ToolGroup.ALL in self.tool_groups:
             return True
         return group in self.tool_groups
+
+    def sanitized_config_fingerprint(self) -> str:
+        """Return a stable identity hash without embedding credential values."""
+
+        sanitized = {
+            "server": self.server,
+            "default_database": self.default_database,
+            "allowed_databases": self.allowed_databases,
+            "auth_mode": self.auth_mode.value,
+            "access_mode": self.access_mode.value,
+            "query_timeout_seconds": self.query_timeout_seconds,
+            "row_limit": self.row_limit,
+            "comparison_row_limit": self.comparison_row_limit,
+            "pool_size": self.pool_size,
+            "max_retries": self.max_retries,
+            "tool_timeout_seconds": self.tool_timeout_seconds,
+            "trust_server_certificate": self.trust_server_certificate,
+            "transport": {
+                "mode": self.transport.mode.value,
+                "host": self.transport.host,
+                "port": self.transport.port,
+            },
+            "tool_groups": sorted(group.value for group in self.tool_groups),
+            "log_format": self.log_format,
+            "log_level": self.log_level,
+            "profile": self.profile.value if self.profile is not None else None,
+            "write_policy": self.write_policy.value,
+            "audit_dir": self.audit_dir,
+            "audit_full_sql": self.audit_full_sql,
+            "remote_admin_enabled": self.remote_admin_enabled,
+            "plan_apply_kill_switch": self.plan_apply_kill_switch,
+            "persist_view_sql_state": self.persist_view_sql_state,
+            "database_policy_file": self.database_policy_file,
+            "performance_state_dir": self.performance_state_dir,
+            "legacy_state_server_binding_configured": (
+                self.legacy_state_server_binding is not None
+            ),
+            "database_policy_file_configured": self.database_policy_file is not None,
+            "performance_state_store": (
+                "memory" if self.performance_state_dir == ":memory:" else "durable"
+            ),
+            "credentials_configured": {
+                "username": self.username is not None,
+                "password": self.password is not None,
+                "tenant_id": self.tenant_id is not None,
+                "client_id": self.client_id is not None,
+                "client_secret": self.client_secret is not None,
+                "mcp_bearer_token": self.mcp_bearer_token is not None,
+            },
+        }
+        encoded = json.dumps(
+            sanitized,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
 
 def parse_csv(value: str | None) -> tuple[str, ...]:

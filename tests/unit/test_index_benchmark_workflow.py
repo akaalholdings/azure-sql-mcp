@@ -17,6 +17,7 @@ from azure_sql_mcp.database_policy import DatabasePolicySet
 from azure_sql_mcp.index_metadata import ExistingIndex
 from azure_sql_mcp.index_metadata import parse_candidate_key
 from azure_sql_mcp.index_optimizer import IndexCandidate
+from azure_sql_mcp.performance_contracts import EvidenceEnvelopeV1
 from azure_sql_mcp.plans import ProfiledPlanResult
 from azure_sql_mcp.performance_store import IdempotencyConflictError
 from azure_sql_mcp.performance_workflows import database_fingerprint
@@ -214,6 +215,65 @@ def _candidate(
     return session["session_id"], candidate["candidate_id"]
 
 
+def _combined_candidate(
+    app: AzureSqlMcpApplication,
+    *,
+    baseline_sql: str,
+    rewrite_sql: str,
+) -> tuple[str, str, str]:
+    case = app.performance_workflows.start_case("appdb", baseline_sql)
+    session = app.performance_workflows.start_session(case.case_id, "appdb")
+    session_id = session["session_id"]
+    parent = app.performance_workflows.add_candidate(
+        session_id,
+        rewrite_sql,
+        strategy="predicate",
+    )
+    parent_id = parent["candidate_id"]
+    app.tuning_sessions.start_screening(session_id)
+    app.tuning_sessions.mark_candidate_finalist(session_id, parent_id)
+    proof = app.performance_store.create_evidence(
+        EvidenceEnvelopeV1(
+            source="azure-sql-mcp",
+            kind="tuning_finalist",
+            query_fingerprint=case.query_fingerprint,
+            database_fingerprint=case.database_fingerprint,
+            observed_execution_count=12,
+            metrics={"classification": "improved"},
+            metadata={
+                "session_id": session_id,
+                "candidate_id": parent_id,
+                "phase": "finalist",
+                "proof_scope": "direct_snapshot",
+                "equivalence": [
+                    {
+                        "status": "match",
+                        "proven_for_parameter_case": True,
+                        "same_snapshot": True,
+                        "snapshot_isolation_verified": True,
+                    }
+                ],
+            },
+        )
+    )
+    app.tuning_sessions.record_candidate_result(
+        session_id,
+        parent_id,
+        state="improved",
+        finalist_runs=5,
+        parameter_cases=1,
+        executions=12,
+        evidence_ids=(proof.evidence_id,),
+    )
+    child = app.performance_workflows.add_candidate(
+        session_id,
+        rewrite_sql,
+        strategy="combined",
+        artifact_ref=f"candidate:{parent_id}",
+    )
+    return session_id, parent_id, child["candidate_id"]
+
+
 def _set_session_deadline(
     app: AzureSqlMcpApplication,
     session_id: str,
@@ -231,6 +291,235 @@ def _set_session_deadline(
         (json.dumps(payload, sort_keys=True), session_id),
     )
     app.performance_store._connection.commit()
+
+
+@pytest.mark.asyncio
+async def test_unproven_combined_parent_stops_before_index_ddl(
+    server_config_factory,
+) -> None:
+    app = _app(server_config_factory)
+    baseline_sql = "SELECT id FROM dbo.Items"
+    rewrite_sql = "SELECT id FROM dbo.Items AS candidate"
+    case = app.performance_workflows.start_case("appdb", baseline_sql)
+    session = app.performance_workflows.start_session(case.case_id, "appdb")
+    parent = app.performance_workflows.add_candidate(
+        session["session_id"],
+        rewrite_sql,
+        strategy="predicate",
+    )
+    child = app.tuning_sessions.add_candidate(
+        session["session_id"],
+        strategy="combined",
+        rewrite_fingerprint=parent["rewrite_fingerprint"],
+        rewrite_artifact_ref=f"candidate:{parent['candidate_id']}",
+    )
+    app._create_test_index = AsyncMock()  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match="improved finalist"):
+        await app._benchmark_index_candidate(
+            "appdb",
+            session["session_id"],
+            child.candidate_id,
+            rewrite_sql,
+            "dbo",
+            "Items",
+            ["id"],
+            None,
+            None,
+            False,
+            "finalist",
+            True,
+            True,
+            30,
+            "unproven-combined-parent",
+        )
+
+    app._create_test_index.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_proven_combined_candidate_runs_marginal_index_aba_with_lineage(
+    server_config_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _app(server_config_factory)
+    baseline_sql = "SELECT id FROM dbo.Items"
+    rewrite_sql = "SELECT id FROM dbo.Items AS candidate"
+    session_id, parent_id, child_id = _combined_candidate(
+        app,
+        baseline_sql=baseline_sql,
+        rewrite_sql=rewrite_sql,
+    )
+    app._create_test_index = AsyncMock(return_value={"status": "completed"})  # type: ignore[method-assign]
+    app._drop_test_index = AsyncMock(return_value={"status": "completed"})  # type: ignore[method-assign]
+    index_name, _ = _install_catalog(
+        monkeypatch,
+        key_columns=["id"],
+    )
+    app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[
+            *[_profile(100) for _ in range(5)],
+            *[_profile(50, index_name=index_name) for _ in range(5)],
+            *[_profile(100) for _ in range(5)],
+        ]
+    )
+
+    result = await app._benchmark_index_candidate(
+        "appdb",
+        session_id,
+        child_id,
+        rewrite_sql,
+        "dbo",
+        "Items",
+        ["id"],
+        None,
+        None,
+        False,
+        "finalist",
+        True,
+        True,
+        30,
+        "proven-combined-parent",
+    )
+
+    assert result["classification"] == "improved"
+    assert result["proof_scope"] == "aba_result_stability"
+    assert result["lineage"]["parent_candidate_id"] == parent_id
+    assert result["lineage"]["parent_equivalence"] == "proven"
+    stored = app.performance_store.get_candidate(child_id)
+    evidence = app.performance_store.get_evidence(stored.evidence_ids[-1])
+    assert evidence.metadata["lineage"]["parent_candidate_id"] == parent_id
+    assert evidence.metadata["proof_scope"] == "aba_result_stability"
+    assert result["equivalence"][0]["plan_used_expected_index"] is True
+    app._create_test_index.assert_awaited_once()
+    app._drop_test_index.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_volatile_index_screening_reports_performance_only(
+    server_config_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _app(server_config_factory)
+    sql = "SELECT TOP (1) id, NEWID() AS token FROM dbo.Items"
+    session_id, candidate_id = _candidate(app, sql)
+    app._create_test_index = AsyncMock(return_value={"status": "completed"})  # type: ignore[method-assign]
+    app._drop_test_index = AsyncMock(return_value={"status": "completed"})  # type: ignore[method-assign]
+    index_name, _ = _install_catalog(
+        monkeypatch,
+        key_columns=["id"],
+    )
+    app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[
+            *[_profile(100) for _ in range(3)],
+            *[
+                _profile(50, index_name=index_name, result_value=2)
+                for _ in range(3)
+            ],
+            *[_profile(100) for _ in range(3)],
+        ]
+    )
+
+    result = await app._benchmark_index_candidate(
+        "appdb",
+        session_id,
+        candidate_id,
+        sql,
+        "dbo",
+        "Items",
+        ["id"],
+        None,
+        None,
+        False,
+        "screening",
+        True,
+        True,
+        30,
+        "volatile-index-screening",
+    )
+
+    assert result["classification"] == "proof_contract_required"
+    assert result["durable_state"] == "inconclusive"
+    assert result["proof_scope"] == "performance_only"
+    assert result["equivalence"][0]["status"] == "mismatch"
+    assert result["equivalence_preflight"]["direct_snapshot_supported"] is False
+    assert (
+        app.performance_store.get_evidence(
+            result["evidence_id"]
+        ).metrics["performance_classification"]
+        == "promising"
+    )
+    stored_candidate = app.tuning_sessions.get_candidate(candidate_id)
+    assert stored_candidate.state == "inconclusive"
+    assert stored_candidate.failure_code == "proof_contract_required"
+    app._create_test_index.assert_awaited_once()
+    app._drop_test_index.assert_awaited_once()
+
+    replay = await app._benchmark_index_candidate(
+        "appdb",
+        session_id,
+        candidate_id,
+        sql,
+        "dbo",
+        "Items",
+        ["id"],
+        None,
+        None,
+        False,
+        "screening",
+        True,
+        True,
+        30,
+        "volatile-index-screening",
+    )
+
+    assert replay["classification"] == "proof_contract_required"
+    assert replay["performance_classification"] == "promising"
+    assert replay["durable_state"] == "inconclusive"
+    assert replay["evidence_id"] == result["evidence_id"]
+    assert replay["recovered_from_durable_evidence"] is True
+    assert app.plans.profile_query.await_count == 9
+    app._create_test_index.assert_awaited_once()
+    app._drop_test_index.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_volatile_index_finalist_still_runs_expired_lease_cleanup(
+    server_config_factory,
+) -> None:
+    app = _app(server_config_factory)
+    sql = "SELECT TOP (1) id, NEWID() AS token FROM dbo.Items"
+    session_id, candidate_id = _candidate(app, sql)
+    app._cleanup_expired_index_leases = AsyncMock(  # type: ignore[method-assign]
+        return_value={
+            "expired": 1,
+            "cleaned": 1,
+            "cleanup_required": 0,
+        }
+    )
+    app._create_test_index = AsyncMock()  # type: ignore[method-assign]
+
+    result = await app._benchmark_index_candidate(
+        "appdb",
+        session_id,
+        candidate_id,
+        sql,
+        "dbo",
+        "Items",
+        ["id"],
+        None,
+        None,
+        False,
+        "finalist",
+        True,
+        True,
+        30,
+        "volatile-index-finalist",
+    )
+
+    assert result["classification"] == "proof_contract_required"
+    app._cleanup_expired_index_leases.assert_awaited_once()
+    app._create_test_index.assert_not_awaited()
 
 
 @pytest.mark.asyncio
