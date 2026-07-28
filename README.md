@@ -185,7 +185,8 @@ Synthetic policy example:
 Rules:
 
 - Unknown databases are denied.
-- `allow_read` does not imply benchmark or write permission.
+- `allow_read` is required for schema/catalog tools and schema MCP resources;
+  it does not imply benchmark or write permission.
 - `max_benchmark_executions` is the hard ceiling for one benchmark request.
 - `max_tuning_candidates`, `max_tuning_session_executions`, and `max_tuning_session_minutes` cap the complete campaign. Set them explicitly when a reviewed deep search may run for hours.
 - Temporary indexes are rejected when the policy environment is `production`, `prod`, or `live`, even if another field is misconfigured.

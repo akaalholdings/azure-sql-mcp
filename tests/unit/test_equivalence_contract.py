@@ -5,6 +5,7 @@ import json
 import pytest
 
 from azure_sql_mcp.equivalence_contract import analyze_equivalence_preflight
+from azure_sql_mcp.equivalence_contract import has_outer_literal_top_zero
 from azure_sql_mcp.equivalence_preflight import EquivalencePreflightService
 
 
@@ -116,6 +117,37 @@ def test_nested_unordered_limit_is_detected_even_when_outer_query_is_ordered() -
 
     assert result["risk_codes"] == ["unordered_row_limit"]
     assert result["unordered_row_limit_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT TOP (0) id FROM dbo.Orders",
+        (
+            "WITH picked AS (SELECT TOP (1) id FROM dbo.Orders) "
+            "SELECT TOP 0 id FROM picked"
+        ),
+        "DECLARE @p int = 1; SELECT TOP (0) id FROM dbo.Orders WHERE id = @p",
+    ],
+)
+def test_outer_literal_top_zero_is_detected(sql: str) -> None:
+    assert has_outer_literal_top_zero(sql) is True
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT TOP (1) id FROM dbo.Orders",
+        "SELECT TOP (@row_count) id FROM dbo.Orders",
+        "SELECT id FROM (SELECT TOP (0) id FROM dbo.Orders) AS picked",
+        "SELECT 1; SELECT TOP (0) id FROM dbo.Orders",
+        "SET NOCOUNT ON; SELECT TOP (0) id FROM dbo.Orders",
+        "SELECT TOP (0.0) id FROM dbo.Orders",
+        "SELECT id FROM dbo.Orders",
+    ],
+)
+def test_nonliteral_or_nonouter_top_zero_is_not_detected(sql: str) -> None:
+    assert has_outer_literal_top_zero(sql) is False
 
 
 def test_nonrepeatable_table_sample_requires_a_proof_contract() -> None:

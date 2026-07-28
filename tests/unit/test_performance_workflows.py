@@ -24,6 +24,7 @@ from azure_sql_mcp.performance_contracts import PerformanceCaseV1
 from azure_sql_mcp.performance_store import IdempotencyConflictError
 from azure_sql_mcp.performance_store import PerformanceStore
 from azure_sql_mcp.performance_workflows import PerformanceWorkflowService
+from azure_sql_mcp.performance_workflows import aggregate_samples
 from azure_sql_mcp.performance_workflows import classify_benchmark
 from azure_sql_mcp.performance_workflows import compare_result_collections
 from azure_sql_mcp.performance_workflows import compare_result_sets
@@ -33,6 +34,7 @@ from azure_sql_mcp.plans import ProfiledPlanResult
 from azure_sql_mcp.query_identity import legacy_database_fingerprint
 from azure_sql_mcp.query_identity import legacy_query_fingerprint
 from azure_sql_mcp.safe_sql import SafeSqlValidator
+from azure_sql_mcp.tuning_sessions import InvalidTransitionError
 from azure_sql_mcp.tuning_sessions import TuningSessionStateMachine
 
 
@@ -170,9 +172,22 @@ class SnapshotExecutor:
         self,
         baseline_rows: list[dict[str, Any]] | None = None,
         candidate_rows: list[dict[str, Any]] | None = None,
+        *,
+        baseline_columns: tuple[str, ...] = ("id",),
+        candidate_columns: tuple[str, ...] = ("id",),
+        baseline_type_signatures: tuple[str, ...] = ("synthetic-int",),
+        candidate_type_signatures: tuple[str, ...] = ("synthetic-int",),
     ) -> None:
-        self.baseline_rows = baseline_rows or [{"id": 1}]
-        self.candidate_rows = candidate_rows or [{"id": 1}]
+        self.baseline_rows = (
+            [{"id": 1}] if baseline_rows is None else baseline_rows
+        )
+        self.candidate_rows = (
+            [{"id": 1}] if candidate_rows is None else candidate_rows
+        )
+        self.baseline_columns = baseline_columns
+        self.candidate_columns = candidate_columns
+        self.baseline_type_signatures = baseline_type_signatures
+        self.candidate_type_signatures = candidate_type_signatures
         self.sessions: list[list[str]] = []
         self.session_parameters: list[Any] = []
         self.candidate_dispatches = 0
@@ -196,16 +211,16 @@ class SnapshotExecutor:
             [],
             [
                 QueryResult(
-                    columns=("id",),
+                    columns=self.baseline_columns,
                     rows=self.baseline_rows,
-                    column_type_signatures=("synthetic-int",),
+                    column_type_signatures=self.baseline_type_signatures,
                 )
             ],
             [
                 QueryResult(
-                    columns=("id",),
+                    columns=self.candidate_columns,
                     rows=self.candidate_rows,
-                    column_type_signatures=("synthetic-int",),
+                    column_type_signatures=self.candidate_type_signatures,
                 )
             ],
             [],
@@ -392,6 +407,88 @@ def test_start_session_rejects_budget_above_policy_without_fallback() -> None:
     store.close()
 
 
+def test_get_session_reconciles_unattached_candidate_evidence_read_only() -> None:
+    service, store, _plans, _executor = _service()
+    session_id, candidate_id = _start(service)
+    session = store.get_session(session_id)
+    case = store.get_performance_case(session.performance_case_id)
+
+    def create_session_evidence(
+        *,
+        kind: str,
+        evidence_candidate_id: str,
+        evidence_database_fingerprint: str | None = None,
+    ) -> EvidenceEnvelopeV1:
+        return store.create_evidence(
+            EvidenceEnvelopeV1(
+                kind=kind,
+                query_fingerprint=case.query_fingerprint,
+                database_fingerprint=(
+                    evidence_database_fingerprint
+                    or case.database_fingerprint
+                ),
+                metrics={"classification": "neutral"},
+                metadata={
+                    "session_id": session_id,
+                    "candidate_id": evidence_candidate_id,
+                    "phase": "screening",
+                },
+            )
+        )
+
+    attached = create_session_evidence(
+        kind="tuning_screening",
+        evidence_candidate_id=candidate_id,
+    )
+    service.sessions.start_screening(session_id)
+    service.sessions.record_candidate_result(
+        session_id,
+        candidate_id,
+        state="neutral",
+        evidence_ids=(attached.evidence_id,),
+    )
+    unattached = create_session_evidence(
+        kind="index_screening",
+        evidence_candidate_id=candidate_id,
+    )
+    create_session_evidence(
+        kind="index_screening",
+        evidence_candidate_id="candidate-not-in-session",
+    )
+    create_session_evidence(
+        kind="index_screening",
+        evidence_candidate_id=candidate_id,
+        evidence_database_fingerprint="f" * 64,
+    )
+    current_session = store.get_session(session_id)
+    store.save_session(
+        replace(
+            current_session,
+            metadata={},
+            version=current_session.version + 1,
+        ),
+        expected_version=current_session.version,
+    )
+
+    result = service.get_session(session_id)
+
+    assert {
+        evidence["evidence_id"]
+        for evidence in result["evidence"]
+    } == {attached.evidence_id, unattached.evidence_id}
+    assert result["evidence_reconciliation"] == {
+        "attached_count": 1,
+        "unattached_count": 1,
+        "attached_evidence_ids": [attached.evidence_id],
+        "unattached_evidence_ids": [unattached.evidence_id],
+        "reconciliation_required": True,
+    }
+    assert result["leaderboard"][0]["evidence_ids"] == [attached.evidence_id]
+    assert store.get_candidate(candidate_id).evidence_ids == (
+        attached.evidence_id,
+    )
+
+
 def test_start_case_rejects_idempotency_key_reuse_for_different_query() -> None:
     service, _store, _plans, _executor = _service()
     service.start_case(
@@ -424,6 +521,13 @@ async def test_measured_sample_executes_each_query_exactly_once() -> None:
     )
 
     assert result["classification"] == "improved"
+    assert result["decision_basis"] == "observed_range_separation_v1"
+    assert result["parameter_results"][0]["decision_basis"] == (
+        "observed_range_separation_v1"
+    )
+    assert result["parameter_results"][0]["comparison_margin"][
+        "conservative_gain"
+    ] == 50.0
     assert result["executions"] == 8
     assert len(plans.calls) == 6
     assert len(executor.sessions) == 1
@@ -815,6 +919,12 @@ async def test_retry_recovers_evidence_commit_crash_without_rerunning_sql(
     )
 
     assert recovered["classification"] == "promising"
+    assert recovered["decision_basis"] == "observed_range_separation_v1"
+    persisted = store.get_evidence(recovered["evidence_id"])
+    assert persisted.metrics["decision_basis"] == recovered["decision_basis"]
+    assert persisted.metrics["parameter_results"] == recovered[
+        "parameter_results"
+    ]
     assert recovered["recovered_from_durable_evidence"] is True
     assert recovered["reservation_status"] == "completed"
     assert recovered["executions"] == 6
@@ -823,6 +933,69 @@ async def test_retry_recovers_evidence_commit_crash_without_rerunning_sql(
     candidate = store.get_candidate(candidate_id)
     assert candidate.executions == 6
     assert candidate.evidence_ids == (recovered["evidence_id"],)
+
+
+@pytest.mark.asyncio
+async def test_completed_session_rejects_exact_benchmark_replay_before_side_effects() -> None:
+    service, store, plans, executor = _service()
+    session_id, candidate_id = _start(service)
+    baseline = "SELECT id FROM dbo.Items"
+    candidate_sql = "SELECT id FROM dbo.Items AS candidate"
+    await service.benchmark_candidate(
+        session_id,
+        candidate_id,
+        "appdb",
+        baseline,
+        candidate_sql,
+        runs_override=3,
+        idempotency_key="completed-exact-replay",
+    )
+    service.finalize_session(
+        session_id,
+        selected_candidate_id=None,
+        stopping_reason="benchmark complete",
+    )
+    plan_calls = list(plans.calls)
+    executor_sessions = list(executor.sessions)
+    reservation_count = store._connection.execute(
+        "SELECT COUNT(*) AS count FROM execution_reservations"
+    ).fetchone()
+    evidence_count = store._connection.execute(
+        "SELECT COUNT(*) AS count FROM evidence_envelopes"
+    ).fetchone()
+    assert reservation_count is not None
+    assert evidence_count is not None
+    service.validator.validate_read_only = Mock(  # type: ignore[method-assign]
+        side_effect=AssertionError("SQL validation must not run")
+    )
+    store.get_idempotent_execution_reservation = Mock(  # type: ignore[method-assign]
+        side_effect=AssertionError("replay lookup must not run")
+    )
+
+    with pytest.raises(
+        InvalidTransitionError,
+        match=r"get_tuning_session.*terminal sessions cannot benchmark or replay",
+    ):
+        await service.benchmark_candidate(
+            session_id,
+            candidate_id,
+            "appdb",
+            baseline,
+            candidate_sql,
+            runs_override=3,
+            idempotency_key="completed-exact-replay",
+        )
+
+    assert service.validator.validate_read_only.call_count == 0
+    assert store.get_idempotent_execution_reservation.call_count == 0
+    assert plans.calls == plan_calls
+    assert executor.sessions == executor_sessions
+    assert store._connection.execute(
+        "SELECT COUNT(*) AS count FROM execution_reservations"
+    ).fetchone()["count"] == reservation_count["count"]
+    assert store._connection.execute(
+        "SELECT COUNT(*) AS count FROM evidence_envelopes"
+    ).fetchone()["count"] == evidence_count["count"]
 
 
 @pytest.mark.asyncio
@@ -1302,6 +1475,91 @@ async def test_volatile_comparison_requires_a_proof_contract_before_dispatch() -
 
 
 @pytest.mark.asyncio
+async def test_outer_top_zero_comparison_returns_shape_match() -> None:
+    executor = SnapshotExecutor(baseline_rows=[], candidate_rows=[])
+    service, _store, _plans, _executor = _service(executor=executor)
+
+    result = await service.compare_query_results(
+        "appdb",
+        "SELECT TOP (0) id FROM dbo.Items",
+        "SELECT TOP 0 id FROM dbo.Items AS candidate",
+    )
+
+    assert result["status"] == "match"
+    assert result["comparison_scope"] == "statically_zero_row"
+    assert result["executions"] == 2
+    assert result["equivalence_preflight"]["baseline"]["risk_codes"] == [
+        "unordered_row_limit"
+    ]
+    assert result["equivalence_preflight"]["candidate"]["risk_codes"] == [
+        "unordered_row_limit"
+    ]
+    assert len(executor.sessions) == 1
+
+
+@pytest.mark.asyncio
+async def test_outer_top_zero_comparison_returns_shape_type_mismatch() -> None:
+    executor = SnapshotExecutor(
+        baseline_rows=[],
+        candidate_rows=[],
+        candidate_type_signatures=("synthetic-bigint",),
+    )
+    service, _store, _plans, _executor = _service(executor=executor)
+
+    result = await service.compare_query_results(
+        "appdb",
+        "SELECT TOP (0) id FROM dbo.Items",
+        "SELECT TOP (0) id FROM dbo.Items AS candidate",
+    )
+
+    assert result["status"] == "mismatch"
+    assert result["comparison_scope"] == "statically_zero_row"
+    assert result["result_sets"][0]["types_match"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("baseline_sql", "candidate_sql"),
+    [
+        (
+            "SELECT TOP (0) id FROM dbo.Items",
+            "SELECT TOP (1) id FROM dbo.Items AS candidate",
+        ),
+        (
+            "SELECT TOP (@row_count) id FROM dbo.Items",
+            "SELECT TOP (@row_count) id FROM dbo.Items AS candidate",
+        ),
+        (
+            "SELECT id FROM (SELECT TOP (0) id FROM dbo.Items) AS picked",
+            (
+                "SELECT id FROM "
+                "(SELECT TOP (0) id FROM dbo.Items AS candidate) AS picked"
+            ),
+        ),
+        (
+            "SELECT TOP (1) id FROM dbo.Items",
+            "SELECT TOP (1) id FROM dbo.Items AS candidate",
+        ),
+    ],
+)
+async def test_top_zero_shape_scope_rejects_unsupported_variants(
+    baseline_sql: str,
+    candidate_sql: str,
+) -> None:
+    service, _store, _plans, executor = _service()
+
+    result = await service.compare_query_results(
+        "appdb",
+        baseline_sql,
+        candidate_sql,
+    )
+
+    assert result["status"] == "proof_contract_required"
+    assert result["executions"] == 0
+    assert executor.sessions == []
+
+
+@pytest.mark.asyncio
 async def test_comparison_uses_injected_database_aware_preflight() -> None:
     calls: list[tuple[str, str]] = []
 
@@ -1374,34 +1632,45 @@ async def test_benchmark_uses_injected_database_aware_preflight() -> None:
 
 @pytest.mark.asyncio
 async def test_volatile_finalist_runs_performance_samples_without_snapshot_dispatch() -> None:
-    sql = "SELECT NEWID() AS value"
+    baseline = "SELECT NEWID() AS value FROM dbo.Items"
+    candidate = "SELECT NEWID() AS value FROM dbo.Items AS candidate"
     service, store, plans, executor = _service()
     session_id, candidate_id = _start(
         service,
-        baseline=sql,
-        candidate=sql,
+        baseline=baseline,
+        candidate=candidate,
+    )
+
+    screening = await service.benchmark_candidate(
+        session_id,
+        candidate_id,
+        "appdb",
+        baseline,
+        candidate,
+        phase="screening",
     )
 
     result = await service.benchmark_candidate(
         session_id,
         candidate_id,
         "appdb",
-        sql,
-        sql,
+        baseline,
+        candidate,
         phase="finalist",
     )
 
-    assert result["classification"] == "neutral"
+    assert screening["classification"] == "promising"
+    assert result["classification"] == "performance_only"
     assert result["executions"] == 10
     assert result["proof_scope"] == "performance_only"
     assert result["equivalence"] == []
-    assert plans.calls == [sql] * 10
+    assert len(plans.calls) == 16
     assert executor.sessions == []
     reservation_count = store._connection.execute(
         "SELECT COUNT(*) AS count FROM execution_reservations"
     ).fetchone()
     assert reservation_count is not None
-    assert reservation_count["count"] == 1
+    assert reservation_count["count"] == 2
 
 
 @pytest.mark.asyncio
@@ -2312,6 +2581,204 @@ def test_finalize_marks_unresolved_candidates_inconclusive() -> None:
     assert result["leaderboard"][0]["state"] == "inconclusive"
 
 
+def _objective_aggregate(
+    objective: str,
+    values: list[float],
+) -> dict[str, Any]:
+    metric_name = {
+        "elapsed_time": "elapsed_ms",
+        "cpu": "cpu_ms",
+        "logical_reads": "logical_reads",
+        "physical_reads": "physical_reads",
+    }[objective]
+    source_field = {
+        "elapsed_time": ("elapsed_source", "client_wall_clock"),
+        "cpu": ("cpu_source", "showplan_query_time_stats"),
+        "logical_reads": ("read_source", "statistics_io_table_messages"),
+        "physical_reads": ("read_source", "statistics_io_table_messages"),
+    }[objective]
+    return aggregate_samples(
+        [
+            {
+                metric_name: value,
+                source_field[0]: source_field[1],
+            }
+            for value in values
+        ]
+    )
+
+
+def test_classification_accepts_large_separation_despite_relative_candidate_noise() -> None:
+    parameter_results = [
+        {
+            "parameter_case": "reported_case",
+            "weight": 1.0,
+            "baseline": _objective_aggregate(
+                "elapsed_time",
+                [157_900.0, 158_035.0, 158_100.0],
+            ),
+            "candidate": _objective_aggregate(
+                "elapsed_time",
+                [1_500.0, 1_598.0, 2_300.0],
+            ),
+        }
+    ]
+
+    state, _reason = classify_benchmark(
+        parameter_results,
+        [{"status": "match"}],
+        objective="elapsed_time",
+    )
+
+    assert state == "improved"
+    assert parameter_results[0]["candidate"]["noise_ratio"] > 0.25
+    assert parameter_results[0]["decision_basis"] == (
+        "observed_range_separation_v1"
+    )
+    assert parameter_results[0]["comparison_margin"] == {
+        "objective": "elapsed_time",
+        "metric": "elapsed_ms",
+        "baseline_min": 157_900.0,
+        "baseline_max": 158_100.0,
+        "candidate_min": 1_500.0,
+        "candidate_max": 2_300.0,
+        "conservative_gain": 155_600.0,
+        "conservative_gain_ratio": pytest.approx(155_600.0 / 158_035.0),
+        "conservative_regression": -156_600.0,
+        "conservative_regression_ratio": pytest.approx(
+            -156_600.0 / 158_035.0
+        ),
+    }
+
+
+def test_classification_treats_overlapping_observed_ranges_as_neutral() -> None:
+    parameter_results = [
+        {
+            "baseline": _objective_aggregate(
+                "elapsed_time",
+                [100.0, 110.0, 120.0],
+            ),
+            "candidate": _objective_aggregate(
+                "elapsed_time",
+                [90.0, 110.0, 130.0],
+            ),
+        }
+    ]
+
+    state, _reason = classify_benchmark(
+        parameter_results,
+        [{"status": "match"}],
+    )
+
+    assert state == "neutral"
+    assert parameter_results[0]["comparison_margin"]["conservative_gain"] == (
+        -30.0
+    )
+    assert parameter_results[0]["comparison_margin"][
+        "conservative_regression"
+    ] == -30.0
+
+
+def test_classification_fails_closed_without_observed_ranges() -> None:
+    parameter_results = [
+        {
+            "baseline": {
+                "elapsed_ms": 100.0,
+                "sample_count": 3,
+                "metric_sources": {"elapsed_ms": ["client_wall_clock"]},
+            },
+            "candidate": {
+                "elapsed_ms": 50.0,
+                "sample_count": 3,
+                "metric_sources": {"elapsed_ms": ["client_wall_clock"]},
+            },
+        }
+    ]
+
+    state, reason = classify_benchmark(
+        parameter_results,
+        [{"status": "match"}],
+    )
+
+    assert state == "inconclusive"
+    assert "observed ranges" in reason
+    assert "comparison_margin" not in parameter_results[0]
+
+
+def test_classification_rejects_materially_separated_bucket_regression() -> None:
+    parameter_results = [
+        {
+            "weight": 0.01,
+            "baseline": _objective_aggregate(
+                "elapsed_time",
+                [100.0, 101.0, 102.0],
+            ),
+            "candidate": _objective_aggregate(
+                "elapsed_time",
+                [120.0, 121.0, 122.0],
+            ),
+        },
+        {
+            "weight": 0.99,
+            "baseline": _objective_aggregate(
+                "elapsed_time",
+                [1_000.0, 1_001.0, 1_002.0],
+            ),
+            "candidate": _objective_aggregate(
+                "elapsed_time",
+                [100.0, 101.0, 102.0],
+            ),
+        },
+    ]
+
+    state, _reason = classify_benchmark(
+        parameter_results,
+        [{"status": "match"}],
+    )
+
+    assert state == "regressed"
+
+
+@pytest.mark.parametrize(
+    ("objective", "baseline_values", "candidate_values"),
+    [
+        ("elapsed_time", [100.0, 101.0], [70.0, 71.0]),
+        ("cpu", [100.0, 101.0], [70.0, 71.0]),
+        ("logical_reads", [1_000.0, 1_001.0], [700.0, 701.0]),
+        ("physical_reads", [100.0, 101.0], [70.0, 71.0]),
+    ],
+)
+def test_classification_weights_conservative_gain_for_every_objective(
+    objective: str,
+    baseline_values: list[float],
+    candidate_values: list[float],
+) -> None:
+    parameter_results = [
+        {
+            "weight": 9.0,
+            "baseline": _objective_aggregate(objective, baseline_values),
+            "candidate": _objective_aggregate(objective, candidate_values),
+        },
+        {
+            "weight": 1.0,
+            "baseline": _objective_aggregate(objective, baseline_values),
+            "candidate": _objective_aggregate(objective, baseline_values),
+        },
+    ]
+
+    state, _reason = classify_benchmark(
+        parameter_results,
+        [{"status": "match"}],
+        objective=objective,
+    )
+
+    assert state == "improved"
+    assert all(
+        result["decision_basis"] == "observed_range_separation_v1"
+        for result in parameter_results
+    )
+
+
 def test_classification_uses_the_selected_objective() -> None:
     parameter_results = [
         {
@@ -2320,6 +2787,10 @@ def test_classification_uses_the_selected_objective() -> None:
                 "cpu_ms": 20.0,
                 "noise_ratio": 0.0,
                 "sample_count": 3,
+                "spread": {
+                    "elapsed_ms": {"min": 100.0, "max": 100.0},
+                    "cpu_ms": {"min": 20.0, "max": 20.0},
+                },
                 "metric_sources": {
                     "elapsed_ms": ["client_wall_clock"],
                     "cpu_ms": ["showplan_query_time_stats"],
@@ -2331,6 +2802,10 @@ def test_classification_uses_the_selected_objective() -> None:
                 "cpu_ms": 40.0,
                 "noise_ratio": 0.0,
                 "sample_count": 3,
+                "spread": {
+                    "elapsed_ms": {"min": 50.0, "max": 50.0},
+                    "cpu_ms": {"min": 40.0, "max": 40.0},
+                },
                 "metric_sources": {
                     "elapsed_ms": ["client_wall_clock"],
                     "cpu_ms": ["showplan_query_time_stats"],
@@ -2359,18 +2834,14 @@ def test_classification_uses_the_selected_objective() -> None:
 def test_classification_requires_runtime_snapshot_attestation_when_requested() -> None:
     parameter_results = [
         {
-            "baseline": {
-                "elapsed_ms": 100.0,
-                "noise_ratio": 0.0,
-                "sample_count": 3,
-                "metric_sources": {"elapsed_ms": ["client_wall_clock"]},
-            },
-            "candidate": {
-                "elapsed_ms": 50.0,
-                "noise_ratio": 0.0,
-                "sample_count": 3,
-                "metric_sources": {"elapsed_ms": ["client_wall_clock"]},
-            },
+            "baseline": _objective_aggregate(
+                "elapsed_time",
+                [100.0, 100.0, 100.0],
+            ),
+            "candidate": _objective_aggregate(
+                "elapsed_time",
+                [50.0, 50.0, 50.0],
+            ),
         }
     ]
 

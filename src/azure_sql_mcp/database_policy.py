@@ -326,6 +326,14 @@ class DatabasePolicySet:
             )
         return policy
 
+    def require_read(self, database_name: str) -> DatabasePolicy:
+        """Return a policy that explicitly permits database reads."""
+
+        policy = self.policy_for(database_name)
+        if not policy.configured or not policy.allow_read:
+            raise PermissionError("Database policy does not permit read access.")
+        return policy
+
     def allows_read(self, database_name: str) -> bool:
         return self.policy_for(database_name).allow_read
 

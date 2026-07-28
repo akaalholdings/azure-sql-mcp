@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from azure_sql_mcp.artifact_store import ArtifactStore
+from azure_sql_mcp.database_policy import DatabasePolicySet
 from azure_sql_mcp.resources import register_resources
 
 
@@ -90,11 +91,30 @@ class FakeIntrospection:
         }
 
 
+def _database_policy(*, allow_read: bool = True) -> DatabasePolicySet:
+    return DatabasePolicySet.from_mapping(
+        {
+            "version": 1,
+            "databases": {
+                "appdb": {
+                    "environment": "test",
+                    "allow_read": allow_read,
+                }
+            },
+        }
+    )
+
+
 @pytest.fixture
 def registered_resources(sample_server_config: Any) -> tuple[FakeMCP, FakeIntrospection]:
     mcp = FakeMCP()
     introspection = FakeIntrospection()
-    register_resources(mcp, sample_server_config, introspection)  # type: ignore[arg-type]
+    register_resources(
+        mcp,
+        sample_server_config,
+        introspection,  # type: ignore[arg-type]
+        database_policy=_database_policy(),
+    )
     return mcp, introspection
 
 
@@ -132,7 +152,13 @@ async def test_artifact_resource_returns_stored_text(sample_server_config: Any) 
         mime_type="application/xml",
     )
 
-    register_resources(mcp, sample_server_config, introspection, store)  # type: ignore[arg-type]
+    register_resources(
+        mcp,
+        sample_server_config,
+        introspection,  # type: ignore[arg-type]
+        store,
+        database_policy=_database_policy(),
+    )
 
     assert "azuresql-artifact://{artifact_id}" in mcp.resources
     text = await mcp.resources["azuresql-artifact://{artifact_id}"].func(
@@ -196,3 +222,34 @@ async def test_resource_handlers_reject_unknown_databases(
 
     with pytest.raises(ValueError, match="AZURE_SQL_ALLOWED_DATABASES"):
         await mcp.resources["azuresql://{database}/schemas"].func("unknown")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("uri", "arguments"),
+    [
+        ("azuresql://{database}/schemas", ("appdb",)),
+        ("azuresql://{database}/{schema}/tables", ("appdb", "dbo")),
+        ("azuresql://{database}/{schema}/views", ("appdb", "dbo")),
+        ("azuresql://{database}/{schema}/procedures", ("appdb", "dbo")),
+        ("azuresql://{database}/{schema}/{table}", ("appdb", "dbo", "Orders")),
+    ],
+)
+async def test_schema_resources_enforce_read_policy_before_introspection(
+    sample_server_config: Any,
+    uri: str,
+    arguments: tuple[str, ...],
+) -> None:
+    mcp = FakeMCP()
+    introspection = FakeIntrospection()
+    register_resources(
+        mcp,
+        sample_server_config,
+        introspection,  # type: ignore[arg-type]
+        database_policy=_database_policy(allow_read=False),
+    )
+
+    with pytest.raises(PermissionError, match="does not permit read access"):
+        await mcp.resources[uri].func(*arguments)
+
+    assert introspection.calls == []

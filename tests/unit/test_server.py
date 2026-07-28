@@ -30,6 +30,7 @@ from azure_sql_mcp.performance_workflows import database_fingerprint
 from azure_sql_mcp.performance_workflows import fingerprint_json
 from azure_sql_mcp.server import async_main
 from azure_sql_mcp.server import AzureSqlMcpApplication
+from azure_sql_mcp.tuning_sessions import InvalidTransitionError
 from azure_sql_mcp.view_workflows import ViewChangeRequest
 from azure_sql_mcp.view_workflows import ViewSnapshot
 from azure_sql_mcp.view_workflows import prepared_view_change_state
@@ -73,6 +74,21 @@ def make_config(
         audit_full_sql=False,
         remote_admin_enabled=False,
         performance_state_dir=":memory:",
+    )
+
+
+def make_read_policy(*database_names: str) -> DatabasePolicySet:
+    return DatabasePolicySet.from_mapping(
+        {
+            "version": 1,
+            "databases": {
+                database_name: {
+                    "environment": "test",
+                    "allow_read": True,
+                }
+                for database_name in database_names
+            },
+        }
     )
 
 
@@ -249,6 +265,46 @@ async def test_validation_errors_are_sanitized_invalid_argument_envelopes(
 
 
 @pytest.mark.asyncio
+async def test_stopping_reason_length_error_is_sanitized(
+    app: AzureSqlMcpApplication,
+) -> None:
+    caller_value = "s" * 2001
+    handler = app.mcp._mcp_server.request_handlers[CallToolRequest]
+    response = await handler(
+        CallToolRequest(
+            params=CallToolRequestParams(
+                name="finalize_tuning_session",
+                arguments={
+                    "session_id": "session-1",
+                    "stopping_reason": caller_value,
+                },
+            )
+        )
+    )
+
+    assert response.root.isError is True
+    text = response.root.content[0].text
+    payload = json.loads(text)
+    assert payload == {
+        "ok": False,
+        "code": "invalid_arguments",
+        "message": "Tool arguments failed validation.",
+        "details": {
+            "issues": [
+                {
+                    "path": "stopping_reason",
+                    "code": "string_too_long",
+                    "message": "Value is above the permitted maximum length.",
+                }
+            ]
+        },
+    }
+    assert caller_value not in text
+    assert "input_value" not in text
+    assert "pydantic" not in text.casefold()
+
+
+@pytest.mark.asyncio
 async def test_sanitized_tool_error_preserves_candidate_reference_format(
     app: AzureSqlMcpApplication,
 ) -> None:
@@ -312,7 +368,7 @@ async def test_runtime_status_is_db_free_stable_and_sanitized(
 
     assert first == second
     assert first["startup_timestamp"] == app._startup_timestamp
-    assert first["package_version"] == "2.2.0"
+    assert first["package_version"] == "2.2.1"
     assert first["profile"] is None
     assert first["transport"] == "stdio"
     assert first["tool_groups"] == ["all"]
@@ -472,6 +528,11 @@ def test_optimizer_inputs_publish_closed_enums(
     ]
     assert selection["enum"] == ["proven", "performance_only"]
     assert selection["default"] == "proven"
+    stopping_reason = tools["finalize_tuning_session"].parameters["properties"][
+        "stopping_reason"
+    ]
+    assert stopping_reason["minLength"] == 1
+    assert stopping_reason["maxLength"] == 2000
 
 
 @pytest.mark.asyncio
@@ -765,6 +826,117 @@ async def test_run_tool_preserves_intentional_tool_error(
         "message": "Apply is disabled.",
         "ok": False,
     }
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    (
+        "list_schemas",
+        "list_objects",
+        "search_objects",
+        "get_object_details",
+        "get_dependencies",
+        "get_table_stats",
+        "capture_schema_snapshot",
+    ),
+)
+@pytest.mark.asyncio
+async def test_catalog_tools_require_allow_read_before_callback(
+    app: AzureSqlMcpApplication,
+    tool_name: str,
+) -> None:
+    callback = AsyncMock(return_value={"ok": True})
+
+    with pytest.raises(ToolError) as error:
+        await app._run_tool(tool_name, "appdb", callback)
+
+    payload = json.loads(str(error.value))
+    assert payload["code"] == "tool_error"
+    assert payload["message"] == "Database policy does not permit read access."
+    callback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_catalog_tool_runs_when_allow_read_is_granted(
+    app: AzureSqlMcpApplication,
+) -> None:
+    app.database_policy = make_read_policy("appdb")
+    callback = AsyncMock(return_value={"objects": []})
+
+    result = await app._run_tool("list_objects", "appdb", callback)
+
+    assert result == {"objects": []}
+    callback.assert_awaited_once_with("appdb")
+
+
+@pytest.mark.asyncio
+async def test_schema_pair_tools_require_allow_read_for_both_databases(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        make_config(tmp_path),
+        allowed_databases=("appdb", "reportingdb"),
+    )
+    app = AzureSqlMcpApplication(config)
+    app.database_policy = make_read_policy("appdb")
+    callback = AsyncMock(return_value={"differences": []})
+
+    with pytest.raises(ToolError) as error:
+        await app._run_database_pair_tool(
+            "compare_schemas",
+            "appdb",
+            "reportingdb",
+            callback,
+        )
+
+    payload = json.loads(str(error.value))
+    assert payload["message"] == "Database policy does not permit read access."
+    callback.assert_not_awaited()
+
+
+@pytest.mark.parametrize("tool_name", ("compare_schemas", "generate_migration_script"))
+@pytest.mark.asyncio
+async def test_schema_pair_tools_run_when_both_databases_allow_read(
+    tmp_path: Path,
+    tool_name: str,
+) -> None:
+    config = replace(
+        make_config(tmp_path),
+        allowed_databases=("appdb", "reportingdb"),
+    )
+    app = AzureSqlMcpApplication(config)
+    app.database_policy = make_read_policy("appdb", "reportingdb")
+    callback = AsyncMock(return_value={"ok": True})
+
+    result = await app._run_database_pair_tool(
+        tool_name,
+        "appdb",
+        "reportingdb",
+        callback,
+    )
+
+    assert result == {"ok": True}
+    callback.assert_awaited_once_with("appdb", "reportingdb")
+
+
+@pytest.mark.asyncio
+async def test_state_machine_error_keeps_safe_enum_codes_visible(
+    app: AzureSqlMcpApplication,
+) -> None:
+    async def reject(_: str) -> dict[str, str]:
+        raise InvalidTransitionError(
+            "Session status completed is not in allowed statuses "
+            "[finalist_validation, screening]."
+        )
+
+    with pytest.raises(ToolError) as error:
+        await app._run_tool("benchmark_tuning_candidate", "appdb", reject)
+
+    payload = json.loads(str(error.value))
+    assert payload["message"] == (
+        "Session status completed is not in allowed statuses "
+        "[finalist_validation, screening]."
+    )
 
 
 @pytest.mark.asyncio

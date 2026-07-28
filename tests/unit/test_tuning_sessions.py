@@ -4,7 +4,13 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from azure_sql_mcp.performance_contracts import EvidenceEnvelopeV1, PerformanceCaseV1
+from azure_sql_mcp.observability import sanitize_error_message
+from azure_sql_mcp.performance_contracts import (
+    STOPPING_REASON_MAX_LENGTH,
+    ContractValidationError,
+    EvidenceEnvelopeV1,
+    PerformanceCaseV1,
+)
 from azure_sql_mcp.performance_store import IdempotencyConflictError, PerformanceStore
 from azure_sql_mcp.tuning_sessions import (
     InvalidTransitionError,
@@ -481,5 +487,69 @@ def test_cancellation_persists_stopping_and_replay_metadata(tmp_path) -> None:
         assert cancelled.replay_metadata["resume_marker"] == "resume-1"
         assert cancelled.replay_metadata["last_attempt"] == 2
         assert machine.get_session(session.session_id) == cancelled
+    finally:
+        store.close()
+
+
+def test_stopping_reason_limit_is_shared_and_persists_at_the_boundary(tmp_path) -> None:
+    state_path = tmp_path / "state"
+    store, machine, case = _new_machine(tmp_path)
+    reason = "x" * STOPPING_REASON_MAX_LENGTH
+    try:
+        session = machine.create_session(case)
+        cancelled = machine.cancel_session(
+            session.session_id,
+            stopping_reason=reason,
+        )
+        assert cancelled.stopping_reason == reason
+    finally:
+        store.close()
+
+    reopened = PerformanceStore(state_path)
+    try:
+        assert reopened.get_session(session.session_id).stopping_reason == reason
+    finally:
+        reopened.close()
+
+    store, machine, case = _new_machine(tmp_path / "too-long")
+    try:
+        session = machine.create_session(case)
+        with pytest.raises(
+            ContractValidationError,
+            match=f"at most {STOPPING_REASON_MAX_LENGTH} characters",
+        ):
+            machine.cancel_session(
+                session.session_id,
+                stopping_reason="x" * (STOPPING_REASON_MAX_LENGTH + 1),
+            )
+    finally:
+        store.close()
+
+
+def test_public_session_status_guard_preserves_validated_states_after_sanitizing(
+    tmp_path,
+) -> None:
+    store, machine, case = _new_machine(tmp_path)
+    try:
+        session = machine.create_session(case)
+        machine.cancel_session(session.session_id)
+
+        with pytest.raises(InvalidTransitionError) as raised:
+            machine.require_session_status(
+                session.session_id,
+                allowed={"screening", "finalist_validation"},
+            )
+
+        sanitized = sanitize_error_message(str(raised.value))
+        assert "is cancelled" in sanitized
+        assert "screening" in sanitized
+        assert "finalist_validation" in sanitized
+        assert "[REDACTED]" not in sanitized
+
+        with pytest.raises(ValueError, match="recognized session statuses"):
+            machine.require_session_status(
+                session.session_id,
+                allowed={"screening", "untrusted state"},
+            )
     finally:
         store.close()

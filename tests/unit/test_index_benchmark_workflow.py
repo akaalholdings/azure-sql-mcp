@@ -23,6 +23,7 @@ from azure_sql_mcp.plans import ProfiledPlanResult
 from azure_sql_mcp.performance_store import IdempotencyConflictError
 from azure_sql_mcp.performance_workflows import database_fingerprint
 from azure_sql_mcp.server import AzureSqlMcpApplication
+from azure_sql_mcp.tuning_sessions import InvalidTransitionError
 
 
 def _policy() -> DatabasePolicySet:
@@ -553,16 +554,19 @@ async def test_volatile_index_screening_reports_performance_only(
     )
 
     assert result["classification"] == "promising"
+    assert result["decision_basis"] == "observed_range_separation_v1"
+    assert result["parameter_results"][0]["decision_basis"] == (
+        "observed_range_separation_v1"
+    )
     assert result["durable_state"] == "screening"
     assert result["proof_scope"] == "performance_only"
     assert result["equivalence"][0]["status"] == "mismatch"
     assert result["equivalence_preflight"]["direct_snapshot_supported"] is False
-    assert (
-        app.performance_store.get_evidence(
-            result["evidence_id"]
-        ).metrics["performance_classification"]
-        == "promising"
-    )
+    evidence_metrics = app.performance_store.get_evidence(
+        result["evidence_id"]
+    ).metrics
+    assert evidence_metrics["performance_classification"] == "promising"
+    assert evidence_metrics["decision_basis"] == "observed_range_separation_v1"
     stored_candidate = app.tuning_sessions.get_candidate(candidate_id)
     assert stored_candidate.state == "screening"
     assert stored_candidate.failure_code is None
@@ -589,6 +593,7 @@ async def test_volatile_index_screening_reports_performance_only(
 
     assert replay["classification"] == "promising"
     assert replay["performance_classification"] == "promising"
+    assert replay["decision_basis"] == "observed_range_separation_v1"
     assert replay["durable_state"] == "screening"
     assert replay["evidence_id"] == result["evidence_id"]
     assert replay["recovered_from_durable_evidence"] is True
@@ -867,6 +872,20 @@ async def test_index_retry_recovers_post_evidence_crash_without_query_or_ddl(
     app._create_test_index.assert_awaited_once()
     app._drop_test_index.assert_awaited_once()
 
+    orphaned = await app._get_tuning_session("appdb", session_id)
+    assert [item["evidence_id"] for item in orphaned["evidence"]] == [
+        app.performance_store.list_evidence_for_session(session_id)[0].evidence_id
+    ]
+    assert orphaned["evidence_reconciliation"] == {
+        "attached_count": 0,
+        "unattached_count": 1,
+        "attached_evidence_ids": [],
+        "unattached_evidence_ids": [
+            app.performance_store.list_evidence_for_session(session_id)[0].evidence_id
+        ],
+        "reconciliation_required": True,
+    }
+
     monkeypatch.setattr(
         app.tuning_sessions,
         "record_candidate_result",
@@ -898,6 +917,17 @@ async def test_index_retry_recovers_post_evidence_crash_without_query_or_ddl(
     assert catalog.await_count == 4
     app._create_test_index.assert_awaited_once()
     app._drop_test_index.assert_awaited_once()
+    attached = await app._get_tuning_session("appdb", session_id)
+    assert [item["evidence_id"] for item in attached["evidence"]] == [
+        recovered["evidence_id"]
+    ]
+    assert attached["evidence_reconciliation"] == {
+        "attached_count": 1,
+        "unattached_count": 0,
+        "attached_evidence_ids": [recovered["evidence_id"]],
+        "unattached_evidence_ids": [],
+        "reconciliation_required": False,
+    }
 
 
 @pytest.mark.asyncio
@@ -1004,6 +1034,271 @@ async def test_covering_index_result_is_idempotent_without_ddl_or_queries(
             30,
             "covering-index",
         )
+
+    app.tuning_sessions.complete_session(
+        session_id,
+        stopping_reason="terminal replay regression",
+    )
+    app._cleanup_expired_index_leases = AsyncMock(  # type: ignore[method-assign]
+        return_value={"examined": 0, "cleaned": 0, "cleanup_required": 0}
+    )
+    with pytest.raises(
+        InvalidTransitionError,
+        match=r"completed.*get_tuning_session",
+    ):
+        await app._benchmark_index_candidate(
+            "appdb",
+            session_id,
+            candidate_id,
+            sql,
+            "dbo",
+            "Items",
+            ["status"],
+            ["id"],
+            None,
+            False,
+            "screening",
+            True,
+            True,
+            30,
+            "covering-index",
+        )
+    app._cleanup_expired_index_leases.assert_not_awaited()
+    assert catalog.await_count == 1
+    app._create_test_index.assert_not_awaited()
+    app.plans.profile_query.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_status", ["completed", "cancelled"])
+async def test_terminal_session_rejects_index_benchmark_before_any_work(
+    server_config_factory,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_status: str,
+) -> None:
+    app = _app(server_config_factory)
+    sql = "SELECT id FROM dbo.Items WHERE status = 1"
+    session_id, candidate_id = _candidate(app, sql)
+    if terminal_status == "completed":
+        app.tuning_sessions.complete_session(
+            session_id,
+            stopping_reason="terminal session regression",
+        )
+    else:
+        app.tuning_sessions.cancel_session(
+            session_id,
+            stopping_reason="terminal session regression",
+        )
+
+    app._cleanup_expired_index_leases = AsyncMock(  # type: ignore[method-assign]
+        return_value={"examined": 0, "cleaned": 0, "cleanup_required": 0}
+    )
+    app._check_equivalence_preflight = AsyncMock()  # type: ignore[method-assign]
+    app.performance_workflows._bind_case = AsyncMock()  # type: ignore[method-assign]
+    app._resolve_canonical_table_identity = AsyncMock()  # type: ignore[method-assign]
+    app.performance_store.bind_index_benchmark_request = Mock()  # type: ignore[method-assign]
+    app.performance_store.reserve_execution_attempts = Mock()  # type: ignore[method-assign]
+    app.performance_store.create_index_lease = Mock()  # type: ignore[method-assign]
+    app.performance_store.create_evidence = Mock()  # type: ignore[method-assign]
+    catalog = AsyncMock()
+    monkeypatch.setattr("azure_sql_mcp.server.collect_existing_indexes", catalog)
+    app._create_test_index = AsyncMock()  # type: ignore[method-assign]
+    app._drop_test_index = AsyncMock()  # type: ignore[method-assign]
+    app.plans.profile_query = AsyncMock()  # type: ignore[method-assign]
+    fetch_all = AsyncMock()
+    app.executor.fetch_all = fetch_all  # type: ignore[method-assign]
+
+    with pytest.raises(
+        InvalidTransitionError,
+        match=rf"{terminal_status}.*get_tuning_session",
+    ):
+        await app._benchmark_index_candidate(
+            "appdb",
+            session_id,
+            candidate_id,
+            sql,
+            "dbo",
+            "Items",
+            ["status"],
+            None,
+            None,
+            False,
+            "screening",
+            True,
+            True,
+            30,
+            f"{terminal_status}-session",
+        )
+
+    app._cleanup_expired_index_leases.assert_not_awaited()
+    app._check_equivalence_preflight.assert_not_awaited()
+    app.performance_workflows._bind_case.assert_not_awaited()
+    app._resolve_canonical_table_identity.assert_not_awaited()
+    app.performance_store.bind_index_benchmark_request.assert_not_called()
+    app.performance_store.reserve_execution_attempts.assert_not_called()
+    app.performance_store.create_index_lease.assert_not_called()
+    app.performance_store.create_evidence.assert_not_called()
+    catalog.assert_not_awaited()
+    app._create_test_index.assert_not_awaited()
+    app._drop_test_index.assert_not_awaited()
+    app.plans.profile_query.assert_not_awaited()
+    fetch_all.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_terminal_race_before_index_create_prevents_ddl_and_releases_budget(
+    server_config_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _app(server_config_factory)
+    sql = "SELECT id FROM dbo.Items WHERE status = 1"
+    session_id, candidate_id = _candidate(app, sql)
+    catalog = AsyncMock(return_value=[])
+    monkeypatch.setattr("azure_sql_mcp.server.collect_existing_indexes", catalog)
+    app._create_test_index = AsyncMock()  # type: ignore[method-assign]
+    app._drop_test_index = AsyncMock()  # type: ignore[method-assign]
+
+    profile_count = 0
+
+    async def complete_after_baseline(*_args, **_kwargs):
+        nonlocal profile_count
+        profile_count += 1
+        if profile_count == 3:
+            app.tuning_sessions.complete_session(
+                session_id,
+                stopping_reason="completed during baseline",
+            )
+        return _profile(100)
+
+    app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
+        side_effect=complete_after_baseline
+    )
+
+    with pytest.raises(
+        InvalidTransitionError,
+        match=r"completed.*get_tuning_session",
+    ):
+        await app._benchmark_index_candidate(
+            "appdb",
+            session_id,
+            candidate_id,
+            sql,
+            "dbo",
+            "Items",
+            ["status"],
+            None,
+            None,
+            False,
+            "screening",
+            True,
+            True,
+            30,
+            "terminal-before-create",
+        )
+
+    app._create_test_index.assert_not_awaited()
+    app._drop_test_index.assert_not_awaited()
+    assert app.plans.profile_query.await_count == 3
+    reservation_row = app.performance_store._connection.execute(
+        "SELECT reservation_id FROM execution_reservations WHERE candidate_id = ?",
+        (candidate_id,),
+    ).fetchone()
+    assert reservation_row is not None
+    reservation = app.performance_store.get_execution_reservation(
+        reservation_row["reservation_id"]
+    )
+    assert reservation["status"] in {"completed", "released"}
+    assert reservation["dispatched_attempt_count"] == 3
+    assert app.performance_store.list_open_index_leases() == []
+    assert app.performance_store.list_evidence_for_session(session_id) == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_race_after_index_create_still_cleans_owned_index(
+    server_config_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _app(server_config_factory)
+    sql = "SELECT id FROM dbo.Items WHERE status = 1"
+    session_id, candidate_id = _candidate(app, sql)
+    provisional = IndexCandidate(
+        schema="dbo",
+        table="Items",
+        key_columns=("status",),
+        include_columns=(),
+    )
+    index_name = f"IX_Testing_{provisional.definition_fingerprint[:16]}"
+    existing = ExistingIndex(
+        schema="dbo",
+        table="Items",
+        index_id=2,
+        name=index_name,
+        index_type="NONCLUSTERED",
+        key_columns=(parse_candidate_key("status"),),
+    )
+    catalog_count = 0
+
+    async def terminate_after_create(*_args, **_kwargs):
+        nonlocal catalog_count
+        catalog_count += 1
+        if catalog_count == 1:
+            return []
+        if catalog_count == 2:
+            app.tuning_sessions.complete_session(
+                session_id,
+                stopping_reason="completed after index create",
+            )
+            return [existing]
+        if catalog_count == 3:
+            return [existing]
+        return []
+
+    catalog = AsyncMock(side_effect=terminate_after_create)
+    monkeypatch.setattr("azure_sql_mcp.server.collect_existing_indexes", catalog)
+    app._create_test_index = AsyncMock(return_value={"status": "completed"})  # type: ignore[method-assign]
+    app._drop_test_index = AsyncMock(return_value={"status": "completed"})  # type: ignore[method-assign]
+    app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[_profile(100) for _ in range(3)]
+    )
+
+    with pytest.raises(
+        InvalidTransitionError,
+        match=r"completed.*get_tuning_session",
+    ):
+        await app._benchmark_index_candidate(
+            "appdb",
+            session_id,
+            candidate_id,
+            sql,
+            "dbo",
+            "Items",
+            ["status"],
+            None,
+            None,
+            False,
+            "screening",
+            True,
+            True,
+            30,
+            "terminal-after-create",
+        )
+
+    app._create_test_index.assert_awaited_once()
+    app._drop_test_index.assert_awaited_once()
+    assert app.plans.profile_query.await_count == 3
+    assert catalog.await_count == 4
+    assert app.performance_store.list_open_index_leases() == []
+    reservation_row = app.performance_store._connection.execute(
+        "SELECT reservation_id FROM execution_reservations WHERE candidate_id = ?",
+        (candidate_id,),
+    ).fetchone()
+    assert reservation_row is not None
+    reservation = app.performance_store.get_execution_reservation(
+        reservation_row["reservation_id"]
+    )
+    assert reservation["status"] in {"completed", "released"}
+    assert reservation["dispatched_attempt_count"] == 3
+    assert app.performance_store.list_evidence_for_session(session_id) == []
 
 
 @pytest.mark.asyncio
@@ -1414,7 +1709,7 @@ async def test_index_candidate_timeout_is_inconclusive_without_create(
 
 
 @pytest.mark.asyncio
-async def test_expired_session_after_reservation_releases_all_index_budget(
+async def test_expired_session_is_rejected_before_index_reservation(
     server_config_factory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1455,12 +1750,7 @@ async def test_expired_session_after_reservation_releases_all_index_budget(
         "SELECT reservation_id FROM execution_reservations WHERE candidate_id = ?",
         (candidate_id,),
     ).fetchone()
-    assert reservation_row is not None
-    reservation = app.performance_store.get_execution_reservation(
-        reservation_row["reservation_id"]
-    )
-    assert reservation["status"] == "released"
-    assert reservation["dispatched_attempt_count"] == 0
+    assert reservation_row is None
     assert app.performance_store.execution_budget_usage(session_id)["remaining"] == 80
     app._create_test_index.assert_not_awaited()
 

@@ -55,6 +55,78 @@ def test_store_persists_redacted_contracts_and_secure_file_modes(tmp_path) -> No
         assert reopened.get_evidence(evidence.evidence_id) == evidence
 
 
+def test_list_evidence_for_session_is_isolated_ordered_and_durable(tmp_path) -> None:
+    state_dir = tmp_path / "state"
+    matching = [
+        EvidenceEnvelopeV1(
+            evidence_id="evidence-z",
+            captured_at_utc="2026-07-28T12:00:01+00:00",
+            metadata={"session_id": "session-target", "phase": "finalist"},
+        ),
+        EvidenceEnvelopeV1(
+            evidence_id="evidence-b",
+            captured_at_utc="2026-07-28T12:00:00+00:00",
+            metadata={"session_id": "session-target", "phase": "screening"},
+        ),
+        EvidenceEnvelopeV1(
+            evidence_id="evidence-a",
+            captured_at_utc="2026-07-28T12:00:00+00:00",
+            metadata={"session_id": "session-target", "phase": "screening"},
+        ),
+    ]
+    excluded = [
+        EvidenceEnvelopeV1(
+            evidence_id="evidence-other-session",
+            metadata={"session_id": "session-other"},
+        ),
+        EvidenceEnvelopeV1(
+            evidence_id="evidence-nested-session",
+            metadata={"context": {"session_id": "session-target"}},
+        ),
+        EvidenceEnvelopeV1(evidence_id="evidence-no-session"),
+    ]
+    with PerformanceStore(state_dir) as store:
+        for envelope in (*matching, *excluded):
+            store.create_evidence(envelope)
+        first = store.list_evidence_for_session("session-target")
+
+    with PerformanceStore(state_dir) as reopened:
+        replay = reopened.list_evidence_for_session("session-target")
+
+    assert [item.evidence_id for item in first] == [
+        "evidence-a",
+        "evidence-b",
+        "evidence-z",
+    ]
+    assert replay == first
+
+
+def test_list_evidence_for_session_deduplicates_idempotent_create() -> None:
+    store = PerformanceStore(db_path=":memory:")
+    first = store.create_evidence(
+        EvidenceEnvelopeV1(
+            evidence_id="evidence-first",
+            metadata={"session_id": "session-target"},
+        ),
+        idempotency_key="evidence-create",
+    )
+    replay = store.create_evidence(
+        EvidenceEnvelopeV1(
+            evidence_id="evidence-replay",
+            metadata={"session_id": "session-target"},
+        ),
+        idempotency_key="evidence-create",
+    )
+
+    evidence = store.list_evidence_for_session("session-target")
+
+    assert replay == first
+    assert evidence == [first]
+    with pytest.raises(ValueError, match="session_id is required"):
+        store.list_evidence_for_session(" ")
+    store.close()
+
+
 def test_create_and_event_operations_are_idempotent(tmp_path) -> None:
     case = PerformanceCaseV1(case_id="case-1", query_fingerprint="query-hash")
     with PerformanceStore(tmp_path / "state") as store:
@@ -430,7 +502,7 @@ def test_index_benchmark_request_binding_requires_exact_key_and_shape() -> None:
     assert binding["request_fingerprint"] == "request-shape-v1"
     assert "caller-key" not in binding["idempotency_key"]
 
-    with pytest.raises(IdempotencyConflictError, match="different request"):
+    with pytest.raises(IdempotencyConflictError) as changed_request:
         store.bind_index_benchmark_request(
             session.session_id,
             candidate.candidate_id,
@@ -438,7 +510,7 @@ def test_index_benchmark_request_binding_requires_exact_key_and_shape() -> None:
             "request-shape-v2",
             idempotency_key="caller-key",
         )
-    with pytest.raises(IdempotencyConflictError, match="different idempotency key"):
+    with pytest.raises(IdempotencyConflictError) as changed_key:
         store.bind_index_benchmark_request(
             session.session_id,
             candidate.candidate_id,
@@ -446,6 +518,11 @@ def test_index_benchmark_request_binding_requires_exact_key_and_shape() -> None:
             "request-shape-v1",
             idempotency_key="another-key",
         )
+    for conflict in (changed_request.value, changed_key.value):
+        message = str(conflict)
+        assert "exact original request" in message
+        assert "exact original idempotency key" in message
+        assert "get_tuning_session" in message
 
     finalist = store.bind_index_benchmark_request(
         session.session_id,
