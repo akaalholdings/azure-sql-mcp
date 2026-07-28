@@ -7,6 +7,7 @@ import pytest
 
 from azure_sql_mcp.config import AccessMode
 from azure_sql_mcp.config import AuthMode
+from azure_sql_mcp.config import LEARNING_TOOL_NAMES
 from azure_sql_mcp.config import McpProfile
 from azure_sql_mcp.config import PROFILE_TOOL_ALLOWLISTS
 from azure_sql_mcp.config import TOOL_GROUPS
@@ -78,6 +79,47 @@ def test_view_sql_state_persistence_requires_explicit_opt_in(monkeypatch) -> Non
     config = load_server_config([])
 
     assert config.persist_view_sql_state is True
+
+
+@pytest.mark.parametrize("profile", list(McpProfile))
+def test_learning_tools_are_available_to_every_local_profile(
+    monkeypatch,
+    profile: McpProfile,
+) -> None:
+    monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
+    monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "appdb")
+    monkeypatch.setenv("AZURE_SQL_ALLOWED_DATABASES", "appdb")
+    args = ["--azure-sql-profile", profile.value, "--azure-sql-tool-groups", "all"]
+    if profile in {McpProfile.SANDBOX, McpProfile.ENFORCER_APPLY}:
+        args.extend(
+            [
+                "--azure-sql-access-mode",
+                "unrestricted",
+                "--azure-sql-write-policy",
+                "apply",
+            ]
+        )
+
+    config = load_server_config(args)
+
+    assert all(config.is_tool_enabled(name) for name in LEARNING_TOOL_NAMES)
+
+
+@pytest.mark.parametrize("transport", [TransportMode.SSE, TransportMode.STREAMABLE_HTTP])
+def test_learning_tools_are_hidden_on_remote_transports(
+    monkeypatch,
+    transport: TransportMode,
+) -> None:
+    monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
+    monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "appdb")
+    monkeypatch.setenv("AZURE_SQL_ALLOWED_DATABASES", "appdb")
+    monkeypatch.setenv("AZURE_SQL_MCP_BEARER_TOKEN", "test-bearer")
+
+    config = load_server_config(
+        ["--transport", transport.value, "--azure-sql-tool-groups", "all"]
+    )
+
+    assert not any(config.is_tool_enabled(name) for name in LEARNING_TOOL_NAMES)
 
 
 def test_view_sql_state_persistence_rejects_memory_store(monkeypatch) -> None:

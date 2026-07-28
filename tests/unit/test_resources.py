@@ -135,6 +135,7 @@ def test_register_resources_exposes_expected_templates(registered_resources: tup
         "azuresql://{database}/{schema}/procedures",
         "azuresql://{database}/{schema}/{table}",
     ]
+    assert not any(uri.startswith("azuresql-learning://") for uri in mcp.resources)
     assert mcp.resources["azuresql://{database}/schemas"].mime_type == "application/json"
     assert mcp.resources["azuresql://{database}/{schema}/{table}"].description == (
         "Get columns, constraints, and indexes for a table."

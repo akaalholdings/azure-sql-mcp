@@ -16,6 +16,7 @@ The supported tuning path is evidence-first but rewrite-active: a missing plan l
 - Durable temporary-index leases, automatic cleanup, and startup recovery of expired leases.
 - Reviewed view preparation with sandbox-only apply, durable restart recovery, verification, and exact rollback.
 - Prepared Query Store plan actions with prior-state capture, policy checks, verification, and exact rollback.
+- Evidence-linked decisions, terminal outcome reviews, reviewed lessons, and typed cross-skill handoffs.
 - Audited general DBA T-SQL execution that rejects direct or statically recoverable `DROP DATABASE` statements.
 
 The Copilot operating instructions live in the [`akaalholdings/SQL` skills](https://github.com/akaalholdings/SQL/tree/main/skills). The skills decide what to investigate and how to present the result; this package owns database execution, policy, durable state, and deterministic workflow transitions.
@@ -476,6 +477,33 @@ changes, and plan counts. Argument validation failures use a sanitized
 returned.
 
 Resources include schema views and token-safe plan artifacts under `azuresql-artifact://{artifact_id}`. Artifact content is process-local and expires with the server.
+
+## Evidence-governed learning
+
+Local stdio servers expose advisory learning tools for `sql-health-triage@1.0.0`,
+`sql-optimizer@2.3.0`, and `sql-plan-enforcer@1.0.0`. They persist redacted
+`DecisionRecordV1`, `OutcomeReviewV1`, `LessonV1`, and `HandoffV1` contracts in
+the existing owner-only `performance.sqlite3`. Remote transports do not expose
+these tools, and an unavailable learning store leaves the normal static and
+database-operation surfaces unchanged.
+
+Lessons never authorize database changes or modify a skill. Normal lessons need
+three aligned terminal reviews across at least two sessions and two subject
+fingerprints before becoming eligible. Activation, rejection, retirement, and
+supersession require the local maintainer CLI, a named reviewer, and the current
+optimistic version:
+
+```bash
+uv run azure-sql-mcp-learning list
+uv run azure-sql-mcp-learning activate lesson-id --reviewer reviewer-name --expected-version 0
+uv run azure-sql-mcp-learning export --output learning-pack.json
+uv run azure-sql-mcp-learning import learning-pack.json
+```
+
+Exports contain active lessons only. Imports are inactive proposals with
+source-pack provenance and require fresh local approval. Learning contracts and
+packs reject raw SQL, parameters, result rows, credentials, environment values,
+and hidden reasoning.
 
 ## Verification
 

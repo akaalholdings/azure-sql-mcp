@@ -42,6 +42,20 @@ class McpProfile(str, Enum):
     ENFORCER_APPLY = "enforcer-apply"
 
 
+LEARNING_TOOL_NAMES = frozenset(
+    {
+        "record_decision",
+        "review_decision",
+        "propose_lesson",
+        "recall_lessons",
+        "list_learning_candidates",
+        "create_handoff",
+        "get_handoff",
+        "resolve_handoff",
+    }
+)
+
+
 # Tool name → group mapping.  Tools not listed here are always registered.
 TOOL_GROUPS: dict[str, ToolGroup] = {
     # core: essential query & introspection (always in "all", registered by default)
@@ -77,6 +91,7 @@ TOOL_GROUPS: dict[str, ToolGroup] = {
     "analyze_db_health": ToolGroup.CORE,
     "get_top_queries": ToolGroup.CORE,
     "analyze_index_recommendations": ToolGroup.CORE,
+    **{tool_name: ToolGroup.CORE for tool_name in LEARNING_TOOL_NAMES},
     # performance: deep diagnostics & tuning
     "analyze_query_indexes": ToolGroup.PERFORMANCE,
     "analyze_workload_indexes": ToolGroup.PERFORMANCE,
@@ -179,7 +194,7 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "get_cached_routine_stats",
             "get_object_index_diagnostics",
         }
-    ),
+    ) | LEARNING_TOOL_NAMES,
     McpProfile.OPTIMIZER: frozenset(
         {
             "check_runtime_status",
@@ -217,7 +232,7 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "get_cached_routine_stats",
             "get_object_index_diagnostics",
         }
-    ),
+    ) | LEARNING_TOOL_NAMES,
     McpProfile.SANDBOX: frozenset(
         {
             "check_runtime_status",
@@ -259,7 +274,7 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "get_cached_routine_stats",
             "get_object_index_diagnostics",
         }
-    ),
+    ) | LEARNING_TOOL_NAMES,
     McpProfile.ENFORCER_REVIEW: frozenset(
         {
             "check_runtime_status",
@@ -285,7 +300,7 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "get_cached_routine_stats",
             "get_object_index_diagnostics",
         }
-    ),
+    ) | LEARNING_TOOL_NAMES,
     McpProfile.ENFORCER_APPLY: frozenset(
         {
             "check_runtime_status",
@@ -314,7 +329,7 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "get_cached_routine_stats",
             "get_object_index_diagnostics",
         }
-    ),
+    ) | LEARNING_TOOL_NAMES,
 }
 
 
@@ -384,6 +399,12 @@ class ServerConfig:
         """Check whether a tool should be registered based on configured tool_groups."""
         if tool_name == "check_runtime_status":
             return True
+        if tool_name in LEARNING_TOOL_NAMES:
+            if self.transport.mode != TransportMode.STDIO:
+                return False
+            if self.profile is not None:
+                return tool_name in PROFILE_TOOL_ALLOWLISTS[self.profile]
+            return ToolGroup.ALL in self.tool_groups or ToolGroup.CORE in self.tool_groups
         group = TOOL_GROUPS.get(tool_name)
         if self.profile is not None:
             if tool_name not in PROFILE_TOOL_ALLOWLISTS[self.profile]:

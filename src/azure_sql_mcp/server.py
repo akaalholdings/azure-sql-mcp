@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import re
+import sqlite3
 import time
 import uuid
 from collections.abc import Awaitable
@@ -17,6 +18,7 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from typing import Any
 from typing import cast
+from typing import Literal
 from typing import NoReturn
 
 from mcp.server.auth.settings import AuthSettings
@@ -58,6 +60,12 @@ from .index_metadata import existing_index_covers_candidate
 from .index_recommendations import IndexRecommendationService
 from .introspection import IntrospectionService
 from .lock_diagnostics import LockDiagnosticsService
+from .learning_contracts import DecisionRecordV1
+from .learning_contracts import HandoffV1
+from .learning_contracts import OutcomeReviewV1
+from .learning_service import LearningService
+from .learning_store import LearningStore
+from .learning_store import LearningStoreError
 from .logging_config import configure_logging
 from .observability import sanitize_error_message
 from .param_binding import detect_parameters
@@ -132,6 +140,11 @@ TEST_INDEX_DEFINITION_PROPERTY = "AzureSqlMcpDefinitionFingerprint"
 _PLAIN_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _INDEX_OWNER_PROOF = re.compile(r"^[A-Za-z0-9_.:-]{16,200}$")
 _IDEMPOTENCY_DIGEST_PATTERN = re.compile(r"^idempotency-v1:[0-9a-f]{64}$")
+_LEARNING_SKILL_VERSIONS = {
+    "sql-health-triage": "1.0.0",
+    "sql-optimizer": "2.3.0",
+    "sql-plan-enforcer": "1.0.0",
+}
 _PENDING_INDEX_OWNERSHIP_SQL = """
 SELECT
     i.index_id,
@@ -369,6 +382,29 @@ class AzureSqlMcpApplication:
             if config.performance_state_dir == ":memory:"
             else PerformanceStore(config.performance_state_dir)
         )
+        self.learning_store: LearningStore | None = None
+        self.learning_service: LearningService | None = None
+        if config.transport.mode == TransportMode.STDIO:
+            try:
+                self.learning_store = (
+                    LearningStore(db_path=":memory:")
+                    if config.performance_state_dir == ":memory:"
+                    else LearningStore(config.performance_state_dir)
+                )
+                self.learning_service = LearningService(
+                    self.learning_store,
+                    evidence_validator=self._learning_evidence_ref_is_valid,
+                )
+            except (LearningStoreError, OSError, sqlite3.Error) as exc:
+                logger.warning(
+                    "Learning state is unavailable; continuing with the static MCP surface.",
+                    extra={
+                        "error_type": type(exc).__name__,
+                        "error": sanitize_error_message(str(exc)),
+                    },
+                )
+                self.learning_store = None
+                self.learning_service = None
         self.tuning_sessions = TuningSessionStateMachine(self.performance_store)
         self.performance_workflows = PerformanceWorkflowService(
             executor=executor,
@@ -406,6 +442,8 @@ class AzureSqlMcpApplication:
         )
 
         self._register_tools()
+        if self.learning_service is not None:
+            self._register_learning_tools()
         self._prune_disabled_tools()
         self._enforce_strict_tool_argument_models()
         register_resources(
@@ -1147,6 +1185,7 @@ class AzureSqlMcpApplication:
                 ),
             ),
             idempotency_key: str | None = Field(default=None),
+            decision_id: str | None = Field(default=None),
             database_name: str | None = Field(default=None),
         ) -> ResponseType:
             return await self._run_tool(
@@ -1161,6 +1200,7 @@ class AzureSqlMcpApplication:
                     idempotency_key,
                     parameter_case,
                 ),
+                decision_id=decision_id,
             )
 
         @self.mcp.tool(
@@ -1348,6 +1388,7 @@ class AzureSqlMcpApplication:
                 ),
             ),
             idempotency_key: str | None = Field(default=None),
+            decision_id: str | None = Field(default=None),
             database_name: str | None = Field(default=None),
         ) -> BenchmarkToolOutput:
             return cast(
@@ -1371,6 +1412,7 @@ class AzureSqlMcpApplication:
                     deadline_provider=lambda: self.tuning_sessions.get_session(
                         session_id
                     ).deadline_at_utc,
+                    decision_id=decision_id,
                 ),
             )
 
@@ -1417,6 +1459,7 @@ class AzureSqlMcpApplication:
             idempotency_key: str = Field(
                 description="Caller-generated key used to fence retries and cleanup."
             ),
+            decision_id: str | None = Field(default=None),
             database_name: str | None = Field(default=None),
         ) -> BenchmarkToolOutput:
             return cast(
@@ -1445,6 +1488,7 @@ class AzureSqlMcpApplication:
                     deadline_provider=lambda: self.tuning_sessions.get_session(
                         session_id
                     ).deadline_at_utc,
+                    decision_id=decision_id,
                 ),
             )
 
@@ -1477,6 +1521,7 @@ class AzureSqlMcpApplication:
                 description="Why the optimizer stopped.",
             ),
             idempotency_key: str | None = Field(default=None),
+            decision_id: str | None = Field(default=None),
             database_name: str | None = Field(default=None),
         ) -> SessionToolOutput:
             return cast(
@@ -1492,6 +1537,7 @@ class AzureSqlMcpApplication:
                         idempotency_key,
                         selection_scope=selection_scope,
                     ),
+                    decision_id=decision_id,
                 ),
             )
 
@@ -2935,6 +2981,7 @@ class AzureSqlMcpApplication:
             authorization_reference: str = Field(
                 description="Authorization used if verification requires rollback."
             ),
+            decision_id: str | None = Field(default=None),
             database_name: str | None = Field(default=None),
         ) -> ResponseType:
             return await self._run_tool(
@@ -2946,6 +2993,7 @@ class AzureSqlMcpApplication:
                     candidate_evidence=candidate_evidence,
                     authorization_reference=authorization_reference,
                 ),
+                decision_id=decision_id,
             )
 
         @self.mcp.tool(
@@ -2964,6 +3012,7 @@ class AzureSqlMcpApplication:
                 description="Explicit rollback authorization or change reference."
             ),
             reason: str = Field(default="explicit rollback requested"),
+            decision_id: str | None = Field(default=None),
             database_name: str | None = Field(default=None),
         ) -> ResponseType:
             return await self._run_tool(
@@ -2975,6 +3024,7 @@ class AzureSqlMcpApplication:
                     authorization_reference=authorization_reference,
                     reason=reason,
                 ),
+                decision_id=decision_id,
             )
 
         @self.mcp.tool(
@@ -3003,6 +3053,7 @@ class AzureSqlMcpApplication:
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
             ),
+            decision_id: str | None = Field(default=None),
         ) -> ResponseType:
             return await self._run_tool(
                 "analyze_db_health",
@@ -3011,6 +3062,7 @@ class AzureSqlMcpApplication:
                     resolved_database,
                     health_type,
                 ),
+                decision_id=decision_id,
             )
 
         if self.config.access_mode == AccessMode.UNRESTRICTED:
@@ -3427,6 +3479,800 @@ class AzureSqlMcpApplication:
                     lambda db: self._kill_session(db, session_id, dry_run),
                 )
 
+    def _register_learning_tools(self) -> None:
+        """Register the owner-only, advisory learning plane on local stdio."""
+
+        learning = self.learning_service
+        if learning is None:  # pragma: no cover - guarded by the caller
+            return
+
+        @self.mcp.tool(
+            description=(
+                "Record a redacted skill decision backed by scoped evidence. "
+                "Learning is advisory and cannot change database activity."
+            ),
+            annotations=ToolAnnotations(
+                title="Record Learning Decision",
+                readOnlyHint=False,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )
+        async def record_decision(
+            skill: Literal[
+                "sql-health-triage", "sql-optimizer", "sql-plan-enforcer"
+            ] = Field(description="Maintained skill that made the decision."),
+            skill_version: str = Field(description="Skill contract version."),
+            learning_key: str = Field(description="Stable decision-family key."),
+            subject_kind: Literal["query", "plan", "incident", "database"] = Field(
+                description="Redacted decision subject kind.",
+            ),
+            subject_fingerprint: str = Field(
+                min_length=1,
+                max_length=512,
+                description="Redacted fingerprint of the decision subject.",
+            ),
+            consumed_evidence_refs: list[str] = Field(
+                description="Immutable evidence or terminal-link identifiers."
+            ),
+            based_on_review_ids: list[str] = Field(
+                default_factory=list,
+                description="Prior review identifiers supporting this decision.",
+            ),
+            tactic: str = Field(description="Concise redacted tactic summary."),
+            expected_result: dict[str, Any] = Field(
+                description="Structured redacted prediction summary."
+            ),
+            confidence: float = Field(ge=0.0, le=1.0),
+            uncertainty: dict[str, Any] = Field(
+                description="Structured redacted uncertainty summary."
+            ),
+            evaluator_fingerprint: str = Field(
+                description="Redacted evaluator/model fingerprint."
+            ),
+            runtime_fingerprint: str = Field(
+                description="Process runtime fingerprint returned by check_runtime_status."
+            ),
+            runtime_compatibility_fingerprint: str = Field(
+                description=(
+                    "Stable compatibility fingerprint returned by check_runtime_status."
+                )
+            ),
+            tool_schema_fingerprint: str = Field(
+                description="Tool-schema fingerprint returned by check_runtime_status."
+            ),
+            sanitized_config_fingerprint: str = Field(
+                description="Sanitized-config fingerprint returned by check_runtime_status."
+            ),
+            case_id: str | None = Field(default=None),
+            session_id: str | None = Field(default=None),
+            candidate_id: str | None = Field(default=None),
+            query_fingerprint: str | None = Field(default=None),
+            applied_lesson_ids: list[str] | None = Field(default=None),
+            tags: list[str] | None = Field(default=None),
+            idempotency_key: str | None = Field(default=None),
+            database_name: str | None = Field(default=None),
+        ) -> ResponseType:
+            self._validate_learning_skill_version(skill, skill_version)
+            resolved_database = self.config.validate_database_name(database_name)
+            scope = self._validated_learning_scope(
+                resolved_database,
+                runtime_fingerprint,
+                runtime_compatibility_fingerprint,
+                tool_schema_fingerprint,
+                sanitized_config_fingerprint,
+            )
+            self._validate_learning_decision_references(
+                resolved_database,
+                case_id=case_id,
+                session_id=session_id,
+                candidate_id=candidate_id,
+                query_fingerprint=query_fingerprint,
+                evidence_refs=consumed_evidence_refs,
+                applied_lesson_ids=tuple(applied_lesson_ids or ()),
+                based_on_review_ids=tuple(based_on_review_ids),
+            )
+            decision = DecisionRecordV1(
+                skill=skill,
+                skill_version=skill_version,
+                case_id=case_id,
+                session_id=session_id,
+                candidate_id=candidate_id,
+                learning_key=learning_key,
+                consumed_evidence_refs=tuple(consumed_evidence_refs),
+                subject_kind=subject_kind,
+                subject_fingerprint=subject_fingerprint,
+                based_on_review_ids=tuple(based_on_review_ids),
+                query_fingerprint=query_fingerprint,
+                tactic=tactic,
+                expected_result=expected_result,
+                confidence=confidence,
+                uncertainty=uncertainty,
+                applied_lesson_ids=tuple(applied_lesson_ids or ()),
+                evaluator_fingerprint=evaluator_fingerprint,
+                runtime_fingerprint=runtime_fingerprint,
+                runtime_compatibility_fingerprint=runtime_compatibility_fingerprint,
+                tool_schema_fingerprint=tool_schema_fingerprint,
+                sanitized_config_fingerprint=sanitized_config_fingerprint,
+                scope=scope,
+                tags=tuple(tags or ()),
+            )
+            request_fingerprint = fingerprint_json(
+                {
+                    key: value
+                    for key, value in decision.to_dict().items()
+                    if key
+                    not in {"decision_id", "created_at_utc", "updated_at_utc", "version"}
+                }
+            )
+            stored = learning.record_decision(
+                decision,
+                idempotency_key=idempotency_key,
+                request_fingerprint=request_fingerprint,
+            )
+            return stored.to_dict()
+
+        @self.mcp.tool(
+            description=(
+                "Review one decision using only MCP-created terminal-link evidence."
+            ),
+            annotations=ToolAnnotations(
+                title="Review Learning Decision",
+                readOnlyHint=False,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )
+        async def review_decision(
+            decision_id: str = Field(description="Recorded decision identifier."),
+            terminal_evidence_refs: list[str] = Field(
+                description="MCP-created terminal-link-* identifiers."
+            ),
+            observed_result: dict[str, Any] = Field(
+                description="Structured redacted observed outcome."
+            ),
+            prediction_error: dict[str, Any] = Field(
+                description="Structured redacted prediction error."
+            ),
+            counterexamples: list[dict[str, Any]] = Field(
+                description="Structured redacted counterexamples or bounded risks."
+            ),
+            next_observation: dict[str, Any] = Field(
+                description="Structured redacted next observation to collect."
+            ),
+            causal_strength: Literal[
+                "strong", "moderate", "weak", "none", "unknown"
+            ] = Field(default="unknown"),
+            alignment: Literal["aligned", "contradiction", "unknown"] = Field(
+                default="unknown"
+            ),
+            safety_signal: Literal[
+                "passed", "proven_failure", "not_applicable", "unknown"
+            ] = Field(default="unknown"),
+            equivalence_signal: Literal[
+                "passed", "proven_failure", "not_applicable", "unknown"
+            ] = Field(default="unknown"),
+            cleanup_signal: Literal[
+                "passed", "proven_failure", "not_applicable", "unknown"
+            ] = Field(default="unknown"),
+            material_regression_signal: Literal[
+                "passed", "proven_failure", "not_applicable", "unknown"
+            ] = Field(default="unknown"),
+            correction: dict[str, Any] | None = Field(default=None),
+            unresolved_gaps: list[str] | None = Field(default=None),
+            unknown_outcome: bool = Field(default=False),
+            explicit_correction: bool = Field(default=False),
+            idempotency_key: str | None = Field(default=None),
+            database_name: str | None = Field(default=None),
+        ) -> ResponseType:
+            resolved_database = self.config.validate_database_name(database_name)
+            decision = learning.store.get_decision(decision_id)
+            self._validate_learning_contract_scope(decision.scope, resolved_database)
+            self._validate_learning_evidence_refs(
+                terminal_evidence_refs,
+                database_name=resolved_database,
+                decision_id=decision_id,
+                terminal_only=True,
+            )
+            completed_at = datetime.now(timezone.utc).isoformat()
+            review_kwargs: dict[str, Any] = {
+                "decision_id": decision_id,
+                "terminal_evidence_refs": tuple(terminal_evidence_refs),
+                "observed_result": observed_result,
+                "prediction_error": prediction_error,
+                "causal_strength": causal_strength,
+                "unresolved_gaps": tuple(unresolved_gaps or ()),
+                "created_at_utc": completed_at,
+                "completed_at_utc": completed_at,
+                "complete": True,
+                "alignment": alignment,
+                "safety_signal": safety_signal,
+                "equivalence_signal": equivalence_signal,
+                "cleanup_signal": cleanup_signal,
+                "material_regression_signal": material_regression_signal,
+                "unknown_outcome": unknown_outcome,
+                "explicit_correction": explicit_correction,
+            }
+            review_kwargs.update(
+                {
+                    "counterexamples": tuple(counterexamples),
+                    "next_observation": next_observation,
+                    "correction": correction,
+                }
+            )
+            review = OutcomeReviewV1(**review_kwargs)
+            request_fingerprint = fingerprint_json(
+                {
+                    key: value
+                    for key, value in review.to_dict().items()
+                    if key
+                    not in {
+                        "review_id",
+                        "created_at_utc",
+                        "completed_at_utc",
+                        "version",
+                    }
+                }
+            )
+            stored = learning.record_outcome_review(
+                review,
+                idempotency_key=idempotency_key,
+                request_fingerprint=request_fingerprint,
+            )
+            return stored.to_dict()
+
+        @self.mcp.tool(
+            description="Propose an inactive lesson from reviewed decisions.",
+            annotations=ToolAnnotations(
+                title="Propose Learning Lesson",
+                readOnlyHint=False,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )
+        async def propose_lesson(
+            learning_key: str = Field(description="Stable decision-family key."),
+            review_ids: list[str] = Field(description="Supporting review identifiers."),
+            trigger: dict[str, Any] = Field(description="Redacted trigger summary."),
+            action: dict[str, Any] = Field(description="Redacted action summary."),
+            preconditions: dict[str, Any] = Field(
+                description="Bounded preconditions for applying the lesson."
+            ),
+            counterexamples: list[dict[str, Any]] = Field(
+                description="Known failures, limits, or bounded risks."
+            ),
+            next_observation: dict[str, Any] | None = Field(
+                default=None,
+                description="Structured redacted next observation to collect.",
+            ),
+            required_evidence: list[str] = Field(
+                description="Evidence labels required before using the lesson."
+            ),
+            applicable_skills: list[
+                Literal[
+                    "sql-health-triage",
+                    "sql-optimizer",
+                    "sql-plan-enforcer",
+                ]
+            ] = Field(
+                description="Skills allowed to recall the lesson."
+            ),
+            tags: list[str] | None = Field(default=None),
+            freshness_days: int | None = Field(default=None, ge=1),
+            supersedes_lesson_id: str | None = Field(default=None),
+            idempotency_key: str | None = Field(default=None),
+            database_name: str | None = Field(default=None),
+        ) -> ResponseType:
+            resolved_database = self.config.validate_database_name(database_name)
+            for review_id in review_ids:
+                review = learning.store.get_review(review_id)
+                decision = learning.store.get_decision(review.decision_id)
+                self._validate_learning_contract_scope(decision.scope, resolved_database)
+            lesson = learning.propose_lesson(
+                learning_key=learning_key,
+                review_ids=review_ids,
+                trigger=trigger,
+                action=action,
+                preconditions=preconditions,
+                counterexamples=counterexamples,
+                next_observation=next_observation,
+                required_evidence=required_evidence,
+                applicable_skills=applicable_skills,
+                tags=tags or (),
+                freshness_days=freshness_days,
+                supersedes_lesson_id=supersedes_lesson_id,
+                idempotency_key=idempotency_key,
+            )
+            return lesson.to_dict()
+
+        @self.mcp.tool(
+            description="Recall at most three fresh, active, scoped lessons.",
+            annotations=ToolAnnotations(
+                title="Recall Learning Lessons",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )
+        async def recall_lessons(
+            skill: Literal[
+                "sql-health-triage", "sql-optimizer", "sql-plan-enforcer"
+            ] = Field(description="Maintained skill requesting advisory lessons."),
+            skill_version: str = Field(description="Version of the requesting skill."),
+            runtime_compatibility_fingerprint: str = Field(
+                description="Stable compatibility fingerprint returned by check_runtime_status."
+            ),
+            tool_schema_fingerprint: str = Field(
+                description="Tool-schema fingerprint returned by check_runtime_status."
+            ),
+            sanitized_config_fingerprint: str = Field(
+                description="Sanitized-config fingerprint returned by check_runtime_status."
+            ),
+            query_fingerprint: str | None = Field(default=None),
+            tags: list[str] | None = Field(default=None),
+            database_name: str | None = Field(default=None),
+        ) -> ResponseType:
+            self._validate_learning_skill_version(skill, skill_version)
+            resolved_database = self.config.validate_database_name(database_name)
+            scope = self._validated_learning_scope(
+                resolved_database,
+                None,
+                runtime_compatibility_fingerprint,
+                tool_schema_fingerprint,
+                sanitized_config_fingerprint,
+            )
+            lessons = learning.recall(
+                skill=skill,
+                skill_version=skill_version,
+                query_fingerprint=query_fingerprint,
+                scope=scope,
+                runtime_compatibility_fingerprint=scope[
+                    "runtime_compatibility_fingerprint"
+                ],
+                tool_schema_fingerprint=scope["tool_schema_fingerprint"],
+                sanitized_config_fingerprint=scope["sanitized_config_fingerprint"],
+                tags=tags or (),
+                max_results=3,
+            )
+            return {
+                "lessons": [lesson.to_dict() for lesson in lessons],
+                "count": len(lessons),
+                "max_results": 3,
+            }
+
+        @self.mcp.tool(
+            description="List deterministic lesson candidates for maintainer review.",
+            annotations=ToolAnnotations(
+                title="List Learning Candidates",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )
+        async def list_learning_candidates(
+            skill: Literal[
+                "sql-health-triage", "sql-optimizer", "sql-plan-enforcer"
+            ]
+            | None = Field(default=None),
+            learning_key: str | None = Field(default=None),
+            database_name: str | None = Field(default=None),
+        ) -> ResponseType:
+            resolved_database = self.config.validate_database_name(database_name)
+            candidates = learning.list_learning_candidates(
+                skill=skill,
+                learning_key=learning_key,
+                scope=self._current_learning_scope(resolved_database),
+            )
+            return {"candidates": [dict(item) for item in candidates], "count": len(candidates)}
+
+        @self.mcp.tool(
+            description="Create a durable, redacted cross-skill learning handoff.",
+            annotations=ToolAnnotations(
+                title="Create Learning Handoff",
+                readOnlyHint=False,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )
+        async def create_handoff(
+            source_skill: Literal[
+                "sql-health-triage", "sql-optimizer", "sql-plan-enforcer"
+            ] = Field(description="Maintained skill creating the handoff."),
+            target_skill: Literal[
+                "sql-health-triage", "sql-optimizer", "sql-plan-enforcer"
+            ] = Field(description="Maintained skill expected to accept it."),
+            objective: dict[str, Any] = Field(description="Redacted handoff objective."),
+            evidence_refs: list[str] = Field(description="Immutable evidence identifiers."),
+            constraints: dict[str, Any] = Field(description="Safety and scope constraints."),
+            gaps: list[dict[str, Any]] = Field(description="Known unresolved gaps."),
+            acceptance_criteria: list[dict[str, Any]] = Field(
+                description="Evidence-backed completion criteria."
+            ),
+            case_id: str | None = Field(default=None),
+            session_id: str | None = Field(default=None),
+            idempotency_key: str | None = Field(default=None),
+            database_name: str | None = Field(default=None),
+        ) -> ResponseType:
+            resolved_database = self.config.validate_database_name(database_name)
+            self._validate_learning_workflow_references(
+                resolved_database,
+                case_id=case_id,
+                session_id=session_id,
+            )
+            self._validate_learning_evidence_refs(
+                evidence_refs,
+                database_name=resolved_database,
+            )
+            handoff = HandoffV1(
+                source_skill=source_skill,
+                target_skill=target_skill,
+                case_id=case_id,
+                session_id=session_id,
+                scope=self._current_learning_scope(resolved_database),
+                objective=objective,
+                evidence_refs=tuple(evidence_refs),
+                constraints=constraints,
+                gaps=tuple(gaps),
+                acceptance_criteria=tuple(acceptance_criteria),
+            )
+            return learning.create_handoff(
+                handoff,
+                idempotency_key=idempotency_key,
+            ).to_dict()
+
+        @self.mcp.tool(
+            description="Read one scoped durable cross-skill learning handoff.",
+            annotations=ToolAnnotations(
+                title="Get Learning Handoff",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )
+        async def get_handoff(
+            handoff_id: str = Field(description="Handoff identifier."),
+            database_name: str | None = Field(default=None),
+        ) -> ResponseType:
+            resolved_database = self.config.validate_database_name(database_name)
+            handoff = learning.store.get_handoff(handoff_id)
+            self._validate_learning_contract_scope(handoff.scope, resolved_database)
+            return handoff.to_dict()
+
+        @self.mcp.tool(
+            description="Claim, resolve, reopen, or cancel a scoped learning handoff; successful resolutions can link a decision.",
+            annotations=ToolAnnotations(
+                title="Resolve Learning Handoff",
+                readOnlyHint=False,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )
+        async def resolve_handoff(
+            handoff_id: str = Field(description="Handoff identifier."),
+            action: Literal["claim", "resolve", "reopen", "cancel"] = Field(
+                description="Lifecycle action."
+            ),
+            expected_version: int = Field(ge=0),
+            owner: str | None = Field(default=None),
+            resolution: dict[str, Any] | None = Field(default=None),
+            resolution_evidence_refs: list[str] | None = Field(default=None),
+            decision_id: str | None = Field(
+                default=None,
+                description="Optional decision to link after a successful resolution.",
+            ),
+            database_name: str | None = Field(default=None),
+        ) -> ResponseType:
+            resolved_database = self.config.validate_database_name(database_name)
+            handoff = learning.store.get_handoff(handoff_id)
+            self._validate_learning_contract_scope(handoff.scope, resolved_database)
+            supplied_resolution_refs = tuple(resolution_evidence_refs or ())
+            if supplied_resolution_refs and action != "resolve":
+                raise ValueError(
+                    "resolution_evidence_refs are only valid when resolving a handoff."
+                )
+            if action == "claim":
+                if not owner:
+                    raise ValueError("Claiming a handoff requires owner.")
+                updated = learning.claim_handoff(
+                    handoff_id, owner, expected_version=expected_version
+                )
+            elif action == "resolve":
+                if resolution is None:
+                    raise ValueError("Resolving a handoff requires resolution.")
+                evidence_refs = supplied_resolution_refs
+                self._validate_learning_evidence_refs(
+                    evidence_refs,
+                    database_name=resolved_database,
+                    terminal_only=True,
+                )
+                updated = learning.resolve_handoff(
+                    handoff_id,
+                    resolution,
+                    resolution_evidence_refs=evidence_refs,
+                    expected_version=expected_version,
+                )
+            elif action == "reopen":
+                updated = learning.reopen_handoff(
+                    handoff_id, expected_version=expected_version
+                )
+            else:
+                updated = learning.cancel_handoff(
+                    handoff_id, expected_version=expected_version
+                )
+            result = updated.to_dict()
+            if action == "resolve" and decision_id is not None:
+                return await self._attach_learning_terminal_link(
+                    "resolve_handoff",
+                    resolved_database,
+                    decision_id,
+                    result,
+                )
+            return result
+
+    @staticmethod
+    def _validate_learning_skill_version(skill: str, skill_version: str) -> None:
+        expected_version = _LEARNING_SKILL_VERSIONS.get(skill)
+        if expected_version is None or skill_version != expected_version:
+            raise ValueError(
+                f"Learning skill {skill!r} requires version "
+                f"{expected_version or 'unsupported'}."
+            )
+
+    def _current_learning_scope(self, database_name: str) -> dict[str, str]:
+        runtime = self._runtime_status()
+        return {
+            "server_fingerprint": fingerprint_text(self.config.server),
+            "database_fingerprint": database_fingerprint(
+                database_name, self.config.server
+            ),
+            "runtime_compatibility_fingerprint": str(
+                runtime["runtime_compatibility_fingerprint"]
+            ),
+            "tool_schema_fingerprint": str(runtime["tool_schema_fingerprint"]),
+            "sanitized_config_fingerprint": str(
+                runtime["sanitized_config_fingerprint"]
+            ),
+        }
+
+    def _validated_learning_scope(
+        self,
+        database_name: str,
+        runtime_fingerprint: str | None,
+        runtime_compatibility_fingerprint: str,
+        tool_schema_fingerprint: str,
+        sanitized_config_fingerprint: str,
+    ) -> dict[str, str]:
+        current = self._current_learning_scope(database_name)
+        supplied = {
+            "runtime_compatibility_fingerprint": runtime_compatibility_fingerprint,
+            "tool_schema_fingerprint": tool_schema_fingerprint,
+            "sanitized_config_fingerprint": sanitized_config_fingerprint,
+        }
+        expected = {
+            "runtime_compatibility_fingerprint": current[
+                "runtime_compatibility_fingerprint"
+            ],
+            "tool_schema_fingerprint": current["tool_schema_fingerprint"],
+            "sanitized_config_fingerprint": current[
+                "sanitized_config_fingerprint"
+            ],
+        }
+        if runtime_fingerprint is not None:
+            supplied["runtime_fingerprint"] = runtime_fingerprint
+            expected["runtime_fingerprint"] = self._runtime_status()[
+                "runtime_fingerprint"
+            ]
+        mismatches = [
+            name for name, value in supplied.items() if value != expected[name]
+        ]
+        if mismatches:
+            raise ValueError(
+                "Learning request runtime gate failed for: "
+                + ", ".join(sorted(mismatches))
+                + ". Call check_runtime_status and retry with its fingerprints."
+            )
+        return current
+
+    def _validate_learning_contract_scope(
+        self,
+        scope: Mapping[str, Any],
+        database_name: str,
+    ) -> None:
+        expected = self._current_learning_scope(database_name)
+        if any(scope.get(name) != value for name, value in expected.items()):
+            raise ValueError(
+                "Learning contract belongs to a different server, database, or runtime scope."
+            )
+
+    def _validate_learning_workflow_references(
+        self,
+        database_name: str,
+        *,
+        case_id: str | None,
+        session_id: str | None,
+        candidate_id: str | None = None,
+    ) -> None:
+        case = (
+            self.performance_store.get_performance_case(case_id)
+            if case_id is not None
+            else None
+        )
+        session = (
+            self.performance_store.get_session(session_id)
+            if session_id is not None and (case_id is not None or candidate_id is not None)
+            else None
+        )
+        candidate = (
+            self.performance_store.get_candidate(candidate_id)
+            if candidate_id is not None
+            else None
+        )
+        if case is not None and not database_fingerprint_matches(
+            case.database_fingerprint or "",
+            database_name,
+            self.config.server,
+            allow_legacy=bool(self.config.legacy_state_server_binding),
+        ):
+            raise ValueError("Learning workflow case belongs to another database scope.")
+        if session is not None and case is not None and session.performance_case_id != case.case_id:
+            raise ValueError("Learning session does not belong to the supplied case.")
+        if candidate is not None and session_id is not None and candidate.session_id != session_id:
+            raise ValueError("Learning candidate does not belong to the supplied session.")
+        if candidate is not None and session is None:
+            session = self.performance_store.get_session(candidate.session_id)
+        if candidate is not None and case is not None and session is not None:
+            if session.performance_case_id != case.case_id:
+                raise ValueError("Learning candidate belongs to another performance case.")
+
+    def _validate_learning_decision_references(
+        self,
+        database_name: str,
+        *,
+        case_id: str | None,
+        session_id: str | None,
+        candidate_id: str | None,
+        query_fingerprint: str | None,
+        evidence_refs: list[str],
+        applied_lesson_ids: tuple[str, ...],
+        based_on_review_ids: tuple[str, ...],
+    ) -> None:
+        self._validate_learning_workflow_references(
+            database_name,
+            case_id=case_id,
+            session_id=session_id,
+            candidate_id=candidate_id,
+        )
+        case = (
+            self.performance_store.get_performance_case(case_id)
+            if case_id is not None
+            else None
+        )
+        if query_fingerprint is not None and case is not None and query_fingerprint != case.query_fingerprint:
+            raise ValueError("Learning query fingerprint does not match the supplied case.")
+        self._validate_learning_evidence_refs(
+            evidence_refs,
+            database_name=database_name,
+        )
+        if self.learning_store is None:  # pragma: no cover - local-only path
+            raise ValueError("Learning store is unavailable.")
+        current_scope = self._current_learning_scope(database_name)
+        for review_id in based_on_review_ids:
+            review = self.learning_store.get_review(review_id)
+            decision = self.learning_store.get_decision(review.decision_id)
+            self._validate_learning_contract_scope(decision.scope, database_name)
+        for lesson_id in applied_lesson_ids:
+            lesson = self.learning_store.get_lesson(lesson_id)
+            if lesson.status != "active":
+                raise ValueError(f"Applied lesson {lesson_id!r} is not active.")
+            if not any(
+                all(candidate_scope.get(key) == value for key, value in current_scope.items())
+                for candidate_scope in lesson.applicable_scopes
+            ):
+                raise ValueError(f"Applied lesson {lesson_id!r} is outside this database scope.")
+
+    def _validate_learning_evidence_refs(
+        self,
+        evidence_refs: tuple[str, ...] | list[str],
+        *,
+        database_name: str | None = None,
+        decision_id: str | None = None,
+        terminal_only: bool = False,
+    ) -> None:
+        for evidence_ref in evidence_refs:
+            if evidence_ref.startswith("evidence-") and not terminal_only:
+                evidence = self.performance_store.get_evidence(evidence_ref)
+                if database_name is not None and not database_fingerprint_matches(
+                    evidence.database_fingerprint or "",
+                    database_name,
+                    self.config.server,
+                    allow_legacy=bool(self.config.legacy_state_server_binding),
+                ):
+                    raise ValueError("Learning evidence belongs to another database scope.")
+                continue
+            if evidence_ref.startswith("terminal-link-"):
+                if not self._learning_terminal_evidence_exists(
+                    evidence_ref,
+                    decision_id=decision_id,
+                ):
+                    raise ValueError(
+                        f"Terminal evidence reference {evidence_ref!r} was not found."
+                    )
+                if self.learning_store is not None:
+                    link = self.learning_store.get_terminal_link(evidence_ref)
+                    if decision_id is not None and link["decision_id"] != decision_id:
+                        raise ValueError(
+                            "Terminal evidence belongs to another decision scope."
+                        )
+                    if database_name is not None and any(
+                        link["scope"].get(key) != value
+                        for key, value in self._current_learning_scope(
+                            database_name
+                        ).items()
+                    ):
+                        raise ValueError(
+                            "Terminal evidence belongs to another server, database, or runtime scope."
+                        )
+                continue
+            raise ValueError(
+                "Unknown learning evidence reference prefix; expected evidence- or terminal-link-."
+            )
+
+    def _learning_evidence_ref_is_valid(
+        self,
+        evidence_ref: str,
+        decision: DecisionRecordV1,
+    ) -> bool:
+        try:
+            if evidence_ref.startswith("evidence-"):
+                evidence = self.performance_store.get_evidence(evidence_ref)
+                return evidence.database_fingerprint == decision.scope.get(
+                    "database_fingerprint"
+                )
+            if evidence_ref.startswith("terminal-link-"):
+                if not self._learning_terminal_evidence_exists(
+                    evidence_ref,
+                ):
+                    return False
+                if self.learning_store is None:
+                    return False
+                link = self.learning_store.get_terminal_link(evidence_ref)
+                return all(
+                    link["scope"].get(key) == value
+                    for key, value in decision.scope.items()
+                    if key
+                    in {
+                        "server_fingerprint",
+                        "database_fingerprint",
+                        "runtime_compatibility_fingerprint",
+                        "tool_schema_fingerprint",
+                        "sanitized_config_fingerprint",
+                    }
+                )
+        except (ContractNotFoundError, KeyError, ValueError):
+            return False
+        return False
+
+    def _learning_terminal_evidence_exists(
+        self,
+        evidence_ref: str,
+        *,
+        decision_id: str | None = None,
+    ) -> bool:
+        if not evidence_ref.startswith("terminal-link-") or self.learning_service is None:
+            return False
+        return self.learning_service.terminal_link_exists(
+            evidence_ref,
+            decision_id=decision_id,
+        )
+
     def _runtime_status(self) -> dict[str, Any]:
         tools = sorted(
             self.mcp._tool_manager.list_tools(),
@@ -3456,13 +4302,23 @@ class AzureSqlMcpApplication:
             "performance_only_selection": True,
         }
         config_fingerprint = self.config.sanitized_config_fingerprint()
+        compatibility_fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "package_version": self._package_version,
+                    "tool_schema_fingerprint": schema_fingerprint,
+                    "sanitized_config_fingerprint": config_fingerprint,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
         runtime_fingerprint = hashlib.sha256(
             json.dumps(
                 {
                     "startup_timestamp": self._startup_timestamp,
-                    "package_version": self._package_version,
-                    "tool_schema_fingerprint": schema_fingerprint,
-                    "sanitized_config_fingerprint": config_fingerprint,
+                    "runtime_compatibility_fingerprint": compatibility_fingerprint,
                 },
                 ensure_ascii=True,
                 sort_keys=True,
@@ -3483,6 +4339,7 @@ class AzureSqlMcpApplication:
             "strict_argument_models": contracts["strict_arguments"],
             "mcp_tool_errors": contracts["mcp_errors"],
             "runtime_fingerprint": runtime_fingerprint,
+            "runtime_compatibility_fingerprint": compatibility_fingerprint,
             "tool_schema_fingerprint": schema_fingerprint,
             "sanitized_config_fingerprint": config_fingerprint,
         }
@@ -5769,6 +6626,119 @@ class AzureSqlMcpApplication:
             raise asyncio.CancelledError
         return result
 
+    async def _attach_learning_terminal_link(
+        self,
+        tool_name: str,
+        database_name: str,
+        decision_id: str,
+        payload: Any,
+    ) -> Any:
+        """Attach a redacted, idempotent terminal outcome without changing the operation result."""
+
+        if self.learning_service is None:
+            status = "unavailable"
+            link_id = None
+        else:
+            try:
+                decision = self.learning_service.store.get_decision(decision_id)
+                self._validate_learning_contract_scope(decision.scope, database_name)
+                runtime = self._runtime_status()
+                if decision.runtime_fingerprint != runtime["runtime_fingerprint"]:
+                    raise ValueError("Decision process runtime scope is stale.")
+                if (
+                    decision.runtime_compatibility_fingerprint
+                    != runtime["runtime_compatibility_fingerprint"]
+                ):
+                    raise ValueError("Decision runtime compatibility scope is stale.")
+
+                outcome: dict[str, Any] = {"outcome": "succeeded"}
+                evidence_refs: list[str] = []
+                if isinstance(payload, Mapping):
+                    for key in (
+                        "status",
+                        "decision",
+                        "classification",
+                        "performance_classification",
+                        "durable_state",
+                        "phase",
+                        "confirmed",
+                        "idempotent",
+                        "reconciliation_required",
+                        "executions",
+                        "case_id",
+                        "session_id",
+                        "candidate_id",
+                        "intent_id",
+                    ):
+                        value = payload.get(key)
+                        if isinstance(value, (str, int, float, bool)) or value is None:
+                            outcome[key] = value
+                    intent = payload.get("intent")
+                    if isinstance(intent, Mapping) and isinstance(intent.get("status"), str):
+                        outcome["intent_status"] = intent["status"]
+                    for key in (
+                        "evidence_id",
+                        "evidence_ids",
+                        "evidence_refs",
+                        "resolution_evidence_refs",
+                    ):
+                        value = payload.get(key)
+                        values = [value] if isinstance(value, str) else value
+                        if isinstance(values, (list, tuple)):
+                            evidence_refs.extend(
+                                ref
+                                for ref in values
+                                if isinstance(ref, str) and ref.startswith("evidence-")
+                            )
+                evidence_refs = list(dict.fromkeys(evidence_refs))
+                self._validate_learning_evidence_refs(
+                    evidence_refs,
+                    database_name=database_name,
+                )
+                response_fingerprint = fingerprint_json(
+                    {
+                        "tool": tool_name,
+                        "decision_id": decision_id,
+                        "outcome": outcome,
+                        "evidence_refs": evidence_refs,
+                    }
+                )
+                link = self.learning_service.record_terminal_link(
+                    decision_id=decision_id,
+                    source_tool=tool_name,
+                    database_fingerprint=database_fingerprint(
+                        database_name, self.config.server
+                    ),
+                    scope=self._current_learning_scope(database_name),
+                    outcome_summary=outcome,
+                    evidence_refs=tuple(evidence_refs),
+                    response_fingerprint=response_fingerprint,
+                    idempotency_key=(
+                        f"terminal-link:{tool_name}:{decision_id}:{response_fingerprint}"
+                    ),
+                )
+                status = "linked"
+                link_id = link.get("link_id")
+            except Exception as exc:
+                logger.warning(
+                    "Learning terminal linkage failed after successful tool operation.",
+                    extra={
+                        "tool_name": tool_name,
+                        "decision_id": decision_id,
+                        "error_type": type(exc).__name__,
+                        "error": sanitize_error_message(str(exc)),
+                    },
+                )
+                status = "failed"
+                link_id = None
+        if isinstance(payload, dict):
+            result = dict(payload)
+        else:
+            result = {"result": payload}
+        result["learning_link_status"] = status
+        result["terminal_link_id"] = link_id
+        return result
+
     async def _run_tool(
         self,
         tool_name: str,
@@ -5776,6 +6746,7 @@ class AzureSqlMcpApplication:
         callback,
         *,
         deadline_provider: Callable[[], str | None] | None = None,
+        decision_id: str | None = None,
     ) -> ResponseType:
         requested_database = (database_name or self.config.default_database).strip()
         correlation_id = str(uuid.uuid4())
@@ -5814,6 +6785,13 @@ class AzureSqlMcpApplication:
                 callback(resolved_database),
                 timeout=timeout_seconds,
             )
+            if decision_id is not None:
+                payload = await self._attach_learning_terminal_link(
+                    tool_name,
+                    resolved_database,
+                    decision_id,
+                    payload,
+                )
             duration_ms = self._duration_ms(started_at)
             row_count = self._estimate_row_count(payload)
             log_extra: dict[str, Any] = {
@@ -7573,6 +8551,17 @@ class AzureSqlMcpApplication:
                         "error": sanitize_error_message(str(exc)),
                     },
                 )
+            if self.learning_store is not None:
+                try:
+                    self.learning_store.close()
+                except Exception as exc:
+                    logger.error(
+                        "Failed to close learning state store during shutdown.",
+                        extra={
+                            "error_type": type(exc).__name__,
+                            "error": sanitize_error_message(str(exc)),
+                        },
+                    )
             try:
                 await self.pool.close_all()
             except Exception as exc:
