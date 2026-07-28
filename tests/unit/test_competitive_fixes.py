@@ -7,6 +7,7 @@ R7: Logging on swallowed exceptions
 """
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
@@ -26,6 +27,17 @@ from azure_sql_mcp.server import AzureSqlMcpApplication
 # Helpers
 # ---------------------------------------------------------------------------
 
+_TEST_AUDIT_DIR: Path | None = None
+
+
+@pytest.fixture(autouse=True)
+def _managed_audit_dir(tmp_path: Path):
+    global _TEST_AUDIT_DIR
+    _TEST_AUDIT_DIR = tmp_path / "audit"
+    yield
+    _TEST_AUDIT_DIR = None
+
+
 def _make_app(
     access_mode: AccessMode = AccessMode.UNRESTRICTED,
     tool_groups: frozenset[ToolGroup] = frozenset({ToolGroup.ALL}),
@@ -41,6 +53,8 @@ def _make_app(
         )
     else:
         # Fallback: import and build directly
+        if _TEST_AUDIT_DIR is None:  # pragma: no cover - pytest fixture contract
+            raise RuntimeError("pytest-managed audit directory is unavailable")
         from azure_sql_mcp.config import (
             AuthMode,
             ServerConfig,
@@ -74,7 +88,7 @@ def _make_app(
             log_level="INFO",
             mcp_bearer_token=None,
             write_policy=write_policy if access_mode == AccessMode.UNRESTRICTED else WritePolicy.DISABLED,
-            audit_dir="/tmp/azure-sql-mcp-test-audit",
+            audit_dir=str(_TEST_AUDIT_DIR),
             audit_full_sql=False,
             remote_admin_enabled=False,
         )

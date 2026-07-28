@@ -110,7 +110,7 @@ async def test_plan_enforcer_tick_rejects_apply_requests():
 
 
 @pytest.mark.asyncio
-async def test_dry_run_plan_action_works_through_the_tool_wrapper() -> None:
+async def test_dry_run_plan_action_works_through_the_tool_wrapper(tmp_path) -> None:
     """Regression: dry_run_action was sync, so the tool wrapper awaited its
     dict and the registered tool ALWAYS failed with
     "'dict' object can't be awaited" (found live)."""
@@ -120,7 +120,9 @@ async def test_dry_run_plan_action_works_through_the_tool_wrapper() -> None:
     from azure_sql_mcp.config import AccessMode
     from azure_sql_mcp.server import AzureSqlMcpApplication
 
-    app = AzureSqlMcpApplication(make_config(AccessMode.UNRESTRICTED))
+    app = AzureSqlMcpApplication(
+        make_config(tmp_path, AccessMode.UNRESTRICTED)
+    )
     app.admin_policy.preview = MagicMock(  # type: ignore[method-assign]
         return_value={"status": "dry_run", "dry_run": True, "audit_id": "a1"}
     )
@@ -135,7 +137,7 @@ async def test_dry_run_plan_action_works_through_the_tool_wrapper() -> None:
 
 
 @pytest.mark.asyncio
-async def test_direct_apply_plan_action_cannot_mutate() -> None:
+async def test_direct_apply_plan_action_cannot_mutate(tmp_path) -> None:
     """Only a prepared intent may cross the mutation boundary."""
     from unittest.mock import AsyncMock
 
@@ -143,7 +145,9 @@ async def test_direct_apply_plan_action_cannot_mutate() -> None:
     from azure_sql_mcp.config import AccessMode
     from azure_sql_mcp.server import AzureSqlMcpApplication
 
-    app = AzureSqlMcpApplication(make_config(AccessMode.UNRESTRICTED))
+    app = AzureSqlMcpApplication(
+        make_config(tmp_path, AccessMode.UNRESTRICTED)
+    )
     app.admin_policy.execute = AsyncMock(  # type: ignore[method-assign]
         return_value={"status": "dry_run", "dry_run": True, "audit_id": "a2"}
     )
@@ -172,12 +176,14 @@ async def test_direct_apply_plan_action_cannot_mutate() -> None:
 
 
 @pytest.mark.asyncio
-async def test_plan_enforcer_tick_apply_request_is_an_mcp_error() -> None:
+async def test_plan_enforcer_tick_apply_request_is_an_mcp_error(tmp_path) -> None:
     from tests.unit.test_server import make_config
     from azure_sql_mcp.config import AccessMode
     from azure_sql_mcp.server import AzureSqlMcpApplication
 
-    app = AzureSqlMcpApplication(make_config(AccessMode.UNRESTRICTED))
+    app = AzureSqlMcpApplication(
+        make_config(tmp_path, AccessMode.UNRESTRICTED)
+    )
 
     with pytest.raises(ToolError) as error:
         await app.mcp._tool_manager.call_tool(

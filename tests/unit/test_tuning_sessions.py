@@ -215,6 +215,72 @@ def test_only_explicit_lineage_work_can_add_a_candidate_during_finalist_validati
         store.close()
 
 
+def test_rewrite_plus_index_accepts_performance_only_parent_without_proving_child(
+    tmp_path,
+) -> None:
+    store, machine, case = _new_machine(tmp_path)
+    try:
+        session = machine.create_session(case)
+        parent = machine.add_candidate(
+            session.session_id,
+            strategy="predicate",
+            rewrite_fingerprint="rewrite-hash",
+        )
+        machine.start_screening(session.session_id)
+        machine.mark_candidate_finalist(session.session_id, parent.candidate_id)
+        evidence = store.create_evidence(
+            EvidenceEnvelopeV1(
+                evidence_id="evidence-performance-only-parent",
+                kind="tuning_finalist",
+                observed_execution_count=10,
+                metrics={
+                    "classification": "performance_only",
+                    "performance_classification": "improved",
+                },
+                metadata={
+                    "session_id": session.session_id,
+                    "candidate_id": parent.candidate_id,
+                    "phase": "finalist",
+                    "proof_scope": "performance_only",
+                    "equivalence_deferred": True,
+                    "equivalence": [],
+                },
+            )
+        )
+        _session, parent = machine.record_candidate_result(
+            session.session_id,
+            parent.candidate_id,
+            state="performance_only",
+            finalist_runs=1,
+            executions=10,
+            evidence_ids=(evidence.evidence_id,),
+        )
+
+        child = machine.add_candidate(
+            session.session_id,
+            strategy="rewrite_plus_index",
+            rewrite_fingerprint="rewrite-hash",
+            rewrite_artifact_ref=f"candidate:{parent.candidate_id}",
+            metadata={
+                "lineage": {
+                    "lineage_contract_version": 1,
+                    "parent_candidate_id": parent.candidate_id,
+                    "parent_evidence_id": evidence.evidence_id,
+                    "parent_rewrite_fingerprint": "rewrite-hash",
+                    "parent_equivalence": "unproven",
+                    "marginal_experiment": (
+                        "rewrite_without_index_with_index_after_cleanup"
+                    ),
+                }
+            },
+        )
+
+        assert child.strategy == "rewrite_plus_index"
+        assert child.metadata["lineage"]["parent_equivalence"] == "unproven"
+    finally:
+        store.close()
+
+
 def test_transition_replay_is_bound_to_the_exact_candidate(tmp_path) -> None:
     store, machine, case = _new_machine(tmp_path)
     try:

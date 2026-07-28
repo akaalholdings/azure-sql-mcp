@@ -5,6 +5,7 @@ import pytest
 from azure_sql_mcp.candidate_lineage import combined_parent_id
 from azure_sql_mcp.candidate_lineage import validate_combined_parent_request
 from azure_sql_mcp.candidate_lineage import validate_combined_parent
+from azure_sql_mcp.candidate_lineage import validate_rewrite_plus_index_parent
 from azure_sql_mcp.performance_contracts import EvidenceEnvelopeV1
 from azure_sql_mcp.performance_contracts import TuningCandidateV1
 
@@ -80,6 +81,33 @@ def test_proven_parent_produces_a_redacted_lineage_contract() -> None:
     }
 
 
+def test_rewrite_plus_index_keeps_performance_only_parent_unproven() -> None:
+    child = _child(strategy="rewrite_plus_index")
+    proof = _proof(
+        metrics={
+            "classification": "performance_only",
+            "performance_classification": "improved",
+        },
+        metadata={
+            "session_id": "session-one",
+            "candidate_id": "candidate-parent",
+            "phase": "finalist",
+            "proof_scope": "performance_only",
+            "equivalence_deferred": True,
+            "equivalence": [],
+        }
+    )
+
+    lineage = validate_rewrite_plus_index_parent(
+        child,
+        _parent(state="performance_only"),
+        [proof],
+    )
+
+    assert lineage["parent_candidate_id"] == "candidate-parent"
+    assert lineage["parent_equivalence"] == "unproven"
+
+
 def test_request_can_be_validated_before_child_is_persisted() -> None:
     lineage = validate_combined_parent_request(
         session_id="session-one",
@@ -151,7 +179,7 @@ def test_parent_proof_requires_runtime_snapshot_attestation() -> None:
 @pytest.mark.parametrize(
     ("parent", "proof", "message"),
     (
-        (_parent(state="screening"), _proof(), "improved finalist"),
+        (_parent(state="screening"), _proof(), "completed finalist"),
         (
             _parent(),
             _proof(metrics={"classification": "neutral"}),

@@ -11,7 +11,8 @@ import json
 import re
 import uuid
 from dataclasses import dataclass, field, fields
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
+from decimal import Decimal
 from typing import Any, ClassVar, Mapping, TypeVar, cast
 
 
@@ -139,6 +140,14 @@ def _redact_value(value: Any, *, key: str | None = None) -> Any:
         return [_redact_value(item) for item in value]
     if isinstance(value, str) and _SQL_PREFIX_PATTERN.match(value):
         return None
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, (date, time)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     raise ContractValidationError(
@@ -290,6 +299,7 @@ class PerformanceCaseV1(VersionedContract):
 TERMINAL_CANDIDATE_STATES = frozenset(
     {
         "improved",
+        "performance_only",
         "neutral",
         "regressed",
         "equivalence_failed",

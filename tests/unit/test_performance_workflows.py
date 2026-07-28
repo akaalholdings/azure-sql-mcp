@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock
 from unittest.mock import Mock
+from uuid import UUID
 
 import pytest
 
@@ -13,9 +15,11 @@ from azure_sql_mcp.artifacts import ExplainPlanArtifact
 from azure_sql_mcp.connection import QueryResult
 from azure_sql_mcp.connection import StatementDispatchPrevented
 from azure_sql_mcp.database_policy import DatabasePolicySet
+from azure_sql_mcp.equivalence_contract import analyze_equivalence_preflight
 from azure_sql_mcp.param_binding import ParameterExecutionContract
 from azure_sql_mcp.param_binding import SqlParameterType
 from azure_sql_mcp.param_binding import TypedParameter
+from azure_sql_mcp.performance_contracts import EvidenceEnvelopeV1
 from azure_sql_mcp.performance_contracts import PerformanceCaseV1
 from azure_sql_mcp.performance_store import IdempotencyConflictError
 from azure_sql_mcp.performance_store import PerformanceStore
@@ -305,6 +309,7 @@ def _service(
     plans: RoutedPlans | None = None,
     binder=None,
     allow_legacy_state: bool = False,
+    equivalence_analyzer=None,
 ) -> tuple[PerformanceWorkflowService, PerformanceStore, RoutedPlans, SnapshotExecutor]:
     store = PerformanceStore(db_path=":memory:")
     actual_plans = plans or RoutedPlans()
@@ -319,6 +324,7 @@ def _service(
         row_limit=50,
         parameter_binder=binder,
         allow_legacy_state=allow_legacy_state,
+        equivalence_analyzer=equivalence_analyzer,
     )
     return service, store, actual_plans, actual_executor
 
@@ -479,7 +485,24 @@ def test_candidate_idempotency_replays_before_duplicate_rejection() -> None:
 async def test_committed_case_evidence_replays_before_collectors_or_query() -> None:
     service, store, plans, _executor = _service()
     case = service.start_case("appdb", "SELECT id FROM dbo.Items")
-    collector = AsyncMock(return_value={"status": "ok"})
+    collector = AsyncMock(
+        return_value={
+            "status": "ok",
+            "logical_database_guid": UUID(
+                "12345678-1234-5678-1234-567812345678"
+            ),
+            "last_updated_date_utc": datetime(
+                2026,
+                7,
+                28,
+                10,
+                11,
+                12,
+                tzinfo=timezone.utc,
+            ),
+            "configured_value": Decimal("123.4500"),
+        }
+    )
 
     first = await service.collect_case_evidence(
         case.case_id,
@@ -501,6 +524,14 @@ async def test_committed_case_evidence_replays_before_collectors_or_query() -> N
     )
 
     assert replay["evidence"]["evidence_id"] == first["evidence"]["evidence_id"]
+    assert replay["evidence"] == first["evidence"]
+    assert replay["sections"] == first["sections"]
+    assert first["sections"]["query_store"]["data"] == {
+        "status": "ok",
+        "logical_database_guid": "12345678-1234-5678-1234-567812345678",
+        "last_updated_date_utc": "2026-07-28T10:11:12+00:00",
+        "configured_value": "123.4500",
+    }
     assert replay["recovered_from_durable_evidence"] is True
     assert collector.await_count == 1
     assert plans.calls == ["SELECT id FROM dbo.Items"]
@@ -1271,7 +1302,78 @@ async def test_volatile_comparison_requires_a_proof_contract_before_dispatch() -
 
 
 @pytest.mark.asyncio
-async def test_volatile_finalist_stops_before_plan_or_budget_dispatch() -> None:
+async def test_comparison_uses_injected_database_aware_preflight() -> None:
+    calls: list[tuple[str, str]] = []
+
+    async def analyze(database_name: str, sql: str) -> dict[str, Any]:
+        calls.append((database_name, sql))
+        return {
+            "direct_snapshot_supported": False,
+            "risk_codes": ["clock_function_in_view"],
+            "resolved_view_dependencies": ["dbo.ReportView"],
+        }
+
+    service, _store, _plans, executor = _service(
+        equivalence_analyzer=analyze,
+    )
+
+    result = await service.compare_query_results(
+        "appdb",
+        "SELECT id FROM dbo.ReportView",
+        "SELECT id FROM dbo.ReportView",
+    )
+
+    assert result["status"] == "proof_contract_required"
+    assert calls == [
+        ("appdb", "SELECT id FROM dbo.ReportView"),
+        ("appdb", "SELECT id FROM dbo.ReportView"),
+    ]
+    assert result["equivalence_preflight"]["baseline"][
+        "resolved_view_dependencies"
+    ] == ["dbo.ReportView"]
+    assert executor.sessions == []
+
+
+@pytest.mark.asyncio
+async def test_benchmark_uses_injected_database_aware_preflight() -> None:
+    calls: list[tuple[str, str]] = []
+
+    async def analyze(database_name: str, sql: str) -> dict[str, Any]:
+        calls.append((database_name, sql))
+        return {
+            "direct_snapshot_supported": True,
+            "risk_codes": [],
+            "resolved_view_dependencies": [],
+        }
+
+    service, _store, _plans, _executor = _service(
+        equivalence_analyzer=analyze,
+    )
+    baseline = "SELECT id FROM dbo.Items"
+    candidate_sql = "SELECT id FROM dbo.Items AS candidate"
+    session_id, candidate_id = _start(
+        service,
+        baseline=baseline,
+        candidate=candidate_sql,
+    )
+
+    await service.benchmark_candidate(
+        session_id,
+        candidate_id,
+        "appdb",
+        baseline,
+        candidate_sql,
+        phase="screening",
+    )
+
+    assert calls == [
+        ("appdb", baseline),
+        ("appdb", candidate_sql),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_volatile_finalist_runs_performance_samples_without_snapshot_dispatch() -> None:
     sql = "SELECT NEWID() AS value"
     service, store, plans, executor = _service()
     session_id, candidate_id = _start(
@@ -1289,16 +1391,17 @@ async def test_volatile_finalist_stops_before_plan_or_budget_dispatch() -> None:
         phase="finalist",
     )
 
-    assert result["classification"] == "proof_contract_required"
-    assert result["executions"] == 0
+    assert result["classification"] == "neutral"
+    assert result["executions"] == 10
     assert result["proof_scope"] == "performance_only"
-    assert plans.calls == []
+    assert result["equivalence"] == []
+    assert plans.calls == [sql] * 10
     assert executor.sessions == []
     reservation_count = store._connection.execute(
         "SELECT COUNT(*) AS count FROM execution_reservations"
     ).fetchone()
     assert reservation_count is not None
-    assert reservation_count["count"] == 0
+    assert reservation_count["count"] == 1
 
 
 @pytest.mark.asyncio
@@ -1323,21 +1426,21 @@ async def test_volatile_screening_is_explicitly_performance_only() -> None:
         idempotency_key="volatile-performance-only",
     )
 
-    assert result["classification"] == "proof_contract_required"
+    assert result["classification"] == "promising"
     assert result["performance_classification"] == "promising"
-    assert result["durable_state"] == "inconclusive"
+    assert result["durable_state"] == "screening"
     assert result["proof_scope"] == "performance_only"
     assert result["equivalence_deferred"] is True
     evidence = store.get_evidence(result["evidence_id"])
-    assert evidence.metrics["classification"] == "proof_contract_required"
+    assert evidence.metrics["classification"] == "promising"
     assert evidence.metrics["performance_classification"] == "promising"
     assert evidence.metadata["proof_scope"] == "performance_only"
     assert evidence.metadata["equivalence_preflight"]["baseline"][
         "direct_snapshot_supported"
     ] is False
     stored_candidate = service.sessions.get_candidate(candidate_id)
-    assert stored_candidate.state == "inconclusive"
-    assert stored_candidate.failure_code == "proof_contract_required"
+    assert stored_candidate.state == "screening"
+    assert stored_candidate.failure_code is None
 
     replay = await service.benchmark_candidate(
         session_id,
@@ -1350,16 +1453,429 @@ async def test_volatile_screening_is_explicitly_performance_only() -> None:
         idempotency_key="volatile-performance-only",
     )
 
-    assert replay["classification"] == "proof_contract_required"
+    assert replay["classification"] == "promising"
     assert replay["performance_classification"] == "promising"
-    assert replay["durable_state"] == "inconclusive"
+    assert replay["durable_state"] == "screening"
     assert replay["evidence_id"] == result["evidence_id"]
     assert replay["recovered_from_durable_evidence"] is True
     assert len(_plans.calls) == 6
 
 
 @pytest.mark.asyncio
-async def test_combined_candidate_requires_and_persists_a_proven_parent(
+async def test_unordered_top_screening_remains_finalist_eligible_and_runs_full_workload() -> None:
+    baseline = "SELECT TOP (1) id FROM dbo.Items"
+    candidate_sql = "SELECT TOP (1) id FROM dbo.Items AS candidate"
+    service, store, plans, executor = _service()
+    session_id, candidate_id = _start(
+        service,
+        baseline=baseline,
+        candidate=candidate_sql,
+    )
+
+    screening = await service.benchmark_candidate(
+        session_id,
+        candidate_id,
+        "appdb",
+        baseline,
+        candidate_sql,
+        phase="screening",
+    )
+    finalist = await service.benchmark_candidate(
+        session_id,
+        candidate_id,
+        "appdb",
+        baseline,
+        candidate_sql,
+        phase="finalist",
+    )
+
+    assert screening["classification"] == "promising"
+    assert screening["durable_state"] == "screening"
+    assert screening["equivalence_preflight"]["baseline"][
+        "direct_snapshot_supported"
+    ] is False
+    assert finalist["classification"] == "performance_only"
+    assert finalist["performance_classification"] == "improved"
+    assert finalist["proof_scope"] == "performance_only"
+    assert finalist["equivalence"] == []
+    assert finalist["executions"] == 10
+    stored = store.get_candidate(candidate_id)
+    assert stored.finalist_runs == 5
+    assert stored.state == "performance_only"
+    assert stored.failure_code is None
+    assert len(plans.calls) == 16
+    assert executor.sessions == []
+
+
+@pytest.mark.asyncio
+async def test_performance_only_finalist_requires_explicit_selection_scope() -> None:
+    baseline = "SELECT TOP (1) id FROM dbo.Items"
+    candidate_sql = "SELECT TOP (1) id FROM dbo.Items AS candidate"
+    service, _store, _plans, _executor = _service()
+    session_id, candidate_id = _start(
+        service,
+        baseline=baseline,
+        candidate=candidate_sql,
+    )
+
+    await service.benchmark_candidate(
+        session_id,
+        candidate_id,
+        "appdb",
+        baseline,
+        candidate_sql,
+        phase="finalist",
+    )
+
+    with pytest.raises(ValueError, match="Selection scope proven"):
+        service.finalize_session(
+            session_id,
+            selected_candidate_id=candidate_id,
+            stopping_reason="choose the measured winner",
+        )
+
+    result = service.finalize_session(
+        session_id,
+        selected_candidate_id=candidate_id,
+        stopping_reason="choose the measured winner",
+        selection_scope="performance_only",
+    )
+
+    assert result["selection_scope"] == "performance_only"
+    assert result["selected_candidate_classification"] == "performance_only"
+    assert result["selected_candidate_proof_scope"] == "performance_only"
+    assert result["semantic_equivalence"] == "unproven"
+    assert result["deployment_ready"] is False
+    assert result["automatic_deployment_approved"] is False
+    assert result["session"]["selected_candidate_id"] == candidate_id
+    assert result["session"]["status"] == "completed"
+
+
+def test_performance_only_selection_rejects_zero_execution_finalist_receipt() -> None:
+    service, store, _plans, _executor = _service()
+    session_id, candidate_id = _start(service)
+    case = store.get_performance_case(
+        store.get_session(session_id).performance_case_id
+    )
+    service.sessions.start_screening(session_id)
+    service.sessions.mark_candidate_finalist(session_id, candidate_id)
+    evidence = store.create_evidence(
+        EvidenceEnvelopeV1(
+            kind="tuning_finalist",
+            query_fingerprint=case.query_fingerprint,
+            database_fingerprint=case.database_fingerprint,
+            observed_execution_count=0,
+            metrics={
+                "classification": "performance_only",
+                "performance_classification": "improved",
+            },
+            metadata={
+                "session_id": session_id,
+                "candidate_id": candidate_id,
+                "phase": "finalist",
+                "proof_scope": "performance_only",
+                "equivalence_deferred": True,
+                "equivalence": [],
+            },
+        )
+    )
+    service.sessions.record_candidate_result(
+        session_id,
+        candidate_id,
+        state="performance_only",
+        finalist_runs=1,
+        executions=0,
+        evidence_ids=(evidence.evidence_id,),
+    )
+
+    with pytest.raises(ValueError, match="nonzero execution count"):
+        service.finalize_session(
+            session_id,
+            selected_candidate_id=candidate_id,
+            stopping_reason="zero execution regression",
+            selection_scope="performance_only",
+        )
+
+
+def test_performance_only_selection_rejects_incomplete_nonzero_finalist_receipt() -> None:
+    service, store, _plans, _executor = _service()
+    session_id, candidate_id = _start(service)
+    case = store.get_performance_case(
+        store.get_session(session_id).performance_case_id
+    )
+    service.sessions.start_screening(session_id)
+    service.sessions.mark_candidate_finalist(session_id, candidate_id)
+    reservation_owner = "incomplete-finalist-owner"
+    reservation = store.reserve_execution_attempts(
+        session_id,
+        candidate_id,
+        10,
+        "c" * 64,
+        owner_reference=reservation_owner,
+    )
+    evidence = store.create_evidence(
+        EvidenceEnvelopeV1(
+            kind="tuning_finalist",
+            query_fingerprint=case.query_fingerprint,
+            database_fingerprint=case.database_fingerprint,
+            observed_execution_count=2,
+            metrics={
+                "classification": "performance_only",
+                "performance_classification": "improved",
+                "parameter_results": [
+                    {
+                        "parameter_case": "unparameterized",
+                        "baseline": {"elapsed_ms": 100.0},
+                        "candidate": {"elapsed_ms": 50.0},
+                    }
+                ],
+            },
+            metadata={
+                "session_id": session_id,
+                "candidate_id": candidate_id,
+                "phase": "finalist",
+                "proof_scope": "performance_only",
+                "equivalence_deferred": True,
+                "equivalence": [],
+                "execution_reservation_id": reservation["reservation_id"],
+            },
+        )
+    )
+    service.sessions.record_candidate_result(
+        session_id,
+        candidate_id,
+        state="performance_only",
+        finalist_runs=5,
+        parameter_cases=1,
+        executions=2,
+        evidence_ids=(evidence.evidence_id,),
+    )
+    store.complete_execution_attempts(
+        reservation["reservation_id"],
+        dispatched_attempt_count=2,
+        owner_reference=reservation_owner,
+        expected_version=reservation["version"],
+    )
+
+    with pytest.raises(ValueError, match="nonzero execution count"):
+        service.finalize_session(
+            session_id,
+            selected_candidate_id=candidate_id,
+            stopping_reason="incomplete finalist regression",
+            selection_scope="performance_only",
+        )
+
+
+@pytest.mark.asyncio
+async def test_exact_legacy_proof_contract_candidate_is_recovered_for_finalist() -> None:
+    baseline = "SELECT TOP (1) id FROM dbo.Items"
+    candidate_sql = "SELECT TOP (1) id FROM dbo.Items AS candidate"
+    service, store, plans, _executor = _service()
+    session_id, candidate_id = _start(
+        service,
+        baseline=baseline,
+        candidate=candidate_sql,
+    )
+    case = store.get_performance_case(
+        store.get_session(session_id).performance_case_id
+    )
+    _install_legacy_proof_contract_receipt(
+        service,
+        store,
+        case,
+        session_id,
+        candidate_id,
+        baseline,
+        candidate_sql,
+    )
+
+    result = await service.benchmark_candidate(
+        session_id,
+        candidate_id,
+        "appdb",
+        baseline,
+        candidate_sql,
+        phase="finalist",
+    )
+
+    assert result["classification"] == "performance_only"
+    assert result["proof_scope"] == "performance_only"
+    assert result["executions"] == 10
+    stored = store.get_candidate(candidate_id)
+    assert stored.state == "performance_only"
+    assert stored.failure_code is None
+    assert stored.executions == 16
+    assert len(plans.calls) == 10
+
+
+def _install_legacy_proof_contract_receipt(
+    service: PerformanceWorkflowService,
+    store: PerformanceStore,
+    case: PerformanceCaseV1,
+    session_id: str,
+    candidate_id: str,
+    baseline: str,
+    candidate_sql: str,
+    *,
+    mutation: str | None = None,
+) -> None:
+    service.sessions.start_screening(session_id)
+    reservation_owner = "legacy-proof-contract-owner"
+    reservation = store.reserve_execution_attempts(
+        session_id,
+        candidate_id,
+        6,
+        "a" * 64,
+        owner_reference=reservation_owner,
+    )
+    parameter_results = [
+        {
+            "parameter_case": "unparameterized",
+            "weight": 1.0,
+            "baseline": {"elapsed_ms": 100.0},
+            "candidate": {"elapsed_ms": 50.0},
+            "plan_delta": {},
+        }
+    ]
+    metrics = {
+        "classification": "proof_contract_required",
+        "performance_classification": "promising",
+        "objective": "elapsed_time",
+        "parameter_results": parameter_results,
+    }
+    metadata = {
+        "session_id": session_id,
+        "candidate_id": candidate_id,
+        "equivalence": [],
+        "equivalence_deferred": True,
+        "equivalence_preflight": {
+            "baseline": analyze_equivalence_preflight(baseline).as_dict(),
+            "candidate": analyze_equivalence_preflight(candidate_sql).as_dict(),
+        },
+        "proof_scope": "performance_only",
+        "phase": "screening",
+        "reason": (
+            "Performance screening improved, but this MCP contract has no "
+            "deterministic proof input for this SQL shape; the candidate was "
+            "not promoted."
+        ),
+        "performance_reason": (
+            "screening signal improved beyond noise; finalist equivalence is "
+            "still required"
+        ),
+        "execution_reservation_id": reservation["reservation_id"],
+        "sql_persisted": False,
+    }
+    candidate_executions = 6
+    dispatched_executions = 6
+    if mutation == "missing_objective":
+        metrics.pop("objective")
+    elif mutation == "missing_preflight":
+        metadata.pop("equivalence_preflight")
+    elif mutation == "missing_parameter_results":
+        metrics["parameter_results"] = []
+    elif mutation == "candidate_counter_mismatch":
+        candidate_executions = 5
+    elif mutation == "reservation_counter_mismatch":
+        dispatched_executions = 5
+    old_evidence = store.create_evidence(
+        EvidenceEnvelopeV1(
+            source="azure-sql-mcp",
+            kind="tuning_screening",
+            query_fingerprint=case.query_fingerprint,
+            database_fingerprint=case.database_fingerprint,
+            parameters_fingerprint="b" * 64,
+            observed_execution_count=6,
+            metrics=metrics,
+            metadata=metadata,
+        )
+    )
+    service.sessions.record_candidate_result(
+        session_id,
+        candidate_id,
+        state="inconclusive",
+        screen_runs=3,
+        parameter_cases=1,
+        executions=candidate_executions,
+        evidence_ids=(old_evidence.evidence_id,),
+        failure_code="proof_contract_required",
+    )
+    store.complete_execution_attempts(
+        reservation["reservation_id"],
+        dispatched_attempt_count=dispatched_executions,
+        owner_reference=reservation_owner,
+        expected_version=reservation["version"],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_objective",
+        "missing_preflight",
+        "missing_parameter_results",
+        "candidate_counter_mismatch",
+        "reservation_counter_mismatch",
+    ],
+)
+async def test_legacy_recovery_rejects_near_match_receipts(
+    mutation: str,
+) -> None:
+    baseline = "SELECT TOP (1) id FROM dbo.Items"
+    candidate_sql = "SELECT TOP (1) id FROM dbo.Items AS candidate"
+    service, store, plans, _executor = _service()
+    session_id, candidate_id = _start(
+        service,
+        baseline=baseline,
+        candidate=candidate_sql,
+    )
+    case = store.get_performance_case(
+        store.get_session(session_id).performance_case_id
+    )
+    _install_legacy_proof_contract_receipt(
+        service,
+        store,
+        case,
+        session_id,
+        candidate_id,
+        baseline,
+        candidate_sql,
+        mutation=mutation,
+    )
+
+    with pytest.raises(ValueError, match="terminal benchmark"):
+        await service.benchmark_candidate(
+            session_id,
+            candidate_id,
+            "appdb",
+            baseline,
+            candidate_sql,
+            phase="finalist",
+        )
+
+    assert plans.calls == []
+    assert store.get_candidate(candidate_id).state == "inconclusive"
+
+
+def test_combined_strategy_is_available_for_a_multi_family_rewrite() -> None:
+    service, _store, _plans, _executor = _service()
+    case = service.start_case("appdb", "SELECT id FROM dbo.Items")
+    session = service.start_session(case.case_id, "appdb")
+
+    candidate = service.add_candidate(
+        session["session_id"],
+        "SELECT id FROM dbo.Items AS candidate",
+        strategy="combined",
+    )
+
+    assert candidate["strategy"] == "combined"
+    assert candidate["rewrite_artifact_ref"] is None
+    assert "lineage" not in candidate["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_rewrite_plus_index_requires_and_persists_a_proven_parent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     parent_sql = "SELECT id FROM dbo.Items AS candidate"
@@ -1388,9 +1904,9 @@ async def test_combined_candidate_requires_and_persists_a_proven_parent(
     child = service.add_candidate(
         session_id,
         parent_sql,
-        strategy="combined",
+        strategy="rewrite_plus_index",
         artifact_ref=f"candidate:{parent_id}",
-        idempotency_key="combined-child",
+        idempotency_key="rewrite-plus-index-child",
     )
 
     assert child["metadata"]["lineage"]["parent_candidate_id"] == parent_id
@@ -1407,9 +1923,9 @@ async def test_combined_candidate_requires_and_persists_a_proven_parent(
     replay = service.add_candidate(
         session_id,
         parent_sql,
-        strategy="combined",
+        strategy="rewrite_plus_index",
         artifact_ref=f"candidate:{parent_id}",
-        idempotency_key="combined-child",
+        idempotency_key="rewrite-plus-index-child",
     )
 
     assert replay == child

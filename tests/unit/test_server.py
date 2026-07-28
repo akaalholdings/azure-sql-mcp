@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
+from pathlib import Path
 from unittest.mock import AsyncMock
 from unittest.mock import Mock
 
@@ -35,6 +36,7 @@ from azure_sql_mcp.view_workflows import prepared_view_change_state
 
 
 def make_config(
+    tmp_path: Path,
     access_mode: AccessMode = AccessMode.RESTRICTED,
     *,
     tool_timeout_seconds: float = 45,
@@ -67,7 +69,7 @@ def make_config(
         log_level="INFO",
         mcp_bearer_token=None,
         write_policy=WritePolicy.DISABLED,
-        audit_dir="/tmp/azure-sql-mcp-test-audit",
+        audit_dir=str(tmp_path / "audit"),
         audit_full_sql=False,
         remote_admin_enabled=False,
         performance_state_dir=":memory:",
@@ -75,8 +77,23 @@ def make_config(
 
 
 @pytest.fixture
-def app() -> AzureSqlMcpApplication:
-    return AzureSqlMcpApplication(make_config())
+def app(tmp_path: Path) -> AzureSqlMcpApplication:
+    return AzureSqlMcpApplication(make_config(tmp_path))
+
+
+def stub_case_preflight(
+    app: AzureSqlMcpApplication,
+) -> AsyncMock:
+    preflight = AsyncMock(
+        return_value={
+            "contract_version": 2,
+            "classification": "direct_snapshot",
+            "direct_snapshot_supported": True,
+            "coverage_complete": True,
+        }
+    )
+    app._check_equivalence_preflight = preflight  # type: ignore[method-assign]
+    return preflight
 
 
 def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
@@ -100,6 +117,7 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
         "explain_query",
         "tune_query",
         "benchmark_query_rewrite",
+        "check_equivalence_preflight",
         "start_performance_case",
         "collect_performance_evidence",
         "get_performance_case",
@@ -195,6 +213,57 @@ async def test_registered_tool_arguments_are_strict_and_reject_unknown_fields(
 
 
 @pytest.mark.asyncio
+async def test_validation_errors_are_sanitized_invalid_argument_envelopes(
+    app: AzureSqlMcpApplication,
+) -> None:
+    handler = app.mcp._mcp_server.request_handlers[CallToolRequest]
+    response = await handler(
+        CallToolRequest(
+            params=CallToolRequestParams(
+                name="check_runtime_status",
+                arguments={"unexpected": "caller-secret-value"},
+            )
+        )
+    )
+
+    assert response.root.isError is True
+    text = response.root.content[0].text
+    payload = json.loads(text)
+    assert payload == {
+        "ok": False,
+        "code": "invalid_arguments",
+        "message": "Tool arguments failed validation.",
+        "details": {
+            "issues": [
+                {
+                    "path": "unexpected",
+                    "code": "extra_forbidden",
+                    "message": "Extra arguments are not permitted.",
+                }
+            ]
+        },
+    }
+    assert "caller-secret-value" not in text
+    assert "input_value" not in text
+    assert "pydantic" not in text.casefold()
+
+
+@pytest.mark.asyncio
+async def test_sanitized_tool_error_preserves_candidate_reference_format(
+    app: AzureSqlMcpApplication,
+) -> None:
+    async def reject(_: str) -> dict[str, object]:
+        raise ValueError("artifact_ref must start with candidate:")
+
+    with pytest.raises(ToolError) as exc_info:
+        await app._run_tool("add_tuning_candidate", "appdb", reject)
+
+    payload = json.loads(str(exc_info.value))
+    assert payload["code"] == "tool_error"
+    assert payload["message"] == "artifact_ref must start with candidate:"
+
+
+@pytest.mark.asyncio
 async def test_mcp_handler_marks_tool_errors_as_is_error(
     app: AzureSqlMcpApplication,
 ) -> None:
@@ -223,7 +292,9 @@ async def test_mcp_handler_marks_tool_errors_as_is_error(
 
 
 @pytest.mark.asyncio
-async def test_runtime_status_is_db_free_stable_and_sanitized() -> None:
+async def test_runtime_status_is_db_free_stable_and_sanitized(
+    tmp_path: Path,
+) -> None:
     test_auth_values = {
         "user" + "name": "sa",
         "pass" + "word": "test-password",
@@ -232,7 +303,7 @@ async def test_runtime_status_is_db_free_stable_and_sanitized() -> None:
     }
     app = AzureSqlMcpApplication(
         replace(
-            make_config(),
+            make_config(tmp_path),
             **test_auth_values,
         )
     )
@@ -241,14 +312,17 @@ async def test_runtime_status_is_db_free_stable_and_sanitized() -> None:
 
     assert first == second
     assert first["startup_timestamp"] == app._startup_timestamp
-    assert first["package_version"] == "2.1.0"
+    assert first["package_version"] == "2.2.0"
     assert first["profile"] is None
     assert first["transport"] == "stdio"
+    assert first["tool_groups"] == ["all"]
     assert first["tool_count"] == len(first["tool_names"])
     assert first["tool_names"] == sorted(first["tool_names"])
     assert first["contracts"] == {
         "strict_arguments": True,
         "mcp_errors": True,
+        "sanitized_validation_errors": True,
+        "performance_only_selection": True,
     }
     assert first["strict_argument_models"] is True
     assert first["mcp_tool_errors"] is True
@@ -277,12 +351,14 @@ def test_registers_resources_and_prompts(app: AzureSqlMcpApplication) -> None:
     }
 
 
-def test_legacy_state_binding_is_opt_in_for_performance_workflows() -> None:
-    strict_app = AzureSqlMcpApplication(make_config())
+def test_legacy_state_binding_is_opt_in_for_performance_workflows(
+    tmp_path: Path,
+) -> None:
+    strict_app = AzureSqlMcpApplication(make_config(tmp_path))
     assert strict_app.performance_workflows.allow_legacy_state is False
 
     legacy_config = replace(
-        make_config(),
+        make_config(tmp_path),
         legacy_state_server_binding="server.database.windows.net",
     )
     legacy_app = AzureSqlMcpApplication(legacy_config)
@@ -290,11 +366,13 @@ def test_legacy_state_binding_is_opt_in_for_performance_workflows() -> None:
 
 
 @pytest.mark.asyncio
-async def test_direct_server_fingerprint_check_honours_legacy_binding() -> None:
+async def test_direct_server_fingerprint_check_honours_legacy_binding(
+    tmp_path: Path,
+) -> None:
     legacy_case = Mock(
         database_fingerprint=legacy_database_fingerprint("appdb"),
     )
-    strict_app = AzureSqlMcpApplication(make_config())
+    strict_app = AzureSqlMcpApplication(make_config(tmp_path))
     strict_app.performance_store.get_performance_case = Mock(  # type: ignore[method-assign]
         return_value=legacy_case,
     )
@@ -309,7 +387,7 @@ async def test_direct_server_fingerprint_check_honours_legacy_binding() -> None:
         )
 
     legacy_config = replace(
-        make_config(),
+        make_config(tmp_path),
         legacy_state_server_binding="server.database.windows.net",
     )
     app = AzureSqlMcpApplication(legacy_config)
@@ -348,6 +426,173 @@ def test_tools_advertise_structured_output_schemas(app: AzureSqlMcpApplication) 
         schema = app.mcp._tool_manager._tools[name].fn_metadata.output_schema
         assert schema is not None
         assert schema["type"] == "object"
+
+    for name in (
+        "explain_query",
+        "benchmark_query_rewrite",
+        "start_performance_case",
+        "get_performance_case",
+        "start_tuning_session",
+        "get_tuning_session",
+        "benchmark_tuning_candidate",
+        "benchmark_index_candidate",
+        "finalize_tuning_session",
+        "check_equivalence_preflight",
+    ):
+        schema = app.mcp._tool_manager._tools[name].fn_metadata.output_schema
+        assert schema is not None
+        assert "headline" in schema["properties"]
+
+
+def test_optimizer_inputs_publish_closed_enums(
+    app: AzureSqlMcpApplication,
+) -> None:
+    tools = app.mcp._tool_manager._tools
+    assert tools["start_performance_case"].parameters["properties"]["objective"][
+        "enum"
+    ] == ["elapsed_time", "cpu", "logical_reads", "physical_reads"]
+    assert tools["add_tuning_candidate"].parameters["properties"]["strategy"][
+        "enum"
+    ] == [
+        "predicate",
+        "join",
+        "aggregation",
+        "cardinality",
+        "index",
+        "combined",
+        "rewrite_plus_index",
+    ]
+    for name in ("benchmark_tuning_candidate", "benchmark_index_candidate"):
+        assert tools[name].parameters["properties"]["phase"]["enum"] == [
+            "screening",
+            "finalist",
+        ]
+    selection = tools["finalize_tuning_session"].parameters["properties"][
+        "selection_scope"
+    ]
+    assert selection["enum"] == ["proven", "performance_only"]
+    assert selection["default"] == "proven"
+
+
+@pytest.mark.asyncio
+async def test_registered_preflight_returns_typed_summary_and_headline(
+    app: AzureSqlMcpApplication,
+) -> None:
+    result = await app.mcp._tool_manager.call_tool(
+        "check_equivalence_preflight",
+        {
+            "sql": "SELECT GETDATE() AS captured_at",
+            "database_name": "appdb",
+        },
+    )
+
+    assert result["classification"] == "proof_contract_required"
+    assert result["coverage_complete"] is True
+    assert result["functions"][0]["function"] == "GETDATE"
+    assert result["headline"] == {
+        "classification": "proof_contract_required",
+        "coverage_complete": True,
+        "direct_snapshot_supported": False,
+        "risk_count": 1,
+        "unresolved_dependency_count": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_optimizer_responses_add_stable_headlines(
+    app: AzureSqlMcpApplication,
+) -> None:
+    async def case_callback(_: str) -> dict[str, object]:
+        return {
+            "case_id": "case-1",
+            "metadata": {
+                "equivalence_preflight": {
+                    "classification": "proof_contract_required",
+                    "direct_snapshot_supported": False,
+                }
+            },
+        }
+
+    async def session_callback(_: str) -> dict[str, object]:
+        return {
+            "session": {
+                "session_id": "session-1",
+                "status": "screening",
+                "time_limit_seconds": 1200,
+            },
+            "budget": {
+                "executions_remaining": 72,
+                "candidate_slots_remaining": 8,
+            },
+        }
+
+    async def benchmark_callback(_: str) -> dict[str, object]:
+        return {
+            "session_id": "session-1",
+            "candidate_id": "candidate-1",
+            "classification": "performance_only",
+            "objective": "elapsed_time",
+            "executions": 8,
+            "proof_scope": "performance_only",
+            "parameter_results": [
+                {
+                    "weight": 1,
+                    "baseline": {"elapsed_ms": 100.0},
+                    "candidate": {"elapsed_ms": 40.0},
+                }
+            ],
+        }
+
+    async def plan_callback(_: str) -> dict[str, object]:
+        return {
+            "plan_kind": "actual",
+            "summary": {
+                "statement_count": 1,
+                "operator_count": 4,
+                "warnings": [{"kind": "spill"}],
+                "missing_indexes": [],
+            },
+        }
+
+    case = await app._run_tool("start_performance_case", "appdb", case_callback)
+    session = await app._run_tool("get_tuning_session", "appdb", session_callback)
+    benchmark = await app._run_tool(
+        "benchmark_tuning_candidate",
+        "appdb",
+        benchmark_callback,
+    )
+    plan = await app._run_tool("explain_query", "appdb", plan_callback)
+
+    assert case["headline"] == {
+        "case_id": "case-1",
+        "classification": "proof_contract_required",
+        "proof_scope": "performance_only",
+    }
+    assert session["headline"] == {
+        "session_id": "session-1",
+        "status": "screening",
+        "time_limit_minutes": 20,
+        "executions_remaining": 72,
+        "candidate_slots_remaining": 8,
+    }
+    assert benchmark["headline"] == {
+        "session_id": "session-1",
+        "candidate_id": "candidate-1",
+        "classification": "performance_only",
+        "objective": "elapsed_time",
+        "metric": "elapsed_ms",
+        "relative_improvement_pct": 60.0,
+        "parameter_case_count": 1,
+        "executions": 8,
+        "proof_scope": "performance_only",
+    }
+    assert plan["headline"] == {
+        "plan_kind": "actual",
+        "statement_count": 1,
+        "operator_count": 4,
+        "warning_count": 1,
+        "missing_index_count": 0,
+    }
 
 
 def test_registered_query_regression_input_schemas(app: AzureSqlMcpApplication) -> None:
@@ -413,9 +658,14 @@ async def test_registered_analyze_query_indexes_forwards_queries_array(
     )
 
 
-def test_diagnostic_tools_are_performance_group_and_available_restricted() -> None:
+def test_diagnostic_tools_are_performance_group_and_available_restricted(
+    tmp_path: Path,
+) -> None:
     app = AzureSqlMcpApplication(
-        make_config(tool_groups=frozenset({ToolGroup.PERFORMANCE}))
+        make_config(
+            tmp_path,
+            tool_groups=frozenset({ToolGroup.PERFORMANCE}),
+        )
     )
     tools = app.mcp._tool_manager._tools
 
@@ -435,9 +685,11 @@ def test_diagnostic_tools_are_performance_group_and_available_restricted() -> No
     assert "execute_tsql_unrestricted" not in tools
 
 
-def test_remote_transport_hides_admin_tools_without_remote_admin_opt_in() -> None:
+def test_remote_transport_hides_admin_tools_without_remote_admin_opt_in(
+    tmp_path: Path,
+) -> None:
     config = replace(
-        make_config(access_mode=AccessMode.UNRESTRICTED),
+        make_config(tmp_path, access_mode=AccessMode.UNRESTRICTED),
         transport=TransportConfig(
             mode=TransportMode.STREAMABLE_HTTP,
             host="127.0.0.1",
@@ -455,9 +707,11 @@ def test_remote_transport_hides_admin_tools_without_remote_admin_opt_in() -> Non
     assert "rebuild_index" not in tools
 
 
-def test_unrestricted_dba_tool_advertises_execution_contract() -> None:
+def test_unrestricted_dba_tool_advertises_execution_contract(
+    tmp_path: Path,
+) -> None:
     config = replace(
-        make_config(access_mode=AccessMode.UNRESTRICTED),
+        make_config(tmp_path, access_mode=AccessMode.UNRESTRICTED),
         write_policy=WritePolicy.APPLY,
     )
     app = AzureSqlMcpApplication(config)
@@ -667,8 +921,10 @@ def test_benchmark_tool_timeout_scales_to_policy_execution_budget(
 
 
 @pytest.mark.asyncio
-async def test_run_tool_returns_timeout_error() -> None:
-    app = AzureSqlMcpApplication(make_config(tool_timeout_seconds=0.01))
+async def test_run_tool_returns_timeout_error(tmp_path: Path) -> None:
+    app = AzureSqlMcpApplication(
+        make_config(tmp_path, tool_timeout_seconds=0.01)
+    )
 
     async def slow(_: str) -> dict[str, str]:
         await asyncio.sleep(0.05)
@@ -705,8 +961,12 @@ async def test_run_tool_bounds_workflow_timeout_by_persisted_deadline(
 
 
 @pytest.mark.asyncio
-async def test_run_database_pair_tool_returns_mcp_timeout_error() -> None:
-    app = AzureSqlMcpApplication(make_config(tool_timeout_seconds=0.01))
+async def test_run_database_pair_tool_returns_mcp_timeout_error(
+    tmp_path: Path,
+) -> None:
+    app = AzureSqlMcpApplication(
+        make_config(tmp_path, tool_timeout_seconds=0.01)
+    )
 
     async def slow(_: str, __: str) -> dict[str, str]:
         await asyncio.sleep(0.05)
@@ -810,6 +1070,7 @@ async def test_explain_query_uses_typed_parameter_execution_and_redacts_values(
 
 @pytest.mark.asyncio
 async def test_tune_query_returns_structured_evidence_pack(app: AzureSqlMcpApplication) -> None:
+    preflight = stub_case_preflight(app)
     app.performance_workflows.start_case = Mock(
         return_value=Mock(case_id="case-1")
     )
@@ -836,6 +1097,16 @@ async def test_tune_query_returns_structured_evidence_pack(app: AzureSqlMcpAppli
     assert payload["evidence"]["outcome"] == "healthy"
     assert "concrete rewrites" in payload["next_step"]
     assert "No database changes" in payload["scripts"]["rollback"]
+    preflight.assert_awaited_once_with(
+        "appdb",
+        "SELECT id FROM dbo.Orders",
+    )
+    assert (
+        app.performance_workflows.start_case.call_args.kwargs["metadata"][
+            "equivalence_preflight"
+        ]["contract_version"]
+        == 2
+    )
 
 
 @pytest.mark.asyncio
@@ -918,7 +1189,77 @@ async def test_start_tuning_session_rejects_policy_overrun_without_shortening(
 
 
 @pytest.mark.asyncio
+async def test_real_session_responses_report_actual_remaining_budgets(
+    app: AzureSqlMcpApplication,
+) -> None:
+    policy = DatabasePolicySet.from_mapping(
+        {
+            "version": 1,
+            "databases": {
+                "appdb": {
+                    "environment": "test",
+                    "allow_read": True,
+                    "allow_benchmark": True,
+                    "max_benchmark_executions": 80,
+                    "max_tuning_candidates": 10,
+                    "max_tuning_session_executions": 80,
+                    "max_tuning_session_minutes": 20,
+                }
+            },
+        }
+    )
+    app.database_policy = policy
+    app.performance_workflows.database_policy = policy
+    case = app.performance_workflows.start_case(
+        "appdb",
+        "SELECT object_id FROM sys.objects",
+    )
+
+    async def start(database_name: str) -> dict[str, object]:
+        return await app._start_tuning_session(
+            database_name,
+            case.case_id,
+            10,
+            80,
+            20,
+            "headline-start",
+        )
+
+    started = await app._run_tool("start_tuning_session", "appdb", start)
+    assert started["headline"] == {
+        "session_id": started["session_id"],
+        "status": "created",
+        "time_limit_minutes": 20,
+        "executions_remaining": 80,
+        "candidate_slots_remaining": 10,
+    }
+
+    async def finalize(database_name: str) -> dict[str, object]:
+        return await app._finalize_tuning_session(
+            database_name,
+            str(started["session_id"]),
+            None,
+            "no viable candidate",
+            "headline-finalize",
+        )
+
+    finalized = await app._run_tool(
+        "finalize_tuning_session",
+        "appdb",
+        finalize,
+    )
+    assert finalized["headline"] == {
+        "session_id": started["session_id"],
+        "status": "completed",
+        "time_limit_minutes": 20,
+        "executions_remaining": 80,
+        "candidate_slots_remaining": 10,
+    }
+
+
+@pytest.mark.asyncio
 async def test_tune_query_binds_explicit_parameters_once(app: AzureSqlMcpApplication) -> None:
+    stub_case_preflight(app)
     app.performance_workflows.start_case = Mock(return_value=Mock(case_id="case-2"))
     app._collect_performance_evidence = AsyncMock(return_value={"outcome": "partial"})  # type: ignore[method-assign]
     app.performance_workflows.start_session = Mock(
@@ -949,6 +1290,7 @@ async def test_tune_query_binds_explicit_parameters_once(app: AzureSqlMcpApplica
 
 @pytest.mark.asyncio
 async def test_benchmark_query_rewrite_reports_sample_equivalence(app: AzureSqlMcpApplication) -> None:
+    stub_case_preflight(app)
     app.performance_workflows.start_case = Mock(return_value=Mock(case_id="case-b1"))
     app.performance_workflows.start_session = Mock(
         return_value={"session_id": "session-b1"}
@@ -987,6 +1329,7 @@ async def test_benchmark_query_rewrite_reports_sample_equivalence(app: AzureSqlM
 async def test_benchmark_query_rewrite_runs_k_reports_median_and_spread(
     app: AzureSqlMcpApplication,
 ) -> None:
+    stub_case_preflight(app)
     app.performance_workflows.start_case = Mock(return_value=Mock(case_id="case-b2"))
     app.performance_workflows.start_session = Mock(
         return_value={"session_id": "session-b2"}
@@ -1021,6 +1364,7 @@ async def test_benchmark_query_rewrite_runs_k_reports_median_and_spread(
 async def test_benchmark_can_compare_unordered_result_samples(
     app: AzureSqlMcpApplication,
 ) -> None:
+    stub_case_preflight(app)
     app.performance_workflows.start_case = Mock(return_value=Mock(case_id="case-b3"))
     app.performance_workflows.start_session = Mock(
         return_value={"session_id": "session-b3"}
@@ -1112,8 +1456,11 @@ async def test_run_closes_pool_on_shutdown(app: AzureSqlMcpApplication, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_async_main_configures_logging(monkeypatch: pytest.MonkeyPatch) -> None:
-    config = make_config()
+async def test_async_main_configures_logging(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
     configure = Mock()
     run = AsyncMock()
 

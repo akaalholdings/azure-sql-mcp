@@ -4,6 +4,7 @@ expose as admin tools, so both are pinned test by test."""
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -24,6 +25,7 @@ from azure_sql_mcp.server import TEST_INDEX_PREFIX
 
 
 def make_config(
+    tmp_path: Path,
     access_mode: AccessMode = AccessMode.RESTRICTED,
     *,
     write_policy: WritePolicy = WritePolicy.DISABLED,
@@ -52,23 +54,25 @@ def make_config(
         log_level="INFO",
         mcp_bearer_token=None,
         write_policy=write_policy,
-        audit_dir="/tmp/azure-sql-mcp-test-audit",
+        audit_dir=str(tmp_path / "audit"),
         audit_full_sql=False,
         remote_admin_enabled=False,
         profile=profile,
     )
 
 
-def unrestricted_app() -> AzureSqlMcpApplication:
-    return AzureSqlMcpApplication(make_config(access_mode=AccessMode.UNRESTRICTED))
+def unrestricted_app(tmp_path: Path) -> AzureSqlMcpApplication:
+    return AzureSqlMcpApplication(
+        make_config(tmp_path, access_mode=AccessMode.UNRESTRICTED)
+    )
 
 
-def test_tools_register_only_in_unrestricted_mode() -> None:
-    restricted = AzureSqlMcpApplication(make_config())
+def test_tools_register_only_in_unrestricted_mode(tmp_path: Path) -> None:
+    restricted = AzureSqlMcpApplication(make_config(tmp_path))
     assert "create_test_index" not in restricted.mcp._tool_manager._tools
     assert "drop_test_index" not in restricted.mcp._tool_manager._tools
 
-    tools = unrestricted_app().mcp._tool_manager._tools
+    tools = unrestricted_app(tmp_path).mcp._tool_manager._tools
     assert "create_test_index" in tools
     assert "drop_test_index" in tools
     assert tools["drop_test_index"].annotations.destructiveHint is True
@@ -76,8 +80,8 @@ def test_tools_register_only_in_unrestricted_mode() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_dry_run_builds_ddl_with_rollback() -> None:
-    payload = await unrestricted_app()._create_test_index(
+async def test_create_dry_run_builds_ddl_with_rollback(tmp_path: Path) -> None:
+    payload = await unrestricted_app(tmp_path)._create_test_index(
         "appdb", "dbo", "Shipments",
         f"{TEST_INDEX_PREFIX}Shipments_ShipDate_a1b2",
         key_columns=["ShipDate", "StatusCode DESC"],
@@ -98,8 +102,8 @@ async def test_create_dry_run_builds_ddl_with_rollback() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_without_online_and_includes() -> None:
-    payload = await unrestricted_app()._create_test_index(
+async def test_create_without_online_and_includes(tmp_path: Path) -> None:
+    payload = await unrestricted_app(tmp_path)._create_test_index(
         "appdb", "dbo", "Orders",
         f"{TEST_INDEX_PREFIX}Orders_Status",
         key_columns=["Status"],
@@ -112,19 +116,19 @@ async def test_create_without_online_and_includes() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_refuses_non_test_prefix() -> None:
+async def test_create_refuses_non_test_prefix(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="test prefix"):
-        await unrestricted_app()._create_test_index(
+        await unrestricted_app(tmp_path)._create_test_index(
             "appdb", "dbo", "Orders", "IX_Orders_Status",
             key_columns=["Status"], include_columns=None, online=True, dry_run=True,
         )
 
 
 @pytest.mark.asyncio
-async def test_drop_refuses_non_test_prefix() -> None:
+async def test_drop_refuses_non_test_prefix(tmp_path: Path) -> None:
     # The safety property: this tool can NEVER touch a real index.
     with pytest.raises(ValueError, match="test prefix"):
-        await unrestricted_app()._drop_test_index(
+        await unrestricted_app(tmp_path)._drop_test_index(
             "appdb", "dbo", "Orders", "PK_Orders", dry_run=True,
         )
 
@@ -140,17 +144,22 @@ async def test_drop_refuses_non_test_prefix() -> None:
         ("dbo", "Orders", []),                   # no key columns
     ],
 )
-async def test_create_rejects_malformed_identifiers(schema, table, columns) -> None:
+async def test_create_rejects_malformed_identifiers(
+    schema,
+    table,
+    columns,
+    tmp_path: Path,
+) -> None:
     with pytest.raises(ValueError):
-        await unrestricted_app()._create_test_index(
+        await unrestricted_app(tmp_path)._create_test_index(
             "appdb", schema, table, f"{TEST_INDEX_PREFIX}X",
             key_columns=columns, include_columns=None, online=True, dry_run=True,
         )
 
 
 @pytest.mark.asyncio
-async def test_execution_blocked_without_apply_policy() -> None:
-    app = unrestricted_app()
+async def test_execution_blocked_without_apply_policy(tmp_path: Path) -> None:
+    app = unrestricted_app(tmp_path)
     assert app.config.write_policy is not WritePolicy.APPLY
     with pytest.raises(PermissionError, match="preview-only"):
         await app._create_test_index(
@@ -159,9 +168,12 @@ async def test_execution_blocked_without_apply_policy() -> None:
         )
 
 
-def test_live_test_index_database_requires_sandbox_profile_and_policy() -> None:
+def test_live_test_index_database_requires_sandbox_profile_and_policy(
+    tmp_path: Path,
+) -> None:
     app = AzureSqlMcpApplication(
         make_config(
+            tmp_path,
             access_mode=AccessMode.UNRESTRICTED,
             write_policy=WritePolicy.APPLY,
             profile=McpProfile.SANDBOX,
@@ -186,9 +198,12 @@ def test_live_test_index_database_requires_sandbox_profile_and_policy() -> None:
 
 
 @pytest.mark.asyncio
-async def test_live_create_and_drop_require_managed_lease_workflow() -> None:
+async def test_live_create_and_drop_require_managed_lease_workflow(
+    tmp_path: Path,
+) -> None:
     app = AzureSqlMcpApplication(
         make_config(
+            tmp_path,
             access_mode=AccessMode.UNRESTRICTED,
             write_policy=WritePolicy.APPLY,
             profile=McpProfile.SANDBOX,
@@ -217,9 +232,12 @@ async def test_live_create_and_drop_require_managed_lease_workflow() -> None:
 
 
 @pytest.mark.asyncio
-async def test_managed_index_ddl_uses_private_atomic_ownership_marker() -> None:
+async def test_managed_index_ddl_uses_private_atomic_ownership_marker(
+    tmp_path: Path,
+) -> None:
     app = AzureSqlMcpApplication(
         make_config(
+            tmp_path,
             access_mode=AccessMode.UNRESTRICTED,
             write_policy=WritePolicy.APPLY,
             profile=McpProfile.SANDBOX,

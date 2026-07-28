@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 
@@ -14,7 +15,7 @@ from azure_sql_mcp.config import WritePolicy
 
 
 @pytest.fixture
-def server_config_factory() -> Callable[..., ServerConfig]:
+def server_config_factory(tmp_path: Path) -> Callable[..., ServerConfig]:
     def factory(**overrides) -> ServerConfig:
         config = {
             "server": "server.database.windows.net",
@@ -43,7 +44,7 @@ def server_config_factory() -> Callable[..., ServerConfig]:
             "log_level": "INFO",
             "mcp_bearer_token": None,
             "write_policy": WritePolicy.DISABLED,
-            "audit_dir": "/tmp/azure-sql-mcp-test-audit",
+            "audit_dir": str(tmp_path / "audit"),
             "audit_full_sql": False,
             "remote_admin_enabled": False,
             "performance_state_dir": ":memory:",

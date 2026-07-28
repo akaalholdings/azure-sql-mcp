@@ -12,6 +12,7 @@ The supported tuning path is evidence-first but rewrite-active: a missing plan l
 - Exactly-once measured query samples with the result sample and actual plan from the same execution.
 - Interleaved baseline/candidate benchmarking with medians, spread, noise classification, and parameter buckets.
 - Snapshot-consistent, shape-, duplicate-, and order-aware result comparison where a complete bounded comparison is possible.
+- Database-aware equivalence preflight with recursive view-dependency and volatile-function analysis.
 - Durable temporary-index leases, automatic cleanup, and startup recovery of expired leases.
 - Reviewed view preparation with sandbox-only apply, durable restart recovery, verification, and exact rollback.
 - Prepared Query Store plan actions with prior-state capture, policy checks, verification, and exact rollback.
@@ -205,15 +206,22 @@ Performance state stores:
 - plan-action prior state and verification decisions;
 - temporary-index lease identifiers and cleanup targets.
 
+Supported database scalar values are normalized at the persistence boundary:
+UUID values become canonical strings, date and time values use ISO-8601, and
+`Decimal` values use precision-preserving strings. Unknown object types remain
+rejected. Initial collection and idempotent replay return the same normalized
+persisted evidence sections.
+
 Performance state does not persist raw query SQL by default. Secret-like metadata and SQL-shaped metadata fields are dropped at the normal persistence boundary. Sandbox view apply is the deliberate exception: exact crash recovery requires the target and prior view definitions, so it is disabled unless `AZURE_SQL_PERSIST_VIEW_SQL_STATE=true`. With that explicit opt-in, only durable view intents store raw view SQL in the same owner-only state directory and mode-0600 SQLite file. The separate admin audit can include full generated SQL only when `AZURE_SQL_AUDIT_FULL_SQL=1`; leave it disabled unless an approved local audit process requires it.
 
 ## Read-only triage workflow
 
-1. `start_performance_case` with the affected SELECT and up to four named parameter cases.
-2. `collect_performance_evidence` with `execute_query=false` for broad read-only evidence.
-3. Inspect the result status: `healthy`, `actionable`, `partial`, or `inconclusive`.
-4. Use `get_performance_case` to retrieve redacted evidence and event history.
-5. Hand the same case id to the optimizer or the Query Store review process.
+1. `check_equivalence_preflight` with the affected SELECT and database.
+2. `start_performance_case` with the affected SELECT and up to four named parameter cases.
+3. `collect_performance_evidence` with `execute_query=false` for broad read-only evidence.
+4. Inspect the result status: `healthy`, `actionable`, `partial`, or `inconclusive`.
+5. Use `get_performance_case` to retrieve redacted evidence and event history.
+6. Hand the same case id to the optimizer or the Query Store review process.
 
 Every diagnostic section carries collection window, availability, truncation, units, provenance, and stable query identity. Missing or truncated required evidence cannot produce `healthy`.
 
@@ -223,13 +231,14 @@ Every diagnostic section carries collection window, availability, truncation, un
 
 1. Record result shape, NULL, duplicate, ordering, tie, isolation, and parameter semantics in the client workflow.
 2. Produce concrete static rewrites before plan access whenever safe.
-3. `start_performance_case` for the baseline and parameter cases.
-4. `start_tuning_session`, passing explicit candidate, execution, and time budgets when the user wants a deep search.
-5. For each single-change experiment, call `add_tuning_candidate` with one family: predicate, join, aggregation, cardinality, index, or combined.
-6. Call `benchmark_tuning_candidate` in `screening` phase.
-7. Continue after neutral, regressed, equivalence-failed, timed-out, or otherwise inconclusive candidates.
-8. Re-run credible winners in `finalist` phase.
-9. Call `finalize_tuning_session` with the winner, if any, and an explicit stopping reason.
+3. `check_equivalence_preflight` for the baseline and database.
+4. `start_performance_case` for the baseline and parameter cases.
+5. `start_tuning_session`, passing explicit candidate, execution, and time budgets when the user wants a deep search.
+6. For each experiment, call `add_tuning_candidate` with one strategy. Use `combined` for multi-family rewrites and `rewrite_plus_index` only for an index child with a recorded parent.
+7. Call `benchmark_tuning_candidate` in `screening` phase.
+8. Continue after neutral, regressed, equivalence-failed, timed-out, or otherwise inconclusive candidates.
+9. Re-run credible winners in `finalist` phase.
+10. Call `finalize_tuning_session` with the winner, if any, an explicit stopping reason, and the default `selection_scope=proven`. Use `selection_scope=performance_only` only for an explicitly accepted unproven finalist.
 
 Compatibility defaults, used only when the caller does not request another
 policy-authorized budget:
@@ -259,9 +268,38 @@ Each measured sample runs the user query once. Parameterized SQL uses typed `sp_
 
 Rewrite screening normally defers full equivalence and costs six executions per parameter case: three baseline/candidate pairs. Finalist validation adds one two-query snapshot comparison, so five pairs cost twelve executions per case and 48 for four cases. Screening one case and validating four costs 54; screening all four and validating four costs 72. All work shares the configured session execution limit.
 
-Candidate outcomes are `improved`, `neutral`, `regressed`, `equivalence_failed`, `inconclusive`, or `cleanup_required`. A screening winner remains open for finalist validation; finalization marks every unresolved experiment `inconclusive`, so the leaderboard has no ambiguous unfinished candidate.
+Input contracts publish these enums:
+
+- Objectives: `elapsed_time`, `cpu`, `logical_reads`, and `physical_reads`.
+- Strategies: `predicate`, `join`, `aggregation`, `cardinality`, `index`, `combined`, and `rewrite_plus_index`.
+- Benchmark phases: `screening` and `finalist`.
+- Finalist selection scopes: `proven` and `performance_only`.
+
+Candidate outcomes are `improved`, `performance_only`, `neutral`, `regressed`, `equivalence_failed`, `inconclusive`, or `cleanup_required`. A screening winner remains open for finalist validation; finalization marks every unresolved experiment `inconclusive`, so the leaderboard has no ambiguous unfinished candidate.
+
+`performance_only` requires complete, nonzero finalist measurements that show
+improvement when semantic equivalence cannot be proven. It is terminal but
+unproven: it never means semantic equivalence, deployment readiness, or
+automatic deployment approval. Finalization selects it only through explicit
+`selection_scope=performance_only`; the default `proven` scope rejects it.
+
+`combined` is the normal strategy for a rewrite that combines multiple query
+families. `rewrite_plus_index` is an index child whose `candidate:` artifact
+references a recorded parent candidate. A performance-only parent propagates
+`parent_equivalence=unproven`, so its child cannot become a proven winner.
+Existing lineage-backed `combined` records remain readable as a deprecated
+compatibility form, but new lineage-backed index children use
+`rewrite_plus_index`.
 
 ### Equivalence
+
+Call `check_equivalence_preflight(sql, database_name)` before opening a case or
+comparing or benchmarking candidates. It returns coverage, risks, a verdict for
+each detected clock, volatile, or safely seeded function, resolved view
+dependencies, and unresolved dependencies. Referenced view definitions are
+inspected recursively to a maximum depth of eight. Encrypted, inaccessible,
+unresolved, cyclic, or depth-exceeded dependencies fail closed. Only summaries
+are persisted; raw definitions are not.
 
 `compare_query_results` executes both SELECT-shaped queries inside one snapshot transaction. A match is proven only for the supplied parameter case when:
 
@@ -272,6 +310,12 @@ Candidate outcomes are `improved`, `neutral`, `regressed`, `equivalence_failed`,
 - both statements complete in the same snapshot.
 
 If the result is truncated, snapshot comparison is unavailable, or execution fails, the result is `inconclusive`, never proven. The client remains responsible for testing semantic cases beyond the supplied buckets.
+
+When preflight shows that direct snapshot proof is impossible, finalist
+validation still runs its complete performance workload and skips only the
+impossible semantic comparison. An improving finalist can then become
+`performance_only` under the gates above. Direct-snapshot-safe finalist
+behavior is unchanged.
 
 ### Compatibility tools
 
@@ -418,6 +462,18 @@ Equivalent `--azure-sql-*` flags are available in `uv run azure-sql-mcp --help`.
 - `schema`: schema capture, comparison, and migration-script generation. Generated scripts are not executed.
 - `admin`: guarded maintenance, prepared apply, and unprofiled general DBA execution. Named profiles prune unrelated direct mutation tools.
 
+`check_runtime_status` includes the configured `tool_groups` so a client can
+confirm the effective runtime surface after startup.
+
+MCP discovery follows the protocol: the tool array returned by `tools/list` is
+under `result.tools`, not at the response root. Input schemas expose the
+objective, strategy, phase, and selection-scope enums. Tool responses retain
+their existing nested keys while adding typed output schemas and stable
+`headline` objects for case classification, session budgets, benchmark
+changes, and plan counts. Argument validation failures use a sanitized
+`invalid_arguments` envelope; caller input and Pydantic internals are not
+returned.
+
 Resources include schema views and token-safe plan artifacts under `azuresql-artifact://{artifact_id}`. Artifact content is process-local and expires with the server.
 
 ## Verification
@@ -436,6 +492,10 @@ uv run python scripts/verify_repository_content.py
 ```
 
 Live validation is opt-in. Use only an allowlisted dedicated non-production Azure SQL database. Start with the `optimizer` profile for read-only validation. Use `sandbox` only for leased test indexes or reviewed view changes, and `enforcer-apply` only for one explicitly authorized prepared intent. Do not use the general DBA path as a production smoke test.
+
+CI runs the repository checks on Ubuntu with Python 3.12 and 3.13 and on
+Windows with Python 3.12. Tests use pytest-managed temporary directories and do
+not rely on a fixed `/tmp` path.
 
 ## Troubleshooting
 
