@@ -16,14 +16,17 @@ from datetime import datetime, timedelta, timezone
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from typing import Any
+from typing import cast
 from typing import NoReturn
 
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.fastmcp.tools import ToolManager
 from mcp.types import ToolAnnotations
 from pydantic import AnyHttpUrl
 from pydantic import Field
+from pydantic import ValidationError
 
 from .admin_policy import AdminAction
 from .admin_policy import AdminPolicy
@@ -43,7 +46,7 @@ from .connection import AzureSqlExecutor
 from .connection_pool import ConnectionPool
 from .database_policy import load_database_policy_or_deny
 from .diagnostics import DiagnosticQueryService
-from .equivalence_contract import analyze_equivalence_preflight
+from .equivalence_preflight import EquivalencePreflightService
 from .health import HealthService
 from .index_optimizer import IndexCandidate
 from .index_optimizer import IndexOptimizer
@@ -61,6 +64,7 @@ from .param_binding import detect_parameters
 from .param_binding import ParameterExecutionContract
 from .param_binding import ParameterBindingService
 from .performance_contracts import EvidenceEnvelopeV1
+from .performance_contracts import PerformanceCaseV1
 from .performance_store import ContractNotFoundError
 from .performance_store import IdempotencyConflictError
 from .performance_store import PerformanceStore
@@ -92,6 +96,16 @@ from .safe_sql import SafeSqlValidator
 from .schema_compare import SchemaCompareService
 from .sessions import SessionsService
 from .tempdb_memory import TempdbMemoryService
+from .tool_contracts import add_tool_headline
+from .tool_contracts import BenchmarkPhase
+from .tool_contracts import BenchmarkToolOutput
+from .tool_contracts import CaseToolOutput
+from .tool_contracts import PlanToolOutput
+from .tool_contracts import PreflightToolOutput
+from .tool_contracts import SelectionScope
+from .tool_contracts import SessionToolOutput
+from .tool_contracts import TuningObjective
+from .tool_contracts import TuningStrategy
 from .tuning_sessions import TuningSessionStateMachine
 from .transport_auth import StaticBearerTokenVerifier
 from .wait_stats import WaitStatsService
@@ -153,6 +167,72 @@ _SESSION_WORKFLOW_TOOLS = frozenset(
 _EVIDENCE_WORKFLOW_TOOLS = frozenset(
     {"collect_performance_evidence", "tune_query"}
 )
+
+
+class _SanitizingToolManager(ToolManager):
+    """Return stable validation failures without echoing untrusted arguments."""
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        context=None,
+        convert_result: bool = False,
+    ) -> Any:
+        try:
+            return await super().call_tool(
+                name,
+                arguments,
+                context=context,
+                convert_result=convert_result,
+            )
+        except ToolError as exc:
+            validation_error = exc.__cause__
+            if not isinstance(validation_error, ValidationError):
+                raise
+            issues = [
+                {
+                    "path": ".".join(str(part) for part in error.get("loc", ())),
+                    "code": str(error.get("type") or "invalid"),
+                    "message": _validation_issue_message(
+                        str(error.get("type") or "invalid")
+                    ),
+                }
+                for error in validation_error.errors(
+                    include_url=False,
+                    include_context=False,
+                    include_input=False,
+                )
+            ]
+            payload = ErrorPayload(
+                code="invalid_arguments",
+                message="Tool arguments failed validation.",
+                details={"issues": issues},
+            ).as_dict()
+            raise ToolError(
+                json.dumps(
+                    payload,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            ) from None
+
+
+def _validation_issue_message(code: str) -> str:
+    messages = {
+        "missing": "Field required.",
+        "extra_forbidden": "Extra arguments are not permitted.",
+        "literal_error": "Value is not one of the permitted choices.",
+        "greater_than_equal": "Value is below the permitted minimum.",
+        "less_than_equal": "Value is above the permitted maximum.",
+        "int_parsing": "Value must be an integer.",
+        "string_type": "Value must be a string.",
+        "bool_parsing": "Value must be a boolean.",
+        "list_type": "Value must be an array.",
+        "dict_type": "Value must be an object.",
+    }
+    return messages.get(code, "Value failed validation.")
 
 
 def _view_change_request_fingerprint(
@@ -220,6 +300,9 @@ class AzureSqlMcpApplication:
             token_verifier=token_verifier,
             auth=_auth_settings(config) if token_verifier else None,
         )
+        self.mcp._tool_manager = _SanitizingToolManager(
+            warn_on_duplicate_tools=self.mcp.settings.warn_on_duplicate_tools
+        )
 
         authenticator = AzureSqlAuthenticator(config)
         pool = ConnectionPool(config, authenticator)
@@ -230,6 +313,7 @@ class AzureSqlMcpApplication:
 
         self.executor = executor
         self.validator = validator
+        self.equivalence_preflight = EquivalencePreflightService(executor=executor)
         self.artifacts = ArtifactStore()
         self.admin_policy = AdminPolicy(config)
         self.introspection = IntrospectionService(executor)
@@ -277,6 +361,7 @@ class AzureSqlMcpApplication:
             comparison_row_limit=config.comparison_row_limit,
             server_name=config.server,
             allow_legacy_state=bool(config.legacy_state_server_binding),
+            equivalence_analyzer=self._check_equivalence_preflight,
         )
         self.plan_actions = PlanActionService(
             config=config,
@@ -763,19 +848,22 @@ class AzureSqlMcpApplication:
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
             ),
-        ) -> ResponseType:
-            return await self._run_tool(
-                "explain_query",
-                database_name,
-                lambda resolved_database: self._explain_query(
-                    resolved_database,
-                    sql,
-                    analyze,
-                    hypothetical_indexes,
-                    auto_bind_params,
-                    include_raw_xml,
-                    parameter_values,
-                    parameter_types,
+        ) -> PlanToolOutput:
+            return cast(
+                PlanToolOutput,
+                await self._run_tool(
+                    "explain_query",
+                    database_name,
+                    lambda resolved_database: self._explain_query(
+                        resolved_database,
+                        sql,
+                        analyze,
+                        hypothetical_indexes,
+                        auto_bind_params,
+                        include_raw_xml,
+                        parameter_values,
+                        parameter_types,
+                    ),
                 ),
             )
 
@@ -899,21 +987,54 @@ class AzureSqlMcpApplication:
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
             ),
-        ) -> ResponseType:
-            return await self._run_tool(
-                "benchmark_query_rewrite",
-                database_name,
-                lambda resolved_database: self._benchmark_query_rewrite(
-                    resolved_database,
-                    baseline_sql,
-                    rewrite_sql,
-                    analyze,
-                    auto_bind_params,
-                    include_raw_xml,
-                    runs,
-                    parameter_values,
-                    compare_order,
-                    parameter_types,
+        ) -> BenchmarkToolOutput:
+            return cast(
+                BenchmarkToolOutput,
+                await self._run_tool(
+                    "benchmark_query_rewrite",
+                    database_name,
+                    lambda resolved_database: self._benchmark_query_rewrite(
+                        resolved_database,
+                        baseline_sql,
+                        rewrite_sql,
+                        analyze,
+                        auto_bind_params,
+                        include_raw_xml,
+                        runs,
+                        parameter_values,
+                        compare_order,
+                        parameter_types,
+                    ),
+                ),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Analyze direct SQL and recursively resolved view definitions for "
+                "semantic-equivalence proof risks without returning raw definitions."
+            ),
+            annotations=ToolAnnotations(
+                title="Check Equivalence Preflight",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
+        async def check_equivalence_preflight(
+            sql: str = Field(
+                description=(
+                    "Read-only SQL to inspect, including referenced view definitions."
+                )
+            ),
+            database_name: str | None = Field(default=None),
+        ) -> PreflightToolOutput:
+            return cast(
+                PreflightToolOutput,
+                await self._run_tool(
+                    "check_equivalence_preflight",
+                    database_name,
+                    lambda db: self._check_equivalence_preflight(db, sql),
                 ),
             )
 
@@ -939,25 +1060,31 @@ class AzureSqlMcpApplication:
                     "and boundary. Values are fingerprinted, not persisted."
                 ),
             ),
-            objective: str = Field(
+            objective: TuningObjective = Field(
                 default="elapsed_time",
-                description="Primary tuning objective recorded with the case.",
+                description=(
+                    "Primary tuning objective: elapsed_time, cpu, logical_reads, "
+                    "or physical_reads."
+                ),
             ),
             idempotency_key: str | None = Field(
                 default=None,
                 description="Optional caller-generated idempotency key.",
             ),
             database_name: str | None = Field(default=None),
-        ) -> ResponseType:
-            return await self._run_tool(
-                "start_performance_case",
-                database_name,
-                lambda db: self._start_performance_case(
-                    db,
-                    sql,
-                    parameter_cases,
-                    objective,
-                    idempotency_key,
+        ) -> CaseToolOutput:
+            return cast(
+                CaseToolOutput,
+                await self._run_tool(
+                    "start_performance_case",
+                    database_name,
+                    lambda db: self._start_performance_case(
+                        db,
+                        sql,
+                        parameter_cases,
+                        objective,
+                        idempotency_key,
+                    ),
                 ),
             )
 
@@ -1021,11 +1148,14 @@ class AzureSqlMcpApplication:
         async def get_performance_case(
             case_id: str = Field(description="Performance case identifier."),
             database_name: str | None = Field(default=None),
-        ) -> ResponseType:
-            return await self._run_tool(
-                "get_performance_case",
-                database_name,
-                lambda db: self._get_performance_case(db, case_id),
+        ) -> CaseToolOutput:
+            return cast(
+                CaseToolOutput,
+                await self._run_tool(
+                    "get_performance_case",
+                    database_name,
+                    lambda db: self._get_performance_case(db, case_id),
+                ),
             )
 
         @self.mcp.tool(
@@ -1061,17 +1191,20 @@ class AzureSqlMcpApplication:
             ),
             idempotency_key: str | None = Field(default=None),
             database_name: str | None = Field(default=None),
-        ) -> ResponseType:
-            return await self._run_tool(
-                "start_tuning_session",
-                database_name,
-                lambda db: self._start_tuning_session(
-                    db,
-                    case_id,
-                    max_candidates,
-                    execution_limit,
-                    time_limit_minutes,
-                    idempotency_key,
+        ) -> SessionToolOutput:
+            return cast(
+                SessionToolOutput,
+                await self._run_tool(
+                    "start_tuning_session",
+                    database_name,
+                    lambda db: self._start_tuning_session(
+                        db,
+                        case_id,
+                        max_candidates,
+                        execution_limit,
+                        time_limit_minutes,
+                        idempotency_key,
+                    ),
                 ),
             )
 
@@ -1091,11 +1224,14 @@ class AzureSqlMcpApplication:
         async def get_tuning_session(
             session_id: str = Field(description="Tuning session identifier."),
             database_name: str | None = Field(default=None),
-        ) -> ResponseType:
-            return await self._run_tool(
-                "get_tuning_session",
-                database_name,
-                lambda db: self._get_tuning_session(db, session_id),
+        ) -> SessionToolOutput:
+            return cast(
+                SessionToolOutput,
+                await self._run_tool(
+                    "get_tuning_session",
+                    database_name,
+                    lambda db: self._get_tuning_session(db, session_id),
+                ),
             )
 
         @self.mcp.tool(
@@ -1114,16 +1250,17 @@ class AzureSqlMcpApplication:
         async def add_tuning_candidate(
             session_id: str = Field(description="Tuning session identifier."),
             candidate_sql: str = Field(description="Concrete read-only candidate SQL."),
-            strategy: str = Field(
+            strategy: TuningStrategy = Field(
                 description=(
-                    "Candidate family: predicate, join, aggregation, cardinality, index, or combined."
+                    "Candidate family: predicate, join, aggregation, cardinality, "
+                    "index, combined, or rewrite_plus_index."
                 )
             ),
             artifact_ref: str | None = Field(
                 default=None,
                 description=(
-                    "Durable artifact reference. Combined candidates require "
-                    "candidate:<proven-parent-id>."
+                    "Durable artifact reference. rewrite_plus_index candidates "
+                    "require candidate:<parent-id>."
                 ),
             ),
             idempotency_key: str | None = Field(default=None),
@@ -1160,7 +1297,10 @@ class AzureSqlMcpApplication:
             candidate_id: str = Field(description="Candidate identifier."),
             baseline_sql: str = Field(description="Baseline read-only SQL."),
             candidate_sql: str = Field(description="Candidate read-only SQL."),
-            phase: str = Field(default="screening", description="screening or finalist"),
+            phase: BenchmarkPhase = Field(
+                default="screening",
+                description="Benchmark phase: screening or finalist.",
+            ),
             parameter_cases: list[dict[str, Any]] | None = Field(default=None),
             compare_order: bool = Field(default=True),
             runs: int | None = Field(
@@ -1181,26 +1321,29 @@ class AzureSqlMcpApplication:
             ),
             idempotency_key: str | None = Field(default=None),
             database_name: str | None = Field(default=None),
-        ) -> ResponseType:
-            return await self._run_tool(
-                "benchmark_tuning_candidate",
-                database_name,
-                lambda db: self.performance_workflows.benchmark_candidate(
-                    session_id,
-                    candidate_id,
-                    db,
-                    baseline_sql,
-                    candidate_sql,
-                    phase=phase,
-                    parameter_cases=parameter_cases,
-                    compare_order=compare_order,
-                    runs_override=runs,
-                    prove_equivalence=prove_equivalence,
-                    idempotency_key=idempotency_key,
+        ) -> BenchmarkToolOutput:
+            return cast(
+                BenchmarkToolOutput,
+                await self._run_tool(
+                    "benchmark_tuning_candidate",
+                    database_name,
+                    lambda db: self.performance_workflows.benchmark_candidate(
+                        session_id,
+                        candidate_id,
+                        db,
+                        baseline_sql,
+                        candidate_sql,
+                        phase=phase,
+                        parameter_cases=parameter_cases,
+                        compare_order=compare_order,
+                        runs_override=runs,
+                        prove_equivalence=prove_equivalence,
+                        idempotency_key=idempotency_key,
+                    ),
+                    deadline_provider=lambda: self.tuning_sessions.get_session(
+                        session_id
+                    ).deadline_at_utc,
                 ),
-                deadline_provider=lambda: self.tuning_sessions.get_session(
-                    session_id
-                ).deadline_at_utc,
             )
 
         @self.mcp.tool(
@@ -1233,7 +1376,10 @@ class AzureSqlMcpApplication:
                 default=None,
                 description="The same named parameter cases recorded on the performance case.",
             ),
-            phase: str = Field(default="screening", description="screening or finalist"),
+            phase: BenchmarkPhase = Field(
+                default="screening",
+                description="Benchmark phase: screening or finalist.",
+            ),
             online: bool = Field(default=True),
             compare_order: bool = Field(
                 default=True,
@@ -1244,31 +1390,34 @@ class AzureSqlMcpApplication:
                 description="Caller-generated key used to fence retries and cleanup."
             ),
             database_name: str | None = Field(default=None),
-        ) -> ResponseType:
-            return await self._run_tool(
-                "benchmark_index_candidate",
-                database_name,
-                lambda db: self._benchmark_index_candidate(
-                    db,
-                    session_id,
-                    candidate_id,
-                    sql,
-                    schema_name,
-                    table_name,
-                    key_columns,
-                    include_columns,
-                    filter_definition,
-                    is_unique,
-                    phase,
-                    online,
-                    compare_order,
-                    lease_minutes,
-                    idempotency_key,
-                    parameter_cases,
+        ) -> BenchmarkToolOutput:
+            return cast(
+                BenchmarkToolOutput,
+                await self._run_tool(
+                    "benchmark_index_candidate",
+                    database_name,
+                    lambda db: self._benchmark_index_candidate(
+                        db,
+                        session_id,
+                        candidate_id,
+                        sql,
+                        schema_name,
+                        table_name,
+                        key_columns,
+                        include_columns,
+                        filter_definition,
+                        is_unique,
+                        phase,
+                        online,
+                        compare_order,
+                        lease_minutes,
+                        idempotency_key,
+                        parameter_cases,
+                    ),
+                    deadline_provider=lambda: self.tuning_sessions.get_session(
+                        session_id
+                    ).deadline_at_utc,
                 ),
-                deadline_provider=lambda: self.tuning_sessions.get_session(
-                    session_id
-                ).deadline_at_utc,
             )
 
         @self.mcp.tool(
@@ -1287,19 +1436,30 @@ class AzureSqlMcpApplication:
         async def finalize_tuning_session(
             session_id: str = Field(description="Tuning session identifier."),
             selected_candidate_id: str | None = Field(default=None),
+            selection_scope: SelectionScope = Field(
+                default="proven",
+                description=(
+                    "Select proven finalists by default. performance_only is an "
+                    "explicit opt-in and never asserts semantic equivalence."
+                ),
+            ),
             stopping_reason: str = Field(description="Why the optimizer stopped."),
             idempotency_key: str | None = Field(default=None),
             database_name: str | None = Field(default=None),
-        ) -> ResponseType:
-            return await self._run_tool(
-                "finalize_tuning_session",
-                database_name,
-                lambda db: self._finalize_tuning_session(
-                    db,
-                    session_id,
-                    selected_candidate_id,
-                    stopping_reason,
-                    idempotency_key,
+        ) -> SessionToolOutput:
+            return cast(
+                SessionToolOutput,
+                await self._run_tool(
+                    "finalize_tuning_session",
+                    database_name,
+                    lambda db: self._finalize_tuning_session(
+                        db,
+                        session_id,
+                        selected_candidate_id,
+                        stopping_reason,
+                        idempotency_key,
+                        selection_scope=selection_scope,
+                    ),
                 ),
             )
 
@@ -3260,6 +3420,8 @@ class AzureSqlMcpApplication:
         contracts = {
             "strict_arguments": True,
             "mcp_errors": True,
+            "sanitized_validation_errors": True,
+            "performance_only_selection": True,
         }
         config_fingerprint = self.config.sanitized_config_fingerprint()
         runtime_fingerprint = hashlib.sha256(
@@ -3282,6 +3444,7 @@ class AzureSqlMcpApplication:
                 self.config.profile.value if self.config.profile is not None else None
             ),
             "transport": self.config.transport.mode.value,
+            "tool_groups": sorted(group.value for group in self.config.tool_groups),
             "tool_count": len(tool_names),
             "tool_names": tool_names,
             "contracts": contracts,
@@ -3373,18 +3536,57 @@ class AzureSqlMcpApplication:
         objective: str,
         idempotency_key: str | None,
     ) -> dict[str, Any]:
-        performance_case = self.performance_workflows.start_case(
+        performance_case = await self._create_performance_case(
             database_name,
             sql,
             parameter_cases=parameter_cases,
-            metadata={
-                "objective": objective,
-                "raw_sql_persisted": False,
-                "equivalence_preflight": analyze_equivalence_preflight(sql).as_dict(),
-            },
+            objective=objective,
             idempotency_key=idempotency_key,
         )
         return performance_case.to_dict()
+
+    async def _create_performance_case(
+        self,
+        database_name: str,
+        sql: str,
+        *,
+        parameter_cases: list[dict[str, Any]] | None,
+        objective: str,
+        metadata: Mapping[str, Any] | None = None,
+        idempotency_key: str | None = None,
+    ) -> PerformanceCaseV1:
+        normalized_sql = self.validator.validate_read_only(sql).execution_sql
+        equivalence_preflight = await self._check_equivalence_preflight(
+            database_name,
+            normalized_sql,
+        )
+        case_metadata = dict(metadata or {})
+        case_metadata.update(
+            {
+                "objective": objective,
+                "raw_sql_persisted": False,
+                "equivalence_preflight": equivalence_preflight,
+            }
+        )
+        return self.performance_workflows.start_case(
+            database_name,
+            normalized_sql,
+            parameter_cases=parameter_cases,
+            metadata=case_metadata,
+            idempotency_key=idempotency_key,
+        )
+
+    async def _check_equivalence_preflight(
+        self,
+        database_name: str,
+        sql: str,
+    ) -> dict[str, Any]:
+        normalized_sql = self.validator.validate_read_only(sql).execution_sql
+        result = await self.equivalence_preflight.analyze(
+            database_name,
+            normalized_sql,
+        )
+        return result.as_dict()
 
     async def _collect_performance_evidence(
         self,
@@ -3647,6 +3849,7 @@ class AzureSqlMcpApplication:
         selected_candidate_id: str | None,
         stopping_reason: str,
         idempotency_key: str | None,
+        selection_scope: SelectionScope = "proven",
     ) -> dict[str, Any]:
         session = self.tuning_sessions.get_session(session_id)
         case = self.performance_store.get_performance_case(session.performance_case_id)
@@ -3660,6 +3863,7 @@ class AzureSqlMcpApplication:
         return self.performance_workflows.finalize_session(
             session_id,
             selected_candidate_id=selected_candidate_id,
+            selection_scope=selection_scope,
             stopping_reason=stopping_reason,
             idempotency_key=idempotency_key,
         )
@@ -4411,9 +4615,18 @@ class AzureSqlMcpApplication:
         case = self.performance_store.get_performance_case(session.performance_case_id)
         if candidate.session_id != session_id:
             raise ValueError("Candidate does not belong to the tuning session.")
-        if candidate.strategy not in {"index", "combined"}:
+        legacy_combined_lineage = bool(
+            candidate.strategy == "combined"
+            and candidate.rewrite_artifact_ref
+            and candidate.metadata.get("lineage")
+        )
+        if (
+            candidate.strategy not in {"index", "rewrite_plus_index"}
+            and not legacy_combined_lineage
+        ):
             raise ValueError(
-                "Index benchmarking requires an index or combined candidate."
+                "Index benchmarking requires index or rewrite_plus_index; "
+                "lineage-backed combined is accepted only for legacy records."
             )
         if not fingerprint_text_matches(
             candidate.rewrite_fingerprint,
@@ -4434,7 +4647,8 @@ class AzureSqlMcpApplication:
         else:
             if phase != "finalist":
                 raise ValueError(
-                    "Combined candidates run only as finalist marginal index experiments."
+                    "Lineage-backed candidates run only as finalist marginal "
+                    "index experiments."
                 )
             parent = self.tuning_sessions.get_candidate(combined_parent_id(candidate))
             parent_evidence = [
@@ -4448,7 +4662,7 @@ class AzureSqlMcpApplication:
             )
             if dict(candidate.metadata.get("lineage") or {}) != lineage:
                 raise ValueError(
-                    "Combined candidate durable lineage does not match its proven parent."
+                    "Lineage candidate durable metadata does not match its parent."
                 )
         if not database_fingerprint_matches(
             case.database_fingerprint or "",
@@ -4459,30 +4673,19 @@ class AzureSqlMcpApplication:
             raise PermissionError("Tuning session belongs to another database.")
         if not key_columns:
             raise ValueError("key_columns must contain at least one column.")
-        equivalence_preflight = analyze_equivalence_preflight(
-            normalized_sql
-        ).as_dict()
+        equivalence_preflight = await self._check_equivalence_preflight(
+            database_name,
+            normalized_sql,
+        )
         direct_snapshot_supported = bool(
             equivalence_preflight["direct_snapshot_supported"]
         )
-        if not direct_snapshot_supported and phase == "finalist":
-            return {
-                "session_id": session_id,
-                "candidate_id": candidate_id,
-                "classification": "proof_contract_required",
-                "durable_state": candidate.state,
-                "reason": (
-                    "This MCP contract has no deterministic proof input for this "
-                    "SQL shape; finalist validation cannot proceed."
-                ),
-                "phase": phase,
-                "executions": 0,
-                "equivalence": [],
-                "equivalence_preflight": equivalence_preflight,
-                "proof_scope": "performance_only",
-                "lineage": lineage,
-                "session_continues": True,
-            }
+        parent_equivalence_unproven = bool(
+            lineage and lineage.get("parent_equivalence") == "unproven"
+        )
+        performance_only_scope = (
+            not direct_snapshot_supported or parent_equivalence_unproven
+        )
         cases = self.performance_workflows._normalize_parameter_cases(parameter_cases)
         if len(cases) > session.parameter_case_limit:
             raise ValueError(
@@ -4509,6 +4712,18 @@ class AzureSqlMcpApplication:
             raise ValueError(
                 "Finalist index validation must cover every registered parameter case."
             )
+
+        def begin_candidate_phase() -> None:
+            if phase == "screening":
+                self.tuning_sessions.start_screening(session_id)
+                return
+            if self.tuning_sessions.get_session(session_id).status == "created":
+                self.tuning_sessions.start_screening(session_id)
+            self.tuning_sessions.mark_candidate_finalist(
+                session_id,
+                candidate_id,
+            )
+
         runs = (
             session.screen_runs_per_candidate
             if phase == "screening"
@@ -4677,13 +4892,7 @@ class AzureSqlMcpApplication:
         )
         if name_conflict is not None:
             if not candidate.is_terminal:
-                if phase == "screening":
-                    self.tuning_sessions.start_screening(session_id)
-                else:
-                    self.tuning_sessions.mark_candidate_finalist(
-                        session_id,
-                        candidate_id,
-                    )
+                begin_candidate_phase()
             _session, updated = self.tuning_sessions.record_candidate_result(
                 session_id,
                 candidate_id,
@@ -4724,13 +4933,7 @@ class AzureSqlMcpApplication:
         ]
         if covering_indexes:
             if not candidate.is_terminal:
-                if phase == "screening":
-                    self.tuning_sessions.start_screening(session_id)
-                else:
-                    self.tuning_sessions.mark_candidate_finalist(
-                        session_id,
-                        candidate_id,
-                    )
+                begin_candidate_phase()
             _session, updated = self.tuning_sessions.record_candidate_result(
                 session_id,
                 candidate_id,
@@ -4868,10 +5071,7 @@ class AzureSqlMcpApplication:
                     },
                     "session_continues": lease["status"] != "cleanup_required",
                 }
-            if phase == "screening":
-                self.tuning_sessions.start_screening(session_id)
-            else:
-                self.tuning_sessions.mark_candidate_finalist(session_id, candidate_id)
+            begin_candidate_phase()
         except BaseException:
             finalize_pre_dispatch_reservation()
             if lease is not None:
@@ -5340,16 +5540,16 @@ class AzureSqlMcpApplication:
         performance_reason = reason
         candidate_state = state
         if (
-            phase == "screening"
-            and not direct_snapshot_supported
+            phase == "finalist"
+            and performance_only_scope
             and state in {"promising", "improved"}
         ):
-            state = "proof_contract_required"
-            candidate_state = "inconclusive"
+            state = "performance_only"
+            candidate_state = "performance_only"
+            performance_classification = "improved"
             reason = (
-                "Performance screening improved, but this MCP contract has no "
-                "deterministic proof input for this SQL shape; the candidate was "
-                "not promoted."
+                "Candidate improved the measured objective, but semantic "
+                "equivalence remains unproven; the result is performance-only."
             )
 
         candidate_plans = [
@@ -5397,10 +5597,11 @@ class AzureSqlMcpApplication:
                     "equivalence": equivalence,
                     "equivalence_preflight": equivalence_preflight,
                     "proof_scope": (
-                        "aba_result_stability"
-                        if direct_snapshot_supported
-                        else "performance_only"
+                        "performance_only"
+                        if performance_only_scope
+                        else "aba_result_stability"
                     ),
+                    "equivalence_deferred": performance_only_scope,
                     "lineage": lineage,
                     "phase": phase,
                     "reason": reason,
@@ -5467,10 +5668,11 @@ class AzureSqlMcpApplication:
             "parameter_results": parameter_results,
             "equivalence": equivalence,
             "equivalence_preflight": equivalence_preflight,
+            "equivalence_deferred": performance_only_scope,
             "proof_scope": (
-                "aba_result_stability"
-                if direct_snapshot_supported
-                else "performance_only"
+                "performance_only"
+                if performance_only_scope
+                else "aba_result_stability"
             ),
             "lineage": lineage,
             "evidence_id": evidence.evidence_id,
@@ -5544,7 +5746,7 @@ class AzureSqlMcpApplication:
                 )
             else:
                 logger.info("Tool completed", extra=log_extra)
-            return self._format_response(payload)
+            return self._format_response(add_tool_headline(tool_name, payload))
         except ToolError:
             raise
         except asyncio.TimeoutError:
@@ -6308,14 +6510,13 @@ class AzureSqlMcpApplication:
             parameter_values,
             parameter_types,
         )
-        performance_case = self.performance_workflows.start_case(
+        performance_case = await self._create_performance_case(
             database_name,
             sql,
             parameter_cases=[parameter_case] if parameter_case is not None else None,
+            objective="elapsed_time",
             metadata={
-                "objective": "elapsed_time",
                 "compatibility_tool": "tune_query",
-                "raw_sql_persisted": False,
             },
         )
         evidence = await self._collect_performance_evidence(
@@ -6389,12 +6590,12 @@ class AzureSqlMcpApplication:
                 rewrite_sql,
                 parameter_case,
             )
-        performance_case = self.performance_workflows.start_case(
+        performance_case = await self._create_performance_case(
             database_name,
             baseline_sql,
             parameter_cases=parameter_cases,
+            objective="elapsed_time",
             metadata={
-                "objective": "elapsed_time",
                 "compatibility_tool": "benchmark_query_rewrite",
             },
         )

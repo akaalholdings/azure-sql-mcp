@@ -7,6 +7,7 @@ import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -23,6 +24,12 @@ from azure_sql_mcp.performance_store import (
 )
 
 
+def _assert_private_mode(path: Path, expected: int) -> None:
+    assert path.exists()
+    if os.name != "nt":
+        assert os.stat(path).st_mode & 0o777 == expected
+
+
 def test_store_persists_redacted_contracts_and_secure_file_modes(tmp_path) -> None:
     state_dir = tmp_path / "state"
     evidence = EvidenceEnvelopeV1(
@@ -33,9 +40,9 @@ def test_store_persists_redacted_contracts_and_secure_file_modes(tmp_path) -> No
     with PerformanceStore(state_dir) as store:
         store.create_evidence(evidence)
 
-    assert os.stat(state_dir).st_mode & 0o777 == 0o700
+    _assert_private_mode(state_dir, 0o700)
     database_path = state_dir / "performance.sqlite3"
-    assert os.stat(database_path).st_mode & 0o777 == 0o600
+    _assert_private_mode(database_path, 0o600)
 
     with sqlite3.connect(database_path) as connection:
         payload = connection.execute(
@@ -838,7 +845,7 @@ def test_view_change_intent_requires_opt_in_and_survives_restart(tmp_path) -> No
     assert restored["status"] == "applied"
     assert restored["payload"] == payload
     assert restored["receipt"]["object_id"] == 17
-    assert os.stat(state_dir / "performance.sqlite3").st_mode & 0o777 == 0o600
+    _assert_private_mode(state_dir / "performance.sqlite3", 0o600)
 
 
 def test_view_change_intent_rejects_identifier_reuse(tmp_path) -> None:

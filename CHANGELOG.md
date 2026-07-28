@@ -6,6 +6,31 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-07-28
+
+### Added
+
+- Added database-aware `check_equivalence_preflight` analysis with recursive view inspection to depth eight, function verdicts, dependency coverage, and fail-closed handling for encrypted, inaccessible, unresolved, cyclic, or depth-exceeded definitions.
+- Published input enums for the four tuning objectives, candidate strategies, benchmark phases, and finalist selection scopes.
+- Added typed, additive output schemas and stable `headline` summaries for performance-case classification, session budgets, benchmark changes, and plan counts without removing existing response keys.
+- Added Windows Python 3.12 to CI alongside Ubuntu Python 3.12 and 3.13.
+
+### Changed
+
+- Added the terminal `performance_only` candidate state. Finalist performance measurements can complete when semantic comparison is impossible, but the state never represents semantic proof or deployment approval.
+- `finalize_tuning_session` now accepts `selection_scope`, defaults to `proven`, and requires explicit `performance_only` opt-in before selecting an unproven finalist.
+- Restored `combined` for multi-family rewrites and added `rewrite_plus_index` for lineage-backed index children. Existing lineage-backed `combined` records remain readable as a deprecated compatibility form.
+- Runtime status now reports the configured `tool_groups`; MCP tool discovery remains in the protocol-standard `tools/list` `result.tools` location.
+
+### Fixed
+
+- Evidence persistence now normalizes UUID values to canonical strings, date and time values to ISO-8601 strings, and `Decimal` values to precision-preserving strings while continuing to reject unknown object types.
+- Initial evidence collection and idempotent replay now return the same normalized persisted sections, evidence id, and content.
+- Unsupported snapshot proof no longer ends a promising candidate before finalist performance measurement. Complete, nonzero finalist evidence is required before a candidate can become `performance_only`.
+- Volatile functions hidden in referenced views now participate in the same preflight used by performance cases, result comparisons, and rewrite and index benchmarks.
+- Invalid tool arguments now return a sanitized `invalid_arguments` envelope without echoing caller input or exposing Pydantic internals.
+- Test paths now use pytest-managed temporary directories instead of fixed `/tmp` locations.
+
 ## [2.1.0] - 2026-07-24
 
 ### Added

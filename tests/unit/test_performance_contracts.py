@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+from datetime import date, datetime, time, timezone
+from decimal import Decimal
+from uuid import UUID
 
 import pytest
 
@@ -73,6 +76,52 @@ def test_contract_metadata_drops_raw_sql_and_secret_like_fields() -> None:
     assert "safe aggregate observation" in payload
 
 
+def test_evidence_normalizes_supported_database_scalars_recursively() -> None:
+    evidence = EvidenceEnvelopeV1(
+        evidence_id="evidence-scalars",
+        query_fingerprint="query-hash",
+        metrics={
+            "request_id": UUID("12345678-1234-5678-1234-567812345678"),
+            "captured_at": datetime(2026, 7, 28, 10, 11, 12, 345678, tzinfo=timezone.utc),
+            "observed_on": date(2026, 7, 28),
+            "cutoff": time(10, 11, 12, 345678),
+            "amount": Decimal("123.4500"),
+            "nested": {
+                "values": (
+                    UUID("87654321-4321-8765-4321-876543218765"),
+                    Decimal("0.0001000"),
+                )
+            },
+        },
+    )
+
+    assert evidence.metrics == {
+        "request_id": "12345678-1234-5678-1234-567812345678",
+        "captured_at": "2026-07-28T10:11:12.345678+00:00",
+        "observed_on": "2026-07-28",
+        "cutoff": "10:11:12.345678",
+        "amount": "123.4500",
+        "nested": {
+            "values": [
+                "87654321-4321-8765-4321-876543218765",
+                "0.0001000",
+            ]
+        },
+    }
+
+
+def test_evidence_rejects_unknown_metadata_objects() -> None:
+    class UnknownScalar:
+        pass
+
+    with pytest.raises(ContractValidationError, match="Unsupported value type UnknownScalar"):
+        EvidenceEnvelopeV1(
+            evidence_id="evidence-unknown-scalar",
+            query_fingerprint="query-hash",
+            metadata={"unknown": UnknownScalar()},
+        )
+
+
 def test_invalid_contract_version_and_terminal_state_are_rejected() -> None:
     with pytest.raises(ContractValidationError):
         EvidenceEnvelopeV1(evidence_id="evidence-3", contract_version=2)
@@ -83,6 +132,21 @@ def test_invalid_contract_version_and_terminal_state_are_rejected() -> None:
             session_id="session-3",
             state="failed",
         )
+
+
+def test_performance_only_candidate_round_trips_as_terminal() -> None:
+    candidate = TuningCandidateV1(
+        candidate_id="candidate-performance-only",
+        session_id="session-performance-only",
+        state="performance_only",
+        finalist_runs=5,
+        executions=10,
+    )
+
+    decoded = deserialize_contract(candidate.to_json())
+
+    assert decoded == candidate
+    assert candidate.is_terminal is True
 
 
 def test_candidate_artifact_reference_cannot_be_raw_sql() -> None:

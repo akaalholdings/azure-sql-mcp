@@ -4,6 +4,8 @@ attempts, unknown hints, malformed clauses — is rejected with a clear reason."
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from azure_sql_mcp.config import AccessMode
@@ -17,7 +19,10 @@ from azure_sql_mcp.query_hints import validate_query_hints
 from azure_sql_mcp.server import AzureSqlMcpApplication
 
 
-def make_config(access_mode: AccessMode = AccessMode.RESTRICTED) -> ServerConfig:
+def make_config(
+    tmp_path: Path,
+    access_mode: AccessMode = AccessMode.RESTRICTED,
+) -> ServerConfig:
     return ServerConfig(
         server="server.database.windows.net",
         default_database="appdb",
@@ -41,7 +46,7 @@ def make_config(access_mode: AccessMode = AccessMode.RESTRICTED) -> ServerConfig
         log_level="INFO",
         mcp_bearer_token=None,
         write_policy=WritePolicy.DISABLED,
-        audit_dir="/tmp/azure-sql-mcp-test-audit",
+        audit_dir=str(tmp_path / "audit"),
         audit_full_sql=False,
         remote_admin_enabled=False,
     )
@@ -115,12 +120,14 @@ def test_rejected_hint_shapes_raise(hints: str, reason_fragment: str) -> None:
 
 # --- tool registration and policy behavior ---
 
-def test_hint_tools_register_only_in_unrestricted_mode() -> None:
-    restricted = AzureSqlMcpApplication(make_config())
+def test_hint_tools_register_only_in_unrestricted_mode(tmp_path: Path) -> None:
+    restricted = AzureSqlMcpApplication(make_config(tmp_path))
     assert "set_query_store_hints" not in restricted.mcp._tool_manager._tools
     assert "clear_query_store_hints" not in restricted.mcp._tool_manager._tools
 
-    unrestricted = AzureSqlMcpApplication(make_config(access_mode=AccessMode.UNRESTRICTED))
+    unrestricted = AzureSqlMcpApplication(
+        make_config(tmp_path, access_mode=AccessMode.UNRESTRICTED)
+    )
     tools = unrestricted.mcp._tool_manager._tools
     assert "set_query_store_hints" in tools
     assert "clear_query_store_hints" in tools
@@ -129,8 +136,10 @@ def test_hint_tools_register_only_in_unrestricted_mode() -> None:
 
 
 @pytest.mark.asyncio
-async def test_set_hints_dry_run_previews_with_rollback() -> None:
-    app = AzureSqlMcpApplication(make_config(access_mode=AccessMode.UNRESTRICTED))
+async def test_set_hints_dry_run_previews_with_rollback(tmp_path: Path) -> None:
+    app = AzureSqlMcpApplication(
+        make_config(tmp_path, access_mode=AccessMode.UNRESTRICTED)
+    )
     payload = await app._set_query_store_hints(
         "appdb", 42, "OPTION(RECOMPILE)", dry_run=True,
     )
@@ -142,8 +151,12 @@ async def test_set_hints_dry_run_previews_with_rollback() -> None:
 
 
 @pytest.mark.asyncio
-async def test_set_hints_rejects_bad_hints_before_any_policy_work() -> None:
-    app = AzureSqlMcpApplication(make_config(access_mode=AccessMode.UNRESTRICTED))
+async def test_set_hints_rejects_bad_hints_before_any_policy_work(
+    tmp_path: Path,
+) -> None:
+    app = AzureSqlMcpApplication(
+        make_config(tmp_path, access_mode=AccessMode.UNRESTRICTED)
+    )
     with pytest.raises(ValueError, match="unsupported"):
         await app._set_query_store_hints(
             "appdb", 42, "OPTION(EVIL_HINT)", dry_run=True,
@@ -155,9 +168,13 @@ async def test_set_hints_rejects_bad_hints_before_any_policy_work() -> None:
 
 
 @pytest.mark.asyncio
-async def test_set_hints_execution_blocked_without_apply_policy() -> None:
+async def test_set_hints_execution_blocked_without_apply_policy(
+    tmp_path: Path,
+) -> None:
     # Direct mutation is blocked before any write policy can be consulted.
-    app = AzureSqlMcpApplication(make_config(access_mode=AccessMode.UNRESTRICTED))
+    app = AzureSqlMcpApplication(
+        make_config(tmp_path, access_mode=AccessMode.UNRESTRICTED)
+    )
     assert app.config.write_policy is not WritePolicy.APPLY
     with pytest.raises(PermissionError, match="prepared workflow"):
         await app._set_query_store_hints(
@@ -166,8 +183,10 @@ async def test_set_hints_execution_blocked_without_apply_policy() -> None:
 
 
 @pytest.mark.asyncio
-async def test_clear_hints_dry_run_previews() -> None:
-    app = AzureSqlMcpApplication(make_config(access_mode=AccessMode.UNRESTRICTED))
+async def test_clear_hints_dry_run_previews(tmp_path: Path) -> None:
+    app = AzureSqlMcpApplication(
+        make_config(tmp_path, access_mode=AccessMode.UNRESTRICTED)
+    )
     payload = await app._clear_query_store_hints("appdb", 42, dry_run=True)
     assert payload["status"] == "dry_run"
     assert payload["action"] == "hints_cleared"
@@ -175,8 +194,12 @@ async def test_clear_hints_dry_run_previews() -> None:
 
 
 @pytest.mark.asyncio
-async def test_direct_set_hints_cannot_bypass_prepared_workflow() -> None:
-    app = AzureSqlMcpApplication(make_config(access_mode=AccessMode.UNRESTRICTED))
+async def test_direct_set_hints_cannot_bypass_prepared_workflow(
+    tmp_path: Path,
+) -> None:
+    app = AzureSqlMcpApplication(
+        make_config(tmp_path, access_mode=AccessMode.UNRESTRICTED)
+    )
     executed: dict = {}
 
     async def fake_execute(action, executor, *, dry_run, max_rows=None):

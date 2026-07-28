@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from .candidate_lineage import parse_combined_parent_reference
-from .candidate_lineage import validate_combined_parent_request
+from .candidate_lineage import validate_rewrite_plus_index_parent_request
 from .connection import AzureSqlExecutor
 from .connection import QueryResult
 from .connection import StatementDispatchPrevented
@@ -50,6 +50,10 @@ EvidenceCollector = Callable[[], Awaitable[Any]]
 ParameterBinder = Callable[
     [str, str, Mapping[str, Any]],
     Awaitable[ParameterExecutionContract],
+]
+EquivalenceAnalyzer = Callable[
+    [str, str],
+    Awaitable[Mapping[str, Any]],
 ]
 
 
@@ -875,6 +879,7 @@ class PerformanceWorkflowService:
         comparison_row_limit: int | None = None,
         server_name: str = "unspecified",
         allow_legacy_state: bool = False,
+        equivalence_analyzer: EquivalenceAnalyzer | None = None,
     ) -> None:
         self.executor = executor
         self.plans = plans
@@ -891,6 +896,16 @@ class PerformanceWorkflowService:
         self.collector_timeout_seconds = collector_timeout_seconds
         self.server_name = server_name
         self.allow_legacy_state = allow_legacy_state
+        self.equivalence_analyzer = equivalence_analyzer
+
+    async def _analyze_equivalence(
+        self,
+        database_name: str,
+        sql: str,
+    ) -> dict[str, Any]:
+        if self.equivalence_analyzer is not None:
+            return dict(await self.equivalence_analyzer(database_name, sql))
+        return analyze_equivalence_preflight(sql).as_dict()
 
     def start_case(
         self,
@@ -1200,6 +1215,7 @@ class PerformanceWorkflowService:
             idempotency_key=evidence_idempotency_key,
             request_fingerprint=evidence_request_fingerprint,
         )
+        persisted_sections = evidence.metadata.get("sections")
         self.store.append_performance_case_evidence(
             case_id,
             evidence.evidence_id,
@@ -1211,7 +1227,11 @@ class PerformanceWorkflowService:
             "performance_case_id": case_id,
             "outcome": outcome,
             "evidence": evidence.to_dict(),
-            "sections": sections,
+            "sections": (
+                dict(persisted_sections)
+                if isinstance(persisted_sections, Mapping)
+                else {}
+            ),
             "profile": profile,
             "incomplete_evidence_can_be_healthy": False,
         }
@@ -1256,7 +1276,31 @@ class PerformanceWorkflowService:
             metadata={"database_fingerprint": case.database_fingerprint},
             idempotency_key=idempotency_key,
         )
-        return session.to_dict()
+        return {
+            **session.to_dict(),
+            "budget": self._session_budget(session, ()),
+        }
+
+    def _session_budget(
+        self,
+        session: Any,
+        candidates: Sequence[Any],
+    ) -> dict[str, Any]:
+        execution_budget = self.store.execution_budget_usage(session.session_id)
+        return {
+            "candidate_limit": session.max_candidates,
+            "candidates_used": len(candidates),
+            "candidate_slots_remaining": max(
+                0,
+                session.max_candidates - len(candidates),
+            ),
+            "execution_limit": session.execution_limit,
+            "executions_used": execution_budget["consumed"],
+            "executions_reserved": execution_budget["reserved"],
+            "executions_committed": execution_budget["committed"],
+            "executions_remaining": execution_budget["remaining"],
+            "deadline_at_utc": session.deadline_at_utc,
+        }
 
     def get_session(self, session_id: str) -> dict[str, Any]:
         session = self.sessions.get_session(session_id)
@@ -1268,7 +1312,6 @@ class PerformanceWorkflowService:
                 for evidence_id in candidate.evidence_ids
             )
         )
-        execution_budget = self.store.execution_budget_usage(session_id)
         return {
             "session": session.to_dict(),
             "leaderboard": [candidate.to_dict() for candidate in candidates],
@@ -1280,20 +1323,7 @@ class PerformanceWorkflowService:
                 aggregate_type="session",
                 aggregate_id=session_id,
             ),
-            "budget": {
-                "candidate_limit": session.max_candidates,
-                "candidates_used": len(candidates),
-                "candidate_slots_remaining": max(
-                    0,
-                    session.max_candidates - len(candidates),
-                ),
-                "execution_limit": session.execution_limit,
-                "executions_used": execution_budget["consumed"],
-                "executions_reserved": execution_budget["reserved"],
-                "executions_committed": execution_budget["committed"],
-                "executions_remaining": execution_budget["remaining"],
-                "deadline_at_utc": session.deadline_at_utc,
-            },
+            "budget": self._session_budget(session, candidates),
             "raw_sql_persisted": False,
         }
 
@@ -1315,11 +1345,12 @@ class PerformanceWorkflowService:
             "cardinality",
             "index",
             "combined",
+            "rewrite_plus_index",
         }
         if normalized_strategy not in allowed_strategies:
             raise ValueError(
                 "strategy must be predicate, join, aggregation, cardinality, "
-                "index, or combined."
+                "index, combined, or rewrite_plus_index."
             )
         rewrite_fingerprint = fingerprint_text(normalized)
         request_metadata: dict[str, Any] = {"sql_persisted": False}
@@ -1334,14 +1365,19 @@ class PerformanceWorkflowService:
         )
         if replay is not None:
             return replay.to_dict()
-        if normalized_strategy == "combined":
+        if normalized_strategy == "combined" and artifact_ref is not None:
+            raise ValueError(
+                "combined is a multi-family rewrite and does not accept lineage; "
+                "use rewrite_plus_index."
+            )
+        if normalized_strategy == "rewrite_plus_index":
             parent_id = parse_combined_parent_reference(artifact_ref)
             parent = self.sessions.get_candidate(parent_id)
             parent_evidence = [
                 self.store.get_evidence(evidence_id)
                 for evidence_id in parent.evidence_ids
             ]
-            candidate_metadata["lineage"] = validate_combined_parent_request(
+            candidate_metadata["lineage"] = validate_rewrite_plus_index_parent_request(
                 session_id=session_id,
                 rewrite_fingerprint=rewrite_fingerprint,
                 parent_reference=artifact_ref,
@@ -1389,8 +1425,8 @@ class PerformanceWorkflowService:
         baseline = self.validator.validate_read_only(baseline_sql).execution_sql
         candidate = self.validator.validate_read_only(candidate_sql).execution_sql
         preflight = {
-            "baseline": analyze_equivalence_preflight(baseline).as_dict(),
-            "candidate": analyze_equivalence_preflight(candidate).as_dict(),
+            "baseline": await self._analyze_equivalence(database_name, baseline),
+            "candidate": await self._analyze_equivalence(database_name, candidate),
         }
         if any(
             not item["direct_snapshot_supported"] for item in preflight.values()
@@ -1721,7 +1757,8 @@ class PerformanceWorkflowService:
                 evidence_ids=(envelope.evidence_id,),
                 failure_code=(
                     None
-                    if candidate_state in {"improved", "neutral", "regressed"}
+                    if candidate_state
+                    in {"improved", "performance_only", "neutral", "regressed"}
                     else state
                 ),
                 idempotency_key=benchmark_operation_key,
@@ -1861,6 +1898,133 @@ class PerformanceWorkflowService:
         result["recovered_from_durable_evidence"] = False
         return result
 
+    def _is_legacy_proof_contract_candidate(
+        self,
+        candidate: Any,
+    ) -> bool:
+        """Recognize only the persisted pre-2.2 stranded screening result."""
+
+        if (
+            candidate.state != "inconclusive"
+            or candidate.failure_code != "proof_contract_required"
+            or candidate.screen_runs <= 0
+            or candidate.finalist_runs != 0
+            or candidate.executions <= 0
+            or len(candidate.evidence_ids) != 1
+        ):
+            return False
+        try:
+            evidence = self.store.get_evidence(candidate.evidence_ids[0])
+            session = self.sessions.get_session(candidate.session_id)
+            case = self.store.get_performance_case(session.performance_case_id)
+        except (KeyError, ValueError):
+            return False
+        try:
+            expected_objective = normalize_tuning_objective(
+                case.metadata.get("objective")
+            )
+        except ValueError:
+            return False
+        metadata = evidence.metadata
+        metrics = evidence.metrics
+        expected_executions = (
+            int(candidate.screen_runs) * 2 * int(candidate.parameter_cases)
+        )
+        parameter_results = metrics.get("parameter_results")
+        preflight = metadata.get("equivalence_preflight")
+        if (
+            evidence.source != "azure-sql-mcp"
+            or evidence.kind != "tuning_screening"
+            or evidence.query_fingerprint != case.query_fingerprint
+            or evidence.database_fingerprint != case.database_fingerprint
+            or not evidence.parameters_fingerprint
+            or evidence.observed_execution_count != expected_executions
+            or candidate.executions != expected_executions
+            or set(metrics) != {
+                "classification",
+                "performance_classification",
+                "objective",
+                "parameter_results",
+            }
+            or metrics.get("classification") != "proof_contract_required"
+            or metrics.get("performance_classification") != "promising"
+            or metrics.get("objective") != expected_objective
+            or not isinstance(parameter_results, (list, tuple))
+            or len(parameter_results) != candidate.parameter_cases
+            or any(
+                not isinstance(result, Mapping)
+                or set(result) != {
+                    "parameter_case",
+                    "weight",
+                    "baseline",
+                    "candidate",
+                    "plan_delta",
+                }
+                or not isinstance(result.get("baseline"), Mapping)
+                or not isinstance(result.get("candidate"), Mapping)
+                for result in parameter_results
+            )
+            or set(metadata) != {
+                "session_id",
+                "candidate_id",
+                "equivalence",
+                "equivalence_deferred",
+                "equivalence_preflight",
+                "proof_scope",
+                "phase",
+                "reason",
+                "performance_reason",
+                "execution_reservation_id",
+                "sql_persisted",
+            }
+            or metadata.get("session_id") != candidate.session_id
+            or metadata.get("candidate_id") != candidate.candidate_id
+            or metadata.get("phase") != "screening"
+            or metadata.get("proof_scope") != "performance_only"
+            or metadata.get("equivalence_deferred") is not True
+            or metadata.get("equivalence") != []
+            or metadata.get("reason")
+            != (
+                "Performance screening improved, but this MCP contract has no "
+                "deterministic proof input for this SQL shape; the candidate was "
+                "not promoted."
+            )
+            or metadata.get("performance_reason")
+            != (
+                "screening signal improved beyond noise; finalist equivalence "
+                "is still required"
+            )
+            or metadata.get("sql_persisted") is not False
+            or not isinstance(preflight, Mapping)
+            or set(preflight) != {"baseline", "candidate"}
+            or not all(
+                isinstance(item, Mapping)
+                and item.get("contract_version") == 1
+                and isinstance(item.get("direct_snapshot_supported"), bool)
+                for item in preflight.values()
+            )
+            or all(
+                item.get("direct_snapshot_supported") is True
+                for item in preflight.values()
+                if isinstance(item, Mapping)
+            )
+        ):
+            return False
+        reservation_id = metadata.get("execution_reservation_id")
+        if not isinstance(reservation_id, str) or not reservation_id:
+            return False
+        try:
+            reservation = self.store.get_execution_reservation(reservation_id)
+        except KeyError:
+            return False
+        return (
+            reservation["session_id"] == candidate.session_id
+            and reservation["candidate_id"] == candidate.candidate_id
+            and reservation["status"] == "completed"
+            and reservation["attempt_count"] == expected_executions
+            and reservation["dispatched_attempt_count"] == expected_executions
+        )
+
     async def benchmark_candidate(
         self,
         session_id: str,
@@ -1880,9 +2044,12 @@ class PerformanceWorkflowService:
         candidate = self.sessions.get_candidate(candidate_id)
         if candidate.session_id != session_id:
             raise ValueError("Candidate does not belong to the tuning session.")
-        if candidate.strategy in {"index", "combined"}:
+        if candidate.strategy == "index" or (
+            candidate.strategy == "combined" and candidate.rewrite_artifact_ref
+        ) or candidate.strategy == "rewrite_plus_index":
             raise ValueError(
-                "Index and combined candidates must use benchmark_index_candidate."
+                "Index and lineage-backed candidates must use "
+                "benchmark_index_candidate."
             )
         baseline = self.validator.validate_read_only(baseline_sql).execution_sql
         rewrite = self.validator.validate_read_only(candidate_sql).execution_sql
@@ -1932,38 +2099,35 @@ class PerformanceWorkflowService:
             phase == "finalist" if prove_equivalence is None else prove_equivalence
         )
         equivalence_preflight = {
-            "baseline": analyze_equivalence_preflight(baseline).as_dict(),
-            "candidate": analyze_equivalence_preflight(rewrite).as_dict(),
+            "baseline": await self._analyze_equivalence(database_name, baseline),
+            "candidate": await self._analyze_equivalence(database_name, rewrite),
         }
         direct_snapshot_supported = all(
             item["direct_snapshot_supported"]
             for item in equivalence_preflight.values()
         )
-        if phase == "finalist" and not should_prove_equivalence:
+        if (
+            phase == "finalist"
+            and direct_snapshot_supported
+            and not should_prove_equivalence
+        ):
             raise ValueError("Finalist validation requires full result equivalence.")
-        if should_prove_equivalence and not direct_snapshot_supported:
-            return {
-                "session_id": session_id,
-                "candidate_id": candidate_id,
-                "classification": "proof_contract_required",
-                "durable_state": candidate.state,
-                "reason": (
-                    "This MCP contract has no deterministic proof input for this "
-                    "SQL shape; finalist validation cannot proceed."
-                ),
-                "phase": phase,
-                "executions": 0,
-                "equivalence": [],
-                "equivalence_preflight": equivalence_preflight,
-                "proof_scope": "performance_only",
-                "session_continues": True,
-                "candidate": candidate.to_dict(),
-            }
+        compare_equivalence = should_prove_equivalence and direct_snapshot_supported
         if phase == "finalist" and set(supplied_case_fingerprints) != (
             registered_case_fingerprints
         ):
             raise ValueError(
                 "Finalist validation must cover every registered parameter case."
+            )
+        if (
+            phase == "finalist"
+            and not direct_snapshot_supported
+            and candidate.is_terminal
+            and self._is_legacy_proof_contract_candidate(candidate)
+        ):
+            candidate = self.sessions.recover_candidate_for_finalist(
+                session_id,
+                candidate_id,
             )
         default_runs = (
             session.screen_runs_per_candidate
@@ -1978,7 +2142,7 @@ class PerformanceWorkflowService:
         if phase == "screening" and runs < 2:
             raise ValueError("Screening requires at least two paired runs.")
         requested_executions = len(cases) * (
-            runs * 2 + (2 if should_prove_equivalence else 0)
+            runs * 2 + (2 if compare_equivalence else 0)
         )
         self._require_benchmark_policy(database_name, requested_executions)
         benchmark_request_fingerprint = request_fingerprint(
@@ -1993,6 +2157,7 @@ class PerformanceWorkflowService:
                 "compare_order": compare_order,
                 "runs": runs,
                 "prove_equivalence": should_prove_equivalence,
+                "compare_equivalence": compare_equivalence,
                 "equivalence_preflight": equivalence_preflight,
                 "idempotency_key": idempotency_key or new_id("benchmark-call"),
             },
@@ -2069,6 +2234,8 @@ class PerformanceWorkflowService:
             if phase == "screening":
                 self.sessions.start_screening(session_id)
             else:
+                if self.sessions.get_session(session_id).status == "created":
+                    self.sessions.start_screening(session_id)
                 self.sessions.mark_candidate_finalist(session_id, candidate_id)
         except Exception:
             self.store.release_execution_attempts(
@@ -2134,7 +2301,7 @@ class PerformanceWorkflowService:
                         ),
                     }
                 )
-                if should_prove_equivalence:
+                if compare_equivalence:
                     self.sessions.ensure_dispatch_allowed(session_id)
                     measured_executions += 2
                     comparison = await self._compare_execution_contracts(
@@ -2162,8 +2329,8 @@ class PerformanceWorkflowService:
                 parameter_results,
                 equivalence,
                 objective=objective,
-                require_equivalence=should_prove_equivalence,
-                require_snapshot_attestation=should_prove_equivalence,
+                require_equivalence=compare_equivalence,
+                require_snapshot_attestation=compare_equivalence,
             )
         except asyncio.CancelledError:
             self._persist_benchmark_failure_receipt(
@@ -2184,7 +2351,7 @@ class PerformanceWorkflowService:
                 evidence_operation_key=evidence_operation_key,
                 benchmark_operation_key=benchmark_operation_key,
                 objective=objective,
-                should_prove_equivalence=should_prove_equivalence,
+                should_prove_equivalence=compare_equivalence,
             )
             raise
         except Exception as exc:
@@ -2206,23 +2373,24 @@ class PerformanceWorkflowService:
                 evidence_operation_key=evidence_operation_key,
                 benchmark_operation_key=benchmark_operation_key,
                 objective=objective,
-                should_prove_equivalence=should_prove_equivalence,
+                should_prove_equivalence=compare_equivalence,
             )
 
         performance_classification = state
         performance_reason = reason
         candidate_state = state
         if (
-            phase == "screening"
-            and not direct_snapshot_supported
-            and state in {"promising", "improved"}
+            phase == "finalist"
+            and not compare_equivalence
+            and state == "promising"
         ):
-            state = "proof_contract_required"
-            candidate_state = "inconclusive"
+            state = "performance_only"
+            candidate_state = "performance_only"
+            performance_classification = "improved"
             reason = (
-                "Performance screening improved, but this MCP contract has no "
-                "deterministic proof input for this SQL shape; the candidate was "
-                "not promoted."
+                "Candidate improved the weighted performance objective, but this "
+                "SQL shape has no deterministic semantic proof input; the result "
+                "is performance-only."
             )
 
         envelope = EvidenceEnvelopeV1(
@@ -2252,7 +2420,7 @@ class PerformanceWorkflowService:
                 "session_id": session_id,
                 "candidate_id": candidate_id,
                 "equivalence": equivalence,
-                "equivalence_deferred": not should_prove_equivalence,
+                "equivalence_deferred": not compare_equivalence,
                 "equivalence_preflight": equivalence_preflight,
                 "proof_scope": (
                     "performance_only"
@@ -2296,7 +2464,8 @@ class PerformanceWorkflowService:
                 evidence_ids=(envelope.evidence_id,),
                 failure_code=(
                     None
-                    if candidate_state in {"improved", "neutral", "regressed"}
+                    if candidate_state
+                    in {"improved", "performance_only", "neutral", "regressed"}
                     else state
                 ),
                 idempotency_key=benchmark_operation_key,
@@ -2323,7 +2492,7 @@ class PerformanceWorkflowService:
             "executions": measured_executions,
             "parameter_results": parameter_results,
             "equivalence": equivalence,
-            "equivalence_deferred": not should_prove_equivalence,
+            "equivalence_deferred": not compare_equivalence,
             "equivalence_preflight": equivalence_preflight,
             "proof_scope": (
                 "performance_only"
@@ -2336,16 +2505,119 @@ class PerformanceWorkflowService:
             "candidate": updated_candidate.to_dict(),
         }
 
+    def _candidate_has_selection_evidence(
+        self,
+        candidate: Any,
+        *,
+        selection_scope: str,
+    ) -> bool:
+        if candidate.finalist_runs <= 0:
+            return False
+        for evidence_id in reversed(candidate.evidence_ids):
+            try:
+                evidence = self.store.get_evidence(evidence_id)
+            except KeyError:
+                continue
+            metadata = evidence.metadata
+            metrics = evidence.metrics
+            if (
+                evidence.kind not in {"tuning_finalist", "index_finalist"}
+                or evidence.observed_execution_count <= 0
+                or metadata.get("session_id") != candidate.session_id
+                or metadata.get("candidate_id") != candidate.candidate_id
+                or metadata.get("phase") != "finalist"
+            ):
+                continue
+            if selection_scope == "performance_only":
+                parameter_results = metrics.get("parameter_results")
+                multiplier = 3 if evidence.kind == "index_finalist" else 2
+                expected_executions = (
+                    candidate.finalist_runs
+                    * candidate.parameter_cases
+                    * multiplier
+                )
+                reservation_id = metadata.get("execution_reservation_id")
+                try:
+                    reservation = (
+                        self.store.get_execution_reservation(reservation_id)
+                        if isinstance(reservation_id, str)
+                        else None
+                    )
+                except KeyError:
+                    reservation = None
+                if (
+                    candidate.state == "performance_only"
+                    and metrics.get("classification") == "performance_only"
+                    and metrics.get("performance_classification") == "improved"
+                    and metadata.get("proof_scope") == "performance_only"
+                    and metadata.get("equivalence_deferred") is True
+                    and candidate.parameter_cases > 0
+                    and evidence.observed_execution_count == expected_executions
+                    and isinstance(parameter_results, list)
+                    and len(parameter_results) == candidate.parameter_cases
+                    and all(
+                        isinstance(result, Mapping)
+                        and isinstance(result.get("baseline"), Mapping)
+                        and isinstance(result.get("candidate"), Mapping)
+                        for result in parameter_results
+                    )
+                    and reservation is not None
+                    and reservation.get("status") == "completed"
+                    and reservation.get("session_id") == candidate.session_id
+                    and reservation.get("candidate_id") == candidate.candidate_id
+                    and reservation.get("attempt_count") == expected_executions
+                    and reservation.get("dispatched_attempt_count")
+                    == evidence.observed_execution_count
+                ):
+                    return True
+                continue
+            comparisons = metadata.get("equivalence")
+            if (
+                candidate.state == "improved"
+                and metrics.get("classification") == "improved"
+                and metadata.get("proof_scope")
+                in {"direct_snapshot", "aba_result_stability"}
+                and isinstance(comparisons, (list, tuple))
+                and comparisons
+                and all(
+                    isinstance(comparison, Mapping)
+                    and comparison.get("status") == "match"
+                    and comparison.get("proven_for_parameter_case") is True
+                    and (
+                        (
+                            metadata.get("proof_scope") == "direct_snapshot"
+                            and comparison.get("same_snapshot") is True
+                            and comparison.get("snapshot_isolation_verified") is True
+                        )
+                        or (
+                            metadata.get("proof_scope")
+                            == "aba_result_stability"
+                            and comparison.get("same_sql") is True
+                            and comparison.get("plan_used_expected_index") is True
+                        )
+                    )
+                    for comparison in comparisons
+                )
+            ):
+                return True
+        return False
+
     def finalize_session(
         self,
         session_id: str,
         *,
         selected_candidate_id: str | None,
         stopping_reason: str,
+        selection_scope: str = "proven",
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         if not stopping_reason.strip():
             raise ValueError("stopping_reason is required.")
+        selection_scope = selection_scope.strip().casefold()
+        if selection_scope not in {"proven", "performance_only"}:
+            raise ValueError(
+                "selection_scope must be proven or performance_only."
+            )
         candidates = self.sessions.list_candidates(session_id)
         if selected_candidate_id is not None:
             selected = next(
@@ -2358,8 +2630,29 @@ class PerformanceWorkflowService:
             )
             if selected is None:
                 raise ValueError("Selected candidate does not belong to the tuning session.")
-            if selected.state != "improved":
-                raise ValueError("Only a finalist classified as improved may be selected.")
+            expected_state = (
+                "performance_only"
+                if selection_scope == "performance_only"
+                else "improved"
+            )
+            if selected.state != expected_state:
+                raise ValueError(
+                    f"Selection scope {selection_scope} requires a finalist "
+                    f"classified as {expected_state}."
+                )
+            if not self._candidate_has_selection_evidence(
+                selected,
+                selection_scope=selection_scope,
+            ):
+                if selection_scope == "performance_only":
+                    raise ValueError(
+                        "Performance-only selection requires evidence-backed finalist "
+                        "execution with a nonzero execution count."
+                    )
+                raise ValueError(
+                    "Proven selection requires complete direct-snapshot finalist "
+                    "equivalence evidence."
+                )
         current_session = self.sessions.get_session(session_id)
         if candidates and current_session.status == "created":
             self.sessions.start_screening(session_id)
@@ -2380,13 +2673,44 @@ class PerformanceWorkflowService:
             session_id,
             selected_candidate_id=selected_candidate_id,
             stopping_reason=stopping_reason.strip(),
+            replay_metadata={"selection_scope": selection_scope},
             idempotency_key=idempotency_key,
         )
         candidates = self.sessions.list_candidates(session_id)
+        selected = next(
+            (
+                candidate
+                for candidate in candidates
+                if candidate.candidate_id == selected_candidate_id
+            ),
+            None,
+        )
+        selected_proof_scope = (
+            "performance_only"
+            if selected is not None and selected.state == "performance_only"
+            else "proven"
+            if selected is not None
+            else None
+        )
         return {
             "session": session.to_dict(),
             "leaderboard": [candidate.to_dict() for candidate in candidates],
+            "budget": self._session_budget(session, candidates),
             "selected_candidate_id": selected_candidate_id,
+            "selection_scope": selection_scope,
+            "selected_candidate_classification": (
+                selected.state if selected is not None else None
+            ),
+            "selected_candidate_proof_scope": selected_proof_scope,
+            "semantic_equivalence": (
+                "unproven"
+                if selected_proof_scope == "performance_only"
+                else "proven"
+                if selected_proof_scope == "proven"
+                else None
+            ),
+            "deployment_ready": selected_proof_scope == "proven",
+            "automatic_deployment_approved": False,
             "stopping_reason": stopping_reason,
             "rejected_experiments": [
                 candidate.to_dict()

@@ -9,6 +9,7 @@ from unittest.mock import Mock
 import pytest
 
 from azure_sql_mcp.artifacts import ExplainPlanArtifact
+from azure_sql_mcp.candidate_lineage import validate_combined_parent_request
 from azure_sql_mcp.config import AccessMode
 from azure_sql_mcp.config import McpProfile
 from azure_sql_mcp.config import WritePolicy
@@ -172,6 +173,17 @@ def _app(server_config_factory) -> AzureSqlMcpApplication:
         params: tuple[object, ...] = (),
         **_kwargs: object,
     ) -> list[dict[str, object]]:
+        if "sys.sql_modules" in sql and "object_type_code" in sql:
+            return [
+                {
+                    "schema_name": "dbo",
+                    "object_name": "Items",
+                    "object_type_code": "U",
+                    "object_type": "USER_TABLE",
+                    "definition": None,
+                    "is_encrypted": 0,
+                }
+            ]
         if "owner_marker" in sql and "definition_marker" in sql:
             index_name = str(params[-1])
             lease = next(
@@ -215,11 +227,13 @@ def _candidate(
     return session["session_id"], candidate["candidate_id"]
 
 
-def _combined_candidate(
+def _lineage_candidate(
     app: AzureSqlMcpApplication,
     *,
     baseline_sql: str,
     rewrite_sql: str,
+    child_strategy: str = "rewrite_plus_index",
+    parent_scope: str = "proven",
 ) -> tuple[str, str, str]:
     case = app.performance_workflows.start_case("appdb", baseline_sql)
     session = app.performance_workflows.start_session(case.case_id, "appdb")
@@ -232,6 +246,7 @@ def _combined_candidate(
     parent_id = parent["candidate_id"]
     app.tuning_sessions.start_screening(session_id)
     app.tuning_sessions.mark_candidate_finalist(session_id, parent_id)
+    performance_only = parent_scope == "performance_only"
     proof = app.performance_store.create_evidence(
         EvidenceEnvelopeV1(
             source="azure-sql-mcp",
@@ -239,39 +254,74 @@ def _combined_candidate(
             query_fingerprint=case.query_fingerprint,
             database_fingerprint=case.database_fingerprint,
             observed_execution_count=12,
-            metrics={"classification": "improved"},
+            metrics=(
+                {
+                    "classification": "performance_only",
+                    "performance_classification": "improved",
+                }
+                if performance_only
+                else {"classification": "improved"}
+            ),
             metadata={
                 "session_id": session_id,
                 "candidate_id": parent_id,
                 "phase": "finalist",
-                "proof_scope": "direct_snapshot",
-                "equivalence": [
-                    {
-                        "status": "match",
-                        "proven_for_parameter_case": True,
-                        "same_snapshot": True,
-                        "snapshot_isolation_verified": True,
-                    }
-                ],
+                "proof_scope": (
+                    "performance_only"
+                    if performance_only
+                    else "direct_snapshot"
+                ),
+                "equivalence_deferred": performance_only,
+                "equivalence": (
+                    []
+                    if performance_only
+                    else [
+                        {
+                            "status": "match",
+                            "proven_for_parameter_case": True,
+                            "same_snapshot": True,
+                            "snapshot_isolation_verified": True,
+                        }
+                    ]
+                ),
             },
         )
     )
     app.tuning_sessions.record_candidate_result(
         session_id,
         parent_id,
-        state="improved",
+        state="performance_only" if performance_only else "improved",
         finalist_runs=5,
         parameter_cases=1,
         executions=12,
         evidence_ids=(proof.evidence_id,),
     )
-    child = app.performance_workflows.add_candidate(
-        session_id,
-        rewrite_sql,
-        strategy="combined",
-        artifact_ref=f"candidate:{parent_id}",
-    )
-    return session_id, parent_id, child["candidate_id"]
+    if child_strategy == "combined":
+        parent_candidate = app.tuning_sessions.get_candidate(parent_id)
+        lineage = validate_combined_parent_request(
+            session_id=session_id,
+            rewrite_fingerprint=parent_candidate.rewrite_fingerprint or "",
+            parent_reference=f"candidate:{parent_id}",
+            parent=parent_candidate,
+            evidence=[proof],
+        )
+        child = app.tuning_sessions.add_candidate(
+            session_id,
+            strategy="combined",
+            rewrite_fingerprint=parent_candidate.rewrite_fingerprint,
+            rewrite_artifact_ref=f"candidate:{parent_id}",
+            metadata={"lineage": lineage},
+        )
+        child_id = child.candidate_id
+    else:
+        child = app.performance_workflows.add_candidate(
+            session_id,
+            rewrite_sql,
+            strategy=child_strategy,
+            artifact_ref=f"candidate:{parent_id}",
+        )
+        child_id = child["candidate_id"]
+    return session_id, parent_id, child_id
 
 
 def _set_session_deadline(
@@ -312,10 +362,16 @@ async def test_unproven_combined_parent_stops_before_index_ddl(
         strategy="combined",
         rewrite_fingerprint=parent["rewrite_fingerprint"],
         rewrite_artifact_ref=f"candidate:{parent['candidate_id']}",
+        metadata={
+            "lineage": {
+                "parent_candidate_id": parent["candidate_id"],
+                "parent_evidence_id": "missing-evidence",
+            }
+        },
     )
     app._create_test_index = AsyncMock()  # type: ignore[method-assign]
 
-    with pytest.raises(ValueError, match="improved finalist"):
+    with pytest.raises(ValueError, match="completed finalist"):
         await app._benchmark_index_candidate(
             "appdb",
             session["session_id"],
@@ -338,17 +394,20 @@ async def test_unproven_combined_parent_stops_before_index_ddl(
 
 
 @pytest.mark.asyncio
-async def test_proven_combined_candidate_runs_marginal_index_aba_with_lineage(
+@pytest.mark.parametrize("child_strategy", ["rewrite_plus_index", "combined"])
+async def test_proven_lineage_candidate_runs_marginal_aba(
     server_config_factory,
     monkeypatch: pytest.MonkeyPatch,
+    child_strategy: str,
 ) -> None:
     app = _app(server_config_factory)
     baseline_sql = "SELECT id FROM dbo.Items"
     rewrite_sql = "SELECT id FROM dbo.Items AS candidate"
-    session_id, parent_id, child_id = _combined_candidate(
+    session_id, parent_id, child_id = _lineage_candidate(
         app,
         baseline_sql=baseline_sql,
         rewrite_sql=rewrite_sql,
+        child_strategy=child_strategy,
     )
     app._create_test_index = AsyncMock(return_value={"status": "completed"})  # type: ignore[method-assign]
     app._drop_test_index = AsyncMock(return_value={"status": "completed"})  # type: ignore[method-assign]
@@ -379,7 +438,7 @@ async def test_proven_combined_candidate_runs_marginal_index_aba_with_lineage(
         True,
         True,
         30,
-        "proven-combined-parent",
+        f"proven-{child_strategy}-parent",
     )
 
     assert result["classification"] == "improved"
@@ -393,6 +452,61 @@ async def test_proven_combined_candidate_runs_marginal_index_aba_with_lineage(
     assert result["equivalence"][0]["plan_used_expected_index"] is True
     app._create_test_index.assert_awaited_once()
     app._drop_test_index.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_rewrite_plus_index_child_of_performance_only_parent_stays_unproven(
+    server_config_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _app(server_config_factory)
+    baseline_sql = "SELECT id FROM dbo.Items"
+    rewrite_sql = "SELECT id FROM dbo.Items AS candidate"
+    session_id, parent_id, child_id = _lineage_candidate(
+        app,
+        baseline_sql=baseline_sql,
+        rewrite_sql=rewrite_sql,
+        parent_scope="performance_only",
+    )
+    app._create_test_index = AsyncMock(return_value={"status": "completed"})  # type: ignore[method-assign]
+    app._drop_test_index = AsyncMock(return_value={"status": "completed"})  # type: ignore[method-assign]
+    index_name, _ = _install_catalog(
+        monkeypatch,
+        key_columns=["id"],
+    )
+    app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[
+            *[_profile(100) for _ in range(5)],
+            *[_profile(50, index_name=index_name) for _ in range(5)],
+            *[_profile(100) for _ in range(5)],
+        ]
+    )
+
+    result = await app._benchmark_index_candidate(
+        "appdb",
+        session_id,
+        child_id,
+        rewrite_sql,
+        "dbo",
+        "Items",
+        ["id"],
+        None,
+        None,
+        False,
+        "finalist",
+        True,
+        True,
+        30,
+        "performance-only-rewrite-plus-index-parent",
+    )
+
+    assert result["classification"] == "performance_only"
+    assert result["proof_scope"] == "performance_only"
+    assert result["lineage"]["parent_candidate_id"] == parent_id
+    assert result["lineage"]["parent_equivalence"] == "unproven"
+    stored = app.tuning_sessions.get_candidate(child_id)
+    assert stored.state == "performance_only"
+    assert stored.failure_code is None
 
 
 @pytest.mark.asyncio
@@ -438,8 +552,8 @@ async def test_volatile_index_screening_reports_performance_only(
         "volatile-index-screening",
     )
 
-    assert result["classification"] == "proof_contract_required"
-    assert result["durable_state"] == "inconclusive"
+    assert result["classification"] == "promising"
+    assert result["durable_state"] == "screening"
     assert result["proof_scope"] == "performance_only"
     assert result["equivalence"][0]["status"] == "mismatch"
     assert result["equivalence_preflight"]["direct_snapshot_supported"] is False
@@ -450,8 +564,8 @@ async def test_volatile_index_screening_reports_performance_only(
         == "promising"
     )
     stored_candidate = app.tuning_sessions.get_candidate(candidate_id)
-    assert stored_candidate.state == "inconclusive"
-    assert stored_candidate.failure_code == "proof_contract_required"
+    assert stored_candidate.state == "screening"
+    assert stored_candidate.failure_code is None
     app._create_test_index.assert_awaited_once()
     app._drop_test_index.assert_awaited_once()
 
@@ -473,9 +587,9 @@ async def test_volatile_index_screening_reports_performance_only(
         "volatile-index-screening",
     )
 
-    assert replay["classification"] == "proof_contract_required"
+    assert replay["classification"] == "promising"
     assert replay["performance_classification"] == "promising"
-    assert replay["durable_state"] == "inconclusive"
+    assert replay["durable_state"] == "screening"
     assert replay["evidence_id"] == result["evidence_id"]
     assert replay["recovered_from_durable_evidence"] is True
     assert app.plans.profile_query.await_count == 9
@@ -484,8 +598,9 @@ async def test_volatile_index_screening_reports_performance_only(
 
 
 @pytest.mark.asyncio
-async def test_volatile_index_finalist_still_runs_expired_lease_cleanup(
+async def test_volatile_index_finalist_runs_complete_performance_workload(
     server_config_factory,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app = _app(server_config_factory)
     sql = "SELECT TOP (1) id, NEWID() AS token FROM dbo.Items"
@@ -497,7 +612,19 @@ async def test_volatile_index_finalist_still_runs_expired_lease_cleanup(
             "cleanup_required": 0,
         }
     )
-    app._create_test_index = AsyncMock()  # type: ignore[method-assign]
+    app._create_test_index = AsyncMock(return_value={"status": "completed"})  # type: ignore[method-assign]
+    app._drop_test_index = AsyncMock(return_value={"status": "completed"})  # type: ignore[method-assign]
+    index_name, _ = _install_catalog(
+        monkeypatch,
+        key_columns=["id"],
+    )
+    app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[
+            *[_profile(100) for _ in range(5)],
+            *[_profile(50, index_name=index_name) for _ in range(5)],
+            *[_profile(100) for _ in range(5)],
+        ]
+    )
 
     result = await app._benchmark_index_candidate(
         "appdb",
@@ -517,9 +644,14 @@ async def test_volatile_index_finalist_still_runs_expired_lease_cleanup(
         "volatile-index-finalist",
     )
 
-    assert result["classification"] == "proof_contract_required"
+    assert result["classification"] == "performance_only"
+    assert result["performance_classification"] == "improved"
+    assert result["durable_state"] == "performance_only"
+    assert result["proof_scope"] == "performance_only"
+    assert result["executions"] == 15
     app._cleanup_expired_index_leases.assert_awaited_once()
-    app._create_test_index.assert_not_awaited()
+    app._create_test_index.assert_awaited_once()
+    app._drop_test_index.assert_awaited_once()
 
 
 @pytest.mark.asyncio

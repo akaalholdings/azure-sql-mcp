@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping
 
 from .candidate_lineage import validate_combined_parent_request
+from .candidate_lineage import validate_rewrite_plus_index_parent_request
 from .performance_contracts import (
     ALL_CANDIDATE_STATES,
     TERMINAL_CANDIDATE_STATES,
@@ -192,12 +193,16 @@ class TuningSessionStateMachine:
         )
         if session.status == "finalist_validation":
             try:
-                if strategy != "combined":
-                    raise ValueError("Candidate strategy is not combined.")
+                lineage_validator = {
+                    "combined": validate_combined_parent_request,
+                    "rewrite_plus_index": validate_rewrite_plus_index_parent_request,
+                }.get(strategy)
+                if lineage_validator is None:
+                    raise ValueError("Candidate strategy is not lineage-backed.")
                 parent_reference = str(rewrite_artifact_ref or "")
                 parent_id = parent_reference.removeprefix("candidate:")
                 parent = self.get_candidate(parent_id)
-                expected_lineage = validate_combined_parent_request(
+                expected_lineage = lineage_validator(
                     session_id=session_id,
                     rewrite_fingerprint=rewrite_fingerprint or "",
                     parent_reference=parent_reference,
@@ -208,14 +213,25 @@ class TuningSessionStateMachine:
                     ],
                 )
             except (KeyError, TypeError, ValueError) as exc:
+                lineage_name = (
+                    "lineage-backed rewrite_plus_index"
+                    if strategy == "rewrite_plus_index"
+                    else "lineage-backed combined"
+                )
                 raise InvalidTransitionError(
                     "Finalist-validation candidate creation requires a valid "
-                    "lineage-backed combined parent."
+                    f"{lineage_name} parent."
                 ) from exc
             if dict((metadata or {}).get("lineage") or {}) != expected_lineage:
+                lineage_name = (
+                    "lineage-backed rewrite_plus_index"
+                    if strategy == "rewrite_plus_index"
+                    else "lineage-backed combined"
+                )
                 raise InvalidTransitionError(
-                    "Only a proven lineage-backed combined candidate may be "
-                    "created during finalist validation."
+                    "Only a valid "
+                    f"{lineage_name} child candidate may be created during "
+                    "finalist validation."
                 )
         self._check_deadline(session)
         candidate = TuningCandidateV1(
@@ -345,6 +361,12 @@ class TuningSessionStateMachine:
         self._check_deadline(session)
         if candidate.is_terminal:
             raise InvalidTransitionError("A terminal candidate cannot become a finalist.")
+        if (
+            candidate.state == "finalist"
+            and candidate_id in session.finalist_candidate_ids
+            and session.status == "finalist_validation"
+        ):
+            return candidate
         updated_candidate = self._next_candidate(candidate, state="finalist")
         updated_session = session
         if candidate_id not in session.finalist_candidate_ids:
@@ -497,6 +519,62 @@ class TuningSessionStateMachine:
             idempotency_key=idempotency_key,
         )
 
+    def recover_candidate_for_finalist(
+        self,
+        session_id: str,
+        candidate_id: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> TuningCandidateV1:
+        """Reopen only an old proof-contract screening result for validation."""
+
+        session = self._active_session(
+            session_id,
+            allowed={"screening", "finalist_validation"},
+        )
+        candidate = self._candidate_in_session(session, candidate_id)
+        if (
+            candidate.state != "inconclusive"
+            or candidate.failure_code != "proof_contract_required"
+            or candidate.screen_runs <= 0
+            or candidate.finalist_runs != 0
+            or candidate.executions <= 0
+        ):
+            raise InvalidTransitionError(
+                "Only the exact legacy proof_contract_required screening result "
+                "may be recovered for finalist validation."
+            )
+        self._check_deadline(session)
+        updated_candidate = self._next_candidate(
+            candidate,
+            state="finalist",
+            failure_code=None,
+        )
+        updated_session = session
+        if candidate_id not in session.finalist_candidate_ids:
+            updated_session = self._next_session(
+                session,
+                finalist_candidate_ids=_unique_strings(
+                    (*session.finalist_candidate_ids, candidate_id)
+                ),
+            )
+        if updated_session.status == "screening":
+            updated_session = replace(updated_session, status="finalist_validation")
+        _session, updated_candidate = self.store.save_session_and_candidate(
+            updated_session,
+            updated_candidate,
+            expected_session_version=session.version,
+            expected_candidate_version=candidate.version,
+            idempotency_key=idempotency_key,
+            request_fingerprint=request_fingerprint(
+                "tuning-session.recover-proof-contract-finalist",
+                {"session_id": session_id, "candidate_id": candidate_id},
+            ),
+            event_type="candidate.finalist.recovered",
+            event_payload={"candidate_id": candidate_id},
+        )
+        return updated_candidate
+
     def complete_session(
         self,
         session_id: str,
@@ -513,8 +591,19 @@ class TuningSessionStateMachine:
         self._check_deadline(session, allow_expired=True)
         if selected_candidate_id is not None:
             candidate = self._candidate_in_session(session, selected_candidate_id)
-            if candidate.state != "improved":
-                raise InvalidTransitionError("Only an improved candidate may be selected.")
+            selection_scope = str(
+                (replay_metadata or {}).get("selection_scope") or "proven"
+            )
+            expected_state = (
+                "performance_only"
+                if selection_scope == "performance_only"
+                else "improved"
+            )
+            if candidate.state != expected_state:
+                raise InvalidTransitionError(
+                    f"Selection scope {selection_scope} requires a candidate in "
+                    f"state {expected_state}."
+                )
         updated = self._next_session(
             session,
             status="completed",
