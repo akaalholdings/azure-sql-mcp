@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from datetime import datetime, timedelta
 
@@ -64,8 +65,11 @@ def make_lesson(**overrides) -> LessonV1:
 def test_store_is_private_additive_and_restarts(tmp_path) -> None:
     with LearningStore(state_dir=tmp_path) as store:
         decision = store.create_decision(make_decision(), idempotency_key="decision-create")
-        assert (tmp_path / "performance.sqlite3").stat().st_mode & 0o777 == 0o600
-        assert tmp_path.stat().st_mode & 0o777 == 0o700
+        database_path = tmp_path / "performance.sqlite3"
+        assert database_path.exists()
+        if os.name != "nt":
+            assert database_path.stat().st_mode & 0o777 == 0o600
+            assert tmp_path.stat().st_mode & 0o777 == 0o700
         assert store.list_events(aggregate_id=decision.decision_id)[0]["event_type"] == "decision.created"
     with LearningStore(state_dir=tmp_path) as reopened:
         assert reopened.get_decision(decision.decision_id) == decision
