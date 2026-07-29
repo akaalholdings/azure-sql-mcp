@@ -33,6 +33,7 @@ Source = "https://github.com/akaalholdings/azure-sql-mcp"
 
 [project.scripts]
 azure-sql-mcp = "azure_sql_mcp:main"
+azure-sql-mcp-learning = "azure_sql_mcp.learning_cli:main"
 
 [build-system]
 requires = ["hatchling"]

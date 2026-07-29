@@ -25,6 +25,9 @@ from azure_sql_mcp.config import TransportConfig
 from azure_sql_mcp.config import TransportMode
 from azure_sql_mcp.config import WritePolicy
 from azure_sql_mcp.database_policy import DatabasePolicySet
+from azure_sql_mcp.learning_contracts import DecisionRecordV1
+from azure_sql_mcp.learning_store import LearningStoreError
+from azure_sql_mcp.performance_contracts import EvidenceEnvelopeV1
 from azure_sql_mcp.query_identity import legacy_database_fingerprint
 from azure_sql_mcp.performance_workflows import database_fingerprint
 from azure_sql_mcp.performance_workflows import fingerprint_json
@@ -191,6 +194,14 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
         "dry_run_plan_action",
         "prepare_plan_action",
         "analyze_db_health",
+        "record_decision",
+        "review_decision",
+        "propose_lesson",
+        "recall_lessons",
+        "list_learning_candidates",
+        "create_handoff",
+        "get_handoff",
+        "resolve_handoff",
     }
 
     assert tools["list_databases"].annotations.readOnlyHint is True
@@ -209,6 +220,80 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
     assert tuning_parameters["max_candidates"]["default"] == 10
     assert tuning_parameters["execution_limit"]["default"] == 80
     assert tuning_parameters["time_limit_minutes"]["default"] == 20
+    decision_properties = tools["record_decision"].parameters["properties"]
+    assert {
+        "subject_kind",
+        "subject_fingerprint",
+        "based_on_review_ids",
+        "runtime_fingerprint",
+        "runtime_compatibility_fingerprint",
+    } <= set(decision_properties)
+    maintained_skills = [
+        "sql-health-triage",
+        "sql-optimizer",
+        "sql-plan-enforcer",
+    ]
+    assert decision_properties["skill"]["enum"] == maintained_skills
+    assert decision_properties["subject_kind"]["enum"] == [
+        "query",
+        "plan",
+        "incident",
+        "database",
+    ]
+    review_properties = tools["review_decision"].parameters["properties"]
+    assert {"counterexamples", "next_observation", "terminal_evidence_refs"} <= set(
+        review_properties
+    )
+    recall_properties = tools["recall_lessons"].parameters["properties"]
+    assert {"skill", "skill_version", "runtime_compatibility_fingerprint"} <= set(
+        recall_properties
+    )
+    assert "runtime_fingerprint" not in recall_properties
+    assert recall_properties["skill"]["enum"] == maintained_skills
+    proposal_properties = tools["propose_lesson"].parameters["properties"]
+    assert "next_observation" in proposal_properties
+    assert proposal_properties["applicable_skills"]["items"]["enum"] == maintained_skills
+    for linked_tool in (
+        "analyze_db_health",
+        "collect_performance_evidence",
+        "benchmark_tuning_candidate",
+        "benchmark_index_candidate",
+        "finalize_tuning_session",
+        "resolve_handoff",
+    ):
+        assert "decision_id" in tools[linked_tool].parameters["properties"]
+    assert "decision_id" not in tools["prepare_plan_action"].parameters["properties"]
+
+
+def test_unrestricted_plan_action_tools_publish_decision_linkage(
+    tmp_path: Path,
+) -> None:
+    app = AzureSqlMcpApplication(
+        make_config(tmp_path, access_mode=AccessMode.UNRESTRICTED)
+    )
+    tools = app.mcp._tool_manager._tools
+
+    for linked_tool in ("verify_plan_action", "rollback_plan_action"):
+        assert "decision_id" in tools[linked_tool].parameters["properties"]
+
+
+def test_learning_store_failure_preserves_static_tool_surface(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "azure_sql_mcp.server.LearningStore",
+        Mock(side_effect=LearningStoreError("malformed learning state")),
+    )
+
+    app = AzureSqlMcpApplication(make_config(tmp_path))
+    tools = app.mcp._tool_manager._tools
+
+    assert app.learning_store is None
+    assert app.learning_service is None
+    assert "analyze_db_health" in tools
+    assert "record_decision" not in tools
+    assert "recall_lessons" not in tools
 
 
 @pytest.mark.asyncio
@@ -383,10 +468,126 @@ async def test_runtime_status_is_db_free_stable_and_sanitized(
     assert first["strict_argument_models"] is True
     assert first["mcp_tool_errors"] is True
     assert len(first["runtime_fingerprint"]) == 64
+    assert len(first["runtime_compatibility_fingerprint"]) == 64
     assert len(first["tool_schema_fingerprint"]) == 64
     assert len(first["sanitized_config_fingerprint"]) == 64
     assert "server.database.windows.net" not in json.dumps(first)
     assert "test-" not in json.dumps(first)
+
+
+@pytest.mark.asyncio
+async def test_runtime_compatibility_fingerprint_is_restart_stable(
+    tmp_path: Path,
+) -> None:
+    config = replace(make_config(tmp_path), performance_state_dir=str(tmp_path / "state"))
+    first_app = AzureSqlMcpApplication(config)
+    first = await first_app.mcp._tool_manager.call_tool("check_runtime_status", {})
+    first_app.performance_store.close()
+    assert first_app.learning_store is not None
+    first_app.learning_store.close()
+
+    second_app = AzureSqlMcpApplication(config)
+    second = await second_app.mcp._tool_manager.call_tool("check_runtime_status", {})
+
+    assert first["runtime_compatibility_fingerprint"] == second[
+        "runtime_compatibility_fingerprint"
+    ]
+    assert first["runtime_fingerprint"] != second["runtime_fingerprint"]
+
+
+@pytest.mark.asyncio
+async def test_successful_operation_links_terminal_outcome_and_learning_failure_is_nonfatal(
+    app: AzureSqlMcpApplication,
+) -> None:
+    assert app.learning_service is not None
+    assert app.learning_store is not None
+    scope = app._current_learning_scope("appdb")
+    runtime = await app.mcp._tool_manager.call_tool("check_runtime_status", {})
+    evidence = app.performance_store.create_evidence(
+        EvidenceEnvelopeV1(
+            database_fingerprint=scope["database_fingerprint"],
+            query_fingerprint="query-fingerprint",
+            metrics={"classification": "baseline"},
+        )
+    )
+    decision = app.learning_service.record_decision(
+        DecisionRecordV1(
+            skill="sql-optimizer",
+            skill_version="2.3.0",
+            case_id="case-1",
+            learning_key="health-check",
+            consumed_evidence_refs=(evidence.evidence_id,),
+            subject_kind="database",
+            subject_fingerprint="subject-fingerprint",
+            based_on_review_ids=(),
+            tactic="inspect-health",
+            expected_result={"class": "available"},
+            confidence=0.8,
+            uncertainty={"kind": "bounded"},
+            evaluator_fingerprint="evaluator-fingerprint",
+            runtime_fingerprint=runtime["runtime_fingerprint"],
+            runtime_compatibility_fingerprint=runtime[
+                "runtime_compatibility_fingerprint"
+            ],
+            tool_schema_fingerprint=scope["tool_schema_fingerprint"],
+            sanitized_config_fingerprint=scope["sanitized_config_fingerprint"],
+            scope=scope,
+        )
+    )
+
+    callback = AsyncMock(
+        return_value={
+            "status": "ok",
+            "evidence_id": evidence.evidence_id,
+            "rows": [{"secret": "not persisted"}],
+        }
+    )
+    linked = await app._run_tool(
+        "analyze_db_health",
+        "appdb",
+        callback,
+        decision_id=decision.decision_id,
+    )
+
+    assert linked["learning_link_status"] == "linked"
+    assert str(linked["terminal_link_id"]).startswith("terminal-link-")
+    terminal = app.learning_store.get_terminal_link(linked["terminal_link_id"])
+    assert terminal["source_tool"] == "analyze_db_health"
+    assert terminal["evidence_refs"] == [evidence.evidence_id]
+    assert "rows" not in terminal["outcome_summary"]
+
+    app.learning_service.record_terminal_link = Mock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("learning store unavailable")
+    )
+    nonfatal_callback = AsyncMock(return_value={"status": "ok"})
+    nonfatal = await app._run_tool(
+        "analyze_db_health",
+        "appdb",
+        nonfatal_callback,
+        decision_id=decision.decision_id,
+    )
+    assert nonfatal["status"] == "ok"
+    assert nonfatal["learning_link_status"] == "failed"
+    assert nonfatal["terminal_link_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_unknown_decision_does_not_fail_successful_operation(
+    app: AzureSqlMcpApplication,
+) -> None:
+    callback = AsyncMock(return_value={"status": "ok"})
+
+    result = await app._run_tool(
+        "analyze_db_health",
+        "appdb",
+        callback,
+        decision_id="decision-does-not-exist",
+    )
+
+    callback.assert_awaited_once_with("appdb")
+    assert result["status"] == "ok"
+    assert result["learning_link_status"] == "failed"
+    assert result["terminal_link_id"] is None
 
 
 def test_registers_resources_and_prompts(app: AzureSqlMcpApplication) -> None:
@@ -766,6 +967,16 @@ def test_remote_transport_hides_admin_tools_without_remote_admin_opt_in(
     assert "execute_tsql_unrestricted" not in tools
     assert "apply_plan_action" not in tools
     assert "rebuild_index" not in tools
+    assert not {
+        "record_decision",
+        "review_decision",
+        "propose_lesson",
+        "recall_lessons",
+        "list_learning_candidates",
+        "create_handoff",
+        "get_handoff",
+        "resolve_handoff",
+    } & set(tools)
 
 
 def test_unrestricted_dba_tool_advertises_execution_contract(
