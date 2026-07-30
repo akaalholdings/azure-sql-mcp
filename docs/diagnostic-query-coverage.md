@@ -18,7 +18,7 @@ produce `partial` or `inconclusive`, never `healthy`.
 | Cached high-cost statements and routines | `get_top_cached_queries`, `get_cached_routine_stats`, and `get_plan_cache_analysis` | Cache evidence can reset or omit uncached executions; Query Store is preferred for durable history |
 | Estimated and actual plans | `explain_query`, `compare_plan_summaries`, and tuning benchmarks | Actual execution is allowed only for read-only SELECT-shaped work under the selected policy |
 | Result equivalence | `compare_query_results` and candidate benchmark workflows | Exact positional columns, types, duplicates, ordering semantics, and typed parameters are required; bounded or unstable evidence is inconclusive |
-| Index opportunities and overlap | `analyze_query_indexes`, `analyze_workload_indexes`, `analyze_index_recommendations`, and `optimize_indexes` | Preserve key order and direction, includes, filters, uniqueness, constraints, disabled state, and partition metadata |
+| Index opportunities and overlap | `analyze_query_indexes`, `analyze_workload_indexes`, `analyze_index_recommendations`, and `optimize_indexes` | Preserve key order and direction, includes, filters, uniqueness, constraints, disabled state, and partition metadata; zero SHOWPLAN missing-index hints are not proof that no index can help |
 | Statistics health | `check_statistics_health` | Statistics age and modification evidence inform an experiment; they do not prove the root cause by themselves |
 
 ## Azure SQL resource and storage health
@@ -29,7 +29,7 @@ produce `partial` or `inconclusive`, never `healthy`.
 | Per-file IO latency and volume | `get_io_stats` | Report reads, writes, bytes, stall time, and calculated latency with units; avoid server-wide database comparisons |
 | Database, file, log, VLF, and storage state | `get_storage_diagnostics` | Storage state is descriptive; changes require a separate reviewed database operation |
 | Database properties, compatibility level, scoped configuration, Query Store, Automatic Tuning, and geo-replication | `get_database_configuration` and `check_capabilities` | Capabilities control which experiments are valid; compatibility level alone is not a hint recommendation |
-| Table size, index usage, write amplification, columnstore state, and resumable operations | `get_table_stats` and `get_object_index_diagnostics` | Fragmentation and usage counters are supporting evidence, not standalone query-health verdicts |
+| Table size, index usage, write amplification, columnstore state, and resumable operations | `get_table_stats` and `get_object_index_diagnostics` | Fragmentation and usage counters are supporting evidence, not standalone query-health verdicts; raw usage counters require covered counter-epoch context before `is_unused=true` is meaningful |
 
 ## Deliberate exclusions
 

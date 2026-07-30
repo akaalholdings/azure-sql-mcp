@@ -477,6 +477,24 @@ def test_optimizer_and_sandbox_profiles_gate_view_mutations() -> None:
     } <= sandbox_tools
 
 
+def test_sandbox_allowlist_exposes_only_safe_execute_sql() -> None:
+    sandbox_tools = PROFILE_TOOL_ALLOWLISTS[McpProfile.SANDBOX]
+
+    assert "execute_sql" in sandbox_tools
+    assert "execute_tsql_unrestricted" not in sandbox_tools
+    assert "execute_sql" not in PROFILE_TOOL_ALLOWLISTS[McpProfile.OPTIMIZER]
+
+
+def test_missing_index_caveat_is_documented() -> None:
+    documentation = (
+        Path(__file__).parents[2] / "docs" / "03-index-query-enhancements.md"
+    ).read_text(encoding="utf-8")
+
+    assert "missing_index_provenance" in documentation
+    assert "zero_hint_is_not_proof_no_index_can_help" in documentation
+    assert "does not prove that no index" in documentation
+
+
 @pytest.mark.parametrize("profile", ["triage", "optimizer", "enforcer-review"])
 def test_read_only_profiles_reject_unrestricted_mode(monkeypatch, profile: str) -> None:
     monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")

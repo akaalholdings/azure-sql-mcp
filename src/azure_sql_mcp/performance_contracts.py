@@ -46,6 +46,13 @@ _RAW_SQL_KEYS = frozenset(
     }
 )
 _SENSITIVE_KEY_PARTS = ("connection_string", "password", "secret", "token")
+_OBSERVED_PARAMETER_VALUE_KEYS = frozenset(
+    {
+        "compiled_value",
+        "runtime_value",
+        "distinct_compiled_parameter_sets",
+    }
+)
 
 ContractT = TypeVar("ContractT", bound="VersionedContract")
 
@@ -94,6 +101,18 @@ def _validate_fingerprint(value: str | None, field_name: str) -> str | None:
     return value
 
 
+def validate_query_store_query_id(value: int | None) -> int | None:
+    """Validate the safe numeric Query Store identity used by a case."""
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ContractValidationError(
+            "query_store_query_id must be a positive integer."
+        )
+    return value
+
+
 def _validate_artifact_ref(value: str | None) -> str | None:
     if value is None:
         return None
@@ -124,7 +143,7 @@ def _redact_value(value: Any, *, key: str | None = None) -> Any:
     """Return JSON-safe metadata while dropping raw SQL and secret-like fields."""
 
     normalized_key = key.casefold().strip() if key else None
-    if normalized_key in _RAW_SQL_KEYS or (
+    if normalized_key in _RAW_SQL_KEYS or normalized_key in _OBSERVED_PARAMETER_VALUE_KEYS or (
         normalized_key
         and any(part in normalized_key for part in _SENSITIVE_KEY_PARTS)
     ):
@@ -266,6 +285,7 @@ class PerformanceCaseV1(VersionedContract):
     status: str = "open"
     version: int = 0
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    query_store_query_id: int | None = None
 
     def __post_init__(self) -> None:
         _validate_version(self.contract_version)
@@ -276,6 +296,7 @@ class PerformanceCaseV1(VersionedContract):
             raise ContractValidationError("query_fingerprint must not be empty.")
         _validate_fingerprint(self.query_fingerprint, "query_fingerprint")
         _validate_fingerprint(self.database_fingerprint, "database_fingerprint")
+        validate_query_store_query_id(self.query_store_query_id)
         if self.status not in {"open", "ready", "closed"}:
             raise ContractValidationError(f"Unsupported performance case status: {self.status!r}.")
         if self.version < 0:

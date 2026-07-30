@@ -67,6 +67,7 @@ from .learning_service import LearningService
 from .learning_store import LearningStore
 from .learning_store import LearningStoreError
 from .logging_config import configure_logging
+from .observability import extract_failure_diagnostic
 from .observability import sanitize_error_message
 from .param_binding import detect_parameters
 from .param_binding import ParameterExecutionContract
@@ -89,6 +90,8 @@ from .performance_workflows import fingerprint_json
 from .performance_workflows import fingerprint_text
 from .performance_workflows import fingerprint_text_matches
 from .performance_workflows import parameter_case_fingerprint
+from .performance_workflows import parameter_case_mismatch
+from .performance_workflows import parameter_case_receipt
 from .performance_workflows import profile_result_fingerprint
 from .plan_action_service import PlanActionService
 from .plan_cache import PlanCacheService
@@ -110,6 +113,7 @@ from .tool_contracts import add_tool_headline
 from .tool_contracts import BenchmarkPhase
 from .tool_contracts import BenchmarkToolOutput
 from .tool_contracts import CaseToolOutput
+from .tool_contracts import ParameterCaseInput
 from .tool_contracts import PlanToolOutput
 from .tool_contracts import PreflightToolOutput
 from .tool_contracts import SelectionScope
@@ -131,6 +135,27 @@ from .view_workflows import view_snapshot_from_receipt
 ResponseType = dict[str, Any]
 
 logger = logging.getLogger(__name__)
+
+
+def _parameter_case_payload(
+    parameter_case: ParameterCaseInput | Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if parameter_case is None:
+        return None
+    if isinstance(parameter_case, ParameterCaseInput):
+        return parameter_case.model_dump(mode="python", exclude_none=True)
+    return dict(parameter_case)
+
+
+def _parameter_case_payloads(
+    parameter_cases: list[ParameterCaseInput] | None,
+) -> list[dict[str, Any]] | None:
+    if parameter_cases is None:
+        return None
+    return [
+        parameter_case.model_dump(mode="python", exclude_none=True)
+        for parameter_case in parameter_cases
+    ]
 
 # Disposable test indexes (create_test_index / drop_test_index) are namespaced by this
 # prefix; the drop tool refuses anything outside it so real indexes are untouchable.
@@ -185,6 +210,7 @@ _EVIDENCE_WORKFLOW_TOOLS = frozenset(
 )
 _CATALOG_READ_TOOLS = frozenset(
     {
+        "execute_sql",
         "list_schemas",
         "list_objects",
         "search_objects",
@@ -833,9 +859,10 @@ class AzureSqlMcpApplication:
 
         @self.mcp.tool(
             description=(
-                "Execute a read-only SQL query in restricted mode. The query may be "
-                "preceded by DECLARE @var and SET @var = ... statements, followed by "
-                "exactly one SELECT."
+                "Execute statically validated, row-capped read-only SQL. The query may "
+                "be preceded by DECLARE @var and SET @var = ... statements, followed "
+                "by exactly one SELECT. DML, DDL, dynamic SQL, and stored procedure "
+                "execution are always rejected."
             ),
             annotations=ToolAnnotations(
                 title="Execute SQL",
@@ -1119,11 +1146,21 @@ class AzureSqlMcpApplication:
         )
         async def start_performance_case(
             sql: str = Field(description="Baseline read-only SELECT-shaped SQL."),
-            parameter_cases: list[dict[str, Any]] | None = Field(
+            parameter_cases: list[ParameterCaseInput] | None = Field(
                 default=None,
                 description=(
                     "Up to four named parameter cases, for example common, rare, NULL, "
-                    "and boundary. Values are fingerprinted, not persisted."
+                    "and boundary. Each has name, values, types, and positive weight. "
+                    "Values are fingerprinted, not persisted."
+                ),
+            ),
+            query_store_query_id: int | None = Field(
+                default=None,
+                ge=1,
+                strict=True,
+                description=(
+                    "Optional exact Query Store query_id. When supplied, evidence "
+                    "collection uses only this identity and never fuzzy matching."
                 ),
             ),
             objective: TuningObjective = Field(
@@ -1147,9 +1184,10 @@ class AzureSqlMcpApplication:
                     lambda db: self._start_performance_case(
                         db,
                         sql,
-                        parameter_cases,
+                        _parameter_case_payloads(parameter_cases),
                         objective,
                         idempotency_key,
+                        query_store_query_id,
                     ),
                 ),
             )
@@ -1177,11 +1215,20 @@ class AzureSqlMcpApplication:
                     "Capture one actual-plan sample. Requires database benchmark policy."
                 ),
             ),
-            parameter_case: dict[str, Any] | None = Field(
+            parameter_case: ParameterCaseInput | None = Field(
                 default=None,
                 description=(
                     "For active evidence on parameterized SQL, one named case containing "
                     "an exact values object and exact SQL types object."
+                ),
+            ),
+            query_store_query_id: int | None = Field(
+                default=None,
+                ge=1,
+                strict=True,
+                description=(
+                    "Optional exact Query Store query_id. It must match any identity "
+                    "already stored on the performance case."
                 ),
             ),
             idempotency_key: str | None = Field(default=None),
@@ -1198,7 +1245,8 @@ class AzureSqlMcpApplication:
                     window_minutes,
                     execute_query,
                     idempotency_key,
-                    parameter_case,
+                    _parameter_case_payload(parameter_case),
+                    query_store_query_id,
                 ),
                 decision_id=decision_id,
             )
@@ -1369,7 +1417,12 @@ class AzureSqlMcpApplication:
                 default="screening",
                 description="Benchmark phase: screening or finalist.",
             ),
-            parameter_cases: list[dict[str, Any]] | None = Field(default=None),
+            parameter_cases: list[ParameterCaseInput] | None = Field(
+                default=None,
+                description=(
+                    "Exact unchanged subset of the performance-case parameter inputs."
+                ),
+            ),
             compare_order: bool = Field(default=True),
             runs: int | None = Field(
                 default=None,
@@ -1403,7 +1456,7 @@ class AzureSqlMcpApplication:
                         baseline_sql,
                         candidate_sql,
                         phase=phase,
-                        parameter_cases=parameter_cases,
+                        parameter_cases=_parameter_case_payloads(parameter_cases),
                         compare_order=compare_order,
                         runs_override=runs,
                         prove_equivalence=prove_equivalence,
@@ -1442,7 +1495,7 @@ class AzureSqlMcpApplication:
                 description="Optional filtered-index predicate; no SQL statements or comments.",
             ),
             is_unique: bool = Field(default=False),
-            parameter_cases: list[dict[str, Any]] | None = Field(
+            parameter_cases: list[ParameterCaseInput] | None = Field(
                 default=None,
                 description="The same named parameter cases recorded on the performance case.",
             ),
@@ -1483,7 +1536,7 @@ class AzureSqlMcpApplication:
                         compare_order,
                         lease_minutes,
                         idempotency_key,
-                        parameter_cases,
+                        _parameter_case_payloads(parameter_cases),
                     ),
                     deadline_provider=lambda: self.tuning_sessions.get_session(
                         session_id
@@ -1558,7 +1611,7 @@ class AzureSqlMcpApplication:
             baseline_sql: str = Field(description="Baseline read-only SQL."),
             candidate_sql: str = Field(description="Candidate read-only SQL."),
             compare_order: bool = Field(default=True),
-            parameter_case: dict[str, Any] | None = Field(
+            parameter_case: ParameterCaseInput | None = Field(
                 default=None,
                 description=(
                     "Required for parameterized SQL: one named case with exact values "
@@ -1575,7 +1628,7 @@ class AzureSqlMcpApplication:
                     baseline_sql,
                     candidate_sql,
                     compare_order=compare_order,
-                    parameter_case=parameter_case,
+                    parameter_case=_parameter_case_payload(parameter_case),
                 ),
             )
 
@@ -1766,7 +1819,13 @@ class AzureSqlMcpApplication:
             )
 
         @self.mcp.tool(
-            description="Analyze up to 10 SQL queries and recommend optimal indexes based on execution plans.",
+            description=(
+                "Extract SQL Server missing-index hints from estimated plans for up to "
+                "10 queries. A per-query missing_index_count of zero means no Showplan "
+                "hint was emitted for that plan. The filtered recommendations can also "
+                "be empty when an existing index already covers an emitted hint; neither "
+                "condition proves that no index could improve the query."
+            ),
             annotations=ToolAnnotations(
                 title="Analyze Query Indexes",
                 readOnlyHint=True,
@@ -4325,6 +4384,9 @@ class AzureSqlMcpApplication:
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
+        default_policy = self.database_policy.policy_for(
+            self.config.default_database
+        )
         return {
             "startup_timestamp": self._startup_timestamp,
             "package_version": self._package_version,
@@ -4338,6 +4400,27 @@ class AzureSqlMcpApplication:
             "contracts": contracts,
             "strict_argument_models": contracts["strict_arguments"],
             "mcp_tool_errors": contracts["mcp_errors"],
+            "timeouts": {
+                "query_seconds": self.config.query_timeout_seconds,
+                "default_tool_seconds": self.config.tool_timeout_seconds,
+                "evidence_collection_stage_seconds": (
+                    self.performance_workflows.collector_timeout_seconds
+                ),
+                "evidence_profile_stage_seconds": self.config.query_timeout_seconds,
+                "evidence_workflow_seconds": self._evidence_workflow_timeout(),
+                "session_workflow_floor_seconds": max(
+                    self.config.tool_timeout_seconds,
+                    21 * 60,
+                ),
+                "session_workflow_seconds": self._session_workflow_timeout(
+                    self.config.default_database
+                ),
+                "session_workflow_max_benchmark_executions": (
+                    default_policy.max_benchmark_executions
+                ),
+                "session_workflow_cleanup_headroom_seconds": 5 * 60,
+                "client_timeout_managed_by_server": False,
+            },
             "runtime_fingerprint": runtime_fingerprint,
             "runtime_compatibility_fingerprint": compatibility_fingerprint,
             "tool_schema_fingerprint": schema_fingerprint,
@@ -4424,6 +4507,7 @@ class AzureSqlMcpApplication:
         parameter_cases: list[dict[str, Any]] | None,
         objective: str,
         idempotency_key: str | None,
+        query_store_query_id: int | None = None,
     ) -> dict[str, Any]:
         performance_case = await self._create_performance_case(
             database_name,
@@ -4431,6 +4515,7 @@ class AzureSqlMcpApplication:
             parameter_cases=parameter_cases,
             objective=objective,
             idempotency_key=idempotency_key,
+            query_store_query_id=query_store_query_id,
         )
         return performance_case.to_dict()
 
@@ -4443,6 +4528,7 @@ class AzureSqlMcpApplication:
         objective: str,
         metadata: Mapping[str, Any] | None = None,
         idempotency_key: str | None = None,
+        query_store_query_id: int | None = None,
     ) -> PerformanceCaseV1:
         normalized_sql = self.validator.validate_read_only(sql).execution_sql
         equivalence_preflight = await self._check_equivalence_preflight(
@@ -4463,6 +4549,7 @@ class AzureSqlMcpApplication:
             parameter_cases=parameter_cases,
             metadata=case_metadata,
             idempotency_key=idempotency_key,
+            query_store_query_id=query_store_query_id,
         )
 
     async def _check_equivalence_preflight(
@@ -4486,6 +4573,7 @@ class AzureSqlMcpApplication:
         execute_query: bool,
         idempotency_key: str | None,
         parameter_case: dict[str, Any] | None = None,
+        query_store_query_id: int | None = None,
     ) -> dict[str, Any]:
         execution_contract: ParameterExecutionContract | None = None
         if execute_query and parameter_case is not None:
@@ -4494,7 +4582,7 @@ class AzureSqlMcpApplication:
                 sql,
                 parameter_case,
             )
-        collectors: dict[str, Callable[[], Awaitable[Any]]] = {
+        collectors: dict[str, Callable[..., Awaitable[Any]]] = {
             "resource_limits": lambda: self.resource_governance.get_resource_limits(
                 database_name
             ),
@@ -4503,10 +4591,11 @@ class AzureSqlMcpApplication:
                 window_minutes,
             ),
             "query_store_status": lambda: self.query_store.get_status(database_name),
-            "query_store_history": lambda: self._collect_query_store_evidence(
+            "query_store_history": lambda effective_query_id=None: self._collect_query_store_evidence(
                 database_name,
                 sql,
                 window_minutes,
+                query_store_query_id=effective_query_id,
             ),
             "waits": lambda: self.wait_stats.get_wait_stats(database_name, top_n=20),
             "blocking": lambda: self.lock_diagnostics.get_lock_details(
@@ -4537,6 +4626,7 @@ class AzureSqlMcpApplication:
             execute_query=execute_query,
             execution_contract=execution_contract,
             idempotency_key=idempotency_key,
+            query_store_query_id=query_store_query_id,
         )
 
     async def _collect_query_store_evidence(
@@ -4544,18 +4634,51 @@ class AzureSqlMcpApplication:
         database_name: str,
         sql: str,
         window_minutes: int,
+        *,
+        query_store_query_id: int | None = None,
     ) -> dict[str, Any]:
-        identity = await self.query_store.resolve_query_identity(database_name, sql)
-        if identity.get("status") != "resolved":
-            return {
-                "available": False,
-                "complete": False,
-                "status": "inconclusive",
-                "reason": "exact Query Store identity was not uniquely resolved",
-                "identity": identity,
+        if query_store_query_id is not None:
+            if (
+                isinstance(query_store_query_id, bool)
+                or not isinstance(query_store_query_id, int)
+                or query_store_query_id <= 0
+            ):
+                raise ValueError("query_store_query_id must be a positive integer.")
+            query_id = query_store_query_id
+            identity: dict[str, Any] = {
+                "status": "resolved",
+                "query_id": query_id,
+                "identity_kind": "query_id",
+                "identity_provenance": "caller_supplied",
+                "identity_verified_against_sql": False,
                 "fuzzy_match_used": False,
             }
-        query_id = int(identity["query_id"])
+        else:
+            identity = await self.query_store.resolve_query_identity(
+                database_name,
+                sql,
+            )
+            if identity.get("status") != "resolved":
+                return {
+                    "available": False,
+                    "complete": False,
+                    "status": "inconclusive",
+                    "reason": "exact Query Store identity was not uniquely resolved",
+                    "identity": {
+                        **identity,
+                        "identity_provenance": "exact_sql_text",
+                        "identity_verified_against_sql": False,
+                    },
+                    "fuzzy_match_used": False,
+                }
+            query_id = int(identity["query_id"])
+            identity = {
+                **identity,
+                "identity_kind": "query_id",
+                "identity_provenance": "exact_sql_text",
+                "identity_verified_against_sql": True,
+                "fuzzy_match_used": False,
+            }
         history, parameter_buckets = await asyncio.gather(
             self.query_store.get_query_history_by_id(
                 database_name,
@@ -4634,6 +4757,10 @@ class AzureSqlMcpApplication:
                 "query_id": query_id,
                 "query_hash": identity.get("query_hash"),
                 "identity_kind": "query_id",
+                "identity_provenance": identity["identity_provenance"],
+                "identity_verified_against_sql": identity[
+                    "identity_verified_against_sql"
+                ],
             },
             "history": history,
             "parameter_buckets": parameter_buckets,
@@ -5423,8 +5550,14 @@ class AzureSqlMcpApplication:
         public_lease = self._public_index_lease(lease)
         parameter_results = metrics.get("parameter_results")
         result_rows = parameter_results if isinstance(parameter_results, list) else []
+        parameter_case_receipts = metadata.get("parameter_case_receipts")
+        result_receipts = (
+            parameter_case_receipts
+            if isinstance(parameter_case_receipts, list)
+            else []
+        )
         equivalence = metadata.get("equivalence")
-        return {
+        result = {
             "session_id": session_id,
             "candidate_id": candidate_id,
             "classification": state,
@@ -5438,6 +5571,7 @@ class AzureSqlMcpApplication:
             "executions": measured_executions,
             "metrics": result_rows[0] if result_rows else {},
             "parameter_results": result_rows,
+            "parameter_case_receipts": result_receipts,
             "equivalence": equivalence if isinstance(equivalence, list) else [],
             "equivalence_preflight": metadata.get("equivalence_preflight"),
             "proof_scope": metadata.get("proof_scope"),
@@ -5455,6 +5589,10 @@ class AzureSqlMcpApplication:
             "recovered_from_durable_evidence": True,
             "session_continues": True,
         }
+        failure_diagnostic = metadata.get("failure_diagnostic")
+        if isinstance(failure_diagnostic, Mapping):
+            result["failure_diagnostic"] = dict(failure_diagnostic)
+        return result
 
     async def _benchmark_index_candidate(
         self,
@@ -5600,6 +5738,16 @@ class AzureSqlMcpApplication:
             parameter_case_fingerprint(parameter_case) for parameter_case in cases
         )
         registered_case_fingerprints = set(case.parameter_case_fingerprints)
+        registered_receipts = case.metadata.get("parameter_case_receipts")
+        if isinstance(registered_receipts, (list, tuple)):
+            for case_index, parameter_case in enumerate(cases):
+                mismatch = parameter_case_mismatch(
+                    parameter_case,
+                    registered_receipts=registered_receipts,
+                    case_index=case_index,
+                )
+                if mismatch is not None:
+                    raise ValueError(mismatch)
         if (
             len(set(supplied_case_fingerprints)) != len(supplied_case_fingerprints)
             or any(
@@ -5608,8 +5756,13 @@ class AzureSqlMcpApplication:
             )
         ):
             raise ValueError(
-                "Index benchmark parameter cases must be an unchanged subset "
-                "of the performance case."
+                "Index benchmark parameter cases must be an unchanged fingerprint-v1 "
+                "subset of the performance case. Matching is exact over name, "
+                "values, types, and normalized weight; parameter-name and SQL-type "
+                "spelling are exact, object key order is ignored, and values are "
+                "not persisted. Received fingerprints: "
+                f"{list(supplied_case_fingerprints)}; registered fingerprints: "
+                f"{list(case.parameter_case_fingerprints)}."
             )
         if phase == "finalist" and set(supplied_case_fingerprints) != (
             registered_case_fingerprints
@@ -6017,6 +6170,7 @@ class AzureSqlMcpApplication:
         create_attempted = False
         ownership_recorded = False
         benchmark_error: str | None = None
+        benchmark_failure_diagnostic: dict[str, Any] | None = None
         terminal_error: InvalidTransitionError | None = None
         cancelled = False
         equivalence: list[dict[str, Any]] = []
@@ -6180,6 +6334,9 @@ class AzureSqlMcpApplication:
                     )
         except asyncio.CancelledError:
             benchmark_error = "timeout"
+            benchmark_failure_diagnostic = {
+                "diagnostic_code": "benchmark_cancelled",
+            }
             cancelled = True
             try:
                 await reconcile_create_outcome()
@@ -6200,6 +6357,7 @@ class AzureSqlMcpApplication:
                 )
         except Exception as exc:
             benchmark_error = type(exc).__name__
+            benchmark_failure_diagnostic = extract_failure_diagnostic(exc)
             try:
                 await reconcile_create_outcome()
             except Exception:
@@ -6353,12 +6511,16 @@ class AzureSqlMcpApplication:
                         measurement["baseline_after_plan"] = profiled.plan.summary
             except asyncio.CancelledError:
                 benchmark_error = "timeout"
+                benchmark_failure_diagnostic = {
+                    "diagnostic_code": "benchmark_cancelled",
+                }
                 cancelled = True
             except InvalidTransitionError as exc:
                 benchmark_error = type(exc).__name__
                 terminal_error = exc
             except Exception as exc:
                 benchmark_error = type(exc).__name__
+                benchmark_failure_diagnostic = extract_failure_diagnostic(exc)
 
         if terminal_error is not None:
             reservation_update = (
@@ -6527,6 +6689,10 @@ class AzureSqlMcpApplication:
                 metadata={
                     "session_id": session_id,
                     "candidate_id": candidate_id,
+                    "parameter_case_receipts": [
+                        parameter_case_receipt(parameter_case)
+                        for parameter_case in cases
+                    ],
                     "lease_id": lease_id,
                     "lease_status": lease["status"],
                     "index_definition_fingerprint": object_fingerprint,
@@ -6545,6 +6711,7 @@ class AzureSqlMcpApplication:
                     "phase": phase,
                     "reason": reason,
                     "performance_reason": performance_reason,
+                    "failure_diagnostic": benchmark_failure_diagnostic,
                 },
             ),
             idempotency_key=index_evidence_key,
@@ -6606,6 +6773,10 @@ class AzureSqlMcpApplication:
             "executions": measured_executions,
             "metrics": parameter_results[0],
             "parameter_results": parameter_results,
+            "parameter_case_receipts": [
+                parameter_case_receipt(parameter_case)
+                for parameter_case in cases
+            ],
             "equivalence": equivalence,
             "equivalence_preflight": equivalence_preflight,
             "equivalence_deferred": performance_only_scope,
@@ -6622,6 +6793,8 @@ class AzureSqlMcpApplication:
             "rollback_ddl": rollback_ddl,
             "session_continues": True,
         }
+        if benchmark_failure_diagnostic is not None:
+            result["failure_diagnostic"] = benchmark_failure_diagnostic
         if cancelled:
             raise asyncio.CancelledError
         return result
@@ -6772,6 +6945,15 @@ class AzureSqlMcpApplication:
                         deadline.astimezone(timezone.utc)
                         - datetime.now(timezone.utc)
                     ).total_seconds()
+                    if remaining <= 0:
+                        self._raise_tool_error(
+                            "session_expired",
+                            (
+                                "The tuning session deadline has passed. Retrieve "
+                                "durable results or finalize an already measured "
+                                "candidate; no new SQL work was started."
+                            ),
+                        )
                     timeout_seconds = min(timeout_seconds, max(0.0, remaining))
             logger.info(
                 "Running tool",
@@ -6830,6 +7012,7 @@ class AzureSqlMcpApplication:
         except Exception as exc:
             duration_ms = self._duration_ms(started_at)
             sanitized_error = sanitize_error_message(str(exc))
+            failure_diagnostic = extract_failure_diagnostic(exc)
             logger.error(
                 "Tool failed",
                 extra={
@@ -6841,7 +7024,11 @@ class AzureSqlMcpApplication:
                     "error": sanitized_error,
                 },
             )
-            self._raise_tool_error("tool_error", sanitized_error)
+            self._raise_tool_error(
+                "tool_error",
+                sanitized_error,
+                details={"failure_diagnostic": failure_diagnostic},
+            )
 
     def _timeout_for_tool(
         self,
@@ -6849,29 +7036,42 @@ class AzureSqlMcpApplication:
         database_name: str | None = None,
     ) -> float:
         if tool_name in _SESSION_WORKFLOW_TOOLS:
-            per_request_executions = (
-                self.database_policy.policy_for(
-                    database_name
-                ).max_benchmark_executions
-                if database_name
-                else 0
-            )
-            benchmark_timeout = (
-                self.config.query_timeout_seconds
-                * max(1, per_request_executions)
-                + 5 * 60
-            )
-            return max(
-                self.config.tool_timeout_seconds,
-                21 * 60,
-                benchmark_timeout,
-            )
+            return self._session_workflow_timeout(database_name)
         if tool_name in _EVIDENCE_WORKFLOW_TOOLS:
-            return max(
-                self.config.tool_timeout_seconds,
-                self.config.query_timeout_seconds + 60,
-            )
+            return self._evidence_workflow_timeout()
         return self.config.tool_timeout_seconds
+
+    def _evidence_workflow_timeout(self) -> float:
+        """Budget concurrent collectors followed by one optional profile query."""
+
+        return max(
+            self.config.tool_timeout_seconds,
+            self.performance_workflows.collector_timeout_seconds
+            + self.config.query_timeout_seconds
+            + 60,
+        )
+
+    def _session_workflow_timeout(
+        self,
+        database_name: str | None,
+    ) -> float:
+        per_request_executions = (
+            self.database_policy.policy_for(
+                database_name
+            ).max_benchmark_executions
+            if database_name
+            else 0
+        )
+        benchmark_timeout = (
+            self.config.query_timeout_seconds
+            * max(1, per_request_executions)
+            + 5 * 60
+        )
+        return max(
+            self.config.tool_timeout_seconds,
+            21 * 60,
+            benchmark_timeout,
+        )
 
     def _require_tuning_session_time(self, session_id: str) -> float:
         """Fence benchmark work against terminal state and the durable deadline."""
@@ -8187,8 +8387,13 @@ class AzureSqlMcpApplication:
         return {"result": payload}
 
     @staticmethod
-    def _raise_tool_error(code: str, message: str) -> NoReturn:
-        payload = ErrorPayload(code=code, message=message).as_dict()
+    def _raise_tool_error(
+        code: str,
+        message: str,
+        *,
+        details: dict[str, Any] | None = None,
+    ) -> NoReturn:
+        payload = ErrorPayload(code=code, message=message, details=details).as_dict()
         raise ToolError(
             json.dumps(
                 payload,

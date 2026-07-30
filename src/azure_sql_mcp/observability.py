@@ -17,6 +17,19 @@ _SERVER_NAME_PATTERN = re.compile(
 _IP_PATTERN = re.compile(
     r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",
 )
+_SP_EXECUTESQL_UNICODE_CONTROL_PATTERN = re.compile(
+    r"(?:\[42000\]\s+)?"
+    r"(?:\[Microsoft\])?"
+    r"(?:\[ODBC Driver [0-9]+(?:\.[0-9]+)? for SQL Server\])?"
+    r"(?:\[SQL Server\])?"
+    r"Procedure expects parameter '@(?:statement|params)' of type "
+    r"'ntext/nchar/nvarchar'\."
+    r"(?: \(214\))?"
+    r"(?: \([A-Za-z0-9_]+\))?"
+    r"$",
+    re.IGNORECASE,
+)
+_MAX_FAILURE_DIAGNOSTIC_TEXT = 240
 
 
 def extract_sql_error_info(exc: Exception) -> dict[str, Any]:
@@ -41,6 +54,57 @@ def extract_sql_error_info(exc: Exception) -> dict[str, Any]:
                     info["sqlstate"] = arg[0]
         current = current.__cause__ or current.__context__
     return info
+
+
+def extract_failure_diagnostic(exc: Exception) -> dict[str, Any]:
+    """Return only an allowlisted, value-free SQL failure diagnostic.
+
+    Generic exception text is intentionally not persisted.  The one useful
+    execution defect currently known to the workflow is the SQL Server 214
+    diagnostic emitted when an ``sp_executesql`` control argument is bound as
+    a non-Unicode value.  Its engine text contains no query or parameter
+    values, so it can be returned as a stable, capped receipt.
+    """
+
+    info = extract_sql_error_info(exc)
+    current: BaseException | None = exc
+    while current is not None:
+        candidates: list[tuple[str, bool]] = []
+        ddbc_error = getattr(current, "ddbc_error", None)
+        if isinstance(ddbc_error, str):
+            candidates.append((ddbc_error, True))
+        for arg in getattr(current, "args", ()):
+            if isinstance(arg, str):
+                candidates.append((arg, False))
+            elif (
+                isinstance(arg, tuple)
+                and len(arg) >= 2
+                and isinstance(arg[1], str)
+            ):
+                candidates.append((arg[1], False))
+        for diagnostic_text, is_driver_ddbc_error in candidates:
+            normalized_arg = " ".join(diagnostic_text.split())
+            if (
+                is_driver_ddbc_error or info.get("sqlstate") == "42000"
+            ) and _SP_EXECUTESQL_UNICODE_CONTROL_PATTERN.fullmatch(normalized_arg):
+                text = (
+                    "Procedure expects an sp_executesql control parameter "
+                    "(@statement or @params) of type ntext/nchar/nvarchar."
+                )[:_MAX_FAILURE_DIAGNOSTIC_TEXT]
+                return {
+                    "diagnostic_code": "sp_executesql_unicode_control_argument",
+                    "sqlstate": "42000",
+                    "native_error_code": 214,
+                    "text": text,
+                }
+        current = current.__cause__ or current.__context__
+
+    diagnostic = {"diagnostic_code": "sql_execution_failed"}
+    if isinstance(info.get("sqlstate"), str):
+        diagnostic["sqlstate"] = info["sqlstate"]
+    if isinstance(info.get("native_error_code"), int):
+        diagnostic["native_error_code"] = info["native_error_code"]
+    return diagnostic
 
 
 def compute_query_hash(sql: str) -> str:

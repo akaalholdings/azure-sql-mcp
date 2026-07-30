@@ -159,6 +159,33 @@ class TuningSessionStateMachine:
     def get_session(self, session_id: str) -> TuningSessionV1:
         return self.store.get_session(session_id)
 
+    def session_availability(self, session: TuningSessionV1) -> dict[str, Any]:
+        """Derive read-time work availability without changing lifecycle state."""
+
+        active = session.status in {"created", "screening", "finalist_validation"}
+        deadline_exceeded = bool(
+            session.deadline_at_utc
+            and self._clock() >= _parse_iso(session.deadline_at_utc)
+        )
+        expired = active and deadline_exceeded
+        accepts_new_work = active and not expired
+        return {
+            "lifecycle_status": session.status,
+            "effective_status": "expired" if expired else session.status,
+            "availability": "expired" if expired else "available" if active else "terminal",
+            "deadline_exceeded": deadline_exceeded,
+            "accepts_new_work": accepts_new_work,
+            "accepts_finalization": active,
+            "available": accepts_new_work,
+            "actionable": accepts_new_work,
+            "reason": "deadline_expired" if expired else None,
+        }
+
+    def is_session_expired(self, session: TuningSessionV1) -> bool:
+        """Return whether the session is currently unavailable for new work."""
+
+        return self.session_availability(session)["effective_status"] == "expired"
+
     def get_candidate(self, candidate_id: str) -> TuningCandidateV1:
         return self.store.get_candidate(candidate_id)
 
@@ -457,7 +484,7 @@ class TuningSessionStateMachine:
 
         session = self._active_session(
             session_id,
-            allowed={"screening", "finalist_validation"},
+            allowed={"created", "screening", "finalist_validation"},
         )
         candidate = self._candidate_in_session(session, candidate_id)
         if candidate.is_terminal:
@@ -468,6 +495,13 @@ class TuningSessionStateMachine:
             session,
             allow_expired=state in TERMINAL_CANDIDATE_STATES,
         )
+        if session.status == "created" and not (
+            state in TERMINAL_CANDIDATE_STATES
+            and self.is_session_expired(session)
+        ):
+            raise InvalidTransitionError(
+                "Candidate results require screening or finalist validation."
+            )
         if state in {"proposed", "screening"} and session.status != "screening":
             raise InvalidTransitionError("Screening results require screening status.")
         if state in {"finalist", "validating"} and session.status != "finalist_validation":

@@ -58,6 +58,28 @@ def test_legacy_performance_case_defaults_to_zero_state_version() -> None:
     assert case.version == 0
 
 
+def test_performance_case_round_trips_positive_query_store_identity() -> None:
+    case = PerformanceCaseV1(
+        case_id="case-query-store",
+        query_fingerprint="query-hash",
+        query_store_query_id=42,
+    )
+
+    decoded = PerformanceCaseV1.from_json(case.to_json())
+
+    assert decoded.query_store_query_id == 42
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "42"])
+def test_performance_case_rejects_non_positive_query_store_identity(value) -> None:
+    with pytest.raises(ContractValidationError, match="positive integer"):
+        PerformanceCaseV1(
+            case_id="case-invalid-query-store",
+            query_fingerprint="query-hash",
+            query_store_query_id=value,
+        )
+
+
 def test_contract_metadata_drops_raw_sql_and_secret_like_fields() -> None:
     evidence = EvidenceEnvelopeV1(
         evidence_id="evidence-2",
@@ -74,6 +96,42 @@ def test_contract_metadata_drops_raw_sql_and_secret_like_fields() -> None:
     assert "SELECT private_value" not in payload
     assert "do-not-store" not in payload
     assert "safe aggregate observation" in payload
+
+
+def test_contract_metadata_drops_observed_parameter_literals() -> None:
+    evidence = EvidenceEnvelopeV1(
+        evidence_id="evidence-query-store-parameters",
+        query_fingerprint="query-hash",
+        metadata={
+            "sections": {
+                "query_store_history": {
+                    "distinct_compiled_parameter_set_count": 1,
+                    "distinct_compiled_parameter_sets": [
+                        [{"name": "@CustomerId", "compiled_value": "(12345)"}]
+                    ],
+                    "buckets": [
+                        {
+                            "compiled_parameters": [
+                                {
+                                    "name": "@CustomerId",
+                                    "data_type": "int",
+                                    "compiled_value": "(12345)",
+                                    "runtime_value": "(67890)",
+                                }
+                            ]
+                        }
+                    ],
+                }
+            }
+        },
+    )
+
+    payload = evidence.to_dict()["metadata"]["sections"]["query_store_history"]
+
+    assert payload["distinct_compiled_parameter_set_count"] == 1
+    assert "distinct_compiled_parameter_sets" not in payload
+    parameter = payload["buckets"][0]["compiled_parameters"][0]
+    assert parameter == {"name": "@CustomerId", "data_type": "int"}
 
 
 def test_evidence_normalizes_supported_database_scalars_recursively() -> None:

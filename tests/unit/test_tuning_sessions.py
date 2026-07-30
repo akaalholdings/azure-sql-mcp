@@ -433,6 +433,78 @@ def test_time_budget_blocks_new_work(tmp_path) -> None:
         store.close()
 
 
+def test_expiry_is_derived_but_late_terminal_result_and_finalization_are_allowed(
+    tmp_path,
+) -> None:
+    clock = MutableClock()
+    store, machine, case = _new_machine(tmp_path, clock=clock)
+    try:
+        session = machine.create_session(case, time_limit_seconds=60)
+        candidate = machine.add_candidate(session.session_id, strategy="late-result")
+        machine.start_screening(session.session_id)
+        clock.value += timedelta(seconds=61)
+
+        availability = machine.session_availability(machine.get_session(session.session_id))
+        assert availability == {
+            "lifecycle_status": "screening",
+            "effective_status": "expired",
+            "availability": "expired",
+            "deadline_exceeded": True,
+            "accepts_new_work": False,
+            "accepts_finalization": True,
+            "available": False,
+            "actionable": False,
+            "reason": "deadline_expired",
+        }
+        assert machine.get_session(session.session_id).status == "screening"
+
+        _session, terminal = machine.mark_candidate_terminal(
+            session.session_id,
+            candidate.candidate_id,
+            "inconclusive",
+            failure_code="timeout",
+        )
+        completed = machine.complete_session(
+            session.session_id,
+            stopping_reason="late result recorded",
+        )
+
+        assert terminal.state == "inconclusive"
+        assert completed.status == "completed"
+        assert machine.get_session(session.session_id).status == "completed"
+    finally:
+        store.close()
+
+
+def test_expired_created_session_can_record_unresolved_candidate_before_finalize(
+    tmp_path,
+) -> None:
+    clock = MutableClock()
+    store, machine, case = _new_machine(tmp_path, clock=clock)
+    try:
+        session = machine.create_session(case, time_limit_seconds=60)
+        candidate = machine.add_candidate(session.session_id, strategy="not-started")
+        clock.value += timedelta(seconds=61)
+
+        with pytest.raises(TuningBudgetExceeded):
+            machine.record_candidate_result(
+                session.session_id,
+                candidate.candidate_id,
+                state="screening",
+            )
+        _session, unresolved = machine.record_candidate_result(
+            session.session_id,
+            candidate.candidate_id,
+            state="inconclusive",
+            failure_code="session_expired",
+        )
+
+        assert unresolved.state == "inconclusive"
+        assert machine.get_session(session.session_id).status == "created"
+    finally:
+        store.close()
+
+
 def test_finalist_reuses_screened_parameter_cases_without_double_counting(
     tmp_path,
 ) -> None:

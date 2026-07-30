@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from mssql_python.exceptions import ProgrammingError
+
 from azure_sql_mcp.observability import (
     compute_query_hash,
+    extract_failure_diagnostic,
     extract_sql_error_info,
     redact_sql_literals,
     sanitize_error_message,
@@ -31,6 +34,91 @@ class TestExtractSqlErrorInfo:
         exc = Exception(("08S01", "Connection lost"))
         info = extract_sql_error_info(exc)
         assert info["sqlstate"] == "08S01"
+
+
+class TestExtractFailureDiagnostic:
+    def test_allowlisted_sp_executesql_unicode_error_is_structured(self):
+        exc = Exception(
+            "[42000] [Microsoft][ODBC Driver 18 for SQL Server][SQL Server]"
+            "Procedure expects parameter '@statement' of type "
+            "'ntext/nchar/nvarchar'. (214)"
+        )
+
+        assert extract_failure_diagnostic(exc) == {
+            "diagnostic_code": "sp_executesql_unicode_control_argument",
+            "sqlstate": "42000",
+            "native_error_code": 214,
+            "text": (
+                "Procedure expects an sp_executesql control parameter "
+                "(@statement or @params) of type ntext/nchar/nvarchar."
+            ),
+        }
+
+    def test_arbitrary_sql_error_does_not_return_exception_text(self):
+        exc = Exception(
+            "[42000] SELECT SecretValue FROM dbo.PrivateTable "
+            "with private literal N'do-not-return'"
+        )
+
+        assert extract_failure_diagnostic(exc) == {
+            "diagnostic_code": "sql_execution_failed",
+            "sqlstate": "42000",
+        }
+
+    def test_unknown_sql_error_keeps_codes_without_returning_text(self):
+        exc = Exception("[42S02] SELECT SecretValue FROM dbo.PrivateTable (Error 208)")
+
+        assert extract_failure_diagnostic(exc) == {
+            "diagnostic_code": "sql_execution_failed",
+            "sqlstate": "42S02",
+            "native_error_code": 208,
+        }
+
+    def test_allowlisted_tuple_error_keeps_sqlstate_and_native_code(self):
+        exc = Exception(
+            (
+                "42000",
+                "Procedure expects parameter '@params' of type "
+                "'ntext/nchar/nvarchar'. (214)",
+            )
+        )
+
+        diagnostic = extract_failure_diagnostic(exc)
+
+        assert diagnostic["diagnostic_code"] == (
+            "sp_executesql_unicode_control_argument"
+        )
+        assert diagnostic["sqlstate"] == "42000"
+        assert diagnostic["native_error_code"] == 214
+
+    def test_real_mssql_python_unicode_control_error_shape_is_structured(self):
+        exc = ProgrammingError(
+            driver_error="Syntax error or access violation",
+            ddbc_error=(
+                "[Microsoft][SQL Server]Procedure expects parameter "
+                "'@statement' of type 'ntext/nchar/nvarchar'."
+            ),
+        )
+
+        assert extract_failure_diagnostic(exc) == {
+            "diagnostic_code": "sp_executesql_unicode_control_argument",
+            "sqlstate": "42000",
+            "native_error_code": 214,
+            "text": (
+                "Procedure expects an sp_executesql control parameter "
+                "(@statement or @params) of type ntext/nchar/nvarchar."
+            ),
+        }
+
+    def test_bare_message_without_sqlstate_is_not_allowlisted(self):
+        exc = Exception(
+            "Procedure expects parameter '@statement' of type "
+            "'ntext/nchar/nvarchar'."
+        )
+
+        assert extract_failure_diagnostic(exc) == {
+            "diagnostic_code": "sql_execution_failed",
+        }
 
 
 class TestComputeQueryHash:

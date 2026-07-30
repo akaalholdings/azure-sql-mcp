@@ -70,6 +70,21 @@ selected database. The server derives each benchmark tool's outer timeout from
 headroom. Multi-hour session budgets therefore remain usable while every
 individual SQL execution still has its own timeout.
 
+The MCP client has an independent tool-call timeout. Increasing
+`AZURE_SQL_TOOL_TIMEOUT_SECONDS` changes only the server budget; it cannot make
+an earlier client cancellation wait longer. Inspect
+`check_runtime_status.timeouts`, then configure the invoking client's
+per-server timeout above the required workflow budget with transport headroom.
+Use `evidence_workflow_seconds` for evidence collection plus its optional
+profile stage. Use `session_workflow_seconds` for the default database's
+effective per-request benchmark ceiling; the response also publishes the
+policy execution limit and cleanup headroom used to derive it.
+Codex uses `tool_timeout_sec`; GitHub Copilot CLI uses `timeout` in
+milliseconds. Keep the same idempotency key and retrieve durable case/session
+state after an uncertain response. Do not publish a universal
+`window_minutes` ceiling: collection cost depends on the database and evidence
+window.
+
 After reload:
 
 1. Open Copilot Chat.
@@ -232,13 +247,26 @@ Continue after losing candidates and return the winning SQL plus the complete le
 Expected sequence:
 
 1. Static semantic review and concrete candidate SQL.
-2. `start_performance_case` with up to four parameter cases; each case includes one exact value and SQL type for every parameter.
+2. `start_performance_case` with up to four parameter cases; each case includes
+   `name`, exact `values`, exact SQL `types`, and a positive `weight`. Pass a
+   known exact `query_store_query_id` here and again during evidence collection.
 3. `start_tuning_session`.
 4. `add_tuning_candidate` for one family at a time.
 5. `benchmark_tuning_candidate` for three screening runs.
 6. Continue after every non-winning result.
 7. Re-run credible winners with five finalist runs.
 8. `finalize_tuning_session` with a winner or a documented `no_change` stopping reason.
+
+Parameter values are fingerprinted but never persisted. Retain the submitted
+case payload in the active client workflow. Case responses return
+`parameter_case_receipts`, value-free templates, `fingerprint_v1`, and exact
+matching rules so a mismatch identifies its case index and received/expected
+fingerprints without exposing values.
+
+Session lifecycle status remains durable, while time availability is derived
+at read time. After `deadline_exceeded=true` or `accepts_new_work=false`, do not
+dispatch or replay benchmark work. `accepts_finalization=true` means already
+measured or late terminal results can still be reconciled and finalized.
 
 Measured candidates use typed `sp_executesql` and exactly-once user-query samples. Screening normally uses three baseline/candidate pairs: six executions per parameter case. Finalists use five pairs plus one two-query snapshot comparison: twelve per case and 48 for four. A full duplicate/order-aware comparison is proven only when both complete results fit `AZURE_SQL_COMPARISON_ROW_LIMIT` in one snapshot; otherwise equivalence is inconclusive.
 
@@ -278,6 +306,17 @@ finalist costs fifteen per case and 60 for four.
 DDL separates the phases, so the workflow does not call this same-snapshot rewrite equivalence. The SQL is unchanged, and complete non-truncated result fingerprints must remain stable across A-B-A. Data changes make the result inconclusive. A slower index is classified and rejected without ending the session. Cleanup failure returns `cleanup_required` and blocks another test. A finalized idempotent reservation is retrieved rather than rerun. Expired leases are reconciled when the sandbox process starts.
 
 Do not use direct create/drop tools for live DDL; they are preview-only.
+
+The sandbox profile also exposes `execute_sql` for safe, read-only inspection.
+It remains statically validated and row-capped by the normal restricted SQL
+path. `execute_tsql_unrestricted` is not part of the sandbox profile and must
+not be used as a workaround.
+
+Index usage counters are raw DMV values. A missing DMV row remains unavailable,
+and `is_unused` is `null` when the best-effort counter epoch does not cover the
+requested observation window. A zero counter is usable as unused evidence only
+when the response reports covered usage context; it is not a database-wide
+proof that an index is unnecessary.
 
 ## Sandbox view runbook
 

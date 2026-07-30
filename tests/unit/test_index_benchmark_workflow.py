@@ -2022,7 +2022,94 @@ async def test_index_candidate_measures_all_recorded_parameter_buckets(
     assert [
         item["parameter_case"] for item in result["parameter_results"]
     ] == ["common", "rare", "NULL", "boundary"]
+    assert [
+        receipt["name"] for receipt in result["parameter_case_receipts"]
+    ] == ["common", "rare", "NULL", "boundary"]
+    assert all(
+        receipt["values_persisted"] is False
+        for receipt in result["parameter_case_receipts"]
+    )
+    evidence = app.performance_store.get_evidence(result["evidence_id"])
+    assert evidence.metadata["parameter_case_receipts"] == (
+        result["parameter_case_receipts"]
+    )
+    assert "999999" not in evidence.to_json()
+    replay = await app._benchmark_index_candidate(
+        "appdb",
+        session_id,
+        candidate_id,
+        sql,
+        "dbo",
+        "Items",
+        ["status"],
+        ["id"],
+        None,
+        False,
+        "screening",
+        True,
+        True,
+        30,
+        "parameterized-index",
+        parameter_cases,
+    )
+    assert replay["parameter_case_receipts"] == result["parameter_case_receipts"]
+    assert replay["classification"] == result["classification"]
+    assert replay["evidence_id"] == result["evidence_id"]
     assert app.tuning_sessions.get_candidate(candidate_id).parameter_cases == 4
+
+
+@pytest.mark.asyncio
+async def test_index_parameter_case_mismatch_is_value_free_and_actionable(
+    server_config_factory,
+) -> None:
+    app = _app(server_config_factory)
+    sql = "SELECT id FROM dbo.Items WHERE status = @p"
+    registered = [
+        {
+            "name": "common",
+            "values": {"p": 1},
+            "types": {"p": "int"},
+            "weight": 1.0,
+        }
+    ]
+    session_id, candidate_id = _candidate(
+        app,
+        sql,
+        parameter_cases=registered,
+    )
+    changed = [
+        {
+            "name": "common",
+            "values": {"p": 999999},
+            "types": {"p": "int"},
+            "weight": 1.0,
+        }
+    ]
+
+    with pytest.raises(ValueError) as error:
+        await app._benchmark_index_candidate(
+            "appdb",
+            session_id,
+            candidate_id,
+            sql,
+            "dbo",
+            "Items",
+            ["status"],
+            None,
+            None,
+            False,
+            "screening",
+            True,
+            True,
+            30,
+            "index-parameter-mismatch",
+            changed,
+        )
+
+    message = str(error.value)
+    assert "Parameter case index 0" in message
+    assert "fingerprint" in message
+    assert "999999" not in message
 
 
 @pytest.mark.asyncio

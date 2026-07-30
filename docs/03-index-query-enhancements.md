@@ -112,6 +112,19 @@ def _extract_missing_indexes(self, plan_xml: str) -> list[dict]:
     return results
 ```
 
+SHOWPLAN missing-index entries are optimizer hints for the specific plan that
+was compiled. A successful per-query result with `missing_index_count: 0`
+means that no `MissingIndexGroup` was emitted for that plan; it does not prove that no index
+could improve the query. A failed plan analysis reports
+`analysis_status: unavailable` and `missing_index_count: null`, so it cannot be
+misread as zero hints. Top-level `raw_missing_index_hint_count` is measured
+before existing-index filtering and consolidation, while
+`recommendation_count_after_filtering` is the actionable output count. An
+empty eligible Query Store workload reports `analysis_status: no_evidence`
+and remains inconclusive rather than becoming a zero-hint claim. Review
+existing indexes, workload evidence, and Query Store history before treating
+an empty recommendation set as a decision.
+
 ### Consolidation Logic
 
 When multiple queries recommend the same index (same table + key columns), consolidate:
@@ -181,6 +194,11 @@ async def analyze_workload_indexes(
   "database_name": "appdb",
   "window_minutes": 60,
   "queries_analyzed": 20,
+  "missing_index_provenance": {
+    "source": "SHOWPLAN_XML",
+    "evidence_kind": "optimizer_missing_index_hint",
+    "zero_hint_is_not_proof_no_index_can_help": true
+  },
   "recommendations": [
     {
       "rank": 1,

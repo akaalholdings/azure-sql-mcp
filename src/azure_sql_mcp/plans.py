@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import xml.etree.ElementTree as ET
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -99,6 +100,7 @@ class PlansService:
             database_name,
             execution_sql=contract.sp_executesql_sql,
             execution_params=contract.sp_executesql_values,
+            execution_input_sizes=contract.sp_executesql_input_sizes,
             max_result_rows=max_result_rows,
         )
 
@@ -123,6 +125,7 @@ class PlansService:
             sql=contract.sp_executesql_sql,
             analyze=False,
             params=contract.sp_executesql_values,
+            input_sizes=contract.sp_executesql_input_sizes,
         )
         return ExplainPlanArtifact(
             database_name=database_name,
@@ -139,6 +142,7 @@ class PlansService:
         *,
         execution_sql: str,
         execution_params: tuple[Any, ...],
+        execution_input_sizes: Sequence[Any] | None = None,
         max_result_rows: int | None,
     ) -> ProfiledPlanResult:
         row_limit = (
@@ -146,11 +150,16 @@ class PlansService:
             if max_result_rows is None
             else max(1, int(max_result_rows))
         )
+        execution_kwargs: dict[str, Any] = {
+            "params": execution_params,
+            "max_rows": row_limit + 1,
+        }
+        if execution_input_sizes is not None:
+            execution_kwargs["input_sizes"] = execution_input_sizes
         execution = await self.executor.execute_profiled_read_only(
             database_name,
             execution_sql,
-            params=execution_params,
-            max_rows=row_limit + 1,
+            **execution_kwargs,
         )
         raw_xml = self._extract_plan_xml(execution.result_sets)
         summary = self.summarize_showplan_xml(raw_xml)
@@ -212,6 +221,7 @@ class PlansService:
         sql: str,
         analyze: bool,
         params: tuple[Any, ...] = (),
+        input_sizes: Sequence[Any] | None = None,
     ) -> str:
         # SET SHOWPLAN_XML ON must be in its own batch — SQL Server rejects it
         # when combined with other statements — but the SET option is also
@@ -229,11 +239,20 @@ class PlansService:
         # executes and returns its rows before the plan XML result set, so an
         # unbounded fetch here could pull an entire table into memory.
         if params:
+            session_kwargs: dict[str, Any] = {
+                "max_rows": self.executor.config.row_limit + 1,
+                "statement_params": [None, params, None],
+            }
+            if input_sizes is not None:
+                session_kwargs["statement_input_sizes"] = [
+                    None,
+                    input_sizes,
+                    None,
+                ]
             per_statement_results = await self.executor.execute_session(
                 database_name,
                 [set_on, sql, set_off],
-                max_rows=self.executor.config.row_limit + 1,
-                statement_params=[None, params, None],
+                **session_kwargs,
             )
         else:
             per_statement_results = await self.executor.execute_session(

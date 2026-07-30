@@ -5,6 +5,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from mssql_python import SQL_WVARCHAR
 
 from azure_sql_mcp.param_binding import (
     ParameterBindingService,
@@ -629,6 +630,10 @@ def test_sp_executesql_uses_all_positional_arguments_in_definition_order() -> No
         "SELECT 1 WHERE @CustomerId = @CustomerId",
         "@CustomerId bigint",
         42,
+    )
+    assert contract.sp_executesql_input_sizes == (
+        (SQL_WVARCHAR, 0, 0),
+        (SQL_WVARCHAR, 0, 0),
     )
 
 

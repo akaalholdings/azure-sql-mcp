@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import xml.etree.ElementTree as ET
+from collections.abc import Sequence
 from typing import Any
 
 from .connection import AzureSqlExecutor
@@ -19,6 +20,21 @@ from .safe_sql import SafeSqlValidator
 
 SHOWPLAN_NAMESPACE = {"sp": "http://schemas.microsoft.com/sqlserver/2004/07/showplan"}
 _SELECT_START_PATTERN = re.compile(r"^\s*(SELECT|WITH)\b", re.IGNORECASE)
+MISSING_INDEX_RECOMMENDATION_BASIS = "showplan_missing_index_hints"
+MISSING_INDEX_ZERO_MEANING = "no_optimizer_hint"
+FILTERED_RECOMMENDATION_ZERO_MEANING = (
+    "no_uncovered_optimizer_hint_after_existing_index_filtering"
+)
+MISSING_INDEX_PROVENANCE = {
+    "source": "SHOWPLAN_XML",
+    "evidence_kind": "optimizer_missing_index_hint",
+    "recommendation_basis": MISSING_INDEX_RECOMMENDATION_BASIS,
+    "zero_missing_index_count_mean": MISSING_INDEX_ZERO_MEANING,
+    "zero_hint_means": (
+        "No MissingIndexGroup was emitted for the analyzed plan."
+    ),
+    "zero_hint_is_not_proof_no_index_can_help": True,
+}
 
 
 class QueryIndexAnalysisService:
@@ -67,6 +83,7 @@ class QueryIndexAnalysisService:
                     database_name,
                     contract.sp_executesql_sql,
                     params=contract.sp_executesql_values,
+                    input_sizes=contract.sp_executesql_input_sizes,
                 )
             else:
                 plan_xml = await self._get_estimated_plan(
@@ -76,7 +93,9 @@ class QueryIndexAnalysisService:
             missing = self._extract_missing_indexes(plan_xml)
             query_details.append({
                 "sql": validated.normalized_sql,
+                "analysis_status": "available",
                 "missing_index_count": len(missing),
+                "missing_index_provenance": dict(MISSING_INDEX_PROVENANCE),
             })
             for rec in missing:
                 rec["source_query"] = validated.normalized_sql
@@ -86,12 +105,22 @@ class QueryIndexAnalysisService:
             all_recommendations,
             existing_indexes=existing_indexes,
         )
+        raw_hint_count = len(all_recommendations)
         return {
             "database_name": database_name,
             "queries_analyzed": len(queries),
             "query_details": query_details,
             "recommendations": consolidated,
+            "raw_missing_index_hint_count": raw_hint_count,
+            "recommendation_count_after_filtering": len(consolidated),
+            "hints_removed_by_filtering_or_consolidation": max(
+                0,
+                raw_hint_count - len(consolidated),
+            ),
             "existing_indexes": [index.as_dict() for index in existing_indexes],
+            "recommendation_basis": MISSING_INDEX_RECOMMENDATION_BASIS,
+            "zero_recommendations_mean": FILTERED_RECOMMENDATION_ZERO_MEANING,
+            "missing_index_provenance": dict(MISSING_INDEX_PROVENANCE),
         }
 
     async def analyze_workload(
@@ -104,7 +133,10 @@ class QueryIndexAnalysisService:
         top_queries = await self._get_top_workload_queries(
             database_name, window_minutes, top_n
         )
-        existing_indexes = await self._get_existing_indexes(database_name)
+        existing_indexes = await self._get_existing_indexes(
+            database_name,
+            observation_window_minutes=window_minutes,
+        )
 
         all_recommendations: list[dict[str, Any]] = []
         analyzed_queries: list[dict[str, Any]] = []
@@ -145,14 +177,25 @@ class QueryIndexAnalysisService:
                 analyzed_queries.append({
                     "query_id": row.get("query_id"),
                     "sql": validated.normalized_sql[:200],
+                    "analysis_status": "available",
                     "missing_index_count": len(missing),
+                    "missing_index_provenance": dict(MISSING_INDEX_PROVENANCE),
                 })
             except Exception as exc:
                 analyzed_queries.append({
                     "query_id": row.get("query_id"),
                     "sql": sql_text[:200],
-                    "missing_index_count": 0,
+                    "analysis_status": "unavailable",
+                    "missing_index_count": None,
                     "error": sanitize_error_message(str(exc)),
+                    "missing_index_provenance": {
+                        "source": "SHOWPLAN_XML",
+                        "evidence_kind": "optimizer_missing_index_hint",
+                        "recommendation_basis": MISSING_INDEX_RECOMMENDATION_BASIS,
+                        "available": False,
+                        "reason": "plan_analysis_failed",
+                        "zero_hint_is_not_proof_no_index_can_help": True,
+                    },
                 })
 
         # Cross-reference with DMV missing indexes
@@ -166,15 +209,50 @@ class QueryIndexAnalysisService:
         for rank, rec in enumerate(consolidated, start=1):
             rec["rank"] = rank
 
+        raw_hint_count = len(all_recommendations)
+        unavailable_count = sum(
+            1
+            for query in analyzed_queries
+            if query.get("analysis_status") == "unavailable"
+        )
+        available_count = len(analyzed_queries) - unavailable_count
+        if not analyzed_queries:
+            analysis_status = "no_evidence"
+            zero_recommendations_mean = "inconclusive_without_plan_evidence"
+        elif available_count and unavailable_count:
+            analysis_status = "partial"
+            zero_recommendations_mean = (
+                "inconclusive_when_plan_analysis_is_unavailable"
+            )
+        elif unavailable_count:
+            analysis_status = "unavailable"
+            zero_recommendations_mean = (
+                "inconclusive_when_plan_analysis_is_unavailable"
+            )
+        else:
+            analysis_status = "available"
+            zero_recommendations_mean = FILTERED_RECOMMENDATION_ZERO_MEANING
         return {
             "database_name": database_name,
             "window_minutes": window_minutes,
             "queries_analyzed": len(analyzed_queries),
             "skipped_non_select": skipped_non_select,
             "analyzed_queries": analyzed_queries,
+            "analysis_status": analysis_status,
+            "queries_with_plan_evidence": available_count,
+            "queries_with_unavailable_plan_evidence": unavailable_count,
             "recommendations": consolidated,
+            "raw_missing_index_hint_count": raw_hint_count,
+            "recommendation_count_after_filtering": len(consolidated),
+            "hints_removed_by_filtering_or_consolidation": max(
+                0,
+                raw_hint_count - len(consolidated),
+            ),
             "dmv_recommendations": dmv_recommendations,
             "existing_indexes": [index.as_dict() for index in existing_indexes],
+            "recommendation_basis": MISSING_INDEX_RECOMMENDATION_BASIS,
+            "zero_recommendations_mean": zero_recommendations_mean,
+            "missing_index_provenance": dict(MISSING_INDEX_PROVENANCE),
         }
 
     async def _get_estimated_plan(
@@ -183,12 +261,15 @@ class QueryIndexAnalysisService:
         sql: str,
         *,
         params: tuple[Any, ...] = (),
+        input_sizes: Sequence[Any] | None = None,
     ) -> str:
         kwargs: dict[str, Any] = {
             "max_rows": self.executor.config.row_limit + 1,
         }
         if params:
             kwargs["statement_params"] = [None, params, None]
+            if input_sizes is not None:
+                kwargs["statement_input_sizes"] = [None, input_sizes, None]
         per_statement_results = await self.executor.execute_session(
             database_name,
             ["SET SHOWPLAN_XML ON", sql, "SET SHOWPLAN_XML OFF"],
@@ -444,8 +525,14 @@ class QueryIndexAnalysisService:
     async def _get_existing_indexes(
         self,
         database_name: str,
+        *,
+        observation_window_minutes: int | None = None,
     ) -> list[ExistingIndex]:
-        return await collect_existing_indexes(self.executor, database_name)
+        return await collect_existing_indexes(
+            self.executor,
+            database_name,
+            observation_window_minutes=observation_window_minutes,
+        )
 
     def _recommendation_signature(
         self,

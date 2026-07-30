@@ -6,6 +6,8 @@ from typing import Literal
 
 from pydantic import BaseModel
 from pydantic import ConfigDict
+from pydantic import Field
+from pydantic import field_validator
 
 
 TuningObjective = Literal[
@@ -27,6 +29,31 @@ BenchmarkPhase = Literal["screening", "finalist"]
 SelectionScope = Literal["proven", "performance_only"]
 
 
+class ParameterCaseInput(BaseModel):
+    """Typed public shape for one exact benchmark parameter case."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+    values: dict[str, Any]
+    types: dict[str, str]
+    weight: float = Field(gt=0)
+
+    @field_validator("name")
+    @classmethod
+    def reject_blank_name(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("name must not be blank")
+        return value
+
+    @field_validator("weight", mode="before")
+    @classmethod
+    def reject_boolean_weight(cls, value: Any) -> Any:
+        if isinstance(value, bool):
+            raise ValueError("weight must be a positive number")
+        return value
+
+
 class _ExtensibleOutput(BaseModel):
     """Typed stable fields plus backward-compatible tool-specific payloads."""
 
@@ -45,6 +72,9 @@ class SessionHeadline(BaseModel):
     time_limit_minutes: int | None
     executions_remaining: int | None
     candidate_slots_remaining: int | None
+    deadline_exceeded: bool | None = None
+    accepts_new_work: bool | None = None
+    accepts_finalization: bool | None = None
 
 
 class BenchmarkHeadline(BaseModel):
@@ -190,15 +220,46 @@ def _session_headline(payload: Mapping[str, Any]) -> dict[str, Any]:
         candidate_ids = session.get("candidate_ids")
         if limit is not None and isinstance(candidate_ids, (list, tuple)):
             candidate_slots_remaining = max(0, limit - len(candidate_ids))
-    return {
+    result = {
         "session_id": _optional_string(
             session.get("session_id") or payload.get("session_id")
         ),
-        "status": str(session.get("status") or payload.get("status") or "unknown"),
+        "status": str(
+            session.get("effective_status")
+            or session.get("status")
+            or payload.get("effective_status")
+            or payload.get("status")
+            or "unknown"
+        ),
         "time_limit_minutes": time_limit_minutes,
         "executions_remaining": executions_remaining,
         "candidate_slots_remaining": candidate_slots_remaining,
     }
+    optional_availability = {
+        "deadline_exceeded": _optional_bool(
+            session.get("deadline_exceeded")
+            if "deadline_exceeded" in session
+            else budget.get("deadline_exceeded")
+        ),
+        "accepts_new_work": _optional_bool(
+            session.get("accepts_new_work")
+            if "accepts_new_work" in session
+            else budget.get("accepts_new_work")
+        ),
+        "accepts_finalization": _optional_bool(
+            session.get("accepts_finalization")
+            if "accepts_finalization" in session
+            else budget.get("accepts_finalization")
+        ),
+    }
+    result.update(
+        {
+            key: value
+            for key, value in optional_availability.items()
+            if value is not None
+        }
+    )
+    return result
 
 
 def _benchmark_headline(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -304,3 +365,7 @@ def _optional_int(value: Any) -> int | None:
         if isinstance(value, (int, float)) and not isinstance(value, bool)
         else None
     )
+
+
+def _optional_bool(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None

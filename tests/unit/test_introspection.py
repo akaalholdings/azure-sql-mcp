@@ -49,3 +49,26 @@ async def test_get_dependencies_uses_supported_dependency_query() -> None:
     assert "LEFT JOIN sys.columns AS c" in depends_on_query
     assert payload["depends_on"][0]["column"] == "CustomerId"
     assert payload["depended_on_by"][0]["object"] == "usp_GetOrders"
+
+
+@pytest.mark.asyncio
+async def test_get_table_stats_aggregates_partitions_and_counts_indexes_independently() -> None:
+    executor = StubExecutor([[]])
+    service = IntrospectionService(executor)
+
+    await service.get_table_stats("appdb", schema_name="dbo")
+
+    query = executor.calls[0][1]
+    assert "WITH partition_storage AS" in query
+    assert "au.type IN (1, 3)" in query
+    assert "au.container_id = p.hobt_id" in query
+    assert "au.type = 2" in query
+    assert "au.container_id = p.partition_id" in query
+    assert "WHEN index_id IN (0, 1) THEN partition_rows" in query
+    assert "WHEN index_id IN (0, 1) THEN used_pages" in query
+    assert "WHEN index_id > 1 THEN used_pages" in query
+    assert "i.index_id > 1" in query
+    assert "i.is_hypothetical = 0" in query
+    assert "COUNT(DISTINCT i.index_id)" not in query
+    assert "SUM(p.rows)" not in query
+    assert executor.calls[0][2] == ["dbo", "dbo"]

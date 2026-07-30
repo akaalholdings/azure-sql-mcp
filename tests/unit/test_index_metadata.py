@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
 from azure_sql_mcp.index_metadata import ExistingIndex
+from azure_sql_mcp.index_metadata import collect_existing_indexes
+from azure_sql_mcp.index_metadata import EXISTING_INDEX_METADATA_SQL
 from azure_sql_mcp.index_metadata import IndexKeyColumn
 from azure_sql_mcp.index_metadata import existing_index_covers_candidate
 from azure_sql_mcp.index_metadata import normalize_index_definition
@@ -81,6 +85,24 @@ def test_parser_preserves_full_index_metadata() -> None:
     assert index.partition_compression == ((1, "PAGE"),)
     assert index.usage["user_updates"] == 3
     assert index.provenance["source"].startswith("sys.indexes")
+
+
+def test_parser_preserves_missing_usage_counters_as_unavailable() -> None:
+    [index] = parse_existing_index_rows(
+        [{**_rows()[0], "user_seeks": None, "user_scans": None, "user_lookups": None}]
+    )
+
+    assert index.usage["user_seeks"] is None
+    assert index.usage["user_scans"] is None
+    assert index.usage["user_lookups"] is None
+    assert index.is_unused is None
+
+
+def test_usage_query_preserves_null_dmv_counters() -> None:
+    assert "us.user_seeks AS user_seeks" in EXISTING_INDEX_METADATA_SQL
+    assert "us.user_scans AS user_scans" in EXISTING_INDEX_METADATA_SQL
+    assert "us.user_lookups AS user_lookups" in EXISTING_INDEX_METADATA_SQL
+    assert "COALESCE(us.user_seeks" not in EXISTING_INDEX_METADATA_SQL
 
 
 def test_coverage_requires_keys_directions_includes_filter_and_enabled_state() -> None:
@@ -210,8 +232,78 @@ def test_unused_index_is_identifiable_without_treating_disabled_as_usable() -> N
                 "user_lookups": 0,
                 "user_updates": 12,
             }
-        ]
+        ],
+        observation_window_minutes=60,
+        usage_context={
+            "availability": "available",
+            "counter_epoch_utc": "2026-07-01T00:00:00Z",
+        },
     )
 
     assert index.is_unused is True
     assert replace(index, is_disabled=True).is_unused is True
+
+
+@pytest.mark.parametrize(
+    ("counter_epoch", "usage", "expected"),
+    [
+        ("2026-07-01T00:00:00Z", {"user_seeks": 0, "user_scans": 0, "user_lookups": 0}, True),
+        ("2026-07-15T09:30:00Z", {"user_seeks": 0, "user_scans": 0, "user_lookups": 0}, None),
+        ("2026-07-15T09:30:00Z", {"user_seeks": 1, "user_scans": 0, "user_lookups": 0}, False),
+    ],
+)
+def test_is_unused_reflects_observation_coverage(
+    counter_epoch: str,
+    usage: dict[str, int],
+    expected: bool | None,
+) -> None:
+    [index] = parse_existing_index_rows(
+        [{**_rows()[0], **usage}],
+        observation_window_minutes=60,
+        usage_context={
+            "availability": "available",
+            "counter_epoch_utc": counter_epoch,
+        },
+    )
+
+    assert index.is_unused is expected
+
+
+def test_is_unused_is_unknown_when_counter_epoch_probe_fails() -> None:
+    [index] = parse_existing_index_rows(
+        [{**_rows()[0], "user_seeks": 0, "user_scans": 0, "user_lookups": 0}],
+        observation_window_minutes=60,
+        usage_context={"availability": "unavailable", "coverage": "unavailable"},
+    )
+
+    assert index.usage_context["availability"] == "unavailable"
+    assert index.is_unused is None
+
+
+@pytest.mark.asyncio
+async def test_collect_existing_indexes_degrades_engine_start_probe_failure() -> None:
+    class Executor:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def fetch_all(self, database_name: str, query: str):
+            self.calls += 1
+            if self.calls == 1:
+                return [
+                    {
+                        **_rows()[0],
+                        "user_seeks": 0,
+                        "user_scans": 0,
+                        "user_lookups": 0,
+                    }
+                ]
+            raise PermissionError("VIEW SERVER STATE denied")
+
+    [index] = await collect_existing_indexes(
+        Executor(),
+        "appdb",
+        observation_window_minutes=60,
+    )
+
+    assert index.usage_context["availability"] == "unavailable"
+    assert index.is_unused is None

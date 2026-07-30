@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import warnings
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
@@ -9,6 +10,7 @@ from unittest.mock import call
 from unittest.mock import patch
 
 import pytest
+from mssql_python import SQL_WVARCHAR
 
 from azure_sql_mcp.connection import AdminBatchOutcomeUnknownError
 from azure_sql_mcp.connection import AzureSqlExecutor
@@ -369,6 +371,76 @@ def test_profiled_execution_captures_messages_before_each_nextset(
     )
 
 
+def test_profiled_execution_applies_control_sizes_to_query_cursor_only(
+    sample_server_config,
+) -> None:
+    setup_cursor = MagicMock()
+    query_cursor = MagicMock()
+    teardown_cursor = MagicMock()
+    for cursor in (setup_cursor, query_cursor, teardown_cursor):
+        cursor.description = None
+        cursor.nextset.return_value = False
+    connection = MagicMock()
+    connection.cursor.side_effect = [setup_cursor, query_cursor, teardown_cursor]
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), MagicMock())
+    input_sizes = (SQL_WVARCHAR, SQL_WVARCHAR)
+    params = ("SELECT 1", "", 42)
+
+    executor._execute_profiled_with_connection(
+        connection,
+        "appdb",
+        "EXEC sys.sp_executesql ?, ?, ?",
+        params,
+        max_rows=None,
+        input_sizes=input_sizes,
+    )
+
+    setup_cursor.setinputsizes.assert_not_called()
+    query_cursor.setinputsizes.assert_called_once_with(input_sizes)
+    query_cursor.execute.assert_called_once_with(
+        "EXEC sys.sp_executesql ?, ?, ?",
+        params,
+    )
+    teardown_cursor.setinputsizes.assert_not_called()
+
+
+def test_short_input_size_warning_is_filtered_without_hiding_other_warnings(
+    sample_server_config,
+) -> None:
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), MagicMock())
+    cursor = MagicMock()
+    expected_warning = (
+        "Number of input sizes (2) does not match number of parameters (3). "
+        "This may lead to unexpected behavior."
+    )
+
+    def emit_expected_warning(statement, params):
+        warnings.warn(expected_warning, Warning)
+        return cursor
+
+    cursor.execute.side_effect = emit_expected_warning
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        executor._execute_statement(
+            cursor,
+            "EXEC sys.sp_executesql ?, ?, ?",
+            ("SELECT 1", "", 42),
+            input_sizes=(SQL_WVARCHAR, SQL_WVARCHAR),
+        )
+    assert captured == []
+
+    cursor.execute.side_effect = lambda statement, params: warnings.warn(
+        "unrelated warning", UserWarning
+    )
+    with pytest.warns(UserWarning, match="unrelated warning"):
+        executor._execute_statement(
+            cursor,
+            "EXEC sys.sp_executesql ?, ?, ?",
+            ("SELECT 1", "", 42),
+            input_sizes=(SQL_WVARCHAR, SQL_WVARCHAR),
+        )
+
+
 def test_profiled_execution_preserves_repeated_messages_after_buffer_reset(
     sample_server_config,
 ) -> None:
@@ -474,6 +546,44 @@ async def test_profiled_execution_failure_is_not_automatically_retried(
     execute_mock.assert_called_once()
     pool.release.assert_not_awaited()
     pool.discard.assert_awaited_once_with("appdb", connection)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method_name",
+    ("execute_session", "execute_session_exactly_once"),
+)
+async def test_session_entrypoints_propagate_statement_input_sizes(
+    sample_server_config,
+    method_name,
+) -> None:
+    connection = MagicMock()
+    pool = SimpleNamespace(
+        acquire=AsyncMock(return_value=connection),
+        release=AsyncMock(),
+        discard=AsyncMock(),
+    )
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), pool)
+    input_sizes = (SQL_WVARCHAR, SQL_WVARCHAR)
+
+    with patch.object(
+        executor,
+        "_execute_session_with_connection",
+        return_value=[],
+    ) as execute_mock:
+        result = await getattr(executor, method_name)(
+            "appdb",
+            ["SET SHOWPLAN_XML ON", "EXEC sys.sp_executesql ?, ?, ?", "SET SHOWPLAN_XML OFF"],
+            statement_params=[None, ("SELECT 1", "", 42), None],
+            statement_input_sizes=[None, input_sizes, None],
+        )
+
+    assert result == []
+    assert execute_mock.call_args.kwargs["statement_input_sizes"] == (
+        None,
+        input_sizes,
+        None,
+    )
 
 
 @pytest.mark.asyncio
@@ -634,6 +744,36 @@ def test_session_execution_binds_parameters_to_the_matching_statement(
 
     cursors[1].execute.assert_called_once_with("SELECT ?", (42,))
     cursors[2].execute.assert_called_once_with("SET SHOWPLAN_XML OFF")
+
+
+def test_session_execution_applies_control_sizes_to_matching_statement_cursor(
+    sample_server_config,
+) -> None:
+    cursors = [MagicMock() for _ in range(3)]
+    for cursor in cursors:
+        cursor.description = None
+        cursor.nextset.return_value = False
+    connection = MagicMock()
+    connection.cursor.side_effect = cursors
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), MagicMock())
+    input_sizes = (SQL_WVARCHAR, SQL_WVARCHAR)
+
+    executor._execute_session_with_connection(
+        connection,
+        "appdb",
+        ("SET SHOWPLAN_XML ON", "EXEC sys.sp_executesql ?, ?, ?", "SET SHOWPLAN_XML OFF"),
+        max_rows=10,
+        statement_params=((), ("SELECT 1", "", 42), ()),
+        statement_input_sizes=(None, input_sizes, None),
+    )
+
+    cursors[0].setinputsizes.assert_not_called()
+    cursors[1].setinputsizes.assert_called_once_with(input_sizes)
+    cursors[1].execute.assert_called_once_with(
+        "EXEC sys.sp_executesql ?, ?, ?",
+        ("SELECT 1", "", 42),
+    )
+    cursors[2].setinputsizes.assert_not_called()
 
 
 def test_coerce_value_handles_memoryview_and_bytes(sample_server_config) -> None:

@@ -6,6 +6,9 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
 from typing import Any, Iterable
 
 from .connection import AzureSqlExecutor
@@ -39,10 +42,10 @@ SELECT
     pf.name AS partition_function_name,
     p.partition_number,
     p.data_compression_desc,
-    COALESCE(us.user_seeks, 0) AS user_seeks,
-    COALESCE(us.user_scans, 0) AS user_scans,
-    COALESCE(us.user_lookups, 0) AS user_lookups,
-    COALESCE(us.user_updates, 0) AS user_updates,
+    us.user_seeks AS user_seeks,
+    us.user_scans AS user_scans,
+    us.user_lookups AS user_lookups,
+    us.user_updates AS user_updates,
     CONVERT(varchar(33), SYSUTCDATETIME(), 127) AS collected_at_utc
 FROM sys.indexes AS i
 INNER JOIN sys.tables AS t
@@ -80,6 +83,11 @@ ORDER BY
     ic.key_ordinal,
     ic.index_column_id,
     p.partition_number
+"""
+
+ENGINE_START_TIME_SQL = """
+SELECT CONVERT(varchar(33), sqlserver_start_time, 127) AS engine_start_time_utc
+FROM sys.dm_os_sys_info
 """
 
 _DIRECTION_PATTERN = re.compile(
@@ -133,7 +141,8 @@ class ExistingIndex:
     partition_scheme_name: str | None = None
     partition_function_name: str | None = None
     partition_compression: tuple[tuple[int, str], ...] = ()
-    usage: dict[str, int] = field(default_factory=dict)
+    usage: dict[str, int | None] = field(default_factory=dict)
+    usage_context: dict[str, Any] = field(default_factory=dict)
     provenance: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -190,11 +199,23 @@ class ExistingIndex:
         }
 
     @property
-    def is_unused(self) -> bool:
-        return sum(
-            int(self.usage.get(metric, 0) or 0)
+    def is_unused(self) -> bool | None:
+        read_counters = [
+            self.usage.get(metric)
             for metric in ("user_seeks", "user_scans", "user_lookups")
-        ) == 0
+        ]
+        if any(
+            value is not None and int(value) > 0
+            for value in read_counters
+        ):
+            return False
+        if any(value is None for value in read_counters):
+            return None
+        if self.usage_context.get("availability") != "available":
+            return None
+        if self.usage_context.get("coverage") != "covered":
+            return None
+        return True
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -224,6 +245,7 @@ class ExistingIndex:
                 for number, compression in self.partition_compression
             ],
             "usage": dict(self.usage),
+            "usage_context": dict(self.usage_context),
             "provenance": dict(self.provenance),
             "definition_fingerprint": self.definition_fingerprint,
             "fingerprint": self.fingerprint,
@@ -235,12 +257,42 @@ class ExistingIndex:
 async def collect_existing_indexes(
     executor: AzureSqlExecutor,
     database_name: str,
+    *,
+    observation_window_minutes: int | None = None,
 ) -> list[ExistingIndex]:
     rows = await executor.fetch_all(database_name, EXISTING_INDEX_METADATA_SQL)
-    return parse_existing_index_rows(rows)
+    usage_context = await _collect_usage_context(
+        executor,
+        database_name,
+        observation_window_minutes=observation_window_minutes,
+    )
+    return parse_existing_index_rows(
+        rows,
+        observation_window_minutes=observation_window_minutes,
+        usage_context=usage_context,
+    )
 
 
-def parse_existing_index_rows(rows: Iterable[dict[str, Any]]) -> list[ExistingIndex]:
+def parse_existing_index_rows(
+    rows: Iterable[dict[str, Any]],
+    *,
+    observation_window_minutes: int | None = None,
+    usage_context: dict[str, Any] | None = None,
+) -> list[ExistingIndex]:
+    rows = list(rows)
+    observed_at_utc = next(
+        (
+            row.get("collected_at_utc")
+            for row in rows
+            if row.get("collected_at_utc") is not None
+        ),
+        None,
+    )
+    resolved_usage_context = _resolve_usage_context(
+        usage_context or {},
+        observed_at_utc=observed_at_utc,
+        observation_window_minutes=observation_window_minutes,
+    )
     grouped: dict[tuple[str, str, int], dict[str, Any]] = {}
     for row in rows:
         index_id = _as_int(row.get("index_id"))
@@ -344,16 +396,18 @@ def parse_existing_index_rows(rows: Iterable[dict[str, Any]]) -> list[ExistingIn
                 ),
                 partition_compression=tuple(sorted(item["partitions"])),
                 usage={
-                    "user_seeks": _as_int(row.get("user_seeks")),
-                    "user_scans": _as_int(row.get("user_scans")),
-                    "user_lookups": _as_int(row.get("user_lookups")),
-                    "user_updates": _as_int(row.get("user_updates")),
+                    "user_seeks": _as_optional_int(row.get("user_seeks")),
+                    "user_scans": _as_optional_int(row.get("user_scans")),
+                    "user_lookups": _as_optional_int(row.get("user_lookups")),
+                    "user_updates": _as_optional_int(row.get("user_updates")),
                 },
+                usage_context=dict(resolved_usage_context),
                 provenance={
                     "source": "sys.indexes/sys.index_columns/sys.partitions",
                     "collected_at_utc": row.get("collected_at_utc"),
                     "constraint_source": "sys.key_constraints",
                     "data_space_source": "sys.data_spaces/sys.partition_schemes",
+                    "usage_context": dict(resolved_usage_context),
                 },
             )
         )
@@ -643,11 +697,114 @@ def index_definition_matches(
     return index.definition_fingerprint == expected
 
 
+async def _collect_usage_context(
+    executor: AzureSqlExecutor,
+    database_name: str,
+    *,
+    observation_window_minutes: int | None,
+) -> dict[str, Any]:
+    context: dict[str, Any] = {
+        "source": "sys.dm_db_index_usage_stats",
+        "counter_epoch_source": "sys.dm_os_sys_info.sqlserver_start_time",
+        "availability": "unavailable",
+        "coverage": "unavailable",
+    }
+    if observation_window_minutes is not None:
+        context["requested_window_minutes"] = observation_window_minutes
+    try:
+        rows = await executor.fetch_all(database_name, ENGINE_START_TIME_SQL)
+    except Exception:
+        return context
+    if not rows:
+        return context
+    engine_start_time = rows[0].get("engine_start_time_utc")
+    if engine_start_time is None:
+        return context
+    context.update(
+        {
+            "availability": "available",
+            "counter_epoch_utc": engine_start_time,
+            "engine_start_time_utc": engine_start_time,
+        }
+    )
+    return context
+
+
+def _resolve_usage_context(
+    usage_context: dict[str, Any],
+    *,
+    observed_at_utc: Any,
+    observation_window_minutes: int | None,
+) -> dict[str, Any]:
+    context = dict(usage_context)
+    requested_window = (
+        observation_window_minutes
+        if observation_window_minutes is not None
+        else context.get("requested_window_minutes")
+    )
+    if requested_window is not None:
+        context["requested_window_minutes"] = requested_window
+    if context.get("availability") != "available":
+        context.setdefault("coverage", "unavailable")
+        return context
+    if context.get("coverage") in {"covered", "partial"}:
+        return context
+
+    engine_start = _parse_utc_timestamp(
+        context.get("counter_epoch_utc") or context.get("engine_start_time_utc")
+    )
+    observed_at = _parse_utc_timestamp(observed_at_utc)
+    if engine_start is None or observed_at is None:
+        context["coverage"] = "unknown"
+        return context
+    if requested_window is None:
+        context["coverage"] = "covered"
+        return context
+    try:
+        requested_minutes = int(requested_window)
+    except (TypeError, ValueError):
+        context["coverage"] = "unknown"
+        return context
+    observation_start = observed_at - timedelta(minutes=max(requested_minutes, 0))
+    context["coverage"] = (
+        "covered" if engine_start <= observation_start else "partial"
+    )
+    context["observed_at_utc"] = observed_at_utc
+    return context
+
+
+def _parse_utc_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        timestamp = value
+    elif value is None:
+        return None
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            timestamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if timestamp.tzinfo is None:
+        return timestamp.replace(tzinfo=timezone.utc)
+    return timestamp.astimezone(timezone.utc)
+
+
 def _as_int(value: Any) -> int:
     try:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _as_optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _as_bool(value: Any) -> bool:
@@ -657,6 +814,7 @@ def _as_bool(value: Any) -> bool:
 
 
 __all__ = [
+    "ENGINE_START_TIME_SQL",
     "EXISTING_INDEX_METADATA_SQL",
     "ExistingIndex",
     "IndexKeyColumn",

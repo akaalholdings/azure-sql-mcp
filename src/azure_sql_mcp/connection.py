@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import sys
 import time
+import warnings
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -198,6 +200,7 @@ class AzureSqlExecutor:
         *,
         max_rows: int | None = None,
         statement_params: Sequence[Sequence[Any] | None] | None = None,
+        statement_input_sizes: Sequence[Sequence[Any] | None] | None = None,
     ) -> list[list[QueryResult]]:
         """Execute several statements on the SAME pooled connection.
 
@@ -208,12 +211,21 @@ class AzureSqlExecutor:
         validated_database = self.config.validate_database_name(database_name)
         if statement_params is not None and len(statement_params) != len(statements):
             raise ValueError("statement_params must match the statement count.")
+        if statement_input_sizes is not None and len(statement_input_sizes) != len(statements):
+            raise ValueError("statement_input_sizes must match the statement count.")
         normalized_params = (
             tuple(tuple(params or ()) for params in statement_params)
             if statement_params is not None
             else None
         )
-
+        normalized_input_sizes = (
+            tuple(
+                tuple(input_sizes) if input_sizes is not None else None
+                for input_sizes in statement_input_sizes
+            )
+            if statement_input_sizes is not None
+            else None
+        )
         async def _attempt() -> list[list[QueryResult]]:
             connection = await self.pool.acquire(validated_database)
             succeeded = False
@@ -227,7 +239,8 @@ class AzureSqlExecutor:
                         validated_database,
                         tuple(statements),
                         max_rows,
-                        normalized_params,
+                        statement_params=normalized_params,
+                        statement_input_sizes=normalized_input_sizes,
                     )
                 )
                 result = await asyncio.shield(execution_task)
@@ -260,6 +273,7 @@ class AzureSqlExecutor:
         *,
         max_rows: int | None = None,
         statement_params: Sequence[Sequence[Any] | None] | None = None,
+        statement_input_sizes: Sequence[Sequence[Any] | None] | None = None,
         before_statement_dispatch: Callable[[int], Any] | None = None,
     ) -> list[list[QueryResult]]:
         """Execute one same-connection sequence without automatic retry.
@@ -274,9 +288,19 @@ class AzureSqlExecutor:
         validated_database = self.config.validate_database_name(database_name)
         if statement_params is not None and len(statement_params) != len(statements):
             raise ValueError("statement_params must match the statement count.")
+        if statement_input_sizes is not None and len(statement_input_sizes) != len(statements):
+            raise ValueError("statement_input_sizes must match the statement count.")
         normalized_params = (
             tuple(tuple(params or ()) for params in statement_params)
             if statement_params is not None
+            else None
+        )
+        normalized_input_sizes = (
+            tuple(
+                tuple(input_sizes) if input_sizes is not None else None
+                for input_sizes in statement_input_sizes
+            )
+            if statement_input_sizes is not None
             else None
         )
         connection = await self.pool.acquire(validated_database)
@@ -291,8 +315,9 @@ class AzureSqlExecutor:
                     validated_database,
                     tuple(statements),
                     max_rows,
-                    normalized_params,
-                    before_statement_dispatch,
+                    statement_params=normalized_params,
+                    before_statement_dispatch=before_statement_dispatch,
+                    statement_input_sizes=normalized_input_sizes,
                 )
             )
             result = await asyncio.shield(execution_task)
@@ -372,6 +397,7 @@ class AzureSqlExecutor:
         params: Sequence[Any] | None = None,
         *,
         max_rows: int | None = None,
+        input_sizes: Sequence[Any] | None = None,
     ) -> ProfiledExecution:
         """Execute a measured user query exactly once on one connection.
 
@@ -382,6 +408,11 @@ class AzureSqlExecutor:
 
         validated_database = self.config.validate_database_name(database_name)
         connection = await self.pool.acquire(validated_database)
+        execution_kwargs = (
+            {"input_sizes": tuple(input_sizes)}
+            if input_sizes is not None
+            else {}
+        )
         succeeded = False
         deferred_cleanup = False
         execution_task: asyncio.Task[ProfiledExecution] | None = None
@@ -394,6 +425,7 @@ class AzureSqlExecutor:
                     query,
                     tuple(params or ()),
                     max_rows,
+                    **execution_kwargs,
                 )
             )
             result = await asyncio.shield(execution_task)
@@ -481,6 +513,7 @@ class AzureSqlExecutor:
         max_rows: int | None,
         statement_params: Sequence[Sequence[Any]] | None = None,
         before_statement_dispatch: Callable[[int], Any] | None = None,
+        statement_input_sizes: Sequence[Sequence[Any] | None] | None = None,
     ) -> list[list[QueryResult]]:
         logger.debug(
             "Executing session",
@@ -498,15 +531,22 @@ class AzureSqlExecutor:
                 if index == 0:
                     self._set_lock_timeout(cursor)
                 params = statement_params[index] if statement_params is not None else ()
+                input_sizes = (
+                    statement_input_sizes[index]
+                    if statement_input_sizes is not None
+                    else None
+                )
                 if before_statement_dispatch is not None:
                     try:
                         before_statement_dispatch(index)
                     except Exception as exc:
                         raise StatementDispatchPrevented(index, exc) from exc
-                if params:
-                    cursor.execute(statement, params)
-                else:
-                    cursor.execute(statement)
+                self._execute_statement(
+                    cursor,
+                    statement,
+                    params if params else None,
+                    input_sizes=input_sizes,
+                )
                 per_statement_results.append(
                     self._consume_batches(cursor, max_rows=max_rows, stop_on_cap=False)
                 )
@@ -554,6 +594,7 @@ class AzureSqlExecutor:
         query: str,
         params: Sequence[Any],
         max_rows: int | None,
+        input_sizes: Sequence[Any] | None = None,
     ) -> ProfiledExecution:
         logger.debug(
             "Executing one profiled query sample",
@@ -574,7 +615,12 @@ class AzureSqlExecutor:
         try:
             self._configure_cursor(query_cursor)
             started = time.perf_counter()
-            query_cursor.execute(query, params)
+            self._execute_statement(
+                query_cursor,
+                query,
+                params,
+                input_sizes=input_sizes,
+            )
             statistics_io_messages: list[Any] = []
             result_sets = self._consume_batches(
                 query_cursor,
@@ -612,6 +658,43 @@ class AzureSqlExecutor:
     def _configure_cursor(self, cursor) -> None:
         with contextlib.suppress(Exception):
             cursor.timeout = self.config.query_timeout_seconds
+
+    @staticmethod
+    def _execute_statement(
+        cursor,
+        statement: str,
+        params: Sequence[Any] | None = None,
+        *,
+        input_sizes: Sequence[Any] | None = None,
+    ) -> Any:
+        """Execute one statement, optionally applying driver input sizes.
+
+        mssql-python permits a short ``setinputsizes`` list, but emits one
+        predictable warning because the remaining parameters are inferred.
+        Suppress only that warning and only around this matching execute.
+        """
+
+        if input_sizes is None:
+            if params is None:
+                return cursor.execute(statement)
+            return cursor.execute(statement, params)
+
+        bound_params = () if params is None else params
+        cursor.setinputsizes(input_sizes)
+        if len(input_sizes) < len(bound_params):
+            warning_message = (
+                f"Number of input sizes ({len(input_sizes)}) does not match "
+                f"number of parameters ({len(bound_params)}). "
+                "This may lead to unexpected behavior."
+            )
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=f"^{re.escape(warning_message)}$",
+                    category=Warning,
+                )
+                return cursor.execute(statement, bound_params)
+        return cursor.execute(statement, bound_params)
 
     def _set_lock_timeout(self, cursor) -> None:
         lock_timeout_ms = max(1, int(self.config.query_timeout_seconds)) * 1000

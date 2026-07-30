@@ -76,19 +76,22 @@ def _prepare_schema(app: AzureSqlMcpApplication, database_name: str) -> None:
             f"CREATE TABLE [{TEST_SCHEMA_NAME}].[Orders] ("
             "[OrderId] INT NOT NULL PRIMARY KEY, "
             "[CustomerId] INT NOT NULL, "
+            "[ExternalCode] VARCHAR(20) NOT NULL, "
             "[TotalAmount] DECIMAL(10, 2) NOT NULL, "
             "[CreatedAt] DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(), "
             f"CONSTRAINT [FK_{TEST_SCHEMA_NAME}_Orders_Customers] FOREIGN KEY ([CustomerId]) "
             f"REFERENCES [{TEST_SCHEMA_NAME}].[Customers]([CustomerId]))"
         ),
         f"CREATE INDEX [IX_{TEST_SCHEMA_NAME}_Orders_CustomerId] ON [{TEST_SCHEMA_NAME}].[Orders]([CustomerId])",
+        f"CREATE INDEX [IX_{TEST_SCHEMA_NAME}_Orders_ExternalCode] ON [{TEST_SCHEMA_NAME}].[Orders]([ExternalCode])",
         (
             f"INSERT INTO [{TEST_SCHEMA_NAME}].[Customers] ([CustomerId], [CustomerName]) "
             "VALUES (1, N'Alice'), (2, N'Bob')"
         ),
         (
-            f"INSERT INTO [{TEST_SCHEMA_NAME}].[Orders] ([OrderId], [CustomerId], [TotalAmount]) "
-            "VALUES (100, 1, 25.50), (101, 2, 40.00)"
+            f"INSERT INTO [{TEST_SCHEMA_NAME}].[Orders] "
+            "([OrderId], [CustomerId], [ExternalCode], [TotalAmount]) "
+            "VALUES (100, 1, 'A100', 25.50), (101, 2, 'B200', 40.00)"
         ),
         (
             f"CREATE VIEW [{TEST_SCHEMA_NAME}].[vw_OrderSummary] AS "

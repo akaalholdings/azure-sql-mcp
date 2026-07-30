@@ -217,6 +217,7 @@ async def test_parameter_runtime_buckets_preserve_compiled_values_and_provenance
     assert result["distinct_compiled_parameter_sets"] == [
         [{"name": "@CustomerId", "compiled_value": "(1)"}]
     ]
+    assert result["distinct_compiled_parameter_set_count"] == 1
 
 
 @pytest.mark.asyncio

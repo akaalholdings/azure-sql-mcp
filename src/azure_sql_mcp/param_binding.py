@@ -12,9 +12,16 @@ from typing import Any
 from typing import Mapping
 from uuid import UUID
 
+from mssql_python.constants import ConstantsDDBC
+
 from .connection import AzureSqlExecutor
 from .query_text import strip_query_store_parameter_declarations
 from .safe_sql import strip_literals_and_comments
+
+SP_EXECUTESQL_CONTROL_INPUT_SIZES = (
+    (int(ConstantsDDBC.SQL_WVARCHAR.value), 0, 0),
+    (int(ConstantsDDBC.SQL_WVARCHAR.value), 0, 0),
+)
 
 logger = logging.getLogger(__name__)
 
@@ -428,6 +435,18 @@ class ParameterExecutionContract:
             self.parameter_definition,
             *(parameter.value for parameter in self.parameters),
         )
+
+    @property
+    def sp_executesql_input_sizes(
+        self,
+    ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+        """Bind only ``sp_executesql``'s Unicode control arguments.
+
+        The user parameters intentionally remain absent from this list so
+        mssql-python can infer their native types from their values.
+        """
+
+        return SP_EXECUTESQL_CONTROL_INPUT_SIZES
 
     def to_dict(self) -> dict[str, Any]:
         return {

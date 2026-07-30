@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -17,6 +18,7 @@ from azure_sql_mcp.connection import StatementDispatchPrevented
 from azure_sql_mcp.database_policy import DatabasePolicySet
 from azure_sql_mcp.equivalence_contract import analyze_equivalence_preflight
 from azure_sql_mcp.param_binding import ParameterExecutionContract
+from azure_sql_mcp.param_binding import SP_EXECUTESQL_CONTROL_INPUT_SIZES
 from azure_sql_mcp.param_binding import SqlParameterType
 from azure_sql_mcp.param_binding import TypedParameter
 from azure_sql_mcp.performance_contracts import EvidenceEnvelopeV1
@@ -30,11 +32,14 @@ from azure_sql_mcp.performance_workflows import compare_result_collections
 from azure_sql_mcp.performance_workflows import compare_result_sets
 from azure_sql_mcp.performance_workflows import extract_profile_metrics
 from azure_sql_mcp.performance_workflows import profile_result_fingerprint
+from azure_sql_mcp.performance_workflows import parameter_case_fingerprint
+from azure_sql_mcp.performance_workflows import parameter_case_receipt
 from azure_sql_mcp.plans import ProfiledPlanResult
 from azure_sql_mcp.query_identity import legacy_database_fingerprint
 from azure_sql_mcp.query_identity import legacy_query_fingerprint
 from azure_sql_mcp.safe_sql import SafeSqlValidator
 from azure_sql_mcp.tuning_sessions import InvalidTransitionError
+from azure_sql_mcp.tuning_sessions import TuningBudgetExceeded
 from azure_sql_mcp.tuning_sessions import TuningSessionStateMachine
 
 
@@ -190,6 +195,7 @@ class SnapshotExecutor:
         self.candidate_type_signatures = candidate_type_signatures
         self.sessions: list[list[str]] = []
         self.session_parameters: list[Any] = []
+        self.session_input_sizes: list[Any] = []
         self.candidate_dispatches = 0
         self.baseline_completed = False
 
@@ -200,10 +206,12 @@ class SnapshotExecutor:
         *,
         max_rows: int | None = None,
         statement_params=None,
+        statement_input_sizes=None,
         before_statement_dispatch=None,
     ) -> list[list[QueryResult]]:
         self.sessions.append(statements)
         self.session_parameters.append(statement_params)
+        self.session_input_sizes.append(statement_input_sizes)
         assert max_rows is not None
         assert statement_params is not None
         results = [
@@ -252,6 +260,7 @@ class DispatchFailureExecutor(SnapshotExecutor):
         *,
         max_rows: int | None = None,
         statement_params=None,
+        statement_input_sizes=None,
         before_statement_dispatch=None,
     ) -> list[list[QueryResult]]:
         assert max_rows is not None
@@ -325,6 +334,7 @@ def _service(
     binder=None,
     allow_legacy_state: bool = False,
     equivalence_analyzer=None,
+    clock=None,
 ) -> tuple[PerformanceWorkflowService, PerformanceStore, RoutedPlans, SnapshotExecutor]:
     store = PerformanceStore(db_path=":memory:")
     actual_plans = plans or RoutedPlans()
@@ -334,7 +344,7 @@ def _service(
         plans=actual_plans,  # type: ignore[arg-type]
         validator=SafeSqlValidator(),
         store=store,
-        sessions=TuningSessionStateMachine(store),
+        sessions=TuningSessionStateMachine(store, clock=clock),
         database_policy=_policy(),
         row_limit=50,
         parameter_binder=binder,
@@ -382,6 +392,125 @@ def test_start_session_accepts_policy_authorized_multi_hour_budget() -> None:
     store.close()
 
 
+def test_expired_session_view_hides_actionable_budget_but_keeps_lifecycle_state() -> None:
+    current = [datetime(2026, 1, 1, tzinfo=timezone.utc)]
+
+    def clock() -> datetime:
+        return current[0]
+
+    service, store, _plans, _executor = _service(clock=clock)
+    try:
+        session_id, candidate_id = _start(service)
+        service.sessions.start_screening(session_id)
+        current[0] += timedelta(seconds=20 * 60 + 1)
+
+        view = service.get_session(session_id)
+        assert view["session"]["status"] == "screening"
+        assert view["session"]["effective_status"] == "expired"
+        assert view["session"]["deadline_exceeded"] is True
+        assert view["session"]["accepts_new_work"] is False
+        assert view["session"]["accepts_finalization"] is True
+        assert view["session"]["available"] is False
+        assert view["budget"]["actionable"] is False
+        assert view["budget"]["executions_remaining"] == 0
+        assert view["budget"]["raw_executions_remaining"] == 80
+
+        with pytest.raises(TuningBudgetExceeded):
+            service.sessions.ensure_dispatch_allowed(session_id)
+        with pytest.raises(TuningBudgetExceeded):
+            service.add_candidate(session_id, "SELECT id FROM dbo.Other", strategy="join")
+
+        service.sessions.record_candidate_result(
+            session_id,
+            candidate_id,
+            state="inconclusive",
+            failure_code="late_timeout",
+        )
+        finalized = service.finalize_session(
+            session_id,
+            selected_candidate_id=None,
+            stopping_reason="late terminal result recorded",
+        )
+        assert finalized["session"]["status"] == "completed"
+        assert finalized["session"]["effective_status"] == "completed"
+        assert finalized["session"]["availability_reason"] is None
+        assert store.get_session(session_id).status == "completed"
+    finally:
+        store.close()
+
+
+def test_exhausted_session_budget_reports_no_new_work() -> None:
+    service, store, _plans, _executor = _service()
+    try:
+        case = service.start_case("appdb", "SELECT id FROM dbo.Items")
+        session = service.start_session(
+            case.case_id,
+            "appdb",
+            max_candidates=1,
+            execution_limit=1,
+        )
+        candidate = service.add_candidate(
+            session["session_id"],
+            "SELECT id FROM dbo.Items AS candidate",
+            strategy="predicate",
+        )
+        store.reserve_execution_attempts(
+            session["session_id"],
+            candidate["candidate_id"],
+            1,
+            "b" * 64,
+            owner_reference="budget-exhaustion-test",
+        )
+
+        view = service.get_session(session["session_id"])
+
+        assert view["budget"]["candidate_slots_remaining"] == 0
+        assert view["budget"]["executions_remaining"] == 0
+        assert view["budget"]["accepts_candidate_creation"] is False
+        assert view["budget"]["accepts_execution"] is False
+        assert view["budget"]["accepts_new_work"] is False
+        assert view["session"]["accepts_new_work"] is False
+        assert view["session"]["availability_reason"] == "budget_exhausted"
+    finally:
+        store.close()
+
+
+def test_full_session_with_only_terminal_candidates_reports_no_actionable_work() -> None:
+    service, store, _plans, _executor = _service()
+    try:
+        case = service.start_case("appdb", "SELECT id FROM dbo.Items")
+        session = service.start_session(
+            case.case_id,
+            "appdb",
+            max_candidates=1,
+            execution_limit=80,
+        )
+        candidate = service.add_candidate(
+            session["session_id"],
+            "SELECT id FROM dbo.Items AS candidate",
+            strategy="predicate",
+        )
+        service.sessions.start_screening(session["session_id"])
+        service.sessions.record_candidate_result(
+            session["session_id"],
+            candidate["candidate_id"],
+            state="inconclusive",
+            failure_code="test_terminal",
+        )
+
+        view = service.get_session(session["session_id"])
+
+        assert view["budget"]["candidate_slots_remaining"] == 0
+        assert view["budget"]["executions_remaining"] == 80
+        assert view["budget"]["accepts_candidate_creation"] is False
+        assert view["budget"]["accepts_execution"] is False
+        assert view["budget"]["accepts_new_work"] is False
+        assert view["session"]["accepts_new_work"] is False
+        assert view["session"]["availability_reason"] == "no_actionable_candidate"
+    finally:
+        store.close()
+
+
 def test_start_session_rejects_budget_above_policy_without_fallback() -> None:
     service, store, _plans, _executor = _service()
     service.database_policy = _deep_policy()
@@ -405,6 +534,233 @@ def test_start_session_rejects_budget_above_policy_without_fallback() -> None:
     assert stored_sessions is not None
     assert stored_sessions["session_count"] == 0
     store.close()
+
+
+def test_query_store_identity_is_explicit_and_part_of_case_idempotency() -> None:
+    service, store, _plans, _executor = _service()
+    try:
+        first = service.start_case(
+            "appdb",
+            "SELECT id FROM dbo.Items",
+            query_store_query_id=42,
+            idempotency_key="query-store-case",
+        )
+        replay = service.start_case(
+            "appdb",
+            "SELECT id FROM dbo.Items",
+            query_store_query_id=42,
+            idempotency_key="query-store-case",
+        )
+
+        assert first.query_store_query_id == 42
+        assert replay == first
+        assert '"query_store_query_id":42' in first.to_json()
+        with pytest.raises(IdempotencyConflictError, match="different request"):
+            service.start_case(
+                "appdb",
+                "SELECT id FROM dbo.Items",
+                query_store_query_id=43,
+                idempotency_key="query-store-case",
+            )
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_query_store_collection_passes_only_stored_identity_and_replays() -> None:
+    service, store, _plans, _executor = _service()
+    calls: list[int] = []
+
+    async def collect_by_query_id(query_store_query_id: int) -> dict[str, Any]:
+        calls.append(query_store_query_id)
+        return {
+            "available": True,
+            "query_id": query_store_query_id,
+            "distinct_compiled_parameter_set_count": 1,
+            "distinct_compiled_parameter_sets": [
+                [{"name": "@P1", "compiled_value": "(private-compiled-value)"}]
+            ],
+            "buckets": [
+                {
+                    "compiled_parameters": [
+                        {
+                            "name": "@P1",
+                            "data_type": "int",
+                            "compiled_value": "(private-compiled-value)",
+                            "runtime_value": "(private-runtime-value)",
+                        }
+                    ]
+                }
+            ],
+        }
+
+    case = service.start_case(
+        "appdb",
+        "SELECT id FROM dbo.Items",
+        query_store_query_id=42,
+    )
+    try:
+        first = await service.collect_case_evidence(
+            case.case_id,
+            "appdb",
+            "SELECT id FROM dbo.Items",
+            {"query_store_history": collect_by_query_id},
+            window_minutes=15,
+            query_store_query_id=42,
+            idempotency_key="query-store-evidence",
+        )
+        replay = await service.collect_case_evidence(
+            case.case_id,
+            "appdb",
+            "SELECT id FROM dbo.Items",
+            {"query_store_history": collect_by_query_id},
+            window_minutes=15,
+            query_store_query_id=42,
+            idempotency_key="query-store-evidence",
+        )
+
+        assert calls == [42]
+        assert first["evidence"]["metadata"]["query_store_query_id"] == 42
+        query_store_data = first["sections"]["query_store_history"]["data"]
+        assert query_store_data["distinct_compiled_parameter_set_count"] == 1
+        assert "distinct_compiled_parameter_sets" not in query_store_data
+        assert query_store_data["buckets"][0]["compiled_parameters"][0] == {
+            "name": "@P1",
+            "data_type": "int",
+        }
+        assert replay["recovered_from_durable_evidence"] is True
+        with pytest.raises(ValueError, match="conflicts"):
+            await service.collect_case_evidence(
+                case.case_id,
+                "appdb",
+                "SELECT id FROM dbo.Items",
+                {"query_store_history": collect_by_query_id},
+                window_minutes=15,
+                query_store_query_id=43,
+                idempotency_key="query-store-evidence-other",
+            )
+    finally:
+        store.close()
+
+
+def test_parameter_fingerprint_v1_and_value_free_receipt_are_compatible() -> None:
+    parameter_case = {
+        "name": "common",
+        "values": {"p": 42},
+        "types": {"p": "int"},
+        "weight": 1.0,
+    }
+
+    assert parameter_case_fingerprint(parameter_case) == (
+        "1b69372360307f1e5a4e4f08c9c09ada986f22994bd476ec0673b590dd46989b"
+    )
+    receipt = parameter_case_receipt(parameter_case)
+    assert receipt["name"] == "common"
+    assert receipt["value_parameter_names"] == ["p"]
+    assert receipt["type_parameter_names"] == ["p"]
+    assert receipt["parameter_types"] == {"p": "int"}
+    assert receipt["weight"] == 1.0
+    assert receipt["template"] == {
+        "name": "common",
+        "values": {"p": "<caller-retained value; not persisted>"},
+        "types": {"p": "int"},
+        "weight": 1.0,
+    }
+    assert receipt["fingerprint_v1"] == parameter_case_fingerprint(parameter_case)
+    assert receipt["values_persisted"] is False
+    assert receipt["matching_rules"]["parameter_name_spelling"] == "exact"
+    assert receipt["matching_rules"]["sql_type_spelling"] == "exact"
+    assert "42" not in json.dumps(receipt, sort_keys=True)
+
+
+def test_case_returns_reusable_value_free_parameter_contract() -> None:
+    service, store, _plans, _executor = _service()
+    try:
+        case = service.start_case(
+            "appdb",
+            "SELECT id FROM dbo.Items WHERE id = @P1",
+            parameter_cases=[
+                {
+                    "name": "common",
+                    "values": {"P1": 42},
+                    "types": {"P1": "int"},
+                    "weight": 1.0,
+                }
+            ],
+        )
+
+        payload = service.get_case(case.case_id)
+        metadata = payload["case"]["metadata"]
+        assert metadata["canonical_parameter_case_template"]["values"] == {
+            "<exact parameter name>": "<caller-retained value>"
+        }
+        assert metadata["parameter_case_templates"][0]["types"] == {
+            "P1": "int"
+        }
+        assert metadata["parameter_case_receipts"][0]["fingerprint_v1"] == (
+            case.parameter_case_fingerprints[0]
+        )
+        assert metadata["parameter_case_receipts"][0]["values_persisted"] is False
+        serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        assert '"values":{"P1":42}' not in serialized
+    finally:
+        store.close()
+
+
+def test_parameter_case_mismatch_explains_missing_typed_input() -> None:
+    service, store, _plans, _executor = _service()
+    try:
+        with pytest.raises(ValueError, match="missing SQL types for @p"):
+            service.start_case(
+                "appdb",
+                "SELECT id FROM dbo.Items WHERE id = @p",
+                parameter_cases=[{"name": "common", "values": {"p": 42}}],
+            )
+    finally:
+        store.close()
+
+
+def test_parameter_case_mismatch_explains_value_change_without_persisting_values() -> None:
+    service, store, _plans, _executor = _service()
+    parameter_case = {
+        "name": "common",
+        "values": {"p": 42},
+        "types": {"p": "int"},
+    }
+    baseline = "SELECT id FROM dbo.Items WHERE id = @p"
+    candidate = "SELECT id FROM dbo.Items AS candidate WHERE id = @p"
+    case = service.start_case(
+        "appdb",
+        baseline,
+        parameter_cases=[parameter_case],
+    )
+    session = service.start_session(case.case_id, "appdb")
+    tuning_candidate = service.add_candidate(
+        session["session_id"],
+        candidate,
+        strategy="predicate",
+    )
+    changed_case = {**parameter_case, "values": {"p": 43}}
+    try:
+        with pytest.raises(
+            ValueError,
+            match=r"index 0.*received .* expected .*values are not persisted",
+        ):
+            asyncio.run(
+                service.benchmark_candidate(
+                    session["session_id"],
+                    tuning_candidate["candidate_id"],
+                    "appdb",
+                    baseline,
+                    candidate,
+                    parameter_cases=[changed_case],
+                )
+            )
+        serialized = json.dumps(case.to_dict(), sort_keys=True)
+        assert '"p": 42' not in serialized
+        assert '"p": 43' not in serialized
+    finally:
+        store.close()
 
 
 def test_get_session_reconciles_unattached_candidate_evidence_read_only() -> None:
@@ -1085,6 +1441,60 @@ async def test_candidate_failure_is_inconclusive_and_session_continues() -> None
     )
 
     assert replay["evidence_id"] == evidence.evidence_id
+    assert replay["recovered_from_durable_evidence"] is True
+    assert plans.profile_query.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_known_failure_detail_replays_without_sql_or_sensitive_data() -> None:
+    service, store, plans, _executor = _service()
+    session_id, candidate_id = _start(service)
+    plans.profile_query = AsyncMock(  # type: ignore[method-assign]
+        side_effect=Exception(
+            "[42000] [Microsoft][ODBC Driver 18 for SQL Server][SQL Server]"
+            "Procedure expects parameter '@statement' of type "
+            "'ntext/nchar/nvarchar'. (214)",
+            "SELECT SecretValue FROM dbo.PrivateTable "
+            "where token='do-not-return'",
+        )
+    )
+    baseline = "SELECT id FROM dbo.Items"
+    candidate = "SELECT id FROM dbo.Items AS candidate"
+
+    result = await service.benchmark_candidate(
+        session_id,
+        candidate_id,
+        "appdb",
+        baseline,
+        candidate,
+        runs_override=3,
+        idempotency_key="known-failure-detail",
+    )
+
+    evidence = store.get_evidence(result["evidence_id"])
+    diagnostic = result["failure_diagnostic"]
+    assert diagnostic["diagnostic_code"] == (
+        "sp_executesql_unicode_control_argument"
+    )
+    assert diagnostic["sqlstate"] == "42000"
+    assert diagnostic["native_error_code"] == 214
+    assert evidence.metadata["failure_diagnostic"] == diagnostic
+    serialized = evidence.to_json()
+    assert "SELECT SecretValue" not in serialized
+    assert "PrivateTable" not in serialized
+    assert "do-not-return" not in serialized
+
+    replay = await service.benchmark_candidate(
+        session_id,
+        candidate_id,
+        "appdb",
+        baseline,
+        candidate,
+        runs_override=3,
+        idempotency_key="known-failure-detail",
+    )
+    assert replay["failure_diagnostic"] == diagnostic
+    assert replay["evidence_id"] == result["evidence_id"]
     assert replay["recovered_from_durable_evidence"] is True
     assert plans.profile_query.await_count == 1
 
@@ -2228,6 +2638,9 @@ async def test_parameterized_result_comparison_uses_one_typed_case() -> None:
     params = executor.session_parameters[-1]
     assert params[2][1] == "@p int"
     assert params[3][1] == "@p int"
+    input_sizes = executor.session_input_sizes[-1]
+    assert input_sizes[2] == SP_EXECUTESQL_CONTROL_INPUT_SIZES
+    assert input_sizes[3] == SP_EXECUTESQL_CONTROL_INPUT_SIZES
 
 
 @pytest.mark.asyncio

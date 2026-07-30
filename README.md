@@ -219,13 +219,19 @@ Performance state does not persist raw query SQL by default. Secret-like metadat
 ## Read-only triage workflow
 
 1. `check_equivalence_preflight` with the affected SELECT and database.
-2. `start_performance_case` with the affected SELECT and up to four named parameter cases.
+2. `start_performance_case` with the affected SELECT, up to four typed named
+   parameter cases, and an exact `query_store_query_id` when one is known.
 3. `collect_performance_evidence` with `execute_query=false` for broad read-only evidence.
 4. Inspect the result status: `healthy`, `actionable`, `partial`, or `inconclusive`.
 5. Use `get_performance_case` to retrieve redacted evidence and event history.
 6. Hand the same case id to the optimizer or the Query Store review process.
 
 Every diagnostic section carries collection window, availability, truncation, units, provenance, and stable query identity. Missing or truncated required evidence cannot produce `healthy`.
+
+Parameter-case values are fingerprinted but not persisted. Case responses
+return value-free receipts/templates and exact fingerprint-v1 matching rules.
+Session responses derive `deadline_exceeded`, `accepts_new_work`, and
+`accepts_finalization` without rewriting the durable lifecycle state.
 
 `collect_performance_evidence` focuses on Azure SQL resource history, Query Store state/history, waits, blocking/open transactions, statistics, parameter sensitivity, and regressions. `analyze_db_health` remains available for operational checks such as connections, constraints, replication, identity, Query Store configuration, storage, and statistics; it no longer grades PLE, buffer-cache ratio, or fragmentation as query health.
 

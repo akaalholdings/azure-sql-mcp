@@ -209,6 +209,15 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
     assert tools["search_objects"].annotations.idempotentHint is True
     assert tools["get_dependencies"].annotations.openWorldHint is True
     assert tools["execute_sql"].annotations.idempotentHint is False
+    assert "statically validated, row-capped read-only SQL" in (
+        tools["execute_sql"].description
+    )
+    assert "per-query missing_index_count of zero" in (
+        tools["analyze_query_indexes"].description
+    )
+    assert "existing index already covers an emitted hint" in (
+        tools["analyze_query_indexes"].description
+    )
     assert tools["analyze_db_health"].annotations.idempotentHint is True
     assert tools["get_database_configuration"].annotations.readOnlyHint is True
     assert tools["get_storage_diagnostics"].annotations.readOnlyHint is True
@@ -467,6 +476,35 @@ async def test_runtime_status_is_db_free_stable_and_sanitized(
     }
     assert first["strict_argument_models"] is True
     assert first["mcp_tool_errors"] is True
+    assert first["timeouts"] == {
+        "query_seconds": app.config.query_timeout_seconds,
+        "default_tool_seconds": app.config.tool_timeout_seconds,
+        "evidence_collection_stage_seconds": (
+            app.performance_workflows.collector_timeout_seconds
+        ),
+        "evidence_profile_stage_seconds": app.config.query_timeout_seconds,
+        "evidence_workflow_seconds": max(
+            app.config.tool_timeout_seconds,
+            app.performance_workflows.collector_timeout_seconds
+            + app.config.query_timeout_seconds
+            + 60,
+        ),
+        "session_workflow_floor_seconds": max(
+            app.config.tool_timeout_seconds,
+            21 * 60,
+        ),
+        "session_workflow_seconds": app._timeout_for_tool(
+            "benchmark_tuning_candidate",
+            app.config.default_database,
+        ),
+        "session_workflow_max_benchmark_executions": (
+            app.database_policy.policy_for(
+                app.config.default_database
+            ).max_benchmark_executions
+        ),
+        "session_workflow_cleanup_headroom_seconds": 5 * 60,
+        "client_timeout_managed_by_server": False,
+    }
     assert len(first["runtime_fingerprint"]) == 64
     assert len(first["runtime_compatibility_fingerprint"]) == 64
     assert len(first["tool_schema_fingerprint"]) == 64
@@ -705,6 +743,30 @@ def test_optimizer_inputs_publish_closed_enums(
     app: AzureSqlMcpApplication,
 ) -> None:
     tools = app.mcp._tool_manager._tools
+    start_case_schema = tools["start_performance_case"].parameters
+    parameter_case_schema = start_case_schema["$defs"]["ParameterCaseInput"]
+    assert set(parameter_case_schema["properties"]) == {
+        "name",
+        "values",
+        "types",
+        "weight",
+    }
+    assert parameter_case_schema["additionalProperties"] is False
+    assert set(parameter_case_schema["required"]) == {
+        "name",
+        "values",
+        "types",
+        "weight",
+    }
+    assert parameter_case_schema["properties"]["name"]["minLength"] == 1
+    assert parameter_case_schema["properties"]["weight"]["exclusiveMinimum"] == 0
+    assert start_case_schema["properties"]["query_store_query_id"]["anyOf"][0][
+        "minimum"
+    ] == 1
+    collect_schema = tools["collect_performance_evidence"].parameters
+    assert collect_schema["properties"]["query_store_query_id"]["anyOf"][0][
+        "minimum"
+    ] == 1
     assert tools["start_performance_case"].parameters["properties"]["objective"][
         "enum"
     ] == ["elapsed_time", "cpu", "logical_reads", "physical_reads"]
@@ -734,6 +796,37 @@ def test_optimizer_inputs_publish_closed_enums(
     ]
     assert stopping_reason["minLength"] == 1
     assert stopping_reason["maxLength"] == 2000
+
+
+@pytest.mark.asyncio
+async def test_optimizer_inputs_reject_parameter_case_typos_and_boolean_query_id(
+    app: AzureSqlMcpApplication,
+) -> None:
+    with pytest.raises(ToolError):
+        await app.mcp._tool_manager.call_tool(
+            "start_performance_case",
+            {
+                "sql": "SELECT @P1",
+                "parameter_cases": [
+                    {
+                        "name": "common",
+                        "values": {"P1": 1},
+                        "types": {"P1": "int"},
+                        "weight": 1.0,
+                        "weigth": 2.0,
+                    }
+                ],
+            },
+        )
+
+    with pytest.raises(ToolError):
+        await app.mcp._tool_manager.call_tool(
+            "start_performance_case",
+            {
+                "sql": "SELECT 1",
+                "query_store_query_id": True,
+            },
+        )
 
 
 @pytest.mark.asyncio
@@ -1017,9 +1110,44 @@ async def test_run_tool_formats_errors_from_callback(app: AzureSqlMcpApplication
 
     assert json.loads(str(error.value)) == {
         "code": "tool_error",
+        "details": {
+            "failure_diagnostic": {
+                "diagnostic_code": "sql_execution_failed",
+            }
+        },
         "message": "boom",
         "ok": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_run_tool_returns_allowlisted_structured_sql_diagnostic(
+    app: AzureSqlMcpApplication,
+) -> None:
+    async def boom(_: str) -> dict[str, str]:
+        raise RuntimeError(
+            "[42000] [Microsoft][ODBC Driver 18 for SQL Server][SQL Server]"
+            "Procedure expects parameter '@statement' of type "
+            "'ntext/nchar/nvarchar'. (214)",
+            "SELECT SecretValue FROM dbo.PrivateTable",
+        )
+
+    with pytest.raises(ToolError) as error:
+        await app._run_tool("sample_tool", None, boom)
+
+    payload = json.loads(str(error.value))
+    assert payload["details"]["failure_diagnostic"] == {
+        "diagnostic_code": "sp_executesql_unicode_control_argument",
+        "sqlstate": "42000",
+        "native_error_code": 214,
+        "text": (
+            "Procedure expects an sp_executesql control parameter "
+            "(@statement or @params) of type ntext/nchar/nvarchar."
+        ),
+    }
+    serialized = json.dumps(payload)
+    assert "SecretValue" not in serialized
+    assert "PrivateTable" not in serialized
 
 
 @pytest.mark.asyncio
@@ -1042,6 +1170,7 @@ async def test_run_tool_preserves_intentional_tool_error(
 @pytest.mark.parametrize(
     "tool_name",
     (
+        "execute_sql",
         "list_schemas",
         "list_objects",
         "search_objects",
@@ -1303,6 +1432,17 @@ def test_benchmark_tool_timeout_scales_to_policy_execution_budget(
     )
 
 
+def test_evidence_tool_timeout_covers_collection_then_profile(
+    app: AzureSqlMcpApplication,
+) -> None:
+    assert app._timeout_for_tool("collect_performance_evidence", "appdb") == max(
+        app.config.tool_timeout_seconds,
+        app.performance_workflows.collector_timeout_seconds
+        + app.config.query_timeout_seconds
+        + 60,
+    )
+
+
 @pytest.mark.asyncio
 async def test_run_tool_returns_timeout_error(tmp_path: Path) -> None:
     app = AzureSqlMcpApplication(
@@ -1341,6 +1481,29 @@ async def test_run_tool_bounds_workflow_timeout_by_persisted_deadline(
         )
 
     assert json.loads(str(error.value))["code"] == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_run_tool_rejects_expired_session_before_callback(
+    app: AzureSqlMcpApplication,
+) -> None:
+    callback = AsyncMock(return_value={"status": "unexpected"})
+    deadline = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    ).isoformat()
+
+    with pytest.raises(ToolError) as error:
+        await app._run_tool(
+            "benchmark_tuning_candidate",
+            "appdb",
+            callback,
+            deadline_provider=lambda: deadline,
+        )
+
+    payload = json.loads(str(error.value))
+    assert payload["code"] == "session_expired"
+    assert "no new SQL work was started" in payload["message"]
+    callback.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1615,6 +1778,9 @@ async def test_real_session_responses_report_actual_remaining_budgets(
         "time_limit_minutes": 20,
         "executions_remaining": 80,
         "candidate_slots_remaining": 10,
+        "deadline_exceeded": False,
+        "accepts_new_work": True,
+        "accepts_finalization": True,
     }
 
     async def finalize(database_name: str) -> dict[str, object]:
@@ -1637,6 +1803,9 @@ async def test_real_session_responses_report_actual_remaining_budgets(
         "time_limit_minutes": 20,
         "executions_remaining": 80,
         "candidate_slots_remaining": 10,
+        "deadline_exceeded": False,
+        "accepts_new_work": False,
+        "accepts_finalization": False,
     }
 
 
@@ -2223,6 +2392,48 @@ async def test_unparameterized_query_store_history_does_not_require_buckets(
     assert evidence["complete"] is True
     assert evidence["status"] == "resolved"
     assert evidence["coverage"]["parameter_buckets"]["required"] is False
+
+
+@pytest.mark.asyncio
+async def test_explicit_query_store_id_skips_text_resolution(
+    app: AzureSqlMcpApplication,
+) -> None:
+    app.query_store.resolve_query_identity = AsyncMock()
+    app.query_store.get_query_history_by_id = AsyncMock(
+        return_value={"matches": [{"query_id": 19991306}]}
+    )
+    app.query_store.get_parameter_runtime_buckets = AsyncMock(
+        return_value={"buckets": [{"plan_id": 7}]}
+    )
+
+    evidence = await app._collect_query_store_evidence(
+        "appdb",
+        "SELECT UserId FROM dbo.Users WHERE UserId = @UserId",
+        60,
+        query_store_query_id=19991306,
+    )
+
+    assert evidence["identity"] == {
+        "query_id": 19991306,
+        "query_hash": None,
+        "identity_kind": "query_id",
+        "identity_provenance": "caller_supplied",
+        "identity_verified_against_sql": False,
+    }
+    assert evidence["fuzzy_match_used"] is False
+    app.query_store.resolve_query_identity.assert_not_awaited()
+    app.query_store.get_query_history_by_id.assert_awaited_once_with(
+        "appdb",
+        19991306,
+        window_minutes=60,
+        limit=20,
+    )
+    app.query_store.get_parameter_runtime_buckets.assert_awaited_once_with(
+        "appdb",
+        query_id=19991306,
+        window_minutes=60,
+        limit=50,
+    )
 
 
 @pytest.mark.asyncio

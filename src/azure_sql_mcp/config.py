@@ -243,6 +243,7 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "get_object_details",
             "get_dependencies",
             "get_table_stats",
+            "execute_sql",
             "explain_query",
             "get_top_queries",
             "get_query_parameter_buckets",

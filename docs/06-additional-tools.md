@@ -166,26 +166,61 @@ async def get_table_stats(
 ### SQL Query
 
 ```sql
+WITH partition_storage AS (
+    SELECT
+        p.object_id,
+        p.index_id,
+        p.partition_id,
+        p.rows AS partition_rows,
+        COALESCE(SUM(au.total_pages), 0) AS total_pages,
+        COALESCE(SUM(au.used_pages), 0) AS used_pages
+    FROM sys.partitions AS p
+    LEFT JOIN sys.allocation_units AS au
+        ON (au.type IN (1, 3) AND au.container_id = p.hobt_id)
+        OR (au.type = 2 AND au.container_id = p.partition_id)
+    GROUP BY p.object_id, p.index_id, p.partition_id, p.rows
+), table_storage AS (
+    SELECT
+        object_id,
+        SUM(CASE WHEN index_id IN (0, 1) THEN partition_rows ELSE 0 END)
+            AS approximate_row_count,
+        SUM(total_pages) AS total_pages,
+        SUM(used_pages) AS used_pages,
+        SUM(CASE WHEN index_id IN (0, 1) THEN used_pages ELSE 0 END)
+            AS data_used_pages,
+        SUM(CASE WHEN index_id > 1 THEN used_pages ELSE 0 END)
+            AS index_used_pages
+    FROM partition_storage
+    GROUP BY object_id
+), nonclustered_index_counts AS (
+    SELECT i.object_id, COUNT_BIG(*) AS index_count
+    FROM sys.indexes AS i
+    WHERE i.index_id > 1
+      AND i.is_hypothetical = 0
+    GROUP BY i.object_id
+)
 SELECT
     s.name AS schema_name,
     t.name AS table_name,
-    SUM(p.rows) AS approximate_row_count,
-    CAST(SUM(au.total_pages) * 8.0 / 1024 AS DECIMAL(18, 2)) AS total_size_mb,
-    CAST(SUM(au.used_pages) * 8.0 / 1024 AS DECIMAL(18, 2)) AS used_size_mb,
-    CAST(SUM(CASE WHEN au.type = 1 THEN au.used_pages ELSE 0 END) * 8.0 / 1024
-         AS DECIMAL(18, 2)) AS data_size_mb,
-    CAST(SUM(CASE WHEN au.type = 2 THEN au.used_pages ELSE 0 END) * 8.0 / 1024
-         AS DECIMAL(18, 2)) AS index_size_mb,
-    COUNT(DISTINCT i.index_id) - 1 AS index_count  -- Subtract heap/clustered
+    ts.approximate_row_count,
+    CAST(ts.total_pages * 8.0 / 1024 AS DECIMAL(18, 2)) AS total_size_mb,
+    CAST(ts.used_pages * 8.0 / 1024 AS DECIMAL(18, 2)) AS used_size_mb,
+    CAST(ts.data_used_pages * 8.0 / 1024 AS DECIMAL(18, 2)) AS data_size_mb,
+    CAST(ts.index_used_pages * 8.0 / 1024 AS DECIMAL(18, 2)) AS index_size_mb,
+    COALESCE(ic.index_count, 0) AS index_count
 FROM sys.tables AS t
 INNER JOIN sys.schemas AS s ON t.schema_id = s.schema_id
-INNER JOIN sys.partitions AS p ON t.object_id = p.object_id AND p.index_id IN (0, 1)
-INNER JOIN sys.allocation_units AS au ON p.partition_id = au.container_id
-LEFT JOIN sys.indexes AS i ON t.object_id = i.object_id AND i.index_id > 0
+INNER JOIN table_storage AS ts ON t.object_id = ts.object_id
+LEFT JOIN nonclustered_index_counts AS ic ON t.object_id = ic.object_id
 WHERE (? IS NULL OR s.name = ?)
-GROUP BY s.name, t.name
-ORDER BY SUM(p.rows) DESC
+ORDER BY ts.approximate_row_count DESC, s.name, t.name
 ```
+
+The allocation-unit join is intentionally per partition: in-row and row-overflow
+units (types 1 and 3) use `hobt_id`, while LOB units (type 2) use
+`partition_id`. Total and used storage include every index; data storage is the
+heap/clustered storage and index storage is nonclustered storage. The index count
+is calculated independently and excludes hypothetical indexes.
 
 ---
 

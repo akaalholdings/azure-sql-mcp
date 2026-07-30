@@ -193,7 +193,9 @@ class FakeExecutor:
         self.batch_history = []
         self.session_history = []
         self.session_params = []
+        self.session_input_sizes = []
         self.profile_history = []
+        self.profile_input_sizes = []
         self.non_query_history = []
 
     async def fetch_all(self, database_name, query, params=None):
@@ -215,9 +217,11 @@ class FakeExecutor:
         *,
         max_rows=None,
         statement_params=None,
+        statement_input_sizes=None,
     ):
         self.session_history.append((database_name, list(statements), max_rows))
         self.session_params.append(statement_params)
+        self.session_input_sizes.append(statement_input_sizes)
 
         class Result:
             rows = [{"plan_xml": SAMPLE_SHOWPLAN}]
@@ -232,8 +236,10 @@ class FakeExecutor:
         params=None,
         *,
         max_rows=None,
+        input_sizes=None,
     ):
         self.profile_history.append((database_name, query, params, max_rows))
+        self.profile_input_sizes.append(input_sizes)
         return ProfiledExecution(
             result_sets=[
                 QueryResult(
@@ -536,6 +542,11 @@ async def test_estimated_parameterized_plan_uses_typed_sp_executesql_arguments()
         contract.sp_executesql_values,
         None,
     ]
+    assert executor.session_input_sizes[0] == [
+        None,
+        contract.sp_executesql_input_sizes,
+        None,
+    ]
 
 
 @pytest.mark.asyncio
@@ -559,3 +570,4 @@ async def test_actual_parameterized_plan_executes_one_typed_profile_sample():
             51,
         )
     ]
+    assert executor.profile_input_sizes == [contract.sp_executesql_input_sizes]

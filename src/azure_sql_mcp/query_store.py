@@ -536,6 +536,7 @@ class QueryStoreService:
             "buckets": buckets,
             "bucket_count": len(buckets),
             "plan_count": len({bucket.get("plan_id") for bucket in buckets}),
+            "distinct_compiled_parameter_set_count": len(distinct_parameter_sets),
             "distinct_compiled_parameter_sets": [
                 [{"name": name, "compiled_value": value} for name, value in key]
                 for key in sorted(distinct_parameter_sets, key=repr)

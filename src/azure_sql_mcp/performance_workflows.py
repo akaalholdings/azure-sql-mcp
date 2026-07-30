@@ -13,6 +13,7 @@ import json
 import math
 import statistics
 from collections import Counter
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
@@ -24,11 +25,13 @@ from .connection import StatementDispatchPrevented
 from .database_policy import DatabasePolicySet
 from .equivalence_contract import analyze_equivalence_preflight
 from .equivalence_contract import has_outer_literal_top_zero
+from .observability import extract_failure_diagnostic
 from .performance_contracts import (
     EvidenceEnvelopeV1,
     PerformanceCaseV1,
     new_id,
     utc_now,
+    validate_query_store_query_id,
 )
 from .performance_store import PerformanceStore
 from .param_binding import ParameterExecutionContract, TypedParameterBucket
@@ -48,7 +51,7 @@ from .tuning_sessions import TuningSessionStateMachine
 
 
 ParameterCase = dict[str, Any]
-EvidenceCollector = Callable[[], Awaitable[Any]]
+EvidenceCollector = Callable[..., Awaitable[Any]]
 ParameterBinder = Callable[
     [str, str, Mapping[str, Any]],
     Awaitable[ParameterExecutionContract],
@@ -105,6 +108,8 @@ def fingerprint_json(value: Any) -> str:
 
 
 def parameter_case_fingerprint(parameter_case: Mapping[str, Any]) -> str:
+    # Fingerprint v1 is an established compatibility boundary. Keep this
+    # payload stable; receipts are additive and value-free.
     return fingerprint_json(
         {
             "name": parameter_case.get("name"),
@@ -113,6 +118,172 @@ def parameter_case_fingerprint(parameter_case: Mapping[str, Any]) -> str:
             "weight": parameter_case.get("weight", 1.0),
         }
     )
+
+
+PARAMETER_CASE_MATCHING_RULES = {
+    "fingerprint_version": 1,
+    "comparison": "exact_json_sha256",
+    "fields": ["name", "values", "types", "weight"],
+    "object_key_order": "ignored",
+    "parameter_name_spelling": "exact",
+    "sql_type_spelling": "exact",
+    "weight": "normalized_positive_float",
+    "values_persisted": False,
+}
+
+
+def parameter_case_receipt(parameter_case: Mapping[str, Any]) -> dict[str, Any]:
+    """Describe one parameter case without persisting its values."""
+
+    values = parameter_case.get("values", {})
+    types = parameter_case.get("types", {})
+    value_names = (
+        sorted(str(name) for name in values)
+        if isinstance(values, Mapping)
+        else []
+    )
+    type_names = (
+        sorted(str(name) for name in types)
+        if isinstance(types, Mapping)
+        else []
+    )
+    declared_types = (
+        {
+            str(name): str(value)
+            for name, value in types.items()
+        }
+        if isinstance(types, Mapping)
+        else {}
+    )
+    template = canonical_parameter_case_template(parameter_case)
+    return {
+        "name": str(parameter_case.get("name") or ""),
+        "parameter_names": sorted(set(value_names) | set(type_names)),
+        "value_parameter_names": value_names,
+        "type_parameter_names": type_names,
+        "parameter_types": declared_types,
+        "weight": float(parameter_case.get("weight", 1.0)),
+        "template": template,
+        "fingerprint_v1": parameter_case_fingerprint(parameter_case),
+        "values_persisted": False,
+        "matching_rules": dict(PARAMETER_CASE_MATCHING_RULES),
+    }
+
+
+def canonical_parameter_case_template(
+    parameter_case: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the value-free canonical template for one parameter case."""
+
+    values = parameter_case.get("values", {})
+    types = parameter_case.get("types", {})
+    return {
+        "name": str(parameter_case.get("name") or ""),
+        "values": (
+            {
+                str(name): "<caller-retained value; not persisted>"
+                for name in values
+            }
+            if isinstance(values, Mapping)
+            else {}
+        ),
+        "types": (
+            {str(name): str(value) for name, value in types.items()}
+            if isinstance(types, Mapping)
+            else {}
+        ),
+        "weight": float(parameter_case.get("weight", 1.0)),
+    }
+
+
+def parameter_case_input_contract() -> dict[str, Any]:
+    """Describe the reusable input shape and exact v1 matching boundary."""
+
+    return {
+        "name": "<registered case name>",
+        "values": {"<exact parameter name>": "<caller-retained value>"},
+        "types": {"<exact parameter name>": "<exact declared SQL type>"},
+        "weight": "<same positive numeric weight>",
+        "matching_rules": dict(PARAMETER_CASE_MATCHING_RULES),
+    }
+
+
+def parameter_case_mismatch(
+    parameter_case: Mapping[str, Any],
+    *,
+    expected_parameter_names: set[str] | None = None,
+    registered_receipts: Sequence[Mapping[str, Any]] | None = None,
+    case_index: int | None = None,
+) -> str | None:
+    """Return one precise, value-free mismatch explanation, if any."""
+
+    receipt = parameter_case_receipt(parameter_case)
+    label = (
+        f"Parameter case index {case_index} ({receipt['name']!r})"
+        if case_index is not None
+        else f"Parameter case {receipt['name']!r}"
+    )
+    if expected_parameter_names is not None:
+        expected_names = {
+            str(name).lstrip("@").casefold()
+            for name in expected_parameter_names
+        }
+        value_names = {
+            str(name).lstrip("@").casefold()
+            for name in parameter_case.get("values", {})
+        }
+        type_names = {
+            str(name).lstrip("@").casefold()
+            for name in parameter_case.get("types", {})
+        }
+        actual_names = value_names | type_names
+        missing_values = expected_names - value_names
+        missing_types = expected_names - type_names
+        unexpected = actual_names - expected_names
+        if missing_values or missing_types or unexpected:
+            details: list[str] = []
+            if missing_values:
+                details.append(
+                    "missing values for "
+                    + ", ".join(f"@{name}" for name in sorted(missing_values))
+                )
+            if missing_types:
+                details.append(
+                    "missing SQL types for "
+                    + ", ".join(f"@{name}" for name in sorted(missing_types))
+                )
+            if unexpected:
+                details.append(
+                    "unexpected parameters "
+                    + ", ".join(f"@{name}" for name in sorted(unexpected))
+                )
+            return f"{label} is invalid: " + "; ".join(details) + "."
+
+    if registered_receipts is None:
+        return None
+    registered = {
+        str(item.get("name")): item
+        for item in registered_receipts
+        if isinstance(item, Mapping)
+    }
+    expected = registered.get(str(receipt["name"]))
+    if expected is None:
+        registered_names = ", ".join(sorted(registered)) or "<none>"
+        return (
+            f"{label} is not registered; exact registered names are "
+            f"{registered_names}. Received fingerprint v1 "
+            f"{receipt['fingerprint_v1']}."
+        )
+    if expected.get("fingerprint_v1") != receipt["fingerprint_v1"]:
+        return (
+            f"{label} does not match fingerprint v1: received "
+            f"{receipt['fingerprint_v1']}, expected "
+            f"{expected.get('fingerprint_v1')}. Matching is exact over name, "
+            "values, types, and normalized weight; parameter-name and SQL-type "
+            "spelling are exact, object key order is ignored, and values are "
+            "not persisted."
+        )
+    return None
 
 
 def database_fingerprint(
@@ -964,6 +1135,7 @@ class PerformanceWorkflowService:
         *,
         parameter_cases: Sequence[ParameterCase] | None = None,
         metadata: Mapping[str, Any] | None = None,
+        query_store_query_id: int | None = None,
         idempotency_key: str | None = None,
     ) -> PerformanceCaseV1:
         normalized = self.validator.validate_read_only(sql).execution_sql
@@ -971,53 +1143,69 @@ class PerformanceWorkflowService:
         expected_parameters = {
             name.casefold() for name in detect_parameters(normalized)
         }
-        for parameter_case in cases:
-            value_parameters = {
-                str(name).lstrip("@").casefold()
-                for name in parameter_case["values"]
-            }
-            typed_parameters = {
-                str(name).lstrip("@").casefold()
-                for name in parameter_case["types"]
-            }
-            if (
-                value_parameters != expected_parameters
-                or typed_parameters != expected_parameters
-            ):
+        for case_index, parameter_case in enumerate(cases):
+            mismatch = parameter_case_mismatch(
+                parameter_case,
+                expected_parameter_names=expected_parameters,
+                case_index=case_index,
+            )
+            if mismatch is not None:
                 raise ValueError(
-                    "Every performance-case parameter requires one explicit value "
-                    "and SQL type in every parameter case."
+                    mismatch
+                    + " Every performance-case parameter requires one explicit "
+                    "value and SQL type."
                 )
+        validated_query_store_query_id = validate_query_store_query_id(
+            query_store_query_id
+        )
         normalized_metadata = dict(metadata or {})
         normalized_metadata["objective"] = normalize_tuning_objective(
             normalized_metadata.get("objective")
         )
+        receipts = [parameter_case_receipt(case) for case in cases]
         case = PerformanceCaseV1(
             query_fingerprint=fingerprint_text(normalized),
             database_fingerprint=database_fingerprint(
                 database_name,
                 self.server_name,
             ),
+            query_store_query_id=validated_query_store_query_id,
             parameter_case_fingerprints=tuple(
                 parameter_case_fingerprint(case) for case in cases
             ),
             metadata={
+                **normalized_metadata,
                 "parameter_case_names": [case["name"] for case in cases],
                 "parameter_case_weights": [case["weight"] for case in cases],
-                **normalized_metadata,
+                "parameter_case_receipts": receipts,
+                "parameter_case_templates": [
+                    canonical_parameter_case_template(case)
+                    for case in cases
+                ],
+                "canonical_parameter_case_template": (
+                    parameter_case_input_contract()
+                ),
             },
         )
+        idempotency_metadata = {
+            **normalized_metadata,
+            "parameter_case_names": [case["name"] for case in cases],
+            "parameter_case_weights": [case["weight"] for case in cases],
+        }
+        idempotency_request = {
+            "query_fingerprint": case.query_fingerprint,
+            "database_fingerprint": case.database_fingerprint,
+            "parameter_case_fingerprints": case.parameter_case_fingerprints,
+            "metadata": idempotency_metadata,
+        }
+        if case.query_store_query_id is not None:
+            idempotency_request["query_store_query_id"] = case.query_store_query_id
         return self.store.create_performance_case(
             case,
             idempotency_key=idempotency_key,
             request_fingerprint=request_fingerprint(
                 "performance-case.start",
-                {
-                    "query_fingerprint": case.query_fingerprint,
-                    "database_fingerprint": case.database_fingerprint,
-                    "parameter_case_fingerprints": case.parameter_case_fingerprints,
-                    "metadata": case.metadata,
-                },
+                idempotency_request,
             ),
         )
 
@@ -1045,9 +1233,25 @@ class PerformanceWorkflowService:
         window_minutes: int,
         execute_query: bool = False,
         execution_contract: ParameterExecutionContract | None = None,
+        query_store_query_id: int | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         case = self.store.get_performance_case(case_id)
+        supplied_query_store_query_id = validate_query_store_query_id(
+            query_store_query_id
+        )
+        if (
+            supplied_query_store_query_id is not None
+            and case.query_store_query_id is not None
+            and supplied_query_store_query_id != case.query_store_query_id
+        ):
+            raise ValueError(
+                "Supplied Query Store query_id conflicts with the stored "
+                "performance-case identity."
+            )
+        effective_query_store_query_id = (
+            case.query_store_query_id or supplied_query_store_query_id
+        )
         normalized = self.validator.validate_read_only(sql).execution_sql
         if not fingerprint_text_matches(
             case.query_fingerprint,
@@ -1064,6 +1268,26 @@ class PerformanceWorkflowService:
             raise ValueError("Database fingerprint does not match the performance case.")
         if window_minutes <= 0:
             raise ValueError("window_minutes must be greater than 0.")
+        if (
+            effective_query_store_query_id is not None
+            and case.query_store_query_id is None
+        ):
+            case = self.store.save_performance_case(
+                replace(
+                    case,
+                    query_store_query_id=effective_query_store_query_id,
+                    updated_at_utc=utc_now(),
+                    version=case.version + 1,
+                ),
+                expected_version=case.version,
+                request_fingerprint=request_fingerprint(
+                    "performance-case.query-store-identity",
+                    {
+                        "case_id": case.case_id,
+                        "query_store_query_id": effective_query_store_query_id,
+                    },
+                ),
+            )
 
         evidence_request_fingerprint = request_fingerprint(
             "performance-case.evidence",
@@ -1072,6 +1296,7 @@ class PerformanceWorkflowService:
                 "database_name": database_name,
                 "query_fingerprint": fingerprint_text(normalized),
                 "database_fingerprint": case.database_fingerprint,
+                "query_store_query_id": effective_query_store_query_id,
                 "collector_names": tuple(sorted(collectors)),
                 "window_minutes": window_minutes,
                 "execute_query": execute_query,
@@ -1140,10 +1365,19 @@ class PerformanceWorkflowService:
         ) -> tuple[str, dict[str, Any]]:
             captured_at = utc_now()
             try:
-                data = await asyncio.wait_for(
-                    collector(),
-                    timeout=self.collector_timeout_seconds,
-                )
+                if (
+                    name.casefold() in {"query_store", "query_store_history"}
+                    and effective_query_store_query_id is not None
+                ):
+                    data = await asyncio.wait_for(
+                        collector(effective_query_store_query_id),
+                        timeout=self.collector_timeout_seconds,
+                    )
+                else:
+                    data = await asyncio.wait_for(
+                        collector(),
+                        timeout=self.collector_timeout_seconds,
+                    )
                 gaps = _evidence_gaps(data)
                 top_level_available = not (
                     isinstance(data, Mapping) and data.get("available") is False
@@ -1160,6 +1394,7 @@ class PerformanceWorkflowService:
                     "provenance": f"azure_sql_mcp:{name}",
                     "query_fingerprint": case.query_fingerprint,
                     "database_fingerprint": case.database_fingerprint,
+                    "query_store_query_id": effective_query_store_query_id,
                     "evidence_gaps": gaps,
                     "data": data,
                 }
@@ -1176,10 +1411,12 @@ class PerformanceWorkflowService:
                     "provenance": f"azure_sql_mcp:{name}",
                     "query_fingerprint": case.query_fingerprint,
                     "database_fingerprint": case.database_fingerprint,
+                    "query_store_query_id": effective_query_store_query_id,
                     "evidence_gaps": [
                         {"path": "collector", "reason": "collection_error"}
                     ],
                     "error_type": type(exc).__name__,
+                    "failure_diagnostic": extract_failure_diagnostic(exc),
                 }
             return name, section
 
@@ -1252,6 +1489,7 @@ class PerformanceWorkflowService:
                 "collection_window_minutes": window_minutes,
                 "window_start_utc": window_start.isoformat(),
                 "window_end_utc": window_end.isoformat(),
+                "query_store_query_id": effective_query_store_query_id,
                 "sections": sections,
                 "profile_summary": (
                     {key: value for key, value in profile.items() if key != "result_sample"}
@@ -1326,9 +1564,47 @@ class PerformanceWorkflowService:
             metadata={"database_fingerprint": case.database_fingerprint},
             idempotency_key=idempotency_key,
         )
+        budget = self._session_budget(session, ())
+        return {
+            **self._session_view(session, budget=budget),
+            "budget": budget,
+        }
+
+    def _session_view(
+        self,
+        session: Any,
+        *,
+        budget: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        availability = self.sessions.session_availability(session)
+        budget_availability = {
+            key: budget[key]
+            for key in (
+                "accepts_new_work",
+                "accepts_candidate_creation",
+                "accepts_execution",
+                "available",
+                "actionable",
+            )
+            if budget is not None and key in budget
+        }
+        reason = availability["reason"]
+        if (
+            reason is None
+            and budget is not None
+            and budget.get("accepts_new_work") is False
+        ):
+            budget_reason = budget.get("availability_reason")
+            reason = str(budget_reason) if budget_reason is not None else None
         return {
             **session.to_dict(),
-            "budget": self._session_budget(session, ()),
+            **{
+                key: value
+                for key, value in availability.items()
+                if key != "reason"
+            },
+            **budget_availability,
+            "availability_reason": reason,
         }
 
     def _session_budget(
@@ -1337,19 +1613,59 @@ class PerformanceWorkflowService:
         candidates: Sequence[Any],
     ) -> dict[str, Any]:
         execution_budget = self.store.execution_budget_usage(session.session_id)
+        raw_candidate_slots_remaining = max(
+            0,
+            session.max_candidates - len(candidates),
+        )
+        availability = self.sessions.session_availability(session)
+        expired = availability["effective_status"] == "expired"
+        accepts_candidate_creation = bool(
+            availability["accepts_new_work"]
+            and raw_candidate_slots_remaining > 0
+        )
+        has_executable_candidate = any(
+            not bool(getattr(candidate, "is_terminal", True))
+            for candidate in candidates
+        )
+        accepts_execution = bool(
+            availability["accepts_new_work"]
+            and execution_budget["remaining"] > 0
+            and has_executable_candidate
+        )
+        accepts_new_work = accepts_candidate_creation or accepts_execution
+        budget_unavailability_reason: str | None = None
+        if availability["accepts_new_work"] and not accepts_new_work:
+            budget_unavailability_reason = (
+                "budget_exhausted"
+                if raw_candidate_slots_remaining == 0
+                and execution_budget["remaining"] == 0
+                else "no_actionable_candidate"
+            )
         return {
             "candidate_limit": session.max_candidates,
             "candidates_used": len(candidates),
-            "candidate_slots_remaining": max(
-                0,
-                session.max_candidates - len(candidates),
+            "candidate_slots_remaining": (
+                0 if expired else raw_candidate_slots_remaining
             ),
+            "raw_candidate_slots_remaining": raw_candidate_slots_remaining,
             "execution_limit": session.execution_limit,
             "executions_used": execution_budget["consumed"],
             "executions_reserved": execution_budget["reserved"],
             "executions_committed": execution_budget["committed"],
-            "executions_remaining": execution_budget["remaining"],
+            "executions_remaining": (
+                0 if expired else execution_budget["remaining"]
+            ),
+            "raw_executions_remaining": execution_budget["remaining"],
             "deadline_at_utc": session.deadline_at_utc,
+            "deadline_exceeded": availability["deadline_exceeded"],
+            "accepts_new_work": accepts_new_work,
+            "accepts_candidate_creation": accepts_candidate_creation,
+            "accepts_execution": accepts_execution,
+            "accepts_finalization": availability["accepts_finalization"],
+            "available": accepts_new_work,
+            "actionable": accepts_new_work,
+            "availability_reason": budget_unavailability_reason,
+            "effective_status": availability["effective_status"],
         }
 
     def get_session(self, session_id: str) -> dict[str, Any]:
@@ -1422,8 +1738,9 @@ class PerformanceWorkflowService:
             for evidence in ordered_evidence
             if evidence.evidence_id not in attached_evidence_id_set
         ]
+        budget = self._session_budget(session, candidates)
         return {
-            "session": session.to_dict(),
+            "session": self._session_view(session, budget=budget),
             "leaderboard": [candidate.to_dict() for candidate in candidates],
             "evidence": [
                 evidence.to_dict()
@@ -1440,7 +1757,7 @@ class PerformanceWorkflowService:
                 aggregate_type="session",
                 aggregate_id=session_id,
             ),
-            "budget": self._session_budget(session, candidates),
+            "budget": budget,
             "raw_sql_persisted": False,
         }
 
@@ -1625,6 +1942,16 @@ class PerformanceWorkflowService:
         candidate_params = (
             candidate.sp_executesql_values if candidate.parameters else ()
         )
+        baseline_input_sizes = (
+            baseline.sp_executesql_input_sizes
+            if baseline.parameters
+            else None
+        )
+        candidate_input_sizes = (
+            candidate.sp_executesql_input_sizes
+            if candidate.parameters
+            else None
+        )
         dispatched_query_count = 0
         last_statement_index: int | None = None
 
@@ -1637,41 +1964,54 @@ class PerformanceWorkflowService:
                 before_dispatch()
             dispatched_query_count = statement_index - 1
 
+        statements = [
+            "SET TRANSACTION ISOLATION LEVEL SNAPSHOT",
+            (
+                "BEGIN TRANSACTION;\n"
+                "IF (@@TRANCOUNT <> 1)\n"
+                "   OR NOT EXISTS (\n"
+                "       SELECT 1\n"
+                "       FROM sys.dm_exec_sessions\n"
+                "       WHERE session_id = @@SPID\n"
+                "         AND transaction_isolation_level = 5\n"
+                "   )\n"
+                "BEGIN\n"
+                "    IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;\n"
+                "    THROW 51000, "
+                "'Snapshot transaction could not be verified.', 1;\n"
+                "END"
+            ),
+            baseline_sql,
+            candidate_sql,
+            "ROLLBACK TRANSACTION",
+            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+        ]
+        session_kwargs: dict[str, Any] = {
+            "max_rows": self.comparison_row_limit + 1,
+            "statement_params": [
+                None,
+                None,
+                baseline_params,
+                candidate_params,
+                None,
+                None,
+            ],
+            "before_statement_dispatch": before_statement_dispatch,
+        }
+        if baseline_input_sizes is not None or candidate_input_sizes is not None:
+            session_kwargs["statement_input_sizes"] = [
+                None,
+                None,
+                baseline_input_sizes,
+                candidate_input_sizes,
+                None,
+                None,
+            ]
         try:
             per_statement = await self.executor.execute_session_exactly_once(
                 database_name,
-                [
-                    "SET TRANSACTION ISOLATION LEVEL SNAPSHOT",
-                    (
-                        "BEGIN TRANSACTION;\n"
-                        "IF (@@TRANCOUNT <> 1)\n"
-                        "   OR NOT EXISTS (\n"
-                        "       SELECT 1\n"
-                        "       FROM sys.dm_exec_sessions\n"
-                        "       WHERE session_id = @@SPID\n"
-                        "         AND transaction_isolation_level = 5\n"
-                        "   )\n"
-                        "BEGIN\n"
-                        "    IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;\n"
-                        "    THROW 51000, "
-                        "'Snapshot transaction could not be verified.', 1;\n"
-                        "END"
-                    ),
-                    baseline_sql,
-                    candidate_sql,
-                    "ROLLBACK TRANSACTION",
-                    "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
-                ],
-                max_rows=self.comparison_row_limit + 1,
-                statement_params=[
-                    None,
-                    None,
-                    baseline_params,
-                    candidate_params,
-                    None,
-                    None,
-                ],
-                before_statement_dispatch=before_statement_dispatch,
+                statements,
+                **session_kwargs,
             )
         except StatementDispatchPrevented as exc:
             if exc.statement_index not in {2, 3}:
@@ -1800,6 +2140,9 @@ class PerformanceWorkflowService:
                     "phase": phase,
                     "reason": reason,
                     "failure_code": failure_code,
+                    "failure_diagnostic": {
+                        "diagnostic_code": failure_code,
+                    },
                     "benchmark_failed": True,
                     "completed_parameter_cases": 0,
                     "execution_count_is_conservative": (
@@ -1923,6 +2266,7 @@ class PerformanceWorkflowService:
             "parameter_results": (
                 parameter_results if isinstance(parameter_results, list) else []
             ),
+            "parameter_case_receipts": metadata.get("parameter_case_receipts", []),
             "equivalence": equivalence if isinstance(equivalence, list) else [],
             "equivalence_deferred": bool(metadata.get("equivalence_deferred")),
             "equivalence_preflight": metadata.get("equivalence_preflight"),
@@ -1937,6 +2281,10 @@ class PerformanceWorkflowService:
         if benchmark_failed:
             result["state"] = "inconclusive"
             result["failure_code"] = failure_code
+            result["failure_diagnostic"] = metadata.get(
+                "failure_diagnostic",
+                {"diagnostic_code": "sql_execution_failed"},
+            )
         return result
 
     def _persist_benchmark_failure_receipt(
@@ -1953,6 +2301,7 @@ class PerformanceWorkflowService:
         completed_parameter_cases: int,
         measured_executions: int,
         failure_code: str,
+        failure_diagnostic: Mapping[str, Any] | None,
         reservation: Mapping[str, Any],
         reservation_owner: str,
         benchmark_request_fingerprint: str,
@@ -1995,8 +2344,13 @@ class PerformanceWorkflowService:
                 "equivalence": list(equivalence),
                 "equivalence_deferred": not should_prove_equivalence,
                 "phase": phase,
+                "parameter_case_receipts": [
+                    parameter_case_receipt(parameter_case)
+                    for parameter_case in cases
+                ],
                 "reason": reason,
                 "failure_code": failure_code,
+                "failure_diagnostic": dict(failure_diagnostic or {}),
                 "benchmark_failed": True,
                 "completed_parameter_cases": completed_parameter_cases,
                 "execution_count_is_conservative": False,
@@ -2226,6 +2580,16 @@ class PerformanceWorkflowService:
             for parameter_case in cases
         )
         registered_case_fingerprints = set(case.parameter_case_fingerprints)
+        registered_receipts = case.metadata.get("parameter_case_receipts")
+        if isinstance(registered_receipts, (list, tuple)):
+            for case_index, parameter_case in enumerate(cases):
+                mismatch = parameter_case_mismatch(
+                    parameter_case,
+                    registered_receipts=registered_receipts,
+                    case_index=case_index,
+                )
+                if mismatch is not None:
+                    raise ValueError(mismatch)
         if (
             len(set(supplied_case_fingerprints)) != len(supplied_case_fingerprints)
             or any(
@@ -2234,7 +2598,13 @@ class PerformanceWorkflowService:
             )
         ):
             raise ValueError(
-                "Benchmark parameter cases must be an unchanged subset of the performance case."
+                "Benchmark parameter cases must be an unchanged fingerprint-v1 "
+                "subset of the performance case. Matching is exact over name, "
+                "values, types, and normalized weight; parameter-name and SQL-type "
+                "spelling are exact, object key order is ignored, and values are "
+                "not persisted. Received fingerprints: "
+                f"{list(supplied_case_fingerprints)}; registered fingerprints: "
+                f"{list(case.parameter_case_fingerprints)}."
             )
         should_prove_equivalence = (
             phase == "finalist" if prove_equivalence is None else prove_equivalence
@@ -2486,6 +2856,9 @@ class PerformanceWorkflowService:
                 completed_parameter_cases=completed_parameter_cases,
                 measured_executions=measured_executions,
                 failure_code="timeout",
+                failure_diagnostic={
+                    "diagnostic_code": "benchmark_cancelled",
+                },
                 reservation=reservation,
                 reservation_owner=reservation_owner,
                 benchmark_request_fingerprint=benchmark_request_fingerprint,
@@ -2508,6 +2881,7 @@ class PerformanceWorkflowService:
                 completed_parameter_cases=completed_parameter_cases,
                 measured_executions=measured_executions,
                 failure_code=type(exc).__name__,
+                failure_diagnostic=extract_failure_diagnostic(exc),
                 reservation=reservation,
                 reservation_owner=reservation_owner,
                 benchmark_request_fingerprint=benchmark_request_fingerprint,
@@ -2561,6 +2935,10 @@ class PerformanceWorkflowService:
             metadata={
                 "session_id": session_id,
                 "candidate_id": candidate_id,
+                "parameter_case_receipts": [
+                    parameter_case_receipt(parameter_case)
+                    for parameter_case in cases
+                ],
                 "equivalence": equivalence,
                 "equivalence_deferred": not compare_equivalence,
                 "equivalence_preflight": equivalence_preflight,
@@ -2634,6 +3012,10 @@ class PerformanceWorkflowService:
             "runs_per_parameter_case": runs,
             "executions": measured_executions,
             "parameter_results": parameter_results,
+            "parameter_case_receipts": [
+                parameter_case_receipt(parameter_case)
+                for parameter_case in cases
+            ],
             "equivalence": equivalence,
             "equivalence_deferred": not compare_equivalence,
             "equivalence_preflight": equivalence_preflight,
@@ -2798,7 +3180,8 @@ class PerformanceWorkflowService:
                 )
         current_session = self.sessions.get_session(session_id)
         if candidates and current_session.status == "created":
-            self.sessions.start_screening(session_id)
+            if not self.sessions.is_session_expired(current_session):
+                self.sessions.start_screening(session_id)
         for candidate in candidates:
             if not candidate.is_terminal:
                 self.sessions.mark_candidate_terminal(
@@ -2836,7 +3219,7 @@ class PerformanceWorkflowService:
             else None
         )
         return {
-            "session": session.to_dict(),
+            "session": self._session_view(session),
             "leaderboard": [candidate.to_dict() for candidate in candidates],
             "budget": self._session_budget(session, candidates),
             "selected_candidate_id": selected_candidate_id,
@@ -3087,5 +3470,10 @@ __all__ = [
     "fingerprint_text",
     "fingerprint_text_matches",
     "normalize_tuning_objective",
+    "canonical_parameter_case_template",
+    "parameter_case_input_contract",
+    "parameter_case_fingerprint",
+    "parameter_case_mismatch",
+    "parameter_case_receipt",
     "profile_payload",
 ]

@@ -6,6 +6,44 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+### Added
+
+- Performance cases and evidence collection accept an exact positive Query
+  Store `query_id`; explicit identities use the by-ID path and never fall back
+  to text or fuzzy matching.
+- Parameter-case tools publish a typed `name`/`values`/`types`/`weight` input
+  schema plus value-free fingerprints, templates, and exact v1 matching rules.
+- Runtime and session responses expose effective timeout budgets, derived
+  deadline availability, and definitive new-work/finalization flags.
+- Workload index metadata includes best-effort DMV counter-epoch coverage, and
+  Showplan index analysis states the meaning and provenance of zero hints.
+
+### Changed
+
+- The sandbox profile exposes only the statically validated, row-capped
+  `execute_sql` ad-hoc path, still gated by database-policy `allow_read`.
+- Parameter-case inputs require the exact `name`/`values`/`types`/`weight`
+  shape and reject unknown keys; Query Store ids reject boolean coercion.
+
+### Fixed
+
+- Parameterized plan, benchmark, index-analysis, and snapshot-comparison paths
+  bind only the two `sp_executesql` control arguments as Unicode. User
+  parameters retain driver inference and are not widened.
+- Known safe SQL Server diagnostics now survive redaction as structured,
+  durable failure details without exposing arbitrary SQL, identifiers, values,
+  hosts, or secrets.
+- Table statistics aggregate allocation units per partition with the documented
+  HoBT/partition mapping, count base rows once, and separate base from
+  nonclustered-index storage and counts.
+- Missing index-usage DMV rows remain unavailable, and zero reads produce
+  `is_unused=true` only when the requested observation window is covered.
+- Durable Query Store evidence drops observed compiled/runtime parameter
+  literals while retaining value-free counts and metadata.
+- Session availability accounts for exhausted budgets and executable
+  candidates, and missing-index analysis distinguishes filtered hints, failed
+  plans, and an empty evidence window.
+
 ## [2.2.1] - 2026-07-28
 
 ### Changed
