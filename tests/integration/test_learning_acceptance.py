@@ -91,7 +91,7 @@ async def _record_optimizer_decision(
         "record_decision",
         {
             "skill": "sql-optimizer",
-            "skill_version": "2.3.0",
+            "skill_version": "2.3.1",
             "session_id": session_id,
             "learning_key": "bounded-candidate-selection",
             "consumed_evidence_refs": [evidence.evidence_id],
@@ -179,7 +179,7 @@ async def test_evidence_governed_learning_lifecycle_acceptance(
     scope = app._current_learning_scope("appdb")
     recall_args = {
         "skill": "sql-optimizer",
-        "skill_version": "2.3.0",
+        "skill_version": "2.3.1",
         "runtime_compatibility_fingerprint": runtime[
             "runtime_compatibility_fingerprint"
         ],
@@ -282,7 +282,7 @@ async def test_evidence_governed_learning_lifecycle_acceptance(
         "record_decision",
         {
             "skill": "sql-plan-enforcer",
-            "skill_version": "1.0.0",
+            "skill_version": "1.0.1",
             "session_id": "plan-session-1",
             "learning_key": "plan-control-review",
             "consumed_evidence_refs": [terminal_links[-1]],
@@ -456,7 +456,7 @@ async def test_evidence_governed_learning_lifecycle_acceptance(
             "record_decision",
             {
                 "skill": "sql-optimizer",
-                "skill_version": "2.3.0",
+                "skill_version": "2.3.1",
                 "session_id": invalid_args["session_id"],
                 "learning_key": "privacy-check",
                 "consumed_evidence_refs": [privacy_evidence.evidence_id],

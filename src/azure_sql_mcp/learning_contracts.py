@@ -19,7 +19,7 @@ from typing import Any, ClassVar, Mapping, TypeVar, cast
 
 CONTRACT_VERSION = 1
 DEFAULT_FRESHNESS_DAYS = 180
-SUBJECT_KINDS = frozenset({"query", "plan", "incident", "database"})
+SUBJECT_KINDS = frozenset({"query", "plan", "incident", "database", "index"})
 UTC = timezone.utc
 ContractT = TypeVar("ContractT", bound="VersionedLearningContract")
 

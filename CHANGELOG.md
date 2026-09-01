@@ -8,6 +8,18 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ### Added
 
+- Staged the `2.3.0` recommend-only index portfolio contract with deterministic
+  capture/review/retrieval tools, a manual two-table `dbatools` history
+  installer, redacted subject snapshots, and the daily capture CLI. It remains
+  inactive until the database contract, policy, runtime restart, fingerprints,
+  and non-production smoke test are separately approved and verified.
+- Added exactly-once transaction capture with idempotency range locking,
+  commit-outcome reconciliation, fail-closed contract probing, and seven inert
+  review artifacts.
+- Registered `sql-index-manager@1.0.0` and learning subject `index` for
+  scoped advisory recall only. V1 portfolio selectors are not learning
+  evidence references, and no decision or outcome is written until a future
+  MCP-owned evidence and terminal-link bridge is explicitly added.
 - Performance cases and evidence collection accept an exact positive Query
   Store `query_id`; explicit identities use the by-ID path and never fall back
   to text or fuzzy matching.

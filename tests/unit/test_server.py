@@ -27,7 +27,9 @@ from azure_sql_mcp.config import WritePolicy
 from azure_sql_mcp.database_policy import DatabasePolicySet
 from azure_sql_mcp.learning_contracts import DecisionRecordV1
 from azure_sql_mcp.learning_store import LearningStoreError
+from azure_sql_mcp.index_review import CONTRACT_SCHEMA_FINGERPRINT
 from azure_sql_mcp.performance_contracts import EvidenceEnvelopeV1
+from azure_sql_mcp.performance_store import ContractNotFoundError
 from azure_sql_mcp.query_identity import legacy_database_fingerprint
 from azure_sql_mcp.performance_workflows import database_fingerprint
 from azure_sql_mcp.performance_workflows import fingerprint_json
@@ -115,6 +117,102 @@ def stub_case_preflight(
     return preflight
 
 
+def _stub_index_review_read_stores(
+    app: AzureSqlMcpApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Mock, dict[str, str], Mock]:
+    review = Mock()
+    review.as_dict.return_value = {
+        "review_id": "review-1",
+        "evidence_id": None,
+    }
+    artifacts = {
+        name: f"content for {name}"
+        for name in (
+            "index-review.json",
+            "index-review.md",
+            "create-candidates.sql",
+            "consolidation-candidates.sql",
+            "drop-candidates.sql",
+            "rollback.sql",
+            "validation.sql",
+        )
+    }
+    renderer = Mock(return_value=artifacts)
+    monkeypatch.setattr(
+        "azure_sql_mcp.server.render_index_review_artifacts",
+        renderer,
+    )
+    app.performance_store.create_evidence = Mock(  # type: ignore[method-assign]
+        side_effect=AssertionError("read-side evidence persistence is forbidden")
+    )
+    app.artifacts.put_text = Mock(  # type: ignore[method-assign]
+        side_effect=AssertionError("read-side artifact persistence is forbidden")
+    )
+    return review, artifacts, renderer
+
+
+@pytest.mark.asyncio
+async def test_review_index_portfolio_returns_direct_artifacts_without_local_writes(
+    app: AzureSqlMcpApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    review, artifacts, renderer = _stub_index_review_read_stores(app, monkeypatch)
+    app.index_review.review_portfolio = AsyncMock(  # type: ignore[method-assign]
+        return_value=review
+    )
+
+    result = await app._review_index_portfolio("appdb", None, None)
+
+    assert result == {
+        "review_id": "review-1",
+        "evidence_id": None,
+        "artifacts": artifacts,
+    }
+    renderer.assert_called_once_with(review)
+    app.performance_store.create_evidence.assert_not_called()
+    app.artifacts.put_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_index_review_returns_direct_artifacts_without_local_writes(
+    app: AzureSqlMcpApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    review, artifacts, renderer = _stub_index_review_read_stores(app, monkeypatch)
+    app.index_review.get_review = AsyncMock(return_value=review)  # type: ignore[method-assign]
+
+    result = await app._get_index_review("appdb", "review-1")
+
+    assert result == {
+        "review_id": "review-1",
+        "evidence_id": None,
+        "artifacts": artifacts,
+    }
+    renderer.assert_called_once_with(review)
+    app.performance_store.create_evidence.assert_not_called()
+    app.artifacts.put_text.assert_not_called()
+
+
+def test_index_portfolio_selectors_are_not_learning_evidence(
+    app: AzureSqlMcpApplication,
+) -> None:
+    assert app.learning_store is not None
+
+    with pytest.raises(ValueError, match="Unknown learning evidence reference prefix"):
+        app._validate_learning_evidence_refs(
+            ["ir1.a=a1.d=90.p=p1.db=db1.as=run1.pr=-.h=h1.s=s1"],
+            database_name="appdb",
+        )
+    with pytest.raises(ContractNotFoundError):
+        app._validate_learning_evidence_refs(
+            ["evidence-index-fabricated"],
+            database_name="appdb",
+        )
+
+    assert app.learning_store.list_decisions() == []
+
+
 def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
     tools = app.mcp._tool_manager._tools
 
@@ -194,6 +292,9 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
         "dry_run_plan_action",
         "prepare_plan_action",
         "analyze_db_health",
+        "capture_index_review_snapshot",
+        "review_index_portfolio",
+        "get_index_review",
         "record_decision",
         "review_decision",
         "propose_lesson",
@@ -225,6 +326,15 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
     assert tools["get_top_cached_queries"].annotations.readOnlyHint is True
     assert tools["get_cached_routine_stats"].annotations.readOnlyHint is True
     assert tools["get_object_index_diagnostics"].annotations.readOnlyHint is True
+    for name in (
+        "capture_index_review_snapshot",
+        "review_index_portfolio",
+        "get_index_review",
+    ):
+        schema = tools[name].fn_metadata.arg_model.model_json_schema()
+        assert "database_name" in schema["required"]
+        assert schema["properties"]["database_name"]["type"] == "string"
+        assert "decision_id" not in schema["properties"]
     tuning_parameters = tools["start_tuning_session"].parameters["properties"]
     assert tuning_parameters["max_candidates"]["default"] == 10
     assert tuning_parameters["execution_limit"]["default"] == 80
@@ -241,6 +351,7 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
         "sql-health-triage",
         "sql-optimizer",
         "sql-plan-enforcer",
+        "sql-index-manager",
     ]
     assert decision_properties["skill"]["enum"] == maintained_skills
     assert decision_properties["subject_kind"]["enum"] == [
@@ -248,6 +359,7 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
         "plan",
         "incident",
         "database",
+        "index",
     ]
     review_properties = tools["review_decision"].parameters["properties"]
     assert {"counterexamples", "next_observation", "terminal_evidence_refs"} <= set(
@@ -303,6 +415,26 @@ def test_learning_store_failure_preserves_static_tool_surface(
     assert "analyze_db_health" in tools
     assert "record_decision" not in tools
     assert "recall_lessons" not in tools
+
+
+def test_index_review_tool_list_is_recall_only(
+    tmp_path: Path,
+) -> None:
+    app = AzureSqlMcpApplication(
+        replace(make_config(tmp_path), profile=McpProfile.INDEX_REVIEW)
+    )
+    tools = app.mcp._tool_manager._tools
+
+    assert set(tools) == {
+        "check_runtime_status",
+        "list_databases",
+        "check_capabilities",
+        "capture_index_review_snapshot",
+        "review_index_portfolio",
+        "get_index_review",
+        "recall_lessons",
+    }
+    assert tools["recall_lessons"].annotations.readOnlyHint is True
 
 
 @pytest.mark.asyncio
@@ -462,7 +594,7 @@ async def test_runtime_status_is_db_free_stable_and_sanitized(
 
     assert first == second
     assert first["startup_timestamp"] == app._startup_timestamp
-    assert first["package_version"] == "2.2.1"
+    assert first["package_version"] == "2.3.0"
     assert first["profile"] is None
     assert first["transport"] == "stdio"
     assert first["tool_groups"] == ["all"]
@@ -551,7 +683,7 @@ async def test_successful_operation_links_terminal_outcome_and_learning_failure_
     decision = app.learning_service.record_decision(
         DecisionRecordV1(
             skill="sql-optimizer",
-            skill_version="2.3.0",
+            skill_version="2.3.1",
             case_id="case-1",
             learning_key="health-check",
             consumed_evidence_refs=(evidence.evidence_id,),
@@ -2448,10 +2580,16 @@ async def test_capability_check_publishes_tuning_contract(
     result = await app._check_database_capabilities("appdb")
 
     assert result["mcp_contract"] == {
-        "contract_version": 1,
+        "contract_version": "2.3.0",
         "performance_tuning": 1,
         "durable_view_change": 1,
         "prepared_plan_action": 1,
+        "index_portfolio_review": 1,
+        "index_learning_mode": "recall_only",
+        "index_history_schema_version": "index-history-v1",
+        "index_history_schema_fingerprint": CONTRACT_SCHEMA_FINGERPRINT,
+        "index_review_min_observation_days": 90,
+        "index_review_snapshot_reuse_hours": 48,
     }
     assert result["local_tuning_policy"] == {
         "configured": False,
@@ -2461,6 +2599,8 @@ async def test_capability_check_publishes_tuning_contract(
         "allow_test_indexes": False,
         "allow_view_apply": False,
         "allow_plan_apply": False,
+        "allow_index_history_write": False,
+        "business_cycle_extension_days": 0,
         "max_benchmark_executions": 0,
         "max_tuning_candidates": 0,
         "max_tuning_session_executions": 0,

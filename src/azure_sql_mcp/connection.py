@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import re
 import sys
@@ -13,6 +14,7 @@ from typing import Any
 from typing import Callable
 from typing import Mapping
 from typing import Sequence
+from typing import TypeVar
 
 from .auth import AzureSqlAuthenticator
 from .config import ServerConfig
@@ -107,6 +109,62 @@ class StatementDispatchPrevented(RuntimeError):
         super().__init__(str(cause))
         self.statement_index = statement_index
         self.cause = cause
+
+
+TransactionResultT = TypeVar("TransactionResultT")
+
+
+class TransactionCommitOutcomeUnknownError(RuntimeError):
+    """The commit was dispatched but its final database outcome is unknown."""
+
+
+class TransactionRollbackError(RuntimeError):
+    """A pre-commit failure could not be rolled back safely."""
+
+
+class SqlTransactionSession:
+    """Synchronous operations over the one connection owned by a transaction."""
+
+    def __init__(self, connection: Any, executor: "AzureSqlExecutor") -> None:
+        self._connection = connection
+        self._executor = executor
+
+    def execute(
+        self,
+        statement: str,
+        params: Sequence[Any] | None = None,
+    ) -> int | None:
+        cursor = self._connection.cursor()
+        try:
+            self._executor._configure_cursor(cursor)
+            self._executor._execute_statement(cursor, statement, params)
+            return cursor.rowcount
+        finally:
+            with contextlib.suppress(Exception):
+                cursor.close()
+
+    def fetch_all(
+        self,
+        statement: str,
+        params: Sequence[Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        cursor = self._connection.cursor()
+        try:
+            self._executor._configure_cursor(cursor)
+            self._executor._execute_statement(cursor, statement, params)
+            if not cursor.description:
+                return []
+            columns = tuple(column[0] for column in cursor.description)
+            return [
+                {
+                    column: self._executor._coerce_value(value)
+                    for column, value in zip(columns, row)
+                }
+                for row in cursor.fetchall()
+            ]
+        finally:
+            with contextlib.suppress(Exception):
+                cursor.close()
 
 
 class AzureSqlExecutor:
@@ -341,6 +399,100 @@ class AzureSqlExecutor:
             elif not deferred_cleanup:
                 await self.pool.discard(validated_database, connection)
 
+    async def execute_transaction_exactly_once(
+        self,
+        database_name: str,
+        callback: Callable[[SqlTransactionSession], TransactionResultT],
+    ) -> TransactionResultT:
+        """Run one synchronous callback in one isolated, never-retried transaction.
+
+        The connection is always discarded because transaction/session state is
+        deliberately not returned to the general pool.  Commit exceptions are
+        treated as unknown after dispatch; callers must reconcile by reading,
+        never by replaying the transaction.
+        """
+
+        validated_database = self.config.validate_database_name(database_name)
+        connection = await self.pool.acquire(validated_database)
+        deferred_cleanup = False
+        execution_task: asyncio.Task[TransactionResultT] | None = None
+        try:
+            execution_task = asyncio.create_task(
+                asyncio.to_thread(
+                    self._execute_transaction_with_connection,
+                    connection,
+                    validated_database,
+                    callback,
+                )
+            )
+            result = await asyncio.shield(execution_task)
+            return result
+        except asyncio.CancelledError:
+            if execution_task is not None:
+                self._request_cancel(connection)
+                deferred_cleanup = True
+                asyncio.create_task(
+                    self._discard_connection_when_task_finishes(
+                        validated_database,
+                        connection,
+                        execution_task,
+                    )
+                )
+            raise
+        finally:
+            if not deferred_cleanup:
+                # This is intentionally discard-on-success as well as on
+                # failure: a caller callback may have changed session state.
+                await self.pool.discard(validated_database, connection)
+
+    def _execute_transaction_with_connection(
+        self,
+        connection: Any,
+        database_name: str,
+        callback: Callable[[SqlTransactionSession], TransactionResultT],
+    ) -> TransactionResultT:
+        del database_name
+        original_autocommit = getattr(connection, "autocommit", None)
+        try:
+            if original_autocommit is not None:
+                connection.autocommit = False
+            setup_cursor = connection.cursor()
+            try:
+                self._configure_cursor(setup_cursor)
+                setup_cursor.execute("SET XACT_ABORT ON")
+                setup_cursor.execute(
+                    "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+                )
+                setup_cursor.execute("BEGIN TRANSACTION")
+            finally:
+                with contextlib.suppress(Exception):
+                    setup_cursor.close()
+
+            session = SqlTransactionSession(connection, self)
+            result = callback(session)
+            if inspect.isawaitable(result):
+                raise TypeError(
+                    "execute_transaction_exactly_once requires a synchronous callback."
+                )
+        except BaseException:
+            try:
+                connection.rollback()
+            except BaseException as rollback_error:
+                raise TransactionRollbackError(
+                    "The transaction failed and rollback was not confirmed."
+                ) from rollback_error
+            raise
+
+        try:
+            # Keep commit outside the pre-commit handler.  Once dispatched, a
+            # driver exception cannot prove whether SQL Server committed.
+            connection.commit()
+        except BaseException as commit_error:
+            raise TransactionCommitOutcomeUnknownError(
+                "Commit outcome is unknown; perform one fresh read reconciliation."
+            ) from commit_error
+        return result
+
     async def execute_non_query(
         self,
         database_name: str,
@@ -458,7 +610,7 @@ class AzureSqlExecutor:
         # If a tool call is cancelled (for example by an outer timeout), keep the
         # in-flight DB operation attached to this connection until the worker
         # thread finishes, then discard the connection so it is never reused.
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(BaseException):
             await execution_task
         try:
             await self.pool.discard(database_name, connection)

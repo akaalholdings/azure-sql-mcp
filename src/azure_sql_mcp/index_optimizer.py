@@ -48,6 +48,101 @@ _NON_LEAF_MULTIPLIER = 1.1
 # not be accepted for this statement shape.
 _SUPPORTED_ROWSTORE_INDEX_COMPRESSIONS = frozenset({"NONE", "ROW", "PAGE"})
 
+INDEX_SCORE_ALPHA = 1.5
+INDEX_SCORE_BETA = 0.5
+INDEX_CANDIDATE_IMPACT_FLOOR_PCT = 5.0
+
+
+def _index_candidate_score_components(
+    statement_subtree_cost: float | None,
+    execution_count: float | None,
+    impact_pct: float | None,
+    estimated_size_mb: float | None,
+    write_ratio: float | None,
+    alpha: float,
+    beta: float,
+) -> tuple[float, float] | None:
+    """Return the shared read benefit and score, or no score if incomplete."""
+
+    values = (
+        statement_subtree_cost,
+        execution_count,
+        impact_pct,
+        estimated_size_mb,
+        write_ratio,
+        alpha,
+        beta,
+    )
+    numeric_values: list[float] = []
+    for value in values:
+        if (
+            value is None
+            or isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            return None
+        numeric_values.append(float(value))
+    (
+        statement_subtree_cost_value,
+        execution_count_value,
+        impact_pct_value,
+        estimated_size_mb_value,
+        write_ratio_value,
+        alpha_value,
+        beta_value,
+    ) = numeric_values
+    if (
+        statement_subtree_cost_value < 0
+        or execution_count_value < 0
+        or not 0 <= impact_pct_value <= 100
+        or estimated_size_mb_value < 0
+        or not 0 <= write_ratio_value <= 1
+        or alpha_value < 0
+        or beta_value < 0
+    ):
+        return None
+
+    read_benefit = (
+        (impact_pct_value / 100.0)
+        * max(statement_subtree_cost_value, 0.001)
+        * max(execution_count_value, 1.0)
+    )
+    score = (
+        math.log(read_benefit + 1.0)
+        - alpha_value * math.log(estimated_size_mb_value + 1.0)
+        - beta_value * math.log(write_ratio_value + 0.01)
+    )
+    return read_benefit, score
+
+
+def score_index_candidate(
+    statement_subtree_cost: float | None,
+    execution_count: float | None,
+    impact_pct: float | None,
+    estimated_size_mb: float | None,
+    write_ratio: float | None,
+    alpha: float = INDEX_SCORE_ALPHA,
+    beta: float = INDEX_SCORE_BETA,
+) -> float | None:
+    """Score one index candidate using the optimizer's established model.
+
+    All five evidence inputs are required.  Returning ``None`` for absent or
+    invalid input keeps callers from turning incomplete evidence into a
+    recommendation.
+    """
+
+    components = _index_candidate_score_components(
+        statement_subtree_cost,
+        execution_count,
+        impact_pct,
+        estimated_size_mb,
+        write_ratio,
+        alpha,
+        beta,
+    )
+    return components[1] if components is not None else None
+
 
 @dataclass(frozen=True)
 class IndexCandidate:
@@ -481,9 +576,9 @@ class IndexOptimizer:
         window_minutes: int = 60,
         top_n: int = 30,
         budget_mb: float | None = None,
-        alpha: float = 1.5,
-        beta: float = 0.5,
-        min_improvement_pct: float = 5.0,
+        alpha: float = INDEX_SCORE_ALPHA,
+        beta: float = INDEX_SCORE_BETA,
+        min_improvement_pct: float = INDEX_CANDIDATE_IMPACT_FLOOR_PCT,
     ) -> OptimizationResult:
         # Step 1: collect workload + existing indexes
         workload = await self._collect_workload(database_name, window_minutes, top_n)
@@ -696,15 +791,17 @@ class IndexOptimizer:
         schema: str,
         table: str,
         columns: list[str],
-    ) -> float:
+    ) -> float | None:
         """Estimate index size in MB using row count and column widths."""
         row_count = await self._get_row_count(database_name, schema, table)
+        if row_count is None:
+            return None
         if row_count == 0:
             return 0.0
 
         col_widths = await self._get_column_widths(database_name, schema, table, columns)
-        if not col_widths:
-            return 0.0
+        if not col_widths or any(column not in col_widths for column in columns):
+            return None
 
         total_key_width = sum(col_widths.values()) + _INDEX_ROW_OVERHEAD
         rows_per_page = max(1, _USABLE_PAGE_BYTES // (total_key_width + _SLOT_ARRAY_ENTRY))
@@ -714,7 +811,7 @@ class IndexOptimizer:
 
     async def _get_table_write_ratio(
         self, database_name: str, schema: str, table: str,
-    ) -> float:
+    ) -> float | None:
         """Get write ratio (0.0-1.0) for a table from index usage stats."""
         query = """
         SELECT
@@ -732,12 +829,17 @@ class IndexOptimizer:
         """
         rows = await self.executor.fetch_all(database_name, query, params=[schema, table])
         if rows and rows[0].get("write_ratio") is not None:
-            return float(rows[0]["write_ratio"])
-        return 0.5  # default: balanced read/write when no stats
+            try:
+                write_ratio = float(rows[0]["write_ratio"])
+            except (TypeError, ValueError):
+                return None
+            if math.isfinite(write_ratio) and 0.0 <= write_ratio <= 1.0:
+                return write_ratio
+        return None
 
     async def _get_row_count(
         self, database_name: str, schema: str, table: str,
-    ) -> int:
+    ) -> int | None:
         query = """
         SELECT SUM(p.row_count) AS row_count
         FROM sys.dm_db_partition_stats p
@@ -747,8 +849,12 @@ class IndexOptimizer:
         """
         rows = await self.executor.fetch_all(database_name, query, params=[schema, table])
         if rows and rows[0].get("row_count") is not None:
-            return int(rows[0]["row_count"])
-        return 0
+            try:
+                row_count = int(rows[0]["row_count"])
+            except (TypeError, ValueError):
+                return None
+            return row_count if row_count >= 0 else None
+        return None
 
     async def _get_column_widths(
         self,
@@ -771,11 +877,18 @@ class IndexOptimizer:
         """
         params: list[Any] = [schema, table, *columns]
         rows = await self.executor.fetch_all(database_name, query, params=params)
-        return {
-            row["column_name"]: int(row.get("max_length") or 8)
-            for row in rows
-            if row.get("column_name")
-        }
+        widths: dict[str, int] = {}
+        for row in rows:
+            column_name = row.get("column_name")
+            if not column_name or row.get("max_length") is None:
+                continue
+            try:
+                width = int(row["max_length"])
+            except (TypeError, ValueError):
+                continue
+            if width >= 0:
+                widths[column_name] = width
+        return widths
 
     # ------------------------------------------------------------------
     # Step 4: Overlap detection & consolidation
@@ -876,20 +989,27 @@ class IndexOptimizer:
     ) -> list[ScoredCandidate]:
         scored: list[ScoredCandidate] = []
         for rc in candidates:
-            size_mb = getattr(rc, "estimated_size_mb", 0.0)
-            write_ratio = getattr(rc, "write_ratio", 0.5)
-
-            read_benefit = (
-                (rc.impact_pct / 100.0)
-                * max(rc.statement_subtree_cost, 0.001)
-                * max(rc.total_executions, 1.0)
+            size_mb = getattr(rc, "estimated_size_mb", None)
+            write_ratio = getattr(rc, "write_ratio", None)
+            components = _index_candidate_score_components(
+                rc.statement_subtree_cost,
+                rc.total_executions,
+                rc.impact_pct,
+                size_mb,
+                write_ratio,
+                alpha,
+                beta,
             )
-
-            score = (
-                math.log(read_benefit + 1.0)
-                - alpha * math.log(size_mb + 1.0)
-                - beta * math.log(write_ratio + 0.01)
-            )
+            if components is None:
+                continue
+            read_benefit, score = components
+            if (
+                not isinstance(size_mb, (int, float))
+                or isinstance(size_mb, bool)
+                or not isinstance(write_ratio, (int, float))
+                or isinstance(write_ratio, bool)
+            ):
+                continue
 
             # Remove key columns from include columns to avoid duplication
             key_set = set(rc.key_columns)

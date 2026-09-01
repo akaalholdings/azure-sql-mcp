@@ -58,6 +58,10 @@ from .index_optimizer import verify_plan_uses_index
 from .index_metadata import collect_existing_indexes
 from .index_metadata import existing_index_covers_candidate
 from .index_recommendations import IndexRecommendationService
+from .index_review import IndexReviewService
+from .index_review import CONTRACT_SCHEMA_FINGERPRINT
+from .index_review import SqlIndexHistoryRepository
+from .index_review import render_index_review_artifacts
 from .introspection import IntrospectionService
 from .lock_diagnostics import LockDiagnosticsService
 from .learning_contracts import DecisionRecordV1
@@ -166,9 +170,10 @@ _PLAIN_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _INDEX_OWNER_PROOF = re.compile(r"^[A-Za-z0-9_.:-]{16,200}$")
 _IDEMPOTENCY_DIGEST_PATTERN = re.compile(r"^idempotency-v1:[0-9a-f]{64}$")
 _LEARNING_SKILL_VERSIONS = {
-    "sql-health-triage": "1.0.0",
-    "sql-optimizer": "2.3.0",
-    "sql-plan-enforcer": "1.0.0",
+    "sql-health-triage": "1.0.1",
+    "sql-optimizer": "2.3.1",
+    "sql-plan-enforcer": "1.0.1",
+    "sql-index-manager": "1.0.0",
 }
 _PENDING_INDEX_OWNERSHIP_SQL = """
 SELECT
@@ -218,6 +223,9 @@ _CATALOG_READ_TOOLS = frozenset(
         "get_dependencies",
         "get_table_stats",
         "capture_schema_snapshot",
+        "capture_index_review_snapshot",
+        "review_index_portfolio",
+        "get_index_review",
     }
 )
 _CATALOG_PAIR_TOOLS = frozenset(
@@ -407,6 +415,17 @@ class AzureSqlMcpApplication:
             PerformanceStore(db_path=":memory:")
             if config.performance_state_dir == ":memory:"
             else PerformanceStore(config.performance_state_dir)
+        )
+        self.index_history_repository = SqlIndexHistoryRepository(
+            executor,
+            self.database_policy,
+        )
+        self.index_review = IndexReviewService(
+            executor,
+            self.index_history_repository,
+            database_policy=self.database_policy,
+            recommendations=self.recommendations,
+            query_store=self.query_store,
         )
         self.learning_store: LearningStore | None = None
         self.learning_service: LearningService | None = None
@@ -3538,6 +3557,103 @@ class AzureSqlMcpApplication:
                     lambda db: self._kill_session(db, session_id, dry_run),
                 )
 
+        @self.mcp.tool(
+            description=(
+                "Capture a redacted index portfolio snapshot into the installed, "
+                "append-only history contract. No index DDL is executed."
+            ),
+            annotations=ToolAnnotations(
+                title="Capture Index Review Snapshot",
+                readOnlyHint=False,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
+        async def capture_index_review_snapshot(
+            database_name: str = Field(
+                ...,
+                min_length=1,
+                max_length=128,
+                description="Target database name.",
+            ),
+            idempotency_key: str | None = Field(
+                default=None,
+                min_length=1,
+                max_length=512,
+                description="Optional caller key. Omitted calls use the UTC-day key.",
+            ),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "capture_index_review_snapshot",
+                database_name,
+                lambda db: self._capture_index_review_snapshot(db, idempotency_key),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Review captured index history using deterministic safety gates and "
+                "recommend-only artifacts."
+            ),
+            annotations=ToolAnnotations(
+                title="Review Index Portfolio",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )
+        async def review_index_portfolio(
+            database_name: str = Field(
+                ...,
+                min_length=1,
+                max_length=128,
+                description="Target database name.",
+            ),
+            as_of_run_id: str | None = Field(
+                default=None,
+                min_length=1,
+                max_length=200,
+                description="Optional captured run to review.",
+            ),
+            prior_review_id: str | None = Field(
+                default=None,
+                min_length=1,
+                max_length=200,
+                description="Optional prior review for deterministic recheck transitions.",
+            ),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "review_index_portfolio",
+                database_name,
+                lambda db: self._review_index_portfolio(db, as_of_run_id, prior_review_id),
+            )
+
+        @self.mcp.tool(
+            description="Reconstruct one scoped index portfolio review from validated history.",
+            annotations=ToolAnnotations(
+                title="Get Index Review",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )
+        async def get_index_review(
+            database_name: str = Field(
+                ...,
+                min_length=1,
+                max_length=128,
+                description="Target database name.",
+            ),
+            review_id: str = Field(min_length=1, max_length=200),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "get_index_review",
+                database_name,
+                lambda db: self._get_index_review(db, review_id),
+            )
+
     def _register_learning_tools(self) -> None:
         """Register the owner-only, advisory learning plane on local stdio."""
 
@@ -3560,11 +3676,11 @@ class AzureSqlMcpApplication:
         )
         async def record_decision(
             skill: Literal[
-                "sql-health-triage", "sql-optimizer", "sql-plan-enforcer"
+                "sql-health-triage", "sql-optimizer", "sql-plan-enforcer", "sql-index-manager"
             ] = Field(description="Maintained skill that made the decision."),
             skill_version: str = Field(description="Skill contract version."),
             learning_key: str = Field(description="Stable decision-family key."),
-            subject_kind: Literal["query", "plan", "incident", "database"] = Field(
+            subject_kind: Literal["query", "plan", "incident", "database", "index"] = Field(
                 description="Redacted decision subject kind.",
             ),
             subject_fingerprint: str = Field(
@@ -3815,6 +3931,7 @@ class AzureSqlMcpApplication:
                     "sql-health-triage",
                     "sql-optimizer",
                     "sql-plan-enforcer",
+                    "sql-index-manager",
                 ]
             ] = Field(
                 description="Skills allowed to recall the lesson."
@@ -3859,7 +3976,7 @@ class AzureSqlMcpApplication:
         )
         async def recall_lessons(
             skill: Literal[
-                "sql-health-triage", "sql-optimizer", "sql-plan-enforcer"
+                "sql-health-triage", "sql-optimizer", "sql-plan-enforcer", "sql-index-manager"
             ] = Field(description="Maintained skill requesting advisory lessons."),
             skill_version: str = Field(description="Version of the requesting skill."),
             runtime_compatibility_fingerprint: str = Field(
@@ -3915,7 +4032,7 @@ class AzureSqlMcpApplication:
         )
         async def list_learning_candidates(
             skill: Literal[
-                "sql-health-triage", "sql-optimizer", "sql-plan-enforcer"
+                "sql-health-triage", "sql-optimizer", "sql-plan-enforcer", "sql-index-manager"
             ]
             | None = Field(default=None),
             learning_key: str | None = Field(default=None),
@@ -3941,10 +4058,10 @@ class AzureSqlMcpApplication:
         )
         async def create_handoff(
             source_skill: Literal[
-                "sql-health-triage", "sql-optimizer", "sql-plan-enforcer"
+                "sql-health-triage", "sql-optimizer", "sql-plan-enforcer", "sql-index-manager"
             ] = Field(description="Maintained skill creating the handoff."),
             target_skill: Literal[
-                "sql-health-triage", "sql-optimizer", "sql-plan-enforcer"
+                "sql-health-triage", "sql-optimizer", "sql-plan-enforcer", "sql-index-manager"
             ] = Field(description="Maintained skill expected to accept it."),
             objective: dict[str, Any] = Field(description="Redacted handoff objective."),
             evidence_refs: list[str] = Field(description="Immutable evidence identifiers."),
@@ -4478,10 +4595,16 @@ class AzureSqlMcpApplication:
             **checks,
             "azure_sql_database": platform,
             "mcp_contract": {
-                "contract_version": 1,
+                "contract_version": "2.3.0",
                 "performance_tuning": 1,
                 "durable_view_change": 1,
                 "prepared_plan_action": 1,
+                "index_portfolio_review": 1,
+                "index_learning_mode": "recall_only",
+                "index_history_schema_version": "index-history-v1",
+                "index_history_schema_fingerprint": CONTRACT_SCHEMA_FINGERPRINT,
+                "index_review_min_observation_days": 90,
+                "index_review_snapshot_reuse_hours": 48,
             },
             "local_tuning_policy": {
                 "configured": policy.configured,
@@ -4491,6 +4614,8 @@ class AzureSqlMcpApplication:
                 "allow_test_indexes": policy.allow_test_indexes,
                 "allow_view_apply": policy.allow_view_apply,
                 "allow_plan_apply": policy.allow_plan_apply,
+                "allow_index_history_write": policy.allow_index_history_write,
+                "business_cycle_extension_days": policy.business_cycle_extension_days,
                 "max_benchmark_executions": policy.max_benchmark_executions,
                 "max_tuning_candidates": policy.max_tuning_candidates,
                 "max_tuning_session_executions": (
@@ -4499,6 +4624,42 @@ class AzureSqlMcpApplication:
                 "max_tuning_session_minutes": policy.max_tuning_session_minutes,
             },
         }
+
+    async def _capture_index_review_snapshot(
+        self,
+        database_name: str,
+        idempotency_key: str | None,
+    ) -> dict[str, Any]:
+        result = await self.index_review.capture_snapshot(
+            database_name,
+            idempotency_key=idempotency_key,
+        )
+        return result.as_dict()
+
+    async def _review_index_portfolio(
+        self,
+        database_name: str,
+        as_of_run_id: str | None,
+        prior_review_id: str | None,
+    ) -> dict[str, Any]:
+        review = await self.index_review.review_portfolio(
+            database_name,
+            as_of_run_id=as_of_run_id,
+            prior_review_id=prior_review_id,
+        )
+        payload = review.as_dict()
+        payload["artifacts"] = render_index_review_artifacts(review)
+        return payload
+
+    async def _get_index_review(
+        self,
+        database_name: str,
+        review_id: str,
+    ) -> dict[str, Any]:
+        review = await self.index_review.get_review(database_name, review_id)
+        payload = review.as_dict()
+        payload["artifacts"] = render_index_review_artifacts(review)
+        return payload
 
     async def _start_performance_case(
         self,

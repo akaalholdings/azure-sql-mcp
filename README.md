@@ -18,6 +18,7 @@ The supported tuning path is evidence-first but rewrite-active: a missing plan l
 - Prepared Query Store plan actions with prior-state capture, policy checks, verification, and exact rollback.
 - Evidence-linked decisions, terminal outcome reviews, reviewed lessons, and typed cross-skill handoffs.
 - Audited general DBA T-SQL execution that rejects direct or statically recoverable `DROP DATABASE` statements.
+- Deterministic, recommend-only index portfolio reviews over two manually installed `dbatools` history tables. The index workflow never creates the schema or executes index DDL.
 
 The Copilot operating instructions live in the [`akaalholdings/SQL` skills](https://github.com/akaalholdings/SQL/tree/main/skills). The skills decide what to investigate and how to present the result; this package owns database execution, policy, durable state, and deterministic workflow transitions.
 
@@ -140,6 +141,7 @@ Reload VS Code, enable the server in Copilot Chat, then call `list_databases` an
 | `sandbox` | Disposable non-production index and view tests | local stdio, unrestricted, write apply, sandbox policy | optimizer tools plus leased index benchmark and prepared view apply/verify/rollback |
 | `enforcer-review` | Query Store review and intent preparation | restricted, write disabled | plan health, preview-only review, `prepare_plan_action` |
 | `enforcer-apply` | One authorized prepared plan action | local stdio, unrestricted, write apply, apply policy, kill switch open | apply, verify, and rollback prepared intents |
+| `index-review` | Capture and review index lifecycle history | restricted; separate index-history write policy for capture | six base tools plus `recall_lessons` locally; six base tools remotely |
 
 Named profiles always hide direct force, hint, raw plan-apply, and direct test-index mutation tools. The compatibility implementations of those tools are preview-only even when a server is started without a profile.
 
@@ -162,6 +164,8 @@ Synthetic policy example:
       "allow_test_indexes": true,
       "allow_view_apply": true,
       "allow_plan_apply": false,
+      "allow_index_history_write": false,
+      "business_cycle_extension_days": 0,
       "max_benchmark_executions": 80,
       "max_tuning_candidates": 60,
       "max_tuning_session_executions": 2000,
@@ -174,6 +178,8 @@ Synthetic policy example:
       "allow_test_indexes": false,
       "allow_view_apply": false,
       "allow_plan_apply": false,
+      "allow_index_history_write": false,
+      "business_cycle_extension_days": 0,
       "max_benchmark_executions": 0,
       "max_tuning_candidates": 0,
       "max_tuning_session_executions": 0,
@@ -486,12 +492,17 @@ Resources include schema views and token-safe plan artifacts under `azuresql-art
 
 ## Evidence-governed learning
 
-Local stdio servers expose advisory learning tools for `sql-health-triage@1.0.0`,
-`sql-optimizer@2.3.0`, and `sql-plan-enforcer@1.0.0`. They persist redacted
+Local stdio servers expose advisory learning tools for `sql-health-triage@1.0.1`,
+`sql-optimizer@2.3.1`, `sql-plan-enforcer@1.0.1`, and
+`sql-index-manager@1.0.0`. They persist redacted
 `DecisionRecordV1`, `OutcomeReviewV1`, `LessonV1`, and `HandoffV1` contracts in
 the existing owner-only `performance.sqlite3`. Remote transports do not expose
 these tools, and an unavailable learning store leaves the normal static and
 database-operation surfaces unchanged.
+
+The `index-review` profile narrows that local surface to `recall_lessons`
+only. V1 does not expose decision, lesson, or handoff writes to the index
+manager workflow.
 
 Lessons never authorize database changes or modify a skill. Normal lessons need
 three aligned terminal reviews across at least two sessions and two subject
@@ -510,6 +521,82 @@ Exports contain active lessons only. Imports are inactive proposals with
 source-pack provenance and require fresh local approval. Learning contracts and
 packs reject raw SQL, parameters, result rows, credentials, environment values,
 and hidden reasoning.
+
+`sql-index-manager@1.0.0` is recall-only in V1. Index review, run, snapshot,
+and artifact identifiers are portfolio selectors, not valid
+`consumed_evidence_refs`; review responses deliberately return
+`evidence_id=null`. Clients must not invent an `evidence-*` identifier,
+terminal link, decision, handoff, or outcome review. A later recheck or explicit
+human resolution is necessary evidence for a future learning outcome, but is
+not sufficient until an MCP-owned evidence and terminal-link bridge exists.
+
+## Index portfolio review
+
+This contract is staged but inactive. Source availability does not mean the
+database contract has been installed, policy has been enabled, the MCP host has
+been restarted, or a non-production smoke test has passed.
+
+The additive public contract is version `2.3.0` and exposes only:
+
+- `capture_index_review_snapshot(database_name, idempotency_key?)`
+- `review_index_portfolio(database_name, as_of_run_id?, prior_review_id?)`
+- `get_index_review(database_name, review_id)`
+
+Capture writes only to the manually installed `dbatools.IndexReviewRun` and
+`dbatools.IndexReviewSnapshot` tables. It uses a UTC-day idempotency key by
+default, stores only its hash, and rejects a conflicting request. The
+`index-review` profile has six base tools plus `recall_lessons` locally;
+remote transports expose the six base tools only. Capabilities advertise
+`index_learning_mode=recall_only`.
+
+Install the approved two-table contract separately with
+[`sql/Install-IndexReviewHistory-v1.sql`](sql/Install-IndexReviewHistory-v1.sql).
+The checked-in policy template is at
+[`examples/index-review-policy.json`](examples/index-review-policy.json).
+`allow_index_history_write` defaults to `false` and must be enabled separately
+for each approved database. The MCP process does not run the installer or apply
+the database schema.
+
+Capture is available through the non-interactive command:
+
+```bash
+azure-sql-mcp-index-history capture --database appdb --output json
+```
+
+An explicit idempotency key is optional:
+
+```bash
+azure-sql-mcp-index-history capture --database appdb \
+  --idempotency-key scheduled-appdb-2026-08-28 --output json
+```
+
+The workflow supports three modes:
+
+- `inventory`: definitions, protections, usage epochs, sizes, and coverage.
+- `review`: the default deterministic portfolio classification.
+- `recheck`: comparison with a later, non-overlapping observation.
+
+Clients first check runtime status, list databases, and verify capabilities and
+schema fingerprints. A snapshot under 48 hours old is reused; otherwise capture
+occurs only when database policy permits it.
+
+Reviews are deterministic projections of validated history. States are
+`keep`, `create_candidate`, `consolidate_candidate`, `drop_candidate`, and
+`observe`; overall results are `actionable`, `no_change`, `partial`, or
+`inconclusive`. The fixed minimum observation floor is 90 days. Any protection,
+valid read delta, executed Query Store reference, incomplete evidence, epoch
+change, counter reset, definition change, or unsupported index type keeps the
+workflow from proposing removal. Generated JSON, Markdown, and SQL files are
+recommend-only artifacts; every SQL statement is inert and must be reviewed
+and separately authorised.
+
+V1 evidence comes from Query Store and index DMVs only. Database Watcher
+integration, index maintenance, and index DDL execution are out of scope. The
+LLM may explain classifier evidence and reason codes, but cannot override any
+safety gate.
+
+The three index tools do not write local learning evidence or return a terminal
+link. Their ids must never be passed to write-side learning or handoff tools.
 
 ## Verification
 

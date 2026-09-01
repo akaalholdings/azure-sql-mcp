@@ -40,6 +40,7 @@ class McpProfile(str, Enum):
     SANDBOX = "sandbox"
     ENFORCER_REVIEW = "enforcer-review"
     ENFORCER_APPLY = "enforcer-apply"
+    INDEX_REVIEW = "index-review"
 
 
 LEARNING_TOOL_NAMES = frozenset(
@@ -54,6 +55,7 @@ LEARNING_TOOL_NAMES = frozenset(
         "resolve_handoff",
     }
 )
+INDEX_REVIEW_LEARNING_TOOL_NAMES = frozenset({"recall_lessons"})
 
 
 # Tool name → group mapping.  Tools not listed here are always registered.
@@ -91,6 +93,9 @@ TOOL_GROUPS: dict[str, ToolGroup] = {
     "analyze_db_health": ToolGroup.CORE,
     "get_top_queries": ToolGroup.CORE,
     "analyze_index_recommendations": ToolGroup.CORE,
+    "capture_index_review_snapshot": ToolGroup.CORE,
+    "review_index_portfolio": ToolGroup.CORE,
+    "get_index_review": ToolGroup.CORE,
     **{tool_name: ToolGroup.CORE for tool_name in LEARNING_TOOL_NAMES},
     # performance: deep diagnostics & tuning
     "analyze_query_indexes": ToolGroup.PERFORMANCE,
@@ -331,6 +336,16 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "get_object_index_diagnostics",
         }
     ) | LEARNING_TOOL_NAMES,
+    McpProfile.INDEX_REVIEW: frozenset(
+        {
+            "check_runtime_status",
+            "list_databases",
+            "check_capabilities",
+            "capture_index_review_snapshot",
+            "review_index_portfolio",
+            "get_index_review",
+        }
+    ) | INDEX_REVIEW_LEARNING_TOOL_NAMES,
 }
 
 
@@ -762,6 +777,7 @@ def load_server_config(argv: list[str] | None = None) -> ServerConfig:
         McpProfile.TRIAGE,
         McpProfile.OPTIMIZER,
         McpProfile.ENFORCER_REVIEW,
+        McpProfile.INDEX_REVIEW,
     }
     write_profiles = {McpProfile.SANDBOX, McpProfile.ENFORCER_APPLY}
     if (

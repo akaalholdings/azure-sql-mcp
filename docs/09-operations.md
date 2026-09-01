@@ -1,6 +1,6 @@
 # Operations guide
 
-This guide covers local VS Code Copilot setup, the five enforced MCP profiles, and the separate unprofiled general DBA posture. Keep one MCP process per posture so the advertised tool surface and write authority are obvious.
+This guide covers local VS Code Copilot setup, the six enforced MCP profiles, and the separate unprofiled general DBA posture. Keep one MCP process per posture so the advertised tool surface and write authority are obvious.
 
 ## Before you start
 
@@ -110,6 +110,8 @@ Create an uncommitted JSON file outside the repository:
       "allow_test_indexes": true,
       "allow_view_apply": true,
       "allow_plan_apply": false,
+      "allow_index_history_write": false,
+      "business_cycle_extension_days": 0,
       "max_benchmark_executions": 80,
       "max_tuning_candidates": 60,
       "max_tuning_session_executions": 2000,
@@ -149,9 +151,88 @@ required legacy workflows have completed or been retired.
 | `sandbox` | `sql-optimizer`, temporary index or view | unrestricted, local stdio | apply | core,performance,admin | benchmark, test-index, or view-apply permission as needed; non-production environment |
 | `enforcer-review` | `sql-plan-enforcer`, review | restricted | disabled | core,performance | shared state path required for intent preparation |
 | `enforcer-apply` | `sql-plan-enforcer`, one apply | unrestricted, local stdio | apply | core,performance,admin | plan-apply permission and open kill switch |
+| `index-review` | `sql-index-manager`, capture/review | restricted | disabled for general SQL; separate index-history write policy for capture | index-review | local: six base tools plus `recall_lessons`; remote: six base tools |
 | unset (general DBA) | explicitly authorized DBA work | unrestricted, local stdio | apply | all | normal database allowlist; SQL permissions remain authoritative |
 
 The profile is a server-side tool filter. Access mode, tool groups, Azure SQL permissions, database policy, and workflow state are independent gates.
+
+### Index history capture and review
+
+The index-review workflow is recommend-only and initially inactive. Shipping
+the source does not install the database contract, enable capture policy,
+restart the MCP host, or prove the runtime fingerprints.
+
+Only after separate explicit approval, install
+[`../sql/Install-IndexReviewHistory-v1.sql`](../sql/Install-IndexReviewHistory-v1.sql)
+manually against the intended Azure SQL Database. The installer creates exactly
+`dbatools.IndexReviewRun` and `dbatools.IndexReviewSnapshot` in one transaction
+and grants object-level `SELECT` and `INSERT` to the named MCP principal. It
+does not create the schema or principal, revoke inherited permissions, or prove
+least privilege. Confirm the principal has no broader effective permissions
+before running it. The MCP process never runs the installer, creates the
+tables, performs maintenance, or applies index DDL.
+
+The public tools are `capture_index_review_snapshot`, `review_index_portfolio`,
+and `get_index_review`. Capture requires both database-policy `allow_read` and
+`allow_index_history_write`; review and retrieval require `allow_read` and a
+valid contract probe. The fixed minimum observation period is 90 days, with an
+optional business-cycle extension. A capture reuses the UTC-day idempotency
+hash when already present, and a mismatched request is rejected.
+
+Modes are `inventory` for definitions and coverage, `review` for the default
+classification, and `recheck` for a later non-overlapping observation. V1 uses
+Query Store and index DMVs only. Database Watcher integration is deferred until
+its Azure Data Explorer or Fabric destination is configured. The LLM explains
+evidence and reason codes but cannot override classifier safety gates.
+
+The review service validates every run and subject row after reading it. It
+rejects mismatched subject counts, JSON, contract/schema versions, fingerprints,
+or snapshot manifests. Raw query text, parameters, module or hint text, and
+plan XML are never stored. Query Store and hint text are parsed transiently
+into hashes, ids, aggregates, and coverage blockers.
+
+V1 learning is scoped advisory recall only. Portfolio review, run, snapshot,
+and artifact ids are not learning evidence references, and review returns
+`evidence_id=null`. Do not call `record_decision`, `review_decision`, lesson
+proposal, or handoff lifecycle tools for this workflow, and never invent an
+`evidence-*` id or terminal link. A later recheck or explicit human resolution
+cannot become an `OutcomeReviewV1` until a future MCP-owned evidence and
+terminal-link bridge is explicitly introduced.
+The local `index-review` profile enforces this boundary by exposing only
+`recall_lessons` from the learning plane, and capabilities report
+`index_learning_mode=recall_only`.
+
+Each review returns exactly seven recommend-only artifacts:
+`index-review.json`, `index-review.md`, `create-candidates.sql`,
+`consolidation-candidates.sql`, `drop-candidates.sql`, `rollback.sql`, and
+`validation.sql`. SQL is commented or guarded and is never executed by MCP.
+If exact reverse DDL cannot be reconstructed, the subject remains `observe`.
+
+For scheduled local capture:
+
+```bash
+azure-sql-mcp-index-history capture --database appdb --output json
+```
+
+Use `--idempotency-key KEY` only when the scheduler needs an explicit bounded
+identity; otherwise the command derives the database-fingerprint plus UTC-date
+key.
+
+Exit `0` means captured or already captured, `2` means configuration, schema,
+policy, integrity, or idempotency rejection, and `3` means collection, write,
+or unknown transaction outcome. Do not replay a `3` until the database state
+has been reconciled.
+
+Before calling the feature active:
+
+1. Obtain separate approval for the database contract and inspect effective
+   permissions on the intended MCP principal.
+2. Apply the installer manually and enable `allow_index_history_write` only for
+   the approved database.
+3. Install the skill, restart the MCP host, and confirm the runtime capability
+   and schema fingerprints.
+4. Run capture and review against a non-production Azure SQL Database and
+   verify that no profile exposes index execution.
 
 ## General DBA runbook
 

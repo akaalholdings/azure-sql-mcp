@@ -11,6 +11,7 @@ from azure_sql_mcp.param_binding import ParameterExecutionContract
 from azure_sql_mcp.param_binding import SqlParameterType
 from azure_sql_mcp.param_binding import TypedParameter
 from azure_sql_mcp.plans import PlansService
+from azure_sql_mcp.plans import parse_showplan_index_evidence
 from azure_sql_mcp.safe_sql import SafeSqlValidator
 
 SAMPLE_SHOWPLAN = """\
@@ -420,6 +421,111 @@ def test_summarize_showplan_xml_extracts_actionable_operator_diagnostics() -> No
     assert parallel["thread_count"] == 2
     assert parallel["row_skew_ratio"] == pytest.approx(1.8181818)
     assert summary["actual_metrics"]["actual_logical_reads"] is None
+
+
+def test_redacted_showplan_parser_deduplicates_multi_object_references() -> None:
+    multi_object_plan = DETAILED_SHOWPLAN.replace(
+        "</QueryPlan>",
+        "<RelOp PhysicalOp=\"Index Scan\" LogicalOp=\"Index Scan\"><IndexScan>"
+        "<Object Database=\"[appdb]\" Schema=\"[dbo]\" Table=\"[Orders]\" "
+        "Index=\"[IX_Orders_CustomerId]\" /></IndexScan></RelOp></QueryPlan>",
+    )
+    result = parse_showplan_index_evidence(
+        multi_object_plan,
+        query_id=42,
+        plan_id=7,
+        execution_count=12,
+        runtime_interval_ids=[9, 9],
+        last_seen="2026-07-15T10:00:00Z",
+        is_forced_plan=True,
+    )
+
+    assert len(result["index_references"]) == 1
+    reference = result["index_references"][0]
+    assert reference["database_name"] == "appdb"
+    assert reference["schema_name"] == "dbo"
+    assert reference["object_name"] == "Orders"
+    assert reference["index_name"] == "IX_Orders_CustomerId"
+    assert reference["operator_kind"] == "Multiple"
+    assert reference["operator_kinds"] == ["Index Scan", "Index Seek"]
+    assert reference["is_forced_plan"] is True
+    assert reference["execution_count"] == 12
+    assert reference["runtime_interval_ids"] == [9]
+    assert reference["plan_fingerprint"] == result["plan_fingerprint"]
+    assert result["coverage"]["status"] == "complete"
+
+
+def test_redacted_showplan_parser_returns_canonical_candidate_signatures() -> None:
+    result = parse_showplan_index_evidence(
+        ACTUAL_SHOWPLAN,
+        query_id=42,
+        plan_id=8,
+        execution_count=4,
+        runtime_interval_ids=[1, 2],
+    )
+
+    [candidate] = result["missing_index_candidates"]
+    assert candidate["database_name"] == "appdb"
+    assert candidate["schema_name"] == "dbo"
+    assert candidate["object_name"] == "Orders"
+    assert candidate["key_signature"] == "=CustomerId"
+    assert candidate["include_signature"] == "Status"
+    assert candidate["filter_signature"] is None
+    assert candidate["impact_pct"] == 87.5
+    assert candidate["candidate_signature"] == (
+        "appdb.dbo.Orders|key:=CustomerId|include:Status|filter:"
+    )
+    assert candidate["runtime_interval_ids"] == [1, 2]
+
+
+def test_redacted_showplan_parser_never_returns_text_parameters_predicates_or_xml() -> None:
+    result = parse_showplan_index_evidence(
+        DETAILED_SHOWPLAN,
+        query_id=42,
+        plan_id=7,
+    )
+    serialized = repr(result)
+
+    for secret in (
+        "SELECT * FROM dbo.Orders",
+        "ScalarString",
+        "@CustomerId",
+        "ParameterCompiledValue",
+        "ShowPlanXML",
+    ):
+        assert secret not in serialized
+
+
+@pytest.mark.parametrize(
+    "raw_xml",
+    ("<ShowPlanXML>", "<NotShowPlan />", "<ShowPlanXML />"),
+)
+def test_redacted_showplan_parser_fails_closed_for_malformed_or_wrong_namespace(
+    raw_xml: str,
+) -> None:
+    result = parse_showplan_index_evidence(raw_xml, query_id=42, plan_id=7)
+
+    assert result["index_references"] == []
+    assert result["missing_index_candidates"] == []
+    assert result["coverage"]["status"] == "incomplete"
+    assert result["coverage"]["malformed"] == 1
+
+
+def test_redacted_showplan_parser_reports_input_caps_and_bad_numeric_facts() -> None:
+    result = parse_showplan_index_evidence(
+        DETAILED_SHOWPLAN,
+        query_id=42,
+        plan_id=7,
+        execution_count=-1,
+        runtime_interval_ids=["not-an-id"],  # type: ignore[list-item]
+        max_xml_chars=10,
+    )
+
+    assert result["coverage"]["status"] == "incomplete"
+    assert result["coverage"]["capped"] is True
+    assert "execution_count_malformed" in result["coverage"]["blockers"]
+    assert "runtime_interval_id_malformed" in result["coverage"]["blockers"]
+    assert "showplan_xml_capped" in result["coverage"]["blockers"]
 
 
 def test_statistics_io_is_per_sample_and_sourced_from_messages() -> None:

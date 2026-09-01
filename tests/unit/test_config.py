@@ -81,7 +81,10 @@ def test_view_sql_state_persistence_requires_explicit_opt_in(monkeypatch) -> Non
     assert config.persist_view_sql_state is True
 
 
-@pytest.mark.parametrize("profile", list(McpProfile))
+@pytest.mark.parametrize(
+    "profile",
+    [profile for profile in McpProfile if profile is not McpProfile.INDEX_REVIEW],
+)
 def test_learning_tools_are_available_to_every_local_profile(
     monkeypatch,
     profile: McpProfile,
@@ -103,6 +106,30 @@ def test_learning_tools_are_available_to_every_local_profile(
     config = load_server_config(args)
 
     assert all(config.is_tool_enabled(name) for name in LEARNING_TOOL_NAMES)
+
+
+def test_index_review_profile_exposes_only_recall_learning_tool(monkeypatch) -> None:
+    monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
+    monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "appdb")
+    monkeypatch.setenv("AZURE_SQL_ALLOWED_DATABASES", "appdb")
+
+    config = load_server_config(
+        ["--azure-sql-profile", "index-review", "--azure-sql-tool-groups", "all"]
+    )
+
+    enabled = {
+        name for name in LEARNING_TOOL_NAMES if config.is_tool_enabled(name)
+    }
+    assert enabled == {"recall_lessons"}
+    assert not {
+        "record_decision",
+        "review_decision",
+        "propose_lesson",
+        "list_learning_candidates",
+        "create_handoff",
+        "get_handoff",
+        "resolve_handoff",
+    } & enabled
 
 
 @pytest.mark.parametrize("transport", [TransportMode.SSE, TransportMode.STREAMABLE_HTTP])
@@ -408,7 +435,11 @@ def test_runtime_status_is_available_in_every_named_profile(monkeypatch, profile
 
 @pytest.mark.parametrize(
     "profile",
-    [McpProfile.TRIAGE, McpProfile.OPTIMIZER, McpProfile.ENFORCER_REVIEW],
+    [
+        McpProfile.TRIAGE,
+        McpProfile.OPTIMIZER,
+        McpProfile.ENFORCER_REVIEW,
+    ],
 )
 def test_read_only_profiles_expose_diagnostics_without_mutation_tools(
     monkeypatch,

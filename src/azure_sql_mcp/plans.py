@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
+import math
 import xml.etree.ElementTree as ET
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from .artifacts import ExplainPlanArtifact
@@ -15,8 +19,364 @@ from .plan_diagnostics import summarize_statistics_io_samples
 from .safe_sql import SafeSqlValidator
 
 SHOWPLAN_NAMESPACE = {"sp": "http://schemas.microsoft.com/sqlserver/2004/07/showplan"}
+SHOWPLAN_NAMESPACE_URI = SHOWPLAN_NAMESPACE["sp"]
 logger = logging.getLogger(__name__)
 parse_statistics_io = parse_statistics_io_messages
+
+
+def parse_showplan_index_evidence(
+    raw_xml: str,
+    *,
+    query_id: int,
+    plan_id: int,
+    plan_hash: str | None = None,
+    execution_count: int | None = None,
+    runtime_interval_ids: Sequence[int] = (),
+    last_seen: str | datetime | None = None,
+    is_forced_plan: bool = False,
+    input_truncated: bool = False,
+    max_xml_chars: int = 4_000_000,
+    max_references: int = 500,
+    max_candidates: int = 500,
+) -> dict[str, Any]:
+    """Extract redacted index evidence from one Showplan XML document."""
+
+    blockers: list[str] = []
+    coverage: dict[str, Any] = {
+        "status": "complete",
+        "eligible": 1,
+        "scanned": 0,
+        "malformed": 0,
+        "truncated": bool(input_truncated),
+        "capped": False,
+        "blockers": blockers,
+    }
+    if input_truncated:
+        blockers.append("showplan_input_truncated")
+    if not isinstance(query_id, int) or isinstance(query_id, bool) or query_id <= 0:
+        blockers.append("query_id_invalid")
+    if not isinstance(plan_id, int) or isinstance(plan_id, bool) or plan_id <= 0:
+        blockers.append("plan_id_invalid")
+    if execution_count is not None and (
+        not isinstance(execution_count, int)
+        or isinstance(execution_count, bool)
+        or execution_count < 0
+    ):
+        blockers.append("execution_count_malformed")
+        execution_count = None
+    interval_ids: list[int] = []
+    for interval_id in runtime_interval_ids:
+        if (
+            not isinstance(interval_id, int)
+            or isinstance(interval_id, bool)
+            or interval_id <= 0
+        ):
+            blockers.append("runtime_interval_id_malformed")
+            continue
+        interval_ids.append(interval_id)
+    interval_ids = sorted(set(interval_ids))
+    if max_xml_chars <= 0 or max_references <= 0 or max_candidates <= 0:
+        blockers.append("parser_cap_invalid")
+    if not isinstance(raw_xml, str) or not raw_xml.strip():
+        blockers.append("showplan_xml_unavailable")
+    elif len(raw_xml) > max_xml_chars:
+        coverage["capped"] = True
+        blockers.append("showplan_xml_capped")
+
+    result: dict[str, Any] = {
+        "query_id": query_id,
+        "plan_id": plan_id,
+        "is_forced_plan": bool(is_forced_plan),
+        "execution_count": execution_count,
+        "runtime_interval_ids": interval_ids,
+        "last_seen": _redact_last_seen(last_seen, blockers),
+        "plan_hash": None,
+        "plan_fingerprint": None,
+        "index_references": [],
+        "missing_index_candidates": [],
+        "coverage": coverage,
+    }
+    if blockers:
+        _finish_parser_coverage(coverage, blockers)
+        return result
+
+    try:
+        root = ET.fromstring(raw_xml)
+    except (ET.ParseError, TypeError):
+        blockers.append("showplan_xml_malformed")
+        _finish_parser_coverage(coverage, blockers, malformed=True)
+        return result
+    if root.tag != f"{{{SHOWPLAN_NAMESPACE_URI}}}ShowPlanXML":
+        blockers.append("showplan_root_or_namespace_invalid")
+        _finish_parser_coverage(coverage, blockers, malformed=True)
+        return result
+
+    coverage["scanned"] = 1
+    parent_map = {child: parent for parent in root.iter() for child in parent}
+    statement_hashes = sorted(
+        {
+            str(node.attrib["QueryPlanHash"])
+            for node in root.findall(".//sp:StmtSimple", SHOWPLAN_NAMESPACE)
+            if node.attrib.get("QueryPlanHash")
+        }
+    )
+    result["plan_hash"] = (
+        plan_hash
+        if isinstance(plan_hash, str) and plan_hash.strip()
+        else statement_hashes[0]
+        if len(statement_hashes) == 1
+        else None
+    )
+    if len(statement_hashes) > 1:
+        blockers.append("multiple_plan_hashes")
+
+    references: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    object_nodes = root.findall(".//sp:Object", SHOWPLAN_NAMESPACE)
+    for object_node in object_nodes:
+        identity = _showplan_object_identity(object_node)
+        if identity is None:
+            if object_node.attrib.get("Index"):
+                blockers.append("index_reference_identity_incomplete")
+            continue
+        relop = _nearest_ancestor_relop(root, object_node)
+        physical = relop.attrib.get("PhysicalOp") if relop is not None else None
+        logical = relop.attrib.get("LogicalOp") if relop is not None else None
+        operator_kinds = tuple(
+            value for value in (physical, logical) if value and value.strip()
+        ) or ("Unknown",)
+        item = references.setdefault(
+            identity,
+            {
+                "database_name": identity[0],
+                "schema_name": identity[1],
+                "object_name": identity[2],
+                "index_name": identity[3],
+                "operator_kinds": [],
+            },
+        )
+        item["operator_kinds"] = sorted(
+            set(item["operator_kinds"]) | set(operator_kinds)
+        )
+
+    candidates: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for index_node in root.findall(".//sp:MissingIndex", SHOWPLAN_NAMESPACE):
+        identity = _showplan_missing_identity(index_node)
+        if identity is None:
+            blockers.append("missing_index_identity_incomplete")
+            continue
+        equality = _missing_columns(index_node, "EQUALITY")
+        inequality = _missing_columns(index_node, "INEQUALITY")
+        include = _missing_columns(index_node, "INCLUDE")
+        key_parts = []
+        if equality:
+            key_parts.append("=" + ",".join(equality))
+        if inequality:
+            key_parts.append("~" + ",".join(inequality))
+        key_signature = ";".join(key_parts)
+        include_signature = ",".join(include)
+        filter_signature = None
+        missing_group = _nearest_ancestor_named(
+            index_node,
+            parent_map,
+            "MissingIndexGroup",
+        )
+        impact_pct: float | None = None
+        if missing_group is None or not missing_group.attrib.get("Impact"):
+            blockers.append("missing_index_impact_unavailable")
+        else:
+            try:
+                impact_pct = float(missing_group.attrib["Impact"])
+            except (TypeError, ValueError):
+                blockers.append("missing_index_impact_malformed")
+            else:
+                if not math.isfinite(impact_pct) or not 0.0 <= impact_pct <= 100.0:
+                    blockers.append("missing_index_impact_malformed")
+                    impact_pct = None
+        candidate_signature = "|".join(
+            (
+                ".".join(identity),
+                f"key:{key_signature}",
+                f"include:{include_signature}",
+                "filter:",
+            )
+        )
+        key = (*identity, key_signature, include_signature, filter_signature)
+        candidates[key] = {
+            "database_name": identity[0],
+            "schema_name": identity[1],
+            "object_name": identity[2],
+            "key_signature": key_signature,
+            "include_signature": include_signature,
+            "filter_signature": filter_signature,
+            "impact_pct": impact_pct,
+            "candidate_signature": candidate_signature,
+            "equality_columns": equality,
+            "inequality_columns": inequality,
+            "include_columns": include,
+        }
+
+    if len(references) > max_references:
+        coverage["capped"] = True
+        blockers.append("index_reference_cap_reached")
+    if len(candidates) > max_candidates:
+        coverage["capped"] = True
+        blockers.append("missing_index_candidate_cap_reached")
+    result["index_references"] = [
+        _finish_reference(item, result)
+        for item in list(references.values())[:max_references]
+    ]
+    result["missing_index_candidates"] = [
+        _finish_candidate(item, result)
+        for item in list(candidates.values())[:max_candidates]
+    ]
+    fingerprint_input = {
+        "plan_hash": result["plan_hash"],
+        "references": result["index_references"],
+        "candidates": result["missing_index_candidates"],
+    }
+    plan_fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_input,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    result["plan_fingerprint"] = plan_fingerprint
+    for reference in result["index_references"]:
+        reference["plan_fingerprint"] = plan_fingerprint
+    for candidate in result["missing_index_candidates"]:
+        candidate["plan_fingerprint"] = plan_fingerprint
+    _finish_parser_coverage(coverage, blockers)
+    return result
+
+
+def parse_redacted_showplan_index_evidence(
+    raw_xml: str, **kwargs: Any
+) -> dict[str, Any]:
+    """Compatibility name for the redacted Showplan evidence parser."""
+
+    return parse_showplan_index_evidence(raw_xml, **kwargs)
+
+
+def _showplan_object_identity(node: ET.Element) -> tuple[str, str, str, str] | None:
+    values = tuple(
+        _unquote_showplan_identifier(node.attrib.get(name, ""))
+        for name in ("Database", "Schema", "Table", "Index")
+    )
+    return (values[0], values[1], values[2], values[3]) if all(values) else None
+
+
+def _showplan_missing_identity(node: ET.Element) -> tuple[str, str, str] | None:
+    values = tuple(
+        _unquote_showplan_identifier(node.attrib.get(name, ""))
+        for name in ("Database", "Schema", "Table")
+    )
+    return (values[0], values[1], values[2]) if all(values) else None
+
+
+def _unquote_showplan_identifier(value: str) -> str:
+    text = str(value)
+    if len(text) >= 2 and text[0] == "[" and text[-1] == "]":
+        return text[1:-1].replace("]]", "]")
+    return text
+
+
+def _nearest_ancestor_relop(root: ET.Element, node: ET.Element) -> ET.Element | None:
+    parents = {child: parent for parent in root.iter() for child in parent}
+    parent = parents.get(node)
+    while parent is not None:
+        if parent.tag.rsplit("}", 1)[-1] == "RelOp":
+            return parent
+        parent = parents.get(parent)
+    return None
+
+
+def _nearest_ancestor_named(
+    node: ET.Element,
+    parent_map: dict[ET.Element, ET.Element],
+    local_name: str,
+) -> ET.Element | None:
+    parent = parent_map.get(node)
+    while parent is not None:
+        if parent.tag.rsplit("}", 1)[-1] == local_name:
+            return parent
+        parent = parent_map.get(parent)
+    return None
+
+
+def _missing_columns(index_node: ET.Element, usage: str) -> list[str]:
+    columns: list[str] = []
+    for group in index_node:
+        if group.tag.rsplit("}", 1)[-1] != "ColumnGroup":
+            continue
+        if group.attrib.get("Usage", "").upper() != usage:
+            continue
+        for column in group:
+            if column.tag.rsplit("}", 1)[-1] != "Column":
+                continue
+            name = _unquote_showplan_identifier(column.attrib.get("Name", ""))
+            if name:
+                columns.append(name)
+    return columns
+
+
+def _finish_reference(item: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    operator_kinds = item.pop("operator_kinds")
+    return {
+        **item,
+        "database": item["database_name"],
+        "schema": item["schema_name"],
+        "object": item["object_name"],
+        "index": item["index_name"],
+        "operator_kind": operator_kinds[0] if len(operator_kinds) == 1 else "Multiple",
+        "operator_kinds": operator_kinds,
+        "query_id": result["query_id"],
+        "plan_id": result["plan_id"],
+        "is_forced_plan": result["is_forced_plan"],
+        "plan_hash": result["plan_hash"],
+        "plan_fingerprint": None,
+        "execution_count": result["execution_count"],
+        "runtime_interval_ids": result["runtime_interval_ids"],
+        "last_seen": result["last_seen"],
+    }
+
+
+def _finish_candidate(item: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **item,
+        "database": item["database_name"],
+        "schema": item["schema_name"],
+        "object": item["object_name"],
+        "query_id": result["query_id"],
+        "plan_id": result["plan_id"],
+        "is_forced_plan": result["is_forced_plan"],
+        "plan_hash": result["plan_hash"],
+        "plan_fingerprint": None,
+        "execution_count": result["execution_count"],
+        "runtime_interval_ids": result["runtime_interval_ids"],
+        "last_seen": result["last_seen"],
+    }
+
+
+def _redact_last_seen(value: str | datetime | None, blockers: list[str]) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    blockers.append("last_seen_malformed")
+    return None
+
+
+def _finish_parser_coverage(
+    coverage: dict[str, Any], blockers: list[str], *, malformed: bool = False
+) -> None:
+    if blockers:
+        coverage["status"] = "incomplete"
+    if malformed:
+        coverage["malformed"] = 1
 
 
 @dataclass(frozen=True)

@@ -18,6 +18,8 @@ from azure_sql_mcp.connection import BatchExecutionMode
 from azure_sql_mcp.connection import ProfiledExecution
 from azure_sql_mcp.connection import QueryResult
 from azure_sql_mcp.connection import StatementDispatchPrevented
+from azure_sql_mcp.connection import TransactionCommitOutcomeUnknownError
+from azure_sql_mcp.connection import TransactionRollbackError
 
 
 class RowCountCursor:
@@ -277,6 +279,131 @@ def test_execute_non_query_with_connection_counts_only_positive_rowcounts(
     )
 
     assert rowcount == 10
+
+
+@pytest.mark.asyncio
+async def test_transaction_exactly_once_uses_one_connection_and_discards_it(
+    sample_server_config,
+) -> None:
+    connection = MagicMock()
+    cursor = MagicMock()
+    cursor.description = [("value",)]
+    cursor.fetchall.return_value = [(1,)]
+    connection.cursor.return_value = cursor
+    pool = SimpleNamespace(
+        acquire=AsyncMock(return_value=connection),
+        release=AsyncMock(),
+        discard=AsyncMock(),
+    )
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), pool)
+
+    def callback(session):
+        assert session.fetch_all("SELECT 1") == [{"value": 1}]
+        session.execute("INSERT INTO dbatools.IndexReviewRun VALUES (?)", ("run",))
+        return "ok"
+
+    with patch("azure_sql_mcp.connection.with_retry", side_effect=AssertionError("retry used")):
+        result = await executor.execute_transaction_exactly_once("appdb", callback)
+
+    assert result == "ok"
+    pool.acquire.assert_awaited_once_with("appdb")
+    pool.release.assert_not_awaited()
+    pool.discard.assert_awaited_once_with("appdb", connection)
+    assert connection.cursor.call_count == 3
+    assert [call.args[0] for call in cursor.execute.call_args_list[:3]] == [
+        "SET XACT_ABORT ON",
+        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        "BEGIN TRANSACTION",
+    ]
+    connection.commit.assert_called_once_with()
+    connection.rollback.assert_not_called()
+
+
+def test_transaction_precommit_failure_rolls_back_and_does_not_commit(
+    sample_server_config,
+) -> None:
+    connection = MagicMock()
+    cursor = MagicMock()
+    connection.cursor.return_value = cursor
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), MagicMock())
+
+    def callback(session):
+        session.execute("INSERT INTO dbatools.IndexReviewRun VALUES (?)", ("run",))
+        raise RuntimeError("second subject failed")
+
+    with pytest.raises(RuntimeError, match="second subject failed"):
+        executor._execute_transaction_with_connection(connection, "appdb", callback)
+
+    connection.rollback.assert_called_once_with()
+    connection.commit.assert_not_called()
+
+
+def test_transaction_rollback_failure_is_explicit(sample_server_config) -> None:
+    connection = MagicMock()
+    connection.cursor.return_value = MagicMock()
+    connection.rollback.side_effect = OSError("rollback unavailable")
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), MagicMock())
+
+    with pytest.raises(TransactionRollbackError):
+        executor._execute_transaction_with_connection(
+            connection,
+            "appdb",
+            lambda _session: (_ for _ in ()).throw(RuntimeError("callback failed")),
+        )
+
+
+def test_transaction_commit_dispatch_uncertainty_is_not_retried(sample_server_config) -> None:
+    connection = MagicMock()
+    connection.cursor.return_value = MagicMock()
+    connection.commit.side_effect = OSError("connection dropped after commit dispatch")
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), MagicMock())
+
+    with pytest.raises(TransactionCommitOutcomeUnknownError):
+        executor._execute_transaction_with_connection(
+            connection,
+            "appdb",
+            lambda _session: "committed-or-unknown",
+        )
+
+    connection.commit.assert_called_once_with()
+    connection.rollback.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_transaction_cancellation_defers_discard_until_worker_finishes(
+    sample_server_config,
+) -> None:
+    connection = MagicMock()
+    pool = SimpleNamespace(
+        acquire=AsyncMock(return_value=connection),
+        release=AsyncMock(),
+        discard=AsyncMock(),
+    )
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), pool)
+    worker_started = threading.Event()
+    worker_release = threading.Event()
+
+    def blocked_callback(_session):
+        worker_started.set()
+        worker_release.wait(timeout=2)
+        return "done"
+
+    task = asyncio.create_task(
+        executor.execute_transaction_exactly_once("appdb", blocked_callback)
+    )
+    assert await asyncio.to_thread(worker_started.wait, 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    pool.discard.assert_not_awaited()
+    connection.cancel.assert_called_once_with()
+    worker_release.set()
+    for _ in range(20):
+        if pool.discard.await_count:
+            break
+        await asyncio.sleep(0.01)
+    pool.discard.assert_awaited_once_with("appdb", connection)
 
 
 def test_execute_non_query_marks_post_dispatch_failure_as_unknown(

@@ -17,6 +17,8 @@ Version 1 documents a small, database-scoped allowlist::
           "allow_test_indexes": false,
           "allow_view_apply": false,
           "allow_plan_apply": false,
+          "allow_index_history_write": false,
+          "business_cycle_extension_days": 0,
           "max_benchmark_executions": 0,
           "max_tuning_candidates": 0,
           "max_tuning_session_executions": 0,
@@ -51,6 +53,8 @@ _DATABASE_FIELDS = frozenset(
         "allow_test_indexes",
         "allow_view_apply",
         "allow_plan_apply",
+        "allow_index_history_write",
+        "business_cycle_extension_days",
         "max_benchmark_executions",
         "max_tuning_candidates",
         "max_tuning_session_executions",
@@ -84,6 +88,8 @@ class DatabasePolicy:
     allow_test_indexes: bool = False
     allow_view_apply: bool = False
     allow_plan_apply: bool = False
+    allow_index_history_write: bool = False
+    business_cycle_extension_days: int = 0
     max_benchmark_executions: int = 0
     max_tuning_candidates: int = 0
     max_tuning_session_executions: int = 0
@@ -106,6 +112,7 @@ class DatabasePolicy:
             "allow_test_indexes",
             "allow_view_apply",
             "allow_plan_apply",
+            "allow_index_history_write",
         ):
             if not isinstance(getattr(self, field_name), bool):
                 raise DatabasePolicyValidationError(f"{field_name} must be a boolean.")
@@ -114,6 +121,7 @@ class DatabasePolicy:
             "max_tuning_candidates",
             "max_tuning_session_executions",
             "max_tuning_session_minutes",
+            "business_cycle_extension_days",
         ):
             value = getattr(self, field_name)
             if (
@@ -149,6 +157,7 @@ class DatabasePolicy:
             allow_test_indexes=value.get("allow_test_indexes", False),
             allow_view_apply=value.get("allow_view_apply", False),
             allow_plan_apply=value.get("allow_plan_apply", False),
+            allow_index_history_write=value.get("allow_index_history_write", False),
             max_benchmark_executions=per_request_limit,
             max_tuning_candidates=value.get(
                 "max_tuning_candidates",
@@ -162,6 +171,7 @@ class DatabasePolicy:
                 "max_tuning_session_minutes",
                 20 if allow_benchmark and per_request_limit > 0 else 0,
             ),
+            business_cycle_extension_days=value.get("business_cycle_extension_days", 0),
         )
 
     @classmethod
@@ -181,10 +191,12 @@ class DatabasePolicy:
             allow_test_indexes=False,
             allow_view_apply=False,
             allow_plan_apply=False,
+            allow_index_history_write=False,
             max_benchmark_executions=0,
             max_tuning_candidates=0,
             max_tuning_session_executions=0,
             max_tuning_session_minutes=0,
+            business_cycle_extension_days=0,
             configured=False,
         )
 
@@ -234,6 +246,11 @@ class DatabasePolicy:
         """Whether reviewed view DDL may target this database."""
 
         return self.configured and self.is_non_production and self.allow_view_apply
+
+    def can_write_index_history(self) -> bool:
+        """Whether controlled append-only index telemetry may be recorded."""
+
+        return self.configured and self.allow_read and self.allow_index_history_write
 
     def can_run_index_experiment(self) -> bool:
         """Whether temporary index DDL may target this database."""
@@ -365,6 +382,9 @@ class DatabasePolicySet:
 
     def allows_plan_apply(self, database_name: str) -> bool:
         return self.policy_for(database_name).allow_plan_apply
+
+    def allows_index_history_write(self, database_name: str) -> bool:
+        return self.policy_for(database_name).can_write_index_history()
 
 
 def load_database_policy(path: str | Path) -> DatabasePolicySet:

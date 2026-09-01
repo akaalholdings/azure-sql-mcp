@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "databases": {
+    "appdb": {
+      "environment": "development",
+      "allow_read": true,
+      "allow_index_history_write": false,
+      "business_cycle_extension_days": 0
+    }
+  }
+}
