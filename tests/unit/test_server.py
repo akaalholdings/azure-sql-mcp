@@ -594,7 +594,7 @@ async def test_runtime_status_is_db_free_stable_and_sanitized(
 
     assert first == second
     assert first["startup_timestamp"] == app._startup_timestamp
-    assert first["package_version"] == "2.3.0"
+    assert first["package_version"] == "2.3.1"
     assert first["profile"] is None
     assert first["transport"] == "stdio"
     assert first["tool_groups"] == ["all"]
@@ -2664,3 +2664,14 @@ async def test_tune_history_is_inconclusive_when_exact_identity_is_ambiguous(
     assert history["fuzzy_match_used"] is False
     app.query_store.get_query_history_by_id.assert_not_awaited()
     app.query_store.get_query_history_by_text.assert_not_awaited()
+
+
+def test_index_manager_learning_registry_requires_skill_version_1_0_1() -> None:
+    AzureSqlMcpApplication._validate_learning_skill_version(
+        "sql-index-manager", "1.0.1"
+    )
+
+    with pytest.raises(ValueError, match=r"requires version 1\.0\.1"):
+        AzureSqlMcpApplication._validate_learning_skill_version(
+            "sql-index-manager", "1.0.0"
+        )

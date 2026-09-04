@@ -1,15 +1,14 @@
 /*
   Azure SQL MCP index-history contract v1.
 
-  Manual-only installer. Run it separately with an explicitly provisioned
-  database principal. The MCP server never runs this file, creates these
-  objects, or applies index DDL. The dbatools schema must already exist.
+  Manual-only installer. Run it separately as an authorized database
+  administrator. The MCP server never runs this file, creates these objects,
+  or applies index DDL. The dbatools schema must already exist.
 
-  This script creates exactly two append-only telemetry tables and grants the
-  MCP principal SELECT and INSERT on those tables only. It does not grant
-  UPDATE, DELETE, ALTER, CONTROL, EXECUTE, or any index-DDL permission.
-  It does not revoke permissions inherited from roles or other grants. Confirm
-  that the principal has no broader effective permissions before installation.
+  This script creates exactly two append-only telemetry tables. It does not
+  create, alter, or remove database users or roles, and it does not change
+  permissions. The MCP runtime uses the signed-in identity's existing effective
+  permissions.
 */
 SET NOCOUNT ON;
 SET XACT_ABORT ON;
@@ -17,9 +16,6 @@ SET XACT_ABORT ON;
 BEGIN TRY
     BEGIN TRANSACTION;
 
-DECLARE @PrincipalName sysname = N'azure_sql_mcp_index_history';
-IF DATABASE_PRINCIPAL_ID(@PrincipalName) IS NULL
-    THROW 51010, 'Create the intended least-privilege database principal before running this installer.', 1;
 IF SCHEMA_ID(N'dbatools') IS NULL
     THROW 51011, 'Create the dbatools schema before running this installer.', 1;
 IF OBJECT_ID(N'dbatools.IndexReviewRun', N'U') IS NOT NULL
@@ -92,11 +88,6 @@ CREATE TABLE [dbatools].[IndexReviewSnapshot]
         REFERENCES [dbatools].[IndexReviewRun](RunId),
     CONSTRAINT UQ_IndexReviewSnapshot_Run_Subject UNIQUE (RunId, SubjectId)
 );
-
-DECLARE @GrantSql nvarchar(max) =
-    N'GRANT SELECT, INSERT ON OBJECT::[dbatools].[IndexReviewRun] TO ' + QUOTENAME(@PrincipalName) + N';' +
-    N'GRANT SELECT, INSERT ON OBJECT::[dbatools].[IndexReviewSnapshot] TO ' + QUOTENAME(@PrincipalName) + N';';
-EXEC sys.sp_executesql @GrantSql;
 
     COMMIT TRANSACTION;
 END TRY

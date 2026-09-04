@@ -16,7 +16,7 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 - Added exactly-once transaction capture with idempotency range locking,
   commit-outcome reconciliation, fail-closed contract probing, and seven inert
   review artifacts.
-- Registered `sql-index-manager@1.0.0` and learning subject `index` for
+- Registered `sql-index-manager@1.0.1` and learning subject `index` for
   scoped advisory recall only. V1 portfolio selectors are not learning
   evidence references, and no decision or outcome is written until a future
   MCP-owned evidence and terminal-link bridge is explicitly added.
@@ -32,6 +32,12 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ### Changed
 
+- Released package `2.3.1` while retaining public MCP contract `2.3.0` and
+  history schema `index-history-v1`. Index history now uses the current runtime
+  identity's existing effective permissions: review requires `SELECT`, capture
+  requires `SELECT` and `INSERT`, and broader permissions are diagnostic rather
+  than a contract rejection. The installer no longer manages a dedicated
+  principal, roles, or permissions.
 - The sandbox profile exposes only the statically validated, row-capped
   `execute_sql` ad-hoc path, still gated by database-policy `allow_read`.
 - Parameter-case inputs require the exact `name`/`values`/`types`/`weight`

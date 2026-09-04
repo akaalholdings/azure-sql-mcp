@@ -18,6 +18,7 @@ from azure_sql_mcp.index_review import INSERT_RUN_SQL
 from azure_sql_mcp.index_review import INSERT_SNAPSHOT_SQL
 from azure_sql_mcp.index_review import IndexReviewIdempotencyConflictError
 from azure_sql_mcp.index_review import IndexReviewRunV1
+from azure_sql_mcp.index_review import IndexReviewSchemaError
 from azure_sql_mcp.index_review import IndexReviewSnapshotV1
 from azure_sql_mcp.index_review import SqlIndexHistoryRepository
 from azure_sql_mcp.index_review import _digest
@@ -179,16 +180,17 @@ class _Session:
 
 
 class _Executor:
-    def __init__(self):
+    def __init__(self, probe_rows=None):
         self.run_rows = []
         self.snapshot_rows = []
         self.lock_rows = []
         self.transaction_calls = 0
+        self.probe_rows = probe_rows or _probe_rows()
 
     async def execute_batches(self, database_name, statement, params=None):
         assert database_name == "appdb"
         if statement == CONTRACT_PROBE_SQL:
-            return [_CursorResult(rows) for rows in _probe_rows()]
+            return [_CursorResult(rows) for rows in self.probe_rows]
         if statement == CAPTURE_READ_SQL:
             return [_CursorResult(self.run_rows), _CursorResult(self.snapshot_rows)]
         raise AssertionError("unexpected read statement")
@@ -392,3 +394,42 @@ def _policy(*, allow_write: bool) -> DatabasePolicySet:
             },
         }
     )
+
+
+@pytest.mark.asyncio
+async def test_repository_requires_select_for_review_and_insert_for_capture() -> None:
+    review_only = _probe_rows()
+    for row in review_only[4]:
+        row["InsertState"] = 0
+    repository = SqlIndexHistoryRepository(
+        _Executor(review_only), _policy(allow_write=True)
+    )
+
+    probe = await repository.probe_contract("appdb")
+    assert probe.allow_read is True
+    assert probe.allow_write is False
+    with pytest.raises(IndexReviewSchemaError, match="required SELECT and INSERT"):
+        await repository.probe_contract("appdb", for_write=True)
+
+    no_read = _probe_rows()
+    no_read[4][0]["SelectState"] = 0
+    repository = SqlIndexHistoryRepository(
+        _Executor(no_read), _policy(allow_write=True)
+    )
+    with pytest.raises(IndexReviewSchemaError, match="required SELECT permissions"):
+        await repository.probe_contract("appdb")
+
+
+@pytest.mark.asyncio
+async def test_repository_accepts_existing_broader_effective_permissions() -> None:
+    broad = _probe_rows()
+    broad[4][0]["ControlState"] = 1
+    repository = SqlIndexHistoryRepository(
+        _Executor(broad), _policy(allow_write=True)
+    )
+
+    probe = await repository.probe_contract("appdb", for_write=True)
+
+    assert probe.allow_read is True
+    assert probe.allow_write is True
+    assert probe.dangerous_permissions_absent is False

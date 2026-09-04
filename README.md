@@ -494,7 +494,7 @@ Resources include schema views and token-safe plan artifacts under `azuresql-art
 
 Local stdio servers expose advisory learning tools for `sql-health-triage@1.0.1`,
 `sql-optimizer@2.3.1`, `sql-plan-enforcer@1.0.1`, and
-`sql-index-manager@1.0.0`. They persist redacted
+`sql-index-manager@1.0.1`. They persist redacted
 `DecisionRecordV1`, `OutcomeReviewV1`, `LessonV1`, and `HandoffV1` contracts in
 the existing owner-only `performance.sqlite3`. Remote transports do not expose
 these tools, and an unavailable learning store leaves the normal static and
@@ -522,7 +522,7 @@ source-pack provenance and require fresh local approval. Learning contracts and
 packs reject raw SQL, parameters, result rows, credentials, environment values,
 and hidden reasoning.
 
-`sql-index-manager@1.0.0` is recall-only in V1. Index review, run, snapshot,
+`sql-index-manager@1.0.1` is recall-only in V1. Index review, run, snapshot,
 and artifact identifiers are portfolio selectors, not valid
 `consumed_evidence_refs`; review responses deliberately return
 `evidence_id=null`. Clients must not invent an `evidence-*` identifier,
@@ -536,7 +536,8 @@ This contract is staged but inactive. Source availability does not mean the
 database contract has been installed, policy has been enabled, the MCP host has
 been restarted, or a non-production smoke test has passed.
 
-The additive public contract is version `2.3.0` and exposes only:
+Current-user Entra permission handling requires package `2.3.1` or newer. The
+additive public contract remains version `2.3.0` and exposes only:
 
 - `capture_index_review_snapshot(database_name, idempotency_key?)`
 - `review_index_portfolio(database_name, as_of_run_id?, prior_review_id?)`
@@ -551,6 +552,21 @@ remote transports expose the six base tools only. Capabilities advertise
 
 Install the approved two-table contract separately with
 [`sql/Install-IndexReviewHistory-v1.sql`](sql/Install-IndexReviewHistory-v1.sql).
+The installer creates only the two history tables in one transaction. It does
+not create users or roles and does not change permissions. The `dbatools`
+schema and the operator's database access must already exist.
+
+For an operator-owned local stdio process, use `entra-default` or `interactive`
+authentication to obtain a token for the currently signed-in Entra identity.
+No user principal name is embedded in the MCP server. One process has one
+runtime identity; restart it after changing the signed-in operator. Per-caller
+delegation for a shared remote service is not part of this contract.
+
+Review requires effective `SELECT` on both history tables. Capture requires
+effective `SELECT` and `INSERT` on both. Existing broader permissions, including
+`dbo`, do not make the contract invalid. In that case, the restricted profile,
+database allowlist, and `allow_index_history_write` are application-layer
+controls; they do not reduce the identity's SQL permissions outside MCP.
 The checked-in policy template is at
 [`examples/index-review-policy.json`](examples/index-review-policy.json).
 `allow_index_history_write` defaults to `false` and must be enabled separately

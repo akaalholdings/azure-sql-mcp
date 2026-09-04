@@ -173,7 +173,7 @@ _LEARNING_SKILL_VERSIONS = {
     "sql-health-triage": "1.0.1",
     "sql-optimizer": "2.3.1",
     "sql-plan-enforcer": "1.0.1",
-    "sql-index-manager": "1.0.0",
+    "sql-index-manager": "1.0.1",
 }
 _PENDING_INDEX_OWNERSHIP_SQL = """
 SELECT

@@ -166,11 +166,24 @@ Only after separate explicit approval, install
 [`../sql/Install-IndexReviewHistory-v1.sql`](../sql/Install-IndexReviewHistory-v1.sql)
 manually against the intended Azure SQL Database. The installer creates exactly
 `dbatools.IndexReviewRun` and `dbatools.IndexReviewSnapshot` in one transaction
-and grants object-level `SELECT` and `INSERT` to the named MCP principal. It
-does not create the schema or principal, revoke inherited permissions, or prove
-least privilege. Confirm the principal has no broader effective permissions
-before running it. The MCP process never runs the installer, creates the
-tables, performs maintenance, or applies index DDL.
+and makes no principal, role, or permission changes. The `dbatools` schema and
+the operator's database access must already exist. The MCP process never runs
+the installer, creates the tables, performs maintenance, or applies index DDL.
+
+For an operator-owned local stdio process, configure `entra-default` or
+`interactive` authentication. The runtime obtains a token for the identity
+selected by the current Entra sign-in; it does not contain a fixed user
+principal name. Restart the process after changing the signed-in operator. A
+shared remote service does not delegate a different Entra identity per caller.
+
+Review requires effective `SELECT` on both history tables. Capture requires
+effective `SELECT` and `INSERT` on both. Broader effective permissions do not
+fail the contract probe. If the identity is `dbo`, the restricted profile,
+database allowlist, and write-policy gate remain application-layer controls;
+they do not reduce the identity's SQL permissions outside MCP.
+
+This identity and permission behaviour requires package `2.3.1` or newer. The
+public MCP and history contract version remains `2.3.0`.
 
 The public tools are `capture_index_review_snapshot`, `review_index_portfolio`,
 and `get_index_review`. Capture requires both database-policy `allow_read` and
@@ -225,8 +238,8 @@ has been reconciled.
 
 Before calling the feature active:
 
-1. Obtain separate approval for the database contract and inspect effective
-   permissions on the intended MCP principal.
+1. Obtain separate approval for the database contract. Confirm the signed-in
+   Entra identity and its existing effective database permissions.
 2. Apply the installer manually and enable `allow_index_history_write` only for
    the approved database.
 3. Install the skill, restart the MCP host, and confirm the runtime capability

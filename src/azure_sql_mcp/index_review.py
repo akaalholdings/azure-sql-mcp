@@ -65,7 +65,7 @@ INDEX_REVIEW_ALGORITHM_VERSION = "index-review-algorithm-v1"
 INDEX_REVIEW_CLASSIFIER_POLICY_VERSION = "index-review-classifier-v1"
 INDEX_REVIEW_COLLECTOR_VERSION = "index-review-collector-v1"
 INDEX_REVIEW_SKILL = "sql-index-manager"
-INDEX_REVIEW_SKILL_VERSION = "1.0.0"
+INDEX_REVIEW_SKILL_VERSION = "1.0.1"
 MIN_OBSERVATION_DAYS = 90
 MAX_CAPTURE_ROWS = 10_000
 MAX_PLAN_XML_CHARS = 4_000_000
@@ -1943,6 +1943,16 @@ def validate_contract_probe(result_sets: Sequence[Any]) -> ContractProbeResult:
         table = str(row.get("TableName", ""))
         if table in actual:
             actual[table].add(str(row.get("ColumnName", "")))
+    missing_tables = [
+        f"dbatools.{table_name}"
+        for table_name, column_names in actual.items()
+        if not column_names
+    ]
+    if missing_tables:
+        noun = "table is" if len(missing_tables) == 1 else "tables are"
+        raise IndexReviewSchemaError(
+            f"Index history {noun} missing: {', '.join(missing_tables)}."
+        )
     if actual != expected_columns:
         raise IndexReviewSchemaError("History contract columns do not match the versioned schema.")
     for table_name, expected in expected_columns.items():
@@ -2083,8 +2093,6 @@ def validate_contract_probe(result_sets: Sequence[Any]) -> ContractProbeResult:
         and granted(row.get("InsertState"))
         for row in permissions
     )
-    if not dangerous_absent:
-        raise IndexReviewSchemaError("History contract principal has forbidden effective permissions.")
     observed_material = {
         "schema_version": INDEX_HISTORY_SCHEMA_VERSION,
         "run_columns": tuple(
@@ -2366,8 +2374,13 @@ class SqlIndexHistoryRepository:
         probe = validate_contract_probe(
             [rows for rows in await self._execute_sets(database_name, CONTRACT_PROBE_SQL)]
         )
-        if not probe.allow_read or (for_write and not probe.allow_write):
-            raise IndexReviewSchemaError("Index history principal lacks the required SELECT/INSERT permissions.")
+        permission_allowed = probe.allow_write if for_write else probe.allow_read
+        if not permission_allowed:
+            required = "SELECT and INSERT" if for_write else "SELECT"
+            raise IndexReviewSchemaError(
+                "Current database identity lacks the required "
+                f"{required} permissions on both index history tables."
+            )
         return probe
 
     async def _read_history(

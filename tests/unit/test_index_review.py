@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -21,6 +22,7 @@ from azure_sql_mcp.index_review import RUN_CONTRACT_COLUMNS
 from azure_sql_mcp.index_review import SNAPSHOT_CONTRACT_COLUMNS
 from azure_sql_mcp.index_review import IndexReviewIntegrityError
 from azure_sql_mcp.index_review import IndexReviewRunV1
+from azure_sql_mcp.index_review import IndexReviewSchemaError
 from azure_sql_mcp.index_review import IndexReviewService
 from azure_sql_mcp.index_review import IndexReviewSnapshotV1
 from azure_sql_mcp.index_review import MAX_CAPTURE_ROWS
@@ -314,7 +316,7 @@ def _probe_rows() -> list[list[dict[str, object]]]:
     return [columns, indexes, foreign_keys, constraints, permissions]
 
 
-def test_contract_probe_requires_exact_schema_and_least_privilege() -> None:
+def test_contract_probe_requires_exact_schema_and_minimum_permissions() -> None:
     result = validate_contract_probe(_probe_rows())
     assert result == result.__class__(CONTRACT_SCHEMA_FINGERPRINT, True, True, True)
 
@@ -331,6 +333,63 @@ def test_contract_probe_requires_exact_schema_and_least_privilege() -> None:
     denied_result = validate_contract_probe(denied)
     assert denied_result.allow_read is False
     assert denied_result.allow_write is False
+
+
+@pytest.mark.parametrize(
+    "permission",
+    [
+        "UpdateState",
+        "DeleteState",
+        "AlterState",
+        "ControlState",
+        "ExecuteState",
+        "ReferencesState",
+        "ViewDefinitionState",
+        "TakeOwnershipState",
+    ],
+)
+def test_contract_probe_reports_broader_permissions_without_rejecting_them(
+    permission: str,
+) -> None:
+    probe = _probe_rows()
+    probe[4][0][permission] = 1
+
+    result = validate_contract_probe(probe)
+
+    assert result.allow_read is True
+    assert result.allow_write is True
+    assert result.dangerous_permissions_absent is False
+
+
+@pytest.mark.parametrize(
+    ("remaining_table", "expected_message"),
+    [
+        (
+            None,
+            "Index history tables are missing: dbatools.IndexReviewRun, "
+            "dbatools.IndexReviewSnapshot.",
+        ),
+        (
+            "IndexReviewRun",
+            "Index history table is missing: dbatools.IndexReviewSnapshot.",
+        ),
+    ],
+)
+def test_contract_probe_identifies_missing_history_tables(
+    remaining_table: str | None,
+    expected_message: str,
+) -> None:
+    probe = _probe_rows()
+    probe[0] = [
+        row
+        for row in probe[0]
+        if remaining_table is not None and row["TableName"] == remaining_table
+    ]
+
+    with pytest.raises(
+        IndexReviewSchemaError, match=rf"^{re.escape(expected_message)}$"
+    ):
+        validate_contract_probe(probe)
 
 
 @pytest.mark.parametrize(
