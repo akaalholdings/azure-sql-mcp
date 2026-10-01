@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -20,21 +21,57 @@ TEMP_TABLE_PATTERN = re.compile(r"#[A-Za-z0-9_]+")
 WAITFOR_PATTERN = re.compile(r"\bWAITFOR\b", re.IGNORECASE)
 EXECUTE_AS_PATTERN = re.compile(r"\bEXECUTE\s+AS\b", re.IGNORECASE)
 SP_EXECUTESQL_PATTERN = re.compile(r"\bsp_executesql\b", re.IGNORECASE)
-DANGEROUS_HINTS_PATTERN = re.compile(
-    r"\bWITH\s*\(\s*(UPDLOCK|XLOCK|TABLOCKX)\b",
-    re.IGNORECASE,
-)
 MAXRECURSION_ZERO_PATTERN = re.compile(
     r"\bMAXRECURSION\s+0\b",
     re.IGNORECASE,
 )
-_LINE_COMMENT_PATTERN = re.compile(r"--[^\r\n]*")
-_BLOCK_COMMENT_PATTERN = re.compile(r"/\*.*?\*/", re.DOTALL)
-_STRING_LITERAL_PATTERN = re.compile(r"N?'(?:''|[^'])*'", re.IGNORECASE)
 _READ_ONLY_PREFIX_PATTERN = re.compile(
     r"^\s*(?:SELECT|WITH|DECLARE)\b",
     re.IGNORECASE,
 )
+_CODE_WORD_PATTERN = re.compile(r"[\w@#$]+")
+
+# Table hints that take or hold locks a plain read does not. Under RCSI (the
+# Azure SQL Database default) an unhinted SELECT takes no shared locks; these
+# make the read block writers for its whole duration.
+LOCKING_HINTS = frozenset(
+    {
+        "UPDLOCK",
+        "XLOCK",
+        "TABLOCKX",
+        "TABLOCK",
+        "HOLDLOCK",
+        "SERIALIZABLE",
+        "REPEATABLEREAD",
+        "READCOMMITTEDLOCK",
+    }
+)
+
+# T-SQL reserved keywords that start a statement and never occur inside a
+# read-only SELECT. A reserved keyword cannot be an unbracketed alias in SQL
+# Server, so one of these in code always starts another statement, even with
+# no semicolon before it. sqlglot accepts them as aliases, so this check must
+# not rely on the parse tree.
+STATEMENT_KEYWORDS = frozenset(
+    {
+        "ALTER", "BACKUP", "BEGIN", "BREAK", "BULK", "CHECKPOINT", "CLOSE",
+        "COMMIT", "CONTINUE", "CREATE", "DBCC", "DEALLOCATE", "DELETE", "DENY",
+        "DISK", "DROP", "DUMP", "ERRLVL", "EXEC", "EXECUTE", "EXIT", "GOTO",
+        "GRANT", "IF", "INSERT", "KILL", "LINENO", "LOAD", "OPEN", "PRINT",
+        "RAISERROR", "READTEXT", "RECONFIGURE", "RESTORE", "RETURN", "REVERT",
+        "REVOKE", "ROLLBACK", "SAVE", "SETUSER", "SHUTDOWN", "TRAN",
+        "TRANSACTION", "TRUNCATE", "UPDATE", "UPDATETEXT", "WAITFOR", "WHILE",
+        "WRITETEXT",
+    }
+)
+# Reserved keywords that are statements in general but legal inside a read-only
+# batch when followed by one of these words (or by a @variable).
+_CONDITIONAL_KEYWORDS = {
+    "MERGE": frozenset({"JOIN", "UNION"}),  # join and union hints
+    "USE": frozenset({"HINT", "PLAN"}),  # OPTION (USE HINT(...)/USE PLAN ...)
+    "SET": frozenset(),  # only SET @variable = ...
+    "DECLARE": frozenset(),  # only DECLARE @variable ...
+}
 
 BLOCKED_FUNCTIONS = frozenset(
     {
@@ -67,15 +104,89 @@ BLOCKED_FUNCTIONS = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class _LexedSql:
+    code: str  # comments -> " ", string literals -> "?", quoted identifiers kept
+    words: str  # as code, but quoted identifiers blanked for keyword scans
+    terminated: bool
+
+
+def _lex(sql: str) -> _LexedSql:
+    """Scan T-SQL once, left to right, the way SQL Server's lexer does.
+
+    Comments, string literals and quoted identifiers are recognized in the
+    order they start, so a '/*' inside a string or a line comment cannot hide
+    the code after it. Block comments nest, as they do in SQL Server.
+    """
+    code: list[str] = []
+    words: list[str] = []
+    terminated = True
+    i, n = 0, len(sql)
+    while i < n:
+        if sql.startswith("--", i):
+            end = i + 2
+            while end < n and sql[end] not in "\r\n":
+                end += 1
+            code.append(" ")
+            words.append(" ")
+        elif sql.startswith("/*", i):
+            depth, end = 1, i + 2
+            while end < n and depth:
+                if sql.startswith("/*", end):
+                    depth, end = depth + 1, end + 2
+                elif sql.startswith("*/", end):
+                    depth, end = depth - 1, end + 2
+                else:
+                    end += 1
+            terminated = terminated and depth == 0
+            code.append(" ")
+            words.append(" ")
+        elif sql[i] in "'[\"":
+            close = "]" if sql[i] == "[" else sql[i]
+            end = i + 1
+            while (end := sql.find(close, end)) >= 0 and sql.startswith(close * 2, end):
+                end += 2
+            if end < 0:
+                terminated, end = False, n
+            else:
+                end += 1
+            if sql[i] == "'":
+                # N'...' is one literal: drop a standalone N prefix.
+                if code and code[-1] in ("N", "n") and not (
+                    len(code) > 1 and (code[-2][-1:].isalnum() or code[-2][-1:] in "_@#$")
+                ):
+                    code.pop()
+                    words.pop()
+                code.append("?")
+                words.append("?")
+            else:
+                code.append(sql[i:end])
+                words.append(" ")
+        else:
+            end = i + 1
+            code.append(sql[i])
+            words.append(sql[i])
+        i = end
+    return _LexedSql("".join(code), "".join(words), terminated)
+
+
 def strip_literals_and_comments(sql: str) -> str:
     """Replace comments and string literals so text-rule scans only see code.
 
     Keyword patterns (GO, EXEC, WAITFOR, #temp, ...) must not fire on words
     that merely appear inside string data or comments.
     """
-    without_block_comments = _BLOCK_COMMENT_PATTERN.sub(" ", sql)
-    without_comments = _LINE_COMMENT_PATTERN.sub(" ", without_block_comments)
-    return _STRING_LITERAL_PATTERN.sub("?", without_comments)
+    return _lex(sql).code
+
+
+def _code_words(sql: str) -> list[str]:
+    """Upper-cased words outside literals, comments and quoted identifiers.
+
+    NFKC folds compatibility forms (for example full-width letters) so they
+    cannot disguise a keyword.
+    """
+    words = unicodedata.normalize("NFKC", _lex(sql).words)
+    return [word.upper() for word in _CODE_WORD_PATTERN.findall(words)]
 
 
 @dataclass(frozen=True)
@@ -154,6 +265,7 @@ class SafeSqlValidator:
         try:
             statements = parse(candidate, read="tsql")
         except ParseError as exc:
+            self._check_statement_keywords(candidate)
             if _READ_ONLY_PREFIX_PATTERN.match(candidate):
                 raise UnsupportedSqlError(
                     "T-SQL could not be statically analyzed; admission is not allowed.",
@@ -172,6 +284,7 @@ class SafeSqlValidator:
         if final is None:
             raise ValueError("Invalid T-SQL: parser returned an empty statement.")
         self._check_statement(final)
+        self._check_statement_keywords(candidate)
 
         analysis_sql = ";\n".join(
             statement.sql(dialect="tsql") for statement in statements if statement
@@ -267,7 +380,10 @@ class SafeSqlValidator:
         # against 'go home' or 'item#1' is data, not a batch separator or a
         # temp table. Actual EXEC/DML in code positions is still caught here
         # and again by the AST walk.
-        candidate = strip_literals_and_comments(sql)
+        lexed = _lex(sql)
+        if not lexed.terminated:
+            raise ValueError("Unterminated string literal, quoted identifier, or comment.")
+        candidate = lexed.code
         if GO_PATTERN.search(candidate):
             raise ValueError("Batch separators such as GO are not allowed.")
         if DBCC_PATTERN.search(candidate):
@@ -284,13 +400,31 @@ class SafeSqlValidator:
             raise ValueError("WAITFOR is not allowed in restricted mode (DoS risk).")
         if SP_EXECUTESQL_PATTERN.search(candidate):
             raise ValueError("sp_executesql is not allowed in restricted mode (dynamic SQL risk).")
-        if DANGEROUS_HINTS_PATTERN.search(candidate):
+        hints = sorted(LOCKING_HINTS.intersection(_code_words(sql)))
+        if hints:
             raise ValueError(
-                "Locking hints (UPDLOCK, XLOCK, TABLOCKX) are not allowed in restricted mode."
+                f"Locking hints ({', '.join(hints)}) are not allowed in restricted mode."
             )
         if MAXRECURSION_ZERO_PATTERN.search(candidate):
             raise ValueError(
                 "MAXRECURSION 0 (unlimited recursion) is not allowed in restricted mode."
+            )
+
+    def _check_statement_keywords(self, sql: str) -> None:
+        words = _code_words(sql)
+        for position, word in enumerate(words):
+            allowed_next = _CONDITIONAL_KEYWORDS.get(word)
+            if word not in STATEMENT_KEYWORDS and allowed_next is None:
+                continue
+            if allowed_next is not None:
+                following = words[position + 1] if position + 1 < len(words) else ""
+                if following in allowed_next:
+                    continue
+                if word in ("SET", "DECLARE") and following.startswith("@"):
+                    continue
+            raise ValueError(
+                f"Statement keyword '{word}' is not allowed in restricted mode. Only one "
+                "SELECT statement, optionally preceded by DECLARE/SET @variable, may run."
             )
 
     def _check_statement(self, statement: Any) -> None:
@@ -346,6 +480,11 @@ class SafeSqlValidator:
 
             if isinstance(node, exp.Into):
                 raise ValueError("SELECT INTO is not allowed in restricted mode.")
+
+            if isinstance(node, exp.NextValueFor):
+                raise ValueError(
+                    "NEXT VALUE FOR changes sequence state and is not allowed in restricted mode."
+                )
 
             if isinstance(node, exp.Table):
                 self._check_table_reference(node)

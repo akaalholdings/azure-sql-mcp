@@ -6,6 +6,7 @@ from azure_sql_mcp.safe_sql import AdmissionStatus
 from azure_sql_mcp.safe_sql import SafeSqlValidator
 from azure_sql_mcp.safe_sql import StaticAnalysisStatus
 from azure_sql_mcp.safe_sql import UnsupportedSqlError
+from azure_sql_mcp.safe_sql import strip_literals_and_comments
 
 
 @pytest.fixture
@@ -234,3 +235,121 @@ def test_text_rules_still_reject_code_outside_literals(validator):
         validator.validate_read_only("EXEC dbo.DoThing 'safe string'")
     with pytest.raises(ValueError, match="Temporary table references"):
         validator.validate_read_only("SELECT * FROM #tmp")
+
+
+# T-SQL does not need a semicolon between statements, and an unbracketed
+# reserved keyword can never be an alias. sqlglot does accept one as an alias
+# ("SELECT 1 AS DELETE FROM dbo.t"), so these batches parse as one SELECT while
+# SQL Server runs a second, writing statement on an autocommit connection.
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT 1 DELETE FROM dbo.t WHERE id < 100",
+        "SELECT @x DELETE FROM dbo.t",
+        "DECLARE @x int = 1; SELECT @x DELETE FROM dbo.t",
+        "SELECT (SELECT COUNT(*) FROM dbo.t) DELETE FROM dbo.t WHERE id < 100",
+        "SELECT 1 DELETE FROM dbo.t COMMIT",
+        "SELECT 1 RETURN",
+        # Rejected today only because sqlglot fails to parse them; the policy
+        # must not depend on parser quirks that can change between versions.
+        "SELECT 1 TRUNCATE TABLE dbo.t",
+        "SELECT 1 DROP TABLE dbo.t",
+        "SELECT 1 INSERT dbo.t VALUES (1)",
+        "SELECT 1 USE master",
+        "SELECT 1 SET ROWCOUNT 1",
+        "SELECT 1 GRANT SELECT ON dbo.t TO public",
+        "SELECT 1 BEGIN TRAN",
+        "SELECT 1 ALTER DATABASE SCOPED CONFIGURATION SET MAXDOP = 1",
+        "SELECT 1 MERGE dbo.t AS t USING dbo.s AS s ON t.id = s.id "
+        "WHEN MATCHED THEN UPDATE SET t.v = s.v;",
+        "SELECT 1 DECLARE c CURSOR FOR SELECT 1",
+        # Compatibility forms of keywords are folded before matching.
+        "SELECT ＤＥＬＥＴＥ FROM dbo.t",
+    ],
+)
+def test_rejects_statement_keywords_hidden_after_select(validator, sql):
+    with pytest.raises(ValueError, match="Statement keyword .* is not allowed"):
+        validator.validate_read_only(sql)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # A '/*' inside a string must not hide the code that follows it.
+        "SELECT '/*', 1 DELETE FROM dbo.t --*/'",
+        # A '/*' inside a line comment must not hide the next line.
+        "SELECT 1 -- /*\nDELETE FROM dbo.t -- */",
+    ],
+)
+def test_comment_and_literal_tricks_do_not_hide_code(validator, sql):
+    with pytest.raises(ValueError, match="Statement keyword 'DELETE' is not allowed"):
+        validator.validate_read_only(sql)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM dbo.t WITH (ROWLOCK, XLOCK)",
+        "SELECT * FROM dbo.t WITH (ROWLOCK, UPDLOCK)",
+        "SELECT * FROM dbo.t (XLOCK)",
+        "SELECT * FROM dbo.t -- /*\nWITH (TABLOCKX) -- */",
+        # Under RCSI these take shared locks that block writers for the whole read.
+        "SELECT * FROM dbo.t WITH (TABLOCK)",
+        "SELECT * FROM dbo.t WITH (NOLOCK, HOLDLOCK)",
+        "SELECT * FROM dbo.t WITH (SERIALIZABLE)",
+        "SELECT * FROM dbo.t WITH (REPEATABLEREAD)",
+        "SELECT * FROM dbo.t WITH (READCOMMITTEDLOCK)",
+    ],
+)
+def test_rejects_locking_hints_in_any_position(validator, sql):
+    with pytest.raises(ValueError, match="Locking hints .* are not allowed in restricted mode"):
+        validator.validate_read_only(sql)
+
+
+def test_rejects_sequence_side_effects(validator):
+    with pytest.raises(ValueError, match="NEXT VALUE FOR"):
+        validator.validate_read_only("SELECT NEXT VALUE FOR dbo.OrderNumbers")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM dbo.t ORDER BY id OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY",
+        "SELECT * FROM dbo.a INNER MERGE JOIN dbo.b ON a.id = b.id",
+        "SELECT id FROM dbo.a UNION SELECT id FROM dbo.b OPTION (MERGE UNION)",
+        'SELECT [DELETE], "UPDATE" FROM dbo.t',
+        "SELECT 'DELETE FROM dbo.t' AS note -- DROP TABLE dbo.t",
+        "DECLARE @delete int = 1; SET @delete = 2; SELECT @delete AS [Update]",
+        "SELECT x.updated_at, x.is_deleted, x.created_by FROM dbo.t AS x",
+        "SELECT * FROM dbo.t AS t WHERE t.Status = N'it''s /* not a comment'",
+        "SELECT * FROM dbo.t WITH (NOLOCK)",
+    ],
+)
+def test_keyword_gate_allows_read_only_uses(validator, sql):
+    assert validator.validate_read_only(sql).normalized_sql
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT 'unterminated",
+        "SELECT 1 /* unterminated",
+        "SELECT [unterminated FROM dbo.t",
+    ],
+)
+def test_rejects_unterminated_tokens(validator, sql):
+    with pytest.raises(ValueError, match="Unterminated"):
+        validator.validate_read_only(sql)
+
+
+@pytest.mark.parametrize(
+    "sql, expected",
+    [
+        ("SELECT 1 -- /*\nDELETE", "SELECT 1  \nDELETE"),
+        ("/* a /* nested */ still comment */SELECT 1", " SELECT 1"),
+        ("SELECT '/*' , 1", "SELECT ? , 1"),
+        ("SELECT [a--b], N'x'", "SELECT [a--b], ?"),
+    ],
+)
+def test_strip_literals_and_comments_follows_tsql_lexing(sql, expected):
+    assert strip_literals_and_comments(sql) == expected
