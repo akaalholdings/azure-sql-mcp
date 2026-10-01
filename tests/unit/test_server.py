@@ -2672,14 +2672,15 @@ async def test_tune_history_is_inconclusive_when_exact_identity_is_ambiguous(
     app.query_store.get_query_history_by_text.assert_not_awaited()
 
 
-def test_index_manager_learning_registry_requires_skill_version_1_0_1() -> None:
+def test_index_manager_learning_registry_requires_skill_version_2_0_0() -> None:
+    # Skill 2.0.0 is the workload-driven index manager; recall is pinned to it.
     AzureSqlMcpApplication._validate_learning_skill_version(
-        "sql-index-manager", "1.0.1"
+        "sql-index-manager", "2.0.0"
     )
 
-    with pytest.raises(ValueError, match=r"requires version 1\.0\.1"):
+    with pytest.raises(ValueError, match=r"requires version 2\.0\.0"):
         AzureSqlMcpApplication._validate_learning_skill_version(
-            "sql-index-manager", "1.0.0"
+            "sql-index-manager", "1.0.1"
         )
 
 
