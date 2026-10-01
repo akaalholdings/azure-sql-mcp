@@ -6,6 +6,60 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-10-01
+
+### Added
+
+- Plan digest on `analyze_query_plan`, and a compact `plan_digest` on
+  `explain_query`: plan kind and what it can show, statement time and scalar
+  UDF share, warnings by node, memory grant use, parameter and local-variable
+  tells, top operators by self time (estimated self cost on estimated plans),
+  per-execution estimate errors with fixed-guess fingerprints, repeated table
+  access, thread skew, plan waits, eager index spools, missing-index hints
+  labelled as hints, predicates on cited nodes, and an operator tree capped at
+  80 nodes.
+- `node_id` (with `statement_index`) on `analyze_query_plan`: one operator in
+  full, with estimates, actuals, and per-thread counters.
+- Plan sources on `analyze_query_plan`: `last_actual=true` reads the last
+  actual plan from the plan cache (`sys.dm_exec_query_plan_stats`; returns
+  `precondition` with the exact setting when `LAST_QUERY_PLAN_STATS` is off),
+  and `session_id` reads a running request's in-flight plan
+  (`sys.dm_exec_query_statistics_xml`). Query Store plans now carry measured
+  runtime and wait categories, with the root estimate checked against the rows
+  Query Store measured.
+- `review_workload_indexes` designs the index an eager index spool was building
+  (reason `replace_eager_spool`): the spool suppresses the missing-index request.
+- Plan rules `scalar_udf_time`, `stale_statistics`, and `exchange_spill`.
+- `mcp_contract.plan_digest: 1`, and plan-reading guidance in the server
+  instructions.
+- Self-time attribution adapted from Erik Darling's `sqlserver-query-plans`
+  plugin (MIT); see `NOTICE`.
+
+### Changed
+
+- On actual plans with operator times, findings carry `self_elapsed_ms` and
+  `elapsed_share`, and ranking and access-rule severity use the elapsed share
+  instead of estimated cost share. Access findings now cite their `node_id`.
+- `row_estimate_gap` compares rows per execution and treats a parallel operator
+  that each worker ran once as one execution. Its evidence now has
+  `estimated_rows_per_execution`, `actual_rows_per_execution`, `executions`,
+  `estimated_executions`, `direction`, and `factor` (`estimated_rows` removed).
+- `no_join_predicate` is graded from the join's inputs (`verdict`: correlated,
+  implied_predicate, no_multiplication, not_multiplied, multiplied); an
+  unverifiable warning on an estimated plan is `medium` (was `high`).
+- `eager_index_spool` names the spool's table, key columns, and includes.
+- `explain_query` ranks `top_operators` by `estimated_self_cost`.
+- Plan parsing refuses input over 64 MB, DTDs and entities, and plans nested
+  deeper than 1,000 operators; plan-derived text is flattened to one line.
+- `sql-optimizer` learning skill version 2.5.0.
+
+### Fixed
+
+- The inner side of a nested loop was reported as misestimated when its outer
+  input was the misestimate.
+- `scalar_udf` fired on a Compute Scalar above an operator that held the UDF.
+- `explain_query`'s `top_operators` always started with the root operator.
+
 ## [2.4.0] - 2026-10-01
 
 ### Added

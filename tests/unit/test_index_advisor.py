@@ -567,3 +567,21 @@ def test_report_shape_is_recommend_only_with_stable_ids() -> None:
     assert all("_supports" not in rec for rec in report["recommendations"])
     assert report["summary"]["top_improvement_ids"]
     assert any("change control" in step for step in report["next_steps"])
+
+
+def test_eager_index_spool_becomes_the_index_it_was_building() -> None:
+    existing = [
+        _index("Sales", "OrderLines", "PK_Sales_OrderLines", ("OrderLineID",), index_id=1, type_code=1, primary_key=True)
+    ]
+
+    report = build_index_advice(
+        _inputs([_query(7, "eager_index_spool.xml", cpu_us=3_000_000)], existing)
+    )
+
+    create = _recs(report, "create_index", "OrderLines")
+    assert len(create) == 1
+    rec = create[0]
+    assert _keys(rec) == ["OrderID"]
+    assert set(rec["include_columns"]) == {"Quantity", "UnitPrice"}
+    assert "replace_eager_spool" in rec["reason_codes"]
+    assert "eager index spool" in rec["rationale"]

@@ -20,6 +20,10 @@ from dataclasses import field
 from typing import Any
 from typing import Iterator
 
+from .plan_tree import PlanParseError
+from .plan_tree import parse_showplan
+from .plan_tree import unquote
+
 NS = "http://schemas.microsoft.com/sqlserver/2004/07/showplan"
 _Q = f"{{{NS}}}"
 
@@ -97,6 +101,9 @@ class TableAccess:
     paired_node_id: int | None = None
     ordered: bool = False
     forced_index: bool = False
+    spool_node_id: int | None = None
+    spool_eq_columns: tuple[str, ...] = ()
+    spool_range_columns: tuple[str, ...] = ()
 
     @property
     def residual_eq_columns(self) -> tuple[str, ...]:
@@ -133,7 +140,33 @@ class TableAccess:
             "estimated_cost_share": round(self.cost_share, 6),
             "paired_index": self.paired_index,
             "forced_index": self.forced_index,
+            "eager_spool": (
+                {
+                    "node_id": self.spool_node_id,
+                    "eq_columns": list(self.spool_eq_columns),
+                    "range_columns": list(self.spool_range_columns),
+                }
+                if self.spool_node_id is not None
+                else None
+            ),
         }
+
+
+@dataclass(frozen=True)
+class SpoolIndex:
+    """The index an eager index spool builds on every execution.
+
+    The optimizer builds it because no permanent index fits, and the spool
+    suppresses the missing-index request, so the spool is the request.
+    """
+
+    node_id: int
+    schema: str | None
+    table: str | None
+    eq_columns: tuple[str, ...]
+    range_columns: tuple[str, ...]
+    include_columns: tuple[str, ...]
+    own_cost: float
 
 
 @dataclass
@@ -166,27 +199,11 @@ class PlanAccessSummary:
             yield from statement.accesses
 
 
-def unquote(identifier: str | None) -> str | None:
-    """Turn a showplan identifier such as ``[dbo]`` into ``dbo``."""
-
-    if identifier is None:
-        return None
-    value = identifier.strip()
-    if value.startswith("[") and value.endswith("]") and len(value) >= 2:
-        return value[1:-1].replace("]]", "]")
-    return value
-
-
 def parse_plan_access(plan_xml: str) -> PlanAccessSummary:
-    if not plan_xml or not plan_xml.strip():
-        return PlanAccessSummary(parse_error="plan_unavailable")
-    text = plan_xml.strip()
-    if text.startswith("<?xml"):
-        text = text[text.find("?>") + 2 :].lstrip()
     try:
-        root = ET.fromstring(text)
-    except ET.ParseError as exc:
-        return PlanAccessSummary(parse_error=f"plan_unparseable: {exc}")
+        root = parse_showplan(plan_xml)
+    except PlanParseError as exc:
+        return PlanAccessSummary(parse_error=str(exc))
     summary = PlanAccessSummary()
     for statement in root.iter(f"{_Q}StmtSimple"):
         summary.statements.append(_parse_statement(statement))
@@ -225,6 +242,7 @@ def _parse_statement(statement: ET.Element) -> StatementAccess:
                 result.dml_targets.append(target)
     _attach_order_and_join_columns(root_op, result.accesses)
     _pair_lookups(root_op, result.accesses)
+    _attach_eager_spools(root_op, result.accesses, statement_cost)
     return result
 
 
@@ -319,11 +337,15 @@ def _operation(
 
 
 def _seek_columns(element: ET.Element) -> tuple[list[str], list[str]]:
-    eq: list[str] = []
-    ranged: list[str] = []
     seek_predicates = element.find(f"{_Q}SeekPredicates")
     if seek_predicates is None:
-        return eq, ranged
+        return [], []
+    return _key_columns(seek_predicates)
+
+
+def _key_columns(seek_predicates: ET.Element) -> tuple[list[str], list[str]]:
+    eq: list[str] = []
+    ranged: list[str] = []
     containers = list(seek_predicates.iter(f"{_Q}SeekKeys")) + list(
         seek_predicates.iter(f"{_Q}SeekPredicate")
     )
@@ -611,6 +633,83 @@ def _pair_lookups(root_op: ET.Element, accesses: list[TableAccess]) -> None:
             if feeders:
                 lookup.paired_index = feeders[0].index_name
                 lookup.paired_node_id = feeders[0].node_id
+
+
+def eager_spool_index(relop: ET.Element) -> SpoolIndex | None:
+    """Keys and includes of an eager index spool; None for any other operator."""
+
+    if relop.get("PhysicalOp") != "Index Spool" or "Eager" not in (relop.get("LogicalOp") or ""):
+        return None
+    spool = _first_child(relop, {"Spool"})
+    if spool is None:
+        return None
+    eq: list[str] = []
+    ranged: list[str] = []
+    schema: str | None = None
+    table: str | None = None
+    for container in spool:
+        if _local(container.tag) not in {"SeekPredicateNew", "SeekPredicate"}:
+            continue
+        container_eq, container_range = _key_columns(container)
+        eq.extend(column for column in container_eq if column not in eq)
+        ranged.extend(column for column in container_range if column not in ranged and column not in eq)
+        for ref in _column_refs(container.find(f".//{_Q}RangeColumns")):
+            schema = schema or ref.schema
+            table = table or ref.table
+    if not eq and not ranged:
+        return None
+    keys = set(eq) | set(ranged)
+    includes = [
+        ref.column
+        for ref in _column_refs(relop.find(f"{_Q}OutputList"))
+        if ref.table == table and not _is_internal_column(ref.column) and ref.column not in keys
+    ]
+    own_cost = max(
+        0.0,
+        _float(relop.get("EstimatedTotalSubtreeCost"))
+        - sum(_float(child.get("EstimatedTotalSubtreeCost")) for child in _child_relops(relop)),
+    )
+    return SpoolIndex(
+        node_id=int(_float(relop.get("NodeId"))),
+        schema=schema,
+        table=table,
+        eq_columns=tuple(eq),
+        range_columns=tuple(ranged),
+        include_columns=tuple(dict.fromkeys(includes)),
+        own_cost=own_cost,
+    )
+
+
+def _attach_eager_spools(root_op: ET.Element, accesses: list[TableAccess], statement_cost: float) -> None:
+    """Give the scan feeding an eager index spool the spool's keys and cost.
+
+    A permanent index with those keys removes both the scan and the spool.
+    """
+
+    by_node = {access.node_id: access for access in accesses}
+    for relop in root_op.iter(f"{_Q}RelOp"):
+        spool = eager_spool_index(relop)
+        if spool is None or not spool.table:
+            continue
+        feeder = next(
+            (
+                by_node[node_id]
+                for descendant in relop.iter(f"{_Q}RelOp")
+                if descendant is not relop
+                and (node_id := int(_float(descendant.get("NodeId")))) in by_node
+                and by_node[node_id].table == spool.table
+                and (spool.schema is None or by_node[node_id].schema == spool.schema)
+            ),
+            None,
+        )
+        if feeder is None or feeder.operation not in {"scan", "heap_scan"}:
+            continue
+        feeder.spool_node_id = spool.node_id
+        feeder.spool_eq_columns = spool.eq_columns
+        feeder.spool_range_columns = spool.range_columns
+        feeder.output_columns = tuple(dict.fromkeys(feeder.output_columns + spool.include_columns))
+        feeder.own_cost += spool.own_cost
+        feeder.cost_share = feeder.own_cost / statement_cost if statement_cost > 0 else 0.0
 
 
 def _missing_indexes(query_plan: ET.Element) -> list[MissingIndexHint]:

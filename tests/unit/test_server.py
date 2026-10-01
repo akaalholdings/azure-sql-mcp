@@ -7,6 +7,7 @@ from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock
 from unittest.mock import Mock
 
@@ -604,7 +605,7 @@ async def test_runtime_status_is_db_free_stable_and_sanitized(
 
     assert first == second
     assert first["startup_timestamp"] == app._startup_timestamp
-    assert first["package_version"] == "2.4.0"
+    assert first["package_version"] == "2.5.0"
     assert first["profile"] is None
     assert first["transport"] == "stdio"
     assert first["tool_groups"] == ["all"]
@@ -693,7 +694,7 @@ async def test_successful_operation_links_terminal_outcome_and_learning_failure_
     decision = app.learning_service.record_decision(
         DecisionRecordV1(
             skill="sql-optimizer",
-            skill_version="2.4.0",
+            skill_version="2.5.0",
             case_id="case-1",
             learning_key="health-check",
             consumed_evidence_refs=(evidence.evidence_id,),
@@ -2590,7 +2591,7 @@ async def test_capability_check_publishes_tuning_contract(
     result = await app._check_database_capabilities("appdb")
 
     assert result["mcp_contract"] == {
-        "contract_version": "2.4.0",
+        "contract_version": "2.5.0",
         "performance_tuning": 1,
         "durable_view_change": 1,
         "prepared_plan_action": 1,
@@ -2602,6 +2603,7 @@ async def test_capability_check_publishes_tuning_contract(
         "index_review_snapshot_reuse_hours": 48,
         "workload_index_advisor": 1,
         "result_status": 1,
+        "plan_digest": 1,
     }
     assert result["local_tuning_policy"] == {
         "configured": False,
@@ -2807,11 +2809,35 @@ async def test_get_top_queries_reads_a_past_window(app: AzureSqlMcpApplication) 
     assert payload["window"] == {"start_utc": "2026-09-30T04:00:00Z", "end_utc": "2026-09-30T05:00:00Z"}
 
 
+def _showplan_fixture(name: str) -> str:
+    return (Path(__file__).resolve().parents[1] / "fixtures" / "showplans" / name).read_text(encoding="utf-8")
+
+
+def _plan_source_fetch(responses: dict[str, list[dict[str, Any]]]) -> AsyncMock:
+    """Answer each plan-source query by a fragment of its SQL; unknown SQL fails the test."""
+
+    async def fetch(database_name: str, query: str, params: Any = None) -> list[dict[str, Any]]:
+        for fragment, rows in responses.items():
+            if fragment in query:
+                return rows
+        raise AssertionError(f"unexpected query: {query[:80]}")
+
+    return AsyncMock(side_effect=fetch)
+
+
 @pytest.mark.asyncio
 async def test_analyze_query_plan_reads_query_store_or_raw_xml(app: AzureSqlMcpApplication) -> None:
-    fixture = (Path(__file__).resolve().parents[1] / "fixtures" / "showplans" / "heap_scan_nonsargable.xml").read_text(encoding="utf-8")
-    app.executor.fetch_all = AsyncMock(  # type: ignore[method-assign]
-        return_value=[{"plan_id": 7, "query_id": 3, "is_forced_plan": 0, "query_plan": fixture}]
+    fixture = _showplan_fixture("heap_scan_nonsargable.xml")
+    app.executor.fetch_all = _plan_source_fetch(  # type: ignore[method-assign]
+        {
+            "WHERE p.query_id = ?": [{"plan_id": 7, "query_id": 3, "is_forced_plan": 0, "query_plan": fixture}],
+            "AS avg_rowcount": [
+                {"executions": 120, "avg_duration_ms": 40.0, "avg_cpu_ms": 30.0, "avg_logical_reads": 900.0,
+                 "avg_rowcount": 5000.0, "avg_max_used_memory_kb": 0.0, "max_dop": 1,
+                 "first_execution_time": None, "last_execution_time": None}
+            ],
+            "query_store_wait_stats": [{"wait_category_desc": "Buffer IO", "wait_ms": 1200}],
+        }
     )
 
     by_query = await app.mcp._tool_manager.call_tool(
@@ -2824,9 +2850,166 @@ async def test_analyze_query_plan_reads_query_store_or_raw_xml(app: AzureSqlMcpA
     assert by_query["plan_id"] == 7 and by_query["source"] == "query_store"
     assert by_query["result_status"] == "ok"
     assert {f["rule"] for f in by_query["findings"]} >= {"non_sargable_predicate", "implicit_conversion_on_column"}
-    assert "WHERE p.query_id = ?" in app.executor.fetch_all.await_args_list[0].args[1]
-    assert raw["source"] == "plan_xml"
-    assert app.executor.fetch_all.await_count == 1
+    assert by_query["digest"]["plan_kind"] == "estimated"
+    runtime = by_query["query_store_runtime"]
+    assert runtime["wait_categories"] == [{"category": "Buffer IO", "wait_ms": 1200}]
+    assert runtime["rows_estimate_check"]["direction"] == "under"  # 3 estimated, 5000 measured
+    assert runtime["rows_estimate_check"]["factor"] == 1666.7
+    assert raw["source"] == "plan_xml" and "query_store_runtime" not in raw
+    assert app.executor.fetch_all.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_analyze_query_plan_drills_into_one_node(app: AzureSqlMcpApplication) -> None:
+    fixture = _showplan_fixture("seek_residual_lookup_sort.xml")
+
+    node = await app.mcp._tool_manager.call_tool(
+        "analyze_query_plan", {"database_name": "appdb", "plan_xml": fixture, "node_id": 0}
+    )
+    missing = await app.mcp._tool_manager.call_tool(
+        "analyze_query_plan", {"database_name": "appdb", "plan_xml": fixture, "node_id": 99}
+    )
+
+    assert node["result_status"] == "ok"
+    assert node["node"]["node_id"] == 0 and "digest" not in node and "findings" not in node
+    assert missing["result_status"] == "empty"
+
+
+@pytest.mark.asyncio
+async def test_last_actual_plan_needs_the_database_setting(app: AzureSqlMcpApplication) -> None:
+    app.executor.fetch_all = _plan_source_fetch({"LAST_QUERY_PLAN_STATS": [{"value": "0"}]})  # type: ignore[method-assign]
+
+    payload = await app.mcp._tool_manager.call_tool(
+        "analyze_query_plan", {"database_name": "appdb", "plan_id": 7, "last_actual": True}
+    )
+
+    assert payload["result_status"] == "precondition"
+    assert payload["remediation"] == "ALTER DATABASE SCOPED CONFIGURATION SET LAST_QUERY_PLAN_STATS = ON;"
+    assert payload["source"] == "last_actual_plan"
+
+
+@pytest.mark.asyncio
+async def test_last_actual_plan_comes_from_the_plan_cache(app: AzureSqlMcpApplication) -> None:
+    actual = (
+        '<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan"><BatchSequence><Batch><Statements>'
+        '<StmtSimple StatementType="SELECT" StatementSubTreeCost="1" QueryPlanHash="0x2020202020202020"><QueryPlan>'
+        '<RelOp NodeId="0" PhysicalOp="Clustered Index Scan" LogicalOp="Clustered Index Scan" EstimateRows="10" '
+        'EstimatedTotalSubtreeCost="1"><OutputList /><RunTimeInformation>'
+        '<RunTimeCountersPerThread Thread="0" ActualRows="50000" ActualExecutions="1" /></RunTimeInformation>'
+        '<IndexScan><Object Database="[db]" Schema="[dbo]" Table="[T]" Index="[PK_T]" /></IndexScan></RelOp>'
+        "</QueryPlan></StmtSimple></Statements></Batch></BatchSequence></ShowPlanXML>"
+    )
+    app.executor.fetch_all = _plan_source_fetch(  # type: ignore[method-assign]
+        {
+            "LAST_QUERY_PLAN_STATS": [{"value": "1"}],
+            "dm_exec_query_plan_stats": [
+                {"plan_id": 7, "query_id": 3, "query_plan_hash": "0x2020202020202020",
+                 "last_execution_time": datetime(2026, 10, 1, 9, 0, tzinfo=timezone.utc), "query_plan": actual}
+            ],
+        }
+    )
+
+    payload = await app.mcp._tool_manager.call_tool(
+        "analyze_query_plan", {"database_name": "appdb", "query_id": 3, "last_actual": True}
+    )
+
+    assert payload["source"] == "last_actual_plan" and payload["plan_id"] == 7
+    assert payload["query_plan_hash"] == "0x2020202020202020"
+    assert payload["last_execution_time"] == "2026-10-01T09:00:00+00:00"
+    assert payload["plan_kind"] == "actual"
+    assert payload["digest"]["runtime"] == {"row_counts": True, "operator_times": False, "statement_times": False, "waits": False}
+    assert "without operator times" in payload["digest"]["what_this_plan_can_show"]
+    assert "query_store_runtime" not in payload
+    assert "WHERE p.query_id = ?" in app.executor.fetch_all.await_args_list[1].args[1]
+
+
+@pytest.mark.asyncio
+async def test_last_actual_plan_cache_miss_is_a_true_negative(app: AzureSqlMcpApplication) -> None:
+    app.executor.fetch_all = _plan_source_fetch(  # type: ignore[method-assign]
+        {"LAST_QUERY_PLAN_STATS": [{"value": "1"}], "dm_exec_query_plan_stats": []}
+    )
+
+    payload = await app.mcp._tool_manager.call_tool(
+        "analyze_query_plan", {"database_name": "appdb", "plan_id": 7, "last_actual": True}
+    )
+
+    assert payload["result_status"] == "empty"
+    assert "left the cache" in payload["result_status_reason"]
+
+
+@pytest.mark.asyncio
+async def test_session_id_reads_the_in_flight_plan(app: AzureSqlMcpApplication) -> None:
+    fixture = _showplan_fixture("seek_residual_lookup_sort.xml")
+    app.executor.fetch_all = _plan_source_fetch(  # type: ignore[method-assign]
+        {"dm_exec_query_statistics_xml": [
+            {"session_id": 61, "status": "running", "command": "SELECT", "start_time": None,
+             "total_elapsed_time": 125000, "query_plan": fixture}
+        ]}
+    )
+
+    payload = await app.mcp._tool_manager.call_tool(
+        "analyze_query_plan", {"database_name": "appdb", "session_id": 61}
+    )
+
+    assert payload["source"] == "live_session" and payload["request_status"] == "running"
+    assert payload["elapsed_ms"] == 125000
+    assert "partial" in payload["source_note"]
+    assert payload["digest"]["statements"]
+
+
+@pytest.mark.asyncio
+async def test_idle_session_has_no_live_plan(app: AzureSqlMcpApplication) -> None:
+    app.executor.fetch_all = _plan_source_fetch({"dm_exec_query_statistics_xml": []})  # type: ignore[method-assign]
+
+    payload = await app.mcp._tool_manager.call_tool(
+        "analyze_query_plan", {"database_name": "appdb", "session_id": 61}
+    )
+
+    assert payload["result_status"] == "empty"
+
+
+@pytest.mark.asyncio
+async def test_running_request_without_a_live_plan_names_the_profiling_setting(app: AzureSqlMcpApplication) -> None:
+    app.executor.fetch_all = _plan_source_fetch(  # type: ignore[method-assign]
+        {
+            "dm_exec_query_statistics_xml": [{"session_id": 61, "status": "running", "query_plan": None}],
+            "LIGHTWEIGHT_QUERY_PROFILING": [{"value": "0"}],
+        }
+    )
+
+    payload = await app.mcp._tool_manager.call_tool(
+        "analyze_query_plan", {"database_name": "appdb", "session_id": 61}
+    )
+
+    assert payload["result_status"] == "precondition"
+    assert payload["remediation"] == "ALTER DATABASE SCOPED CONFIGURATION SET LIGHTWEIGHT_QUERY_PROFILING = ON;"
+
+
+@pytest.mark.asyncio
+async def test_plan_source_reads_that_fail_are_unavailable_not_empty(app: AzureSqlMcpApplication) -> None:
+    app.executor.fetch_all = AsyncMock(side_effect=RuntimeError("VIEW DATABASE STATE permission denied"))  # type: ignore[method-assign]
+
+    payload = await app.mcp._tool_manager.call_tool(
+        "analyze_query_plan", {"database_name": "appdb", "session_id": 61}
+    )
+
+    assert payload["result_status"] == "unavailable"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"plan_xml": "<x/>", "last_actual": True},
+        {"plan_xml": "<x/>", "statement_index": 1},
+        {"plan_id": 1, "session_id": 2},
+    ],
+)
+@pytest.mark.asyncio
+async def test_analyze_query_plan_rejects_contradictory_arguments(
+    app: AzureSqlMcpApplication, arguments: dict[str, Any]
+) -> None:
+    with pytest.raises(ToolError):
+        await app.mcp._tool_manager.call_tool("analyze_query_plan", {"database_name": "appdb", **arguments})
 
 
 @pytest.mark.asyncio
@@ -2866,6 +3049,8 @@ async def test_explain_query_attaches_plan_findings(app: AzureSqlMcpApplication)
     assert findings["plan_kind"] == "estimated"
     assert findings["findings"][0]["rule"] == "key_lookup"
     assert findings["families"]["indexes"] >= 1
+    digest = payload["plan_digest"]
+    assert digest["plan_kind"] == "estimated" and len(digest["statements"][0]["top_operators"]) <= 5
 
 
 @pytest.mark.asyncio

@@ -1,0 +1,82 @@
+<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan" Version="1.564" Build="16.0.4135.4">
+  <BatchSequence>
+    <Batch>
+      <Statements>
+        <StmtSimple StatementText="SELECT o.OrderID, x.Quantity FROM Sales.Orders AS o CROSS APPLY (SELECT TOP (1) ol.Quantity, ol.UnitPrice FROM Sales.OrderLines AS ol WHERE ol.OrderID = o.OrderID ORDER BY ol.UnitPrice DESC) AS x" StatementId="1" StatementCompId="1" StatementType="SELECT" StatementSubTreeCost="12" StatementEstRows="73595" QueryHash="0xC1C1C1C1C1C1C1C1" QueryPlanHash="0xD2D2D2D2D2D2D2D2">
+          <QueryPlan CachedPlanSize="40" CompileTime="3" CompileCPU="3" CompileMemory="400">
+            <RelOp NodeId="0" PhysicalOp="Nested Loops" LogicalOp="Inner Join" EstimateRows="73595" EstimateIO="0" EstimateCPU="0.3" AvgRowSize="15" EstimatedTotalSubtreeCost="12" Parallel="0" EstimateRebinds="0" EstimateRewinds="0">
+              <OutputList>
+                <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[Orders]" Alias="[o]" Column="OrderID" />
+                <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[OrderLines]" Alias="[ol]" Column="Quantity" />
+              </OutputList>
+              <NestedLoops Optimized="0">
+                <OuterReferences>
+                  <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[Orders]" Alias="[o]" Column="OrderID" />
+                </OuterReferences>
+                <RelOp NodeId="1" PhysicalOp="Clustered Index Scan" LogicalOp="Clustered Index Scan" EstimateRows="73595" EstimateIO="0.9" EstimateCPU="0.1" AvgRowSize="11" EstimatedTotalSubtreeCost="1" TableCardinality="73595" Parallel="0" EstimateRebinds="0" EstimateRewinds="0">
+                  <OutputList>
+                    <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[Orders]" Alias="[o]" Column="OrderID" />
+                  </OutputList>
+                  <IndexScan Ordered="0" ForcedIndex="0" NoExpandHint="0">
+                    <DefinedValues>
+                      <DefinedValue>
+                        <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[Orders]" Alias="[o]" Column="OrderID" />
+                      </DefinedValue>
+                    </DefinedValues>
+                    <Object Database="[appdb]" Schema="[Sales]" Table="[Orders]" Index="[PK_Sales_Orders]" Alias="[o]" IndexKind="Clustered" Storage="RowStore" />
+                  </IndexScan>
+                </RelOp>
+                <RelOp NodeId="2" PhysicalOp="Index Spool" LogicalOp="Eager Spool" EstimateRows="3.1" EstimateIO="2" EstimateCPU="0.5" AvgRowSize="17" EstimatedTotalSubtreeCost="10.5" Parallel="0" EstimateRebinds="73594" EstimateRewinds="0">
+                  <OutputList>
+                    <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[OrderLines]" Alias="[ol]" Column="OrderID" />
+                    <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[OrderLines]" Alias="[ol]" Column="Quantity" />
+                    <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[OrderLines]" Alias="[ol]" Column="UnitPrice" />
+                  </OutputList>
+                  <Spool>
+                    <SeekPredicateNew>
+                      <SeekKeys>
+                        <Prefix ScanType="EQ">
+                          <RangeColumns>
+                            <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[OrderLines]" Alias="[ol]" Column="OrderID" />
+                          </RangeColumns>
+                          <RangeExpressions>
+                            <ScalarOperator ScalarString="[appdb].[Sales].[Orders].[OrderID] as [o].[OrderID]">
+                              <Identifier>
+                                <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[Orders]" Alias="[o]" Column="OrderID" />
+                              </Identifier>
+                            </ScalarOperator>
+                          </RangeExpressions>
+                        </Prefix>
+                      </SeekKeys>
+                    </SeekPredicateNew>
+                    <RelOp NodeId="3" PhysicalOp="Clustered Index Scan" LogicalOp="Clustered Index Scan" EstimateRows="231412" EstimateIO="3.5" EstimateCPU="0.5" AvgRowSize="17" EstimatedTotalSubtreeCost="4" TableCardinality="231412" Parallel="0" EstimateRebinds="0" EstimateRewinds="0">
+                      <OutputList>
+                        <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[OrderLines]" Alias="[ol]" Column="OrderID" />
+                        <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[OrderLines]" Alias="[ol]" Column="Quantity" />
+                        <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[OrderLines]" Alias="[ol]" Column="UnitPrice" />
+                      </OutputList>
+                      <IndexScan Ordered="0" ForcedIndex="0" NoExpandHint="0">
+                        <DefinedValues>
+                          <DefinedValue>
+                            <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[OrderLines]" Alias="[ol]" Column="OrderID" />
+                          </DefinedValue>
+                          <DefinedValue>
+                            <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[OrderLines]" Alias="[ol]" Column="Quantity" />
+                          </DefinedValue>
+                          <DefinedValue>
+                            <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[OrderLines]" Alias="[ol]" Column="UnitPrice" />
+                          </DefinedValue>
+                        </DefinedValues>
+                        <Object Database="[appdb]" Schema="[Sales]" Table="[OrderLines]" Index="[PK_Sales_OrderLines]" Alias="[ol]" IndexKind="Clustered" Storage="RowStore" />
+                      </IndexScan>
+                    </RelOp>
+                  </Spool>
+                </RelOp>
+              </NestedLoops>
+            </RelOp>
+          </QueryPlan>
+        </StmtSimple>
+      </Statements>
+    </Batch>
+  </BatchSequence>
+</ShowPlanXML>

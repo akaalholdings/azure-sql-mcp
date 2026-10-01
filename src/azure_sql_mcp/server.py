@@ -101,7 +101,12 @@ from .performance_workflows import profile_result_fingerprint
 from .plan_action_service import PlanActionService
 from .plan_cache import PlanCacheService
 from .plan_enforcement import PlanEnforcementService
+from .plan_digest import build_plan_digest
+from .plan_digest import describe_plan_node
 from .plan_rules import analyze_plan
+from .plan_sources import PlanSource
+from .plan_sources import PlanSourceService
+from .plan_tree import PlanParseError
 from .plans import PlansService
 from .platform_capabilities import PlatformCapabilitiesService
 from .prompts import register_prompts
@@ -184,7 +189,7 @@ _INDEX_OWNER_PROOF = re.compile(r"^[A-Za-z0-9_.:-]{16,200}$")
 _IDEMPOTENCY_DIGEST_PATTERN = re.compile(r"^idempotency-v1:[0-9a-f]{64}$")
 _LEARNING_SKILL_VERSIONS = {
     "sql-health-triage": "1.0.1",
-    "sql-optimizer": "2.4.0",
+    "sql-optimizer": "2.5.0",
     "sql-plan-enforcer": "1.0.1",
     "sql-index-manager": "2.0.0",
 }
@@ -374,39 +379,6 @@ def _auth_settings(config: ServerConfig) -> AuthSettings:
 
 MAX_ANALYZED_PLAN_XML_CHARS = 8_000_000
 
-_PLAN_BY_ID_SQL = """
-SELECT
-    p.plan_id,
-    p.query_id,
-    p.is_forced_plan,
-    CAST(p.query_plan AS nvarchar(max)) AS query_plan
-FROM sys.query_store_plan AS p
-WHERE p.plan_id = ?
-"""
-
-_DOMINANT_PLAN_FOR_QUERY_SQL = """
-WITH ranked AS (
-    SELECT
-        p.plan_id,
-        SUM(rs.avg_duration * rs.count_executions) AS total_duration_us,
-        MAX(p.last_execution_time) AS last_execution_time
-    FROM sys.query_store_plan AS p
-    LEFT JOIN sys.query_store_runtime_stats AS rs
-        ON rs.plan_id = p.plan_id
-    WHERE p.query_id = ?
-    GROUP BY p.plan_id
-)
-SELECT TOP (1)
-    p.plan_id,
-    p.query_id,
-    p.is_forced_plan,
-    CAST(p.query_plan AS nvarchar(max)) AS query_plan
-FROM ranked AS r
-INNER JOIN sys.query_store_plan AS p
-    ON p.plan_id = r.plan_id
-ORDER BY r.total_duration_us DESC, r.last_execution_time DESC
-"""
-
 
 def _compact_plan_findings(analysis: dict[str, Any], *, limit: int = 15) -> dict[str, Any]:
     findings = analysis.get("findings") or []
@@ -468,6 +440,7 @@ class AzureSqlMcpApplication:
         self.workload_index_advisor = WorkloadIndexAdvisor(executor)
         self.query_store_trends = QueryStoreTrendService(executor)
         self.version_store = VersionStoreService(executor)
+        self.plan_sources = PlanSourceService(executor)
         self.wait_stats = WaitStatsService(executor)
         self.lock_diagnostics = LockDiagnosticsService(executor)
         self.tempdb_memory = TempdbMemoryService(executor)
@@ -1078,14 +1051,16 @@ class AzureSqlMcpApplication:
 
         @self.mcp.tool(
             description=(
-                "Find plan anti-patterns with rule-based analysis: non-SARGable predicates, "
-                "implicit conversions, key and RID lookups, scans with seekable filters, "
-                "eager index spools, spills, memory-grant problems, estimate gaps, table "
-                "variables, scalar UDFs, multi-statement TVFs, heavy nested loops, "
-                "parallelism blockers, and optimizer timeouts. Each finding has a severity, "
-                "the plan node, evidence from the plan, the operator's share of estimated "
-                "cost, a pattern family, and a fix direction. Pass exactly one of plan_id "
-                "(Query Store), query_id (its most expensive Query Store plan), or plan_xml."
+                "Read a query plan the way an expert does. Returns a digest (plan kind and what "
+                "it can show, statement time and UDF share, warnings by node, memory grant use, "
+                "parameter and local-variable tells, top operators by self time on actual plans "
+                "or estimated self cost otherwise, per-execution estimate errors, repeated table "
+                "access, thread skew, waits, eager index spools, missing-index hints, predicates "
+                "on cited nodes, and an operator tree) plus rule findings ranked by severity and "
+                "self-time share. Pass node_id for one operator in full. Pass exactly one of "
+                "plan_id (Query Store), query_id (its most expensive Query Store plan), plan_xml, "
+                "or session_id (the in-flight plan of a running request); last_actual=true with "
+                "plan_id or query_id reads the last actual plan from the plan cache instead."
             ),
             annotations=ToolAnnotations(
                 title="Analyze Query Plan",
@@ -1106,6 +1081,32 @@ class AzureSqlMcpApplication:
                 default=None,
                 description="Raw showplan XML (estimated or actual) to analyse directly.",
             ),
+            session_id: int | None = Field(
+                default=None,
+                ge=1,
+                description="A running session: analyse its in-flight plan (partial counts).",
+            ),
+            last_actual: bool = Field(
+                default=False,
+                description=(
+                    "With plan_id or query_id: read the last actual plan (actual row counts) "
+                    "from the plan cache. Needs LAST_QUERY_PLAN_STATS = ON."
+                ),
+            ),
+            node_id: int | None = Field(
+                default=None,
+                ge=0,
+                description="Return one operator in full instead of the digest and findings.",
+            ),
+            statement_index: int | None = Field(
+                default=None,
+                ge=0,
+                description="With node_id: which statement of a multi-statement plan.",
+            ),
+            include_digest: bool = Field(
+                default=True,
+                description="Include the plan digest. Set false for findings only.",
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -1114,7 +1115,17 @@ class AzureSqlMcpApplication:
             return await self._run_tool(
                 "analyze_query_plan",
                 database_name,
-                lambda db: self._analyze_query_plan(db, plan_id, query_id, plan_xml),
+                lambda db: self._analyze_query_plan(
+                    db,
+                    plan_id,
+                    query_id,
+                    plan_xml,
+                    session_id=session_id,
+                    last_actual=last_actual,
+                    node_id=node_id,
+                    statement_index=statement_index,
+                    include_digest=include_digest,
+                ),
             )
 
         @self.mcp.tool(
@@ -5072,7 +5083,7 @@ class AzureSqlMcpApplication:
             **checks,
             "azure_sql_database": platform,
             "mcp_contract": {
-                "contract_version": "2.4.0",
+                "contract_version": "2.5.0",
                 "performance_tuning": 1,
                 "durable_view_change": 1,
                 "prepared_plan_action": 1,
@@ -5084,6 +5095,7 @@ class AzureSqlMcpApplication:
                 "index_review_snapshot_reuse_hours": 48,
                 "workload_index_advisor": 1,
                 "result_status": 1,
+                "plan_digest": 1,
             },
             "local_tuning_policy": {
                 "configured": policy.configured,
@@ -8819,42 +8831,60 @@ class AzureSqlMcpApplication:
         plan_id: int | None,
         query_id: int | None,
         plan_xml: str | None,
+        *,
+        session_id: int | None = None,
+        last_actual: bool = False,
+        node_id: int | None = None,
+        statement_index: int | None = None,
+        include_digest: bool = True,
     ) -> dict[str, Any]:
-        sources = [value is not None for value in (plan_id, query_id, plan_xml)]
+        sources = [value is not None for value in (plan_id, query_id, plan_xml, session_id)]
         if sum(sources) != 1:
-            raise ValueError("Pass exactly one of plan_id, query_id, or plan_xml.")
-        source: dict[str, Any]
+            raise ValueError("Pass exactly one of plan_id, query_id, plan_xml, or session_id.")
+        if last_actual and plan_id is None and query_id is None:
+            raise ValueError("last_actual applies only with plan_id or query_id.")
+        if statement_index is not None and node_id is None:
+            raise ValueError("statement_index applies only with node_id.")
         if plan_xml is not None:
             if len(plan_xml) > MAX_ANALYZED_PLAN_XML_CHARS:
                 raise ValueError("plan_xml is too large to analyse.")
-            source = {"source": "plan_xml"}
-            xml_text = plan_xml
+            found = PlanSource(plan_xml, {"source": "plan_xml"})
+        elif session_id is not None:
+            found = await self.plan_sources.live(database_name, session_id)
+        elif last_actual:
+            found = await self.plan_sources.last_actual(database_name, plan_id=plan_id, query_id=query_id)
         else:
-            query = _PLAN_BY_ID_SQL if plan_id is not None else _DOMINANT_PLAN_FOR_QUERY_SQL
-            rows = await self.executor.fetch_all(
-                database_name, query, params=[int(plan_id or query_id or 0)]
-            )
-            if not rows:
+            found = await self.plan_sources.query_store(database_name, plan_id=plan_id, query_id=query_id)
+        base: dict[str, Any] = {"database_name": database_name, **found.source}
+        if found.xml is None:
+            return {**base, "findings": [], **found.status}
+        if node_id is not None:
+            try:
+                node = describe_plan_node(found.xml, node_id, statement_index=statement_index)
+            except PlanParseError as exc:
+                return {**base, **status_payload(ResultStatus.UNAVAILABLE, f"The plan could not be parsed: {exc}.")}
+            if node is None:
                 return {
-                    "database_name": database_name,
-                    "plan_id": plan_id,
-                    "query_id": query_id,
-                    "findings": [],
-                    **status_payload(
-                        ResultStatus.EMPTY,
-                        "No Query Store plan matched; check the id and the Query Store retention window.",
-                    ),
+                    **base,
+                    **status_payload(ResultStatus.EMPTY, f"No operator with node_id {node_id} in this plan."),
                 }
-            row = rows[0]
-            source = {
-                "source": "query_store",
-                "plan_id": row.get("plan_id"),
-                "query_id": row.get("query_id"),
-                "is_forced_plan": bool(row.get("is_forced_plan")),
-            }
-            xml_text = str(row.get("query_plan") or "")
-        analysis = analyze_plan(xml_text)
-        return {"database_name": database_name, **source, **analysis}
+            return {**base, "node": node, **status_payload(ResultStatus.OK, "Operator detail returned.")}
+        result = {**base, **analyze_plan(found.xml)}
+        if include_digest:
+            result["digest"] = build_plan_digest(found.xml)
+        if found.source.get("source") == "query_store" and found.source.get("plan_id"):
+            result["query_store_runtime"] = await self.plan_sources.query_store_runtime(
+                database_name, int(found.source["plan_id"]), found.xml
+            )
+        if result.get("parse_error"):
+            result.update(
+                status_payload(ResultStatus.UNAVAILABLE, f"The plan could not be analysed: {result['parse_error']}.")
+            )
+        elif include_digest:
+            result.update(
+                status_payload(ResultStatus.OK, "Digest and findings returned; no findings means no rule fired.")
+            )
+        return result
 
     async def _explain_query(
         self,
@@ -8906,6 +8936,7 @@ class AzureSqlMcpApplication:
             result["parameter_binding"] = binding_info
         if artifact.raw_xml:
             result["plan_findings"] = _compact_plan_findings(analyze_plan(artifact.raw_xml))
+            result["plan_digest"] = build_plan_digest(artifact.raw_xml, top_n=5, tree_budget=40)
         return result
 
     @staticmethod
