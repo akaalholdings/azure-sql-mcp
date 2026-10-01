@@ -1122,7 +1122,7 @@ async def test_registered_query_regression_tools_forward_window_minutes(
         {"database_name": "appdb", "window_minutes": 90},
     )
 
-    assert payload == {"tool": tool_name}
+    assert payload == {"tool": tool_name, "result_status": "ok"}
     service_call.assert_awaited_once_with("appdb", 90)
 
 
@@ -1139,7 +1139,7 @@ async def test_registered_analyze_query_indexes_forwards_queries_array(
         {"database_name": "appdb", "queries": ["SELECT 1"]},
     )
 
-    assert payload == {"queries_analyzed": 1}
+    assert payload == {"queries_analyzed": 1, "result_status": "ok"}
     app._analyze_query_indexes.assert_awaited_once_with(
         "appdb", ["SELECT 1"], False, None, None
     )

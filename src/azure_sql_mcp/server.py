@@ -109,6 +109,7 @@ from .query_regression import QueryRegressionService
 from .query_store import QueryStoreService
 from .resource_governance import ResourceGovernanceService
 from .resources import register_resources
+from .result_status import apply_result_status
 from .safe_sql import SafeSqlValidator
 from .schema_compare import SchemaCompareService
 from .sessions import SessionsService
@@ -247,11 +248,11 @@ class _SanitizingToolManager(ToolManager):
         convert_result: bool = False,
     ) -> Any:
         try:
-            return await super().call_tool(
+            result = await super().call_tool(
                 name,
                 arguments,
                 context=context,
-                convert_result=convert_result,
+                convert_result=False,
             )
         except ToolError as exc:
             validation_error = exc.__cause__
@@ -284,6 +285,16 @@ class _SanitizingToolManager(ToolManager):
                     separators=(",", ":"),
                 )
             ) from None
+        result = apply_result_status(name, result)
+        if not convert_result:
+            return result
+        tool = self.get_tool(name)
+        if tool is None:  # pragma: no cover - super().call_tool already resolved it
+            raise ToolError(f"Unknown tool: {name}")
+        try:
+            return tool.fn_metadata.convert_result(result)
+        except Exception as exc:
+            raise ToolError(f"Error executing tool {name}: {exc}") from exc
 
 
 def _validation_issue_message(code: str) -> str:

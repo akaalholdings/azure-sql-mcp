@@ -88,6 +88,8 @@ async def _lifecycle(server: StdioServerParameters):
                     },
                 )
             )
+            assert recalled.pop("result_status") == "empty"
+            assert recalled.pop("result_status_reason")
             assert recalled == {"lessons": [], "count": 0, "max_results": 3}
             return runtime
 

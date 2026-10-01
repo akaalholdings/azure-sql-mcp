@@ -189,7 +189,10 @@ async def test_evidence_governed_learning_lifecycle_acceptance(
         ],
         "database_name": "appdb",
     }
-    assert await app.mcp._tool_manager.call_tool("recall_lessons", recall_args) == {
+    recalled = await app.mcp._tool_manager.call_tool("recall_lessons", recall_args)
+    assert recalled.pop("result_status") == "empty"
+    assert recalled.pop("result_status_reason")
+    assert recalled == {
         "lessons": [],
         "count": 0,
         "max_results": 3,
