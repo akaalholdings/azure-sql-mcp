@@ -89,8 +89,14 @@ SELECT
     r.total_elapsed_time,
     CAST(qp.query_plan AS nvarchar(max)) AS query_plan
 FROM sys.dm_exec_requests AS r
-CROSS APPLY sys.dm_exec_query_statistics_xml(r.session_id) AS qp
+OUTER APPLY sys.dm_exec_query_statistics_xml(r.session_id) AS qp
 WHERE r.session_id = ?
+"""
+
+LIGHTWEIGHT_PROFILING_SQL = """
+SELECT CAST(value AS nvarchar(20)) AS value
+FROM sys.database_scoped_configurations
+WHERE name = N'LIGHTWEIGHT_QUERY_PROFILING'
 """
 
 PLAN_RUNTIME_SQL = """
@@ -120,6 +126,7 @@ ORDER BY wait_ms DESC
 """
 
 ENABLE_LAST_ACTUAL_PLANS = "ALTER DATABASE SCOPED CONFIGURATION SET LAST_QUERY_PLAN_STATS = ON;"
+ENABLE_LIVE_PLANS = "ALTER DATABASE SCOPED CONFIGURATION SET LIGHTWEIGHT_QUERY_PROFILING = ON;"
 
 
 @dataclass
@@ -212,16 +219,15 @@ class PlanSourceService:
             rows = await self.executor.fetch_all(database_name, LIVE_PLAN_SQL, params=[int(session_id)])
         except Exception as exc:
             return PlanSource(None, source, _unreadable("sys.dm_exec_query_statistics_xml", exc))
-        if not rows or not rows[0].get("query_plan"):
+        if not rows:
             return PlanSource(
                 None,
                 source,
-                status_payload(
-                    ResultStatus.EMPTY,
-                    f"Session {session_id} is not running a query with a readable plan in this database.",
-                ),
+                status_payload(ResultStatus.EMPTY, f"Session {session_id} is not running a request in this database."),
             )
         row = rows[0]
+        if not row.get("query_plan"):
+            return PlanSource(None, source, await self._missing_live_plan(database_name, session_id))
         source.update(
             {
                 "request_status": row.get("status"),
@@ -232,6 +238,25 @@ class PlanSourceService:
             }
         )
         return PlanSource(str(row["query_plan"]), source)
+
+    async def _missing_live_plan(self, database_name: str, session_id: int) -> dict[str, Any]:
+        """A running request without a live plan: profiling is off, or there is no plan yet."""
+
+        try:
+            rows = await self.executor.fetch_all(database_name, LIGHTWEIGHT_PROFILING_SQL)
+        except Exception as exc:
+            return _unreadable("sys.database_scoped_configurations", exc)
+        value = str((rows[0].get("value") if rows else "") or "").strip().upper()
+        if value in {"0", "OFF", "FALSE"}:
+            return status_payload(
+                ResultStatus.PRECONDITION,
+                "Live plans need lightweight query profiling, which is off for this database.",
+                remediation=ENABLE_LIVE_PLANS,
+            )
+        return status_payload(
+            ResultStatus.EMPTY,
+            f"Session {session_id} is running a request with no live plan yet (compiling, or between statements).",
+        )
 
     async def query_store_runtime(self, database_name: str, plan_id: int, plan_xml: str) -> dict[str, Any]:
         """Measured statement-level runtime and waits for a Query Store plan, over its retention."""

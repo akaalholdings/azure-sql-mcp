@@ -2969,6 +2969,23 @@ async def test_idle_session_has_no_live_plan(app: AzureSqlMcpApplication) -> Non
 
 
 @pytest.mark.asyncio
+async def test_running_request_without_a_live_plan_names_the_profiling_setting(app: AzureSqlMcpApplication) -> None:
+    app.executor.fetch_all = _plan_source_fetch(  # type: ignore[method-assign]
+        {
+            "dm_exec_query_statistics_xml": [{"session_id": 61, "status": "running", "query_plan": None}],
+            "LIGHTWEIGHT_QUERY_PROFILING": [{"value": "0"}],
+        }
+    )
+
+    payload = await app.mcp._tool_manager.call_tool(
+        "analyze_query_plan", {"database_name": "appdb", "session_id": 61}
+    )
+
+    assert payload["result_status"] == "precondition"
+    assert payload["remediation"] == "ALTER DATABASE SCOPED CONFIGURATION SET LIGHTWEIGHT_QUERY_PROFILING = ON;"
+
+
+@pytest.mark.asyncio
 async def test_plan_source_reads_that_fail_are_unavailable_not_empty(app: AzureSqlMcpApplication) -> None:
     app.executor.fetch_all = AsyncMock(side_effect=RuntimeError("VIEW DATABASE STATE permission denied"))  # type: ignore[method-assign]
 
