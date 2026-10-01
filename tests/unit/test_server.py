@@ -257,6 +257,7 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
         "get_query_store_regressions",
         "analyze_query_plan",
         "get_version_store_stats",
+        "diagnose_database",
         # Phase 9: Wait Statistics
         "get_wait_stats",
         "get_query_wait_stats",
@@ -2865,3 +2866,20 @@ async def test_explain_query_attaches_plan_findings(app: AzureSqlMcpApplication)
     assert findings["plan_kind"] == "estimated"
     assert findings["findings"][0]["rule"] == "key_lookup"
     assert findings["families"]["indexes"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_diagnose_database_forwards_window_and_master_access(app: AzureSqlMcpApplication) -> None:
+    app.database_diagnosis.diagnose = AsyncMock(  # type: ignore[method-assign]
+        return_value={"findings": [], "result_status": "ok", "result_status_reason": "Read 7 of 7 sources."}
+    )
+
+    payload = await app.mcp._tool_manager.call_tool(
+        "diagnose_database", {"database_name": "appdb", "window_minutes": 30, "sample_seconds": 5}
+    )
+
+    assert payload["result_status"] == "ok"
+    app.database_diagnosis.diagnose.assert_awaited_once_with(
+        "appdb", window_minutes=30, sample_seconds=5, master_available=False
+    )
+    assert app._timeout_for_tool("diagnose_database") >= app.config.query_timeout_seconds * 3

@@ -46,6 +46,7 @@ from .config import TransportMode
 from .config import load_server_config
 from .connection import AzureSqlExecutor
 from .connection_pool import ConnectionPool
+from .database_diagnosis import DatabaseDiagnosisService
 from .database_policy import load_database_policy_or_deny
 from .diagnostics import DiagnosticQueryService
 from .equivalence_preflight import EquivalencePreflightService
@@ -559,6 +560,14 @@ class AzureSqlMcpApplication:
             self.recommendations,
         )
 
+        self.database_diagnosis = DatabaseDiagnosisService(
+            resource_governance=self.resource_governance,
+            wait_stats=self.wait_stats,
+            sessions=self.sessions,
+            query_store=self.query_store,
+            query_store_trends=self.query_store_trends,
+            version_store=self.version_store,
+        )
         self._register_tools()
         if self.learning_service is not None:
             self._register_learning_tools()
@@ -2748,6 +2757,52 @@ class AzureSqlMcpApplication:
                     db,
                     window_minutes,
                     source=source,
+                    master_available=self._master_allowlisted(),
+                ),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Diagnose an Azure SQL database in one call: resource use against its limits, "
+                "waits (optionally a live interval sample), current blocking, the top Query "
+                "Store CPU consumers, regressions against a 7-day baseline, and version store "
+                "health. Returns findings ranked by severity, each with evidence and the next "
+                "tool calls (with arguments) to drill in. Unreadable sources are listed as "
+                "gaps, never treated as healthy. Start incident triage here."
+            ),
+            annotations=ToolAnnotations(
+                title="Diagnose Database",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=False,
+                openWorldHint=True,
+            ),
+        )
+        async def diagnose_database(
+            window_minutes: int = Field(
+                default=60,
+                ge=5,
+                le=10080,
+                description="Window for resource history, top queries, and the recent side of regressions.",
+            ),
+            sample_seconds: int = Field(
+                default=0,
+                ge=0,
+                le=30,
+                description="Seconds to sample waits for a live interval; 0 uses cumulative counters.",
+            ),
+            database_name: str | None = Field(
+                default=None,
+                description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
+            ),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "diagnose_database",
+                database_name,
+                lambda db: self.database_diagnosis.diagnose(
+                    db,
+                    window_minutes=window_minutes,
+                    sample_seconds=sample_seconds,
                     master_available=self._master_allowlisted(),
                 ),
             )
@@ -7625,6 +7680,12 @@ class AzureSqlMcpApplication:
             return self._session_workflow_timeout(database_name)
         if tool_name in _EVIDENCE_WORKFLOW_TOOLS:
             return self._evidence_workflow_timeout()
+        if tool_name == "diagnose_database":
+            # Sources run concurrently; allow a wait sample plus the slowest read.
+            return max(
+                float(self.config.tool_timeout_seconds),
+                self.config.query_timeout_seconds * 3 + 45.0,
+            )
         if tool_name == "get_wait_stats":
             # Two snapshots plus an optional sample of up to 30 seconds.
             return max(

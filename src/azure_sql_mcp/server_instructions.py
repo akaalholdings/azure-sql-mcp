@@ -26,7 +26,8 @@ Every tool result has result_status:
   never run it yourself.
 
 ## Pick the workflow
-- Incident or broad slowness: get_resource_stats_history (window_minutes up to 14 days;
+- Incident or broad slowness: diagnose_database first (one call, ranked findings with
+  next tool calls), then drill in with get_resource_stats_history (window_minutes up to 14 days;
   over 60 minutes needs master allowlisted), get_resource_limits, get_wait_stats
   (sample_seconds=15 during a live incident), get_currently_waiting_tasks,
   get_active_sessions, get_lock_details, get_open_transactions, get_deadlock_history,
