@@ -25,6 +25,11 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
   `get_top_queries`.
 - `sample_seconds` interval mode for `get_wait_stats`; 14-day hourly resource
   history from `sys.resource_stats` when `master` is allowlisted.
+- `diagnose_database`: one-call triage that reads resource use, waits,
+  blocking, top Query Store consumers, regressions, and version store health
+  concurrently and returns ranked findings with the next tool calls.
+- `get_version_store_stats`: ADR persistent version store size, cleanup state,
+  and the transactions holding cleanup back.
 - Azure SQL Database server instructions in the MCP initialize response.
 - Portable tool input schemas for strict function-calling clients
   (`AZURE_SQL_SCHEMA_PROFILE`, default `portable`).

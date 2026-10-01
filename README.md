@@ -11,6 +11,7 @@ The supported tuning path is evidence-first but rewrite-active: a missing plan l
 - Workload-driven index design (`review_workload_indexes`): Query Store runtime history and stored plans, per-table access patterns, existing-index reconciliation, and inert DDL with exact rollback. No install step.
 - Rule-based plan analysis (`analyze_query_plan`, and `plan_findings` on `explain_query`) for estimated and actual plans.
 - Query Store over time: trends, regressions against a baseline window, and past windows through `as_of_utc`.
+- One-call database triage (`diagnose_database`) and ADR version store health (`get_version_store_stats`).
 - Azure SQL Database server instructions sent at MCP initialization.
 - Versioned `EvidenceEnvelopeV1`, `PerformanceCaseV1`, `TuningSessionV1`, `TuningCandidateV1`, and `PlanActionIntentV1` contracts.
 - Redacted SQLite state under `~/.azure-sql-mcp/state` by default.
@@ -263,6 +264,14 @@ such as `warnings`. Services set the other values explicitly.
 
 ## Live diagnostics notes
 
+- `diagnose_database` is the first call for an incident. It reads resource use
+  against limits, waits (`sample_seconds` for a live interval), blocking, the
+  top Query Store CPU consumers, regressions against a 7-day baseline, and
+  version store health concurrently, and returns findings ranked by severity
+  with the next tool calls. Unreadable sources are listed as gaps.
+- `get_version_store_stats` reports the ADR persistent version store (always
+  on in Azure SQL Database): size and share of used data space, cleanup state,
+  and the oldest open and snapshot transactions that hold cleanup back.
 - `get_wait_stats` returns counters accumulated since the last reset and
   reports `window.since_utc`. Pass `sample_seconds` (1-30) during a live
   incident to get only the waits that accrued between two snapshots.
