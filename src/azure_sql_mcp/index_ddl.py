@@ -79,7 +79,7 @@ def render_reverse_index_ddl(index: ExistingIndex) -> dict[str, Any]:
                 blockers.append("partition_scheme_name_unavailable")
             if not index.partition_compression:
                 blockers.append("partition_compression_unavailable")
-        elif data_space_type not in {"FILEGROUP", "ROWS", "FG"}:
+        elif data_space_type not in {"ROWS_FILEGROUP", "FILEGROUP", "ROWS", "FG"}:
             blockers.append("data_space_type_unsupported")
 
     if index.has_filter is True and not index.filter_definition:
