@@ -115,6 +115,7 @@ from .result_status import ResultStatus
 from .result_status import apply_result_status
 from .result_status import status_payload
 from .safe_sql import SafeSqlValidator
+from .schema_compat import portable_input_schema
 from .server_instructions import SERVER_INSTRUCTIONS
 from .schema_compare import SchemaCompareService
 from .sessions import SessionsService
@@ -569,6 +570,21 @@ class AzureSqlMcpApplication:
             database_policy=self.database_policy,
         )
         register_prompts(self.mcp, self.config)
+        if self.config.schema_profile == "portable":
+            self._install_portable_tool_listing()
+
+    def _install_portable_tool_listing(self) -> None:
+        """Serve strict-client input schemas on tools/list without touching validation."""
+
+        list_raw_tools = self.mcp.list_tools
+
+        async def list_portable_tools() -> list[Any]:
+            return [
+                tool.model_copy(update={"inputSchema": portable_input_schema(tool.inputSchema)})
+                for tool in await list_raw_tools()
+            ]
+
+        self.mcp._mcp_server.list_tools()(list_portable_tools)
 
     def _prune_disabled_tools(self) -> None:
         """Remove tools that are not in the configured tool_groups."""

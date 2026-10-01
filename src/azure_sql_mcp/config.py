@@ -422,6 +422,7 @@ class ServerConfig:
     comparison_row_limit: int = 10_000
     persist_view_sql_state: bool = False
     legacy_state_server_binding: str | None = None
+    schema_profile: str = "portable"
 
     def validate_database_name(self, database_name: str | None) -> str:
         """Resolve a database against the allowlist, case-insensitively.
@@ -503,6 +504,7 @@ class ServerConfig:
             "legacy_state_server_binding_configured": (
                 self.legacy_state_server_binding is not None
             ),
+            "schema_profile": self.schema_profile,
             "database_policy_file_configured": self.database_policy_file is not None,
             "performance_state_store": (
                 "memory" if self.performance_state_dir == ":memory:" else "durable"
@@ -644,6 +646,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--azure-sql-legacy-state-server-binding",
         dest="azure_sql_legacy_state_server_binding",
     )
+    parser.add_argument(
+        "--azure-sql-schema-profile",
+        dest="azure_sql_schema_profile",
+        help="portable (default): strict-client tool schemas; full: raw Pydantic schemas.",
+    )
     return parser
 
 
@@ -744,6 +751,9 @@ def load_server_config(argv: list[str] | None = None) -> ServerConfig:
     log_format = args.log_format.lower()
     if log_format not in {"text", "json"}:
         raise ValueError("AZURE_SQL_LOG_FORMAT must be 'text' or 'json'.")
+    schema_profile = (env_or_arg(args, "azure_sql_schema_profile") or "portable").strip().lower()
+    if schema_profile not in {"portable", "full"}:
+        raise ValueError("AZURE_SQL_SCHEMA_PROFILE must be 'portable' or 'full'.")
 
     tool_groups_raw = env_or_arg(args, "azure_sql_tool_groups") or "all"
     tool_groups = frozenset(
@@ -862,4 +872,5 @@ def load_server_config(argv: list[str] | None = None) -> ServerConfig:
         comparison_row_limit=comparison_row_limit,
         persist_view_sql_state=persist_view_sql_state,
         legacy_state_server_binding=legacy_state_server_binding,
+        schema_profile=schema_profile,
     )
