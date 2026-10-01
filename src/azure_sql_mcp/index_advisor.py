@@ -588,7 +588,7 @@ def _candidates_for_table(
 
 def _equality_columns(access: TableAccess) -> list[str]:
     columns = list(access.seek_eq_columns)
-    for column in access.residual_eq_columns:
+    for column in access.residual_eq_columns + access.spool_eq_columns:
         if column not in columns:
             columns.append(column)
     return columns
@@ -607,7 +607,11 @@ def _access_candidate(
     eq = [column for column in _equality_columns(access) if _key_eligible(columns, column)]
     ranges = [
         column
-        for column in list(access.seek_range_columns) + list(access.residual_range_columns)
+        for column in (
+            list(access.seek_range_columns)
+            + list(access.residual_range_columns)
+            + list(access.spool_range_columns)
+        )
         if column not in eq and _key_eligible(columns, column)
     ]
     if access.operation == "seek":
@@ -618,7 +622,7 @@ def _access_candidate(
     else:
         if not eq and not ranges:
             return None
-        kind = "scan_to_seek"
+        kind = "replace_eager_spool" if access.spool_node_id is not None else "scan_to_seek"
 
     order_columns = [
         (column, direction)
@@ -673,7 +677,14 @@ def _access_candidate(
     selectivity_ratio = 0.5
     if table_rows and table_rows > 0 and access.estimated_rows >= 0:
         selectivity_ratio = min(1.0, access.estimated_rows / table_rows)
-    factor = (1.0 - selectivity_ratio) if kind == "scan_to_seek" else 0.4
+    if kind == "scan_to_seek":
+        factor = 1.0 - selectivity_ratio
+    elif kind == "replace_eager_spool":
+        # The scan feeds a spool, so it reads the whole table on every
+        # execution; a permanent index removes nearly all of that work.
+        factor = 0.9
+    else:
+        factor = 0.4
     candidate.savings = item.attributed * max(0.0, factor)
     return candidate
 
@@ -1765,6 +1776,8 @@ def _candidate_rationale(
     key_text = ", ".join(f"{n}{' DESC' if d == 'DESC' else ''}" for n, d in keys)
     kinds = candidate.kinds
     reasons = []
+    if "replace_eager_spool" in kinds:
+        reasons.append("replaces the eager index spool the optimizer builds on every execution")
     if "scan_to_seek" in kinds:
         reasons.append("turns scans with filters into seeks")
     if "extend_seek" in kinds:

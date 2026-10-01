@@ -154,3 +154,16 @@ def test_unquote_handles_escaped_brackets() -> None:
     assert unquote("[a]]b]") == "a]b"
     assert unquote("plain") == "plain"
     assert unquote(None) is None
+
+
+def test_eager_index_spool_gives_its_keys_and_cost_to_the_feeding_scan() -> None:
+    summary = parse_plan_access(_plan("eager_index_spool.xml"))
+    feeder = _access(summary, table="OrderLines", operation="scan")
+
+    assert feeder.spool_node_id == 2
+    assert feeder.spool_eq_columns == ("OrderID",)
+    assert set(feeder.output_columns) >= {"Quantity", "UnitPrice"}
+    # The spool's own cost (10.5 - 4) joins the scan's: one index removes both.
+    assert feeder.cost_share == pytest.approx((4 + 6.5) / 12)
+    assert feeder.as_dict()["eager_spool"] == {"node_id": 2, "eq_columns": ["OrderID"], "range_columns": []}
+    assert feeder.residual == {}
