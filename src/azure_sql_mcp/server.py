@@ -2133,6 +2133,16 @@ class AzureSqlMcpApplication:
         )
         async def get_wait_stats(
             top_n: int = Field(default=20, description="Number of top waits to return."),
+            sample_seconds: int = Field(
+                default=0,
+                ge=0,
+                le=30,
+                description=(
+                    "0 returns counters accumulated since the last reset (window.since_utc). "
+                    "1-30 samples twice that many seconds apart and returns only the waits "
+                    "that accrued in between: use it for a live incident."
+                ),
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -2141,7 +2151,9 @@ class AzureSqlMcpApplication:
             return await self._run_tool(
                 "get_wait_stats",
                 database_name,
-                lambda db: self.wait_stats.get_wait_stats(db, top_n),
+                lambda db: self.wait_stats.get_wait_stats(
+                    db, top_n, sample_seconds=sample_seconds
+                ),
             )
 
         @self.mcp.tool(
@@ -7331,6 +7343,12 @@ class AzureSqlMcpApplication:
             return self._session_workflow_timeout(database_name)
         if tool_name in _EVIDENCE_WORKFLOW_TOOLS:
             return self._evidence_workflow_timeout()
+        if tool_name == "get_wait_stats":
+            # Two snapshots plus an optional sample of up to 30 seconds.
+            return max(
+                float(self.config.tool_timeout_seconds),
+                self.config.query_timeout_seconds * 2 + 45.0,
+            )
         if tool_name == "review_workload_indexes":
             # About eight bounded catalog and Query Store reads run in sequence.
             return max(

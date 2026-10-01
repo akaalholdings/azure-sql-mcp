@@ -2738,3 +2738,18 @@ def test_review_workload_indexes_needs_no_policy_file_and_gets_a_longer_timeout(
     assert app._timeout_for_tool("review_workload_indexes") >= (
         app.config.query_timeout_seconds * 8
     )
+
+
+@pytest.mark.asyncio
+async def test_get_wait_stats_forwards_the_sample_window(app: AzureSqlMcpApplication) -> None:
+    app.wait_stats.get_wait_stats = AsyncMock(  # type: ignore[method-assign]
+        return_value={"top_waits": [{"wait_type": "WRITELOG"}]}
+    )
+
+    payload = await app.mcp._tool_manager.call_tool(
+        "get_wait_stats", {"database_name": "appdb", "sample_seconds": 15}
+    )
+
+    assert payload["result_status"] == "ok"
+    app.wait_stats.get_wait_stats.assert_awaited_once_with("appdb", 20, sample_seconds=15)
+    assert app._timeout_for_tool("get_wait_stats") >= 45
