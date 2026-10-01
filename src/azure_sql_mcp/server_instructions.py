@@ -37,7 +37,9 @@ Every tool result has result_status:
   widen, consolidate, drop, and heap recommendations with inert DDL and rollback.
   Prove a candidate with benchmark_index_candidate (sandbox profile, non-production
   copy) before any production change.
-- One slow query: check_equivalence_preflight, explain_query, start_performance_case,
+- One slow query: analyze_query_plan (Query Store plan_id or query_id) or explain_query
+  (both return rule-based plan findings), get_query_store_trend for its history,
+  check_equivalence_preflight, start_performance_case,
   start_tuning_session, add_tuning_candidate, benchmark_tuning_candidate,
   finalize_tuning_session. Measured claims come only from these results.
 - Plan stability: plan_health_review, review_plan_enforcement, prepare_plan_action.
