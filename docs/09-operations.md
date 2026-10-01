@@ -151,14 +151,35 @@ required legacy workflows have completed or been retired.
 | `sandbox` | `sql-optimizer`, temporary index or view | unrestricted, local stdio | apply | core,performance,admin | benchmark, test-index, or view-apply permission as needed; non-production environment |
 | `enforcer-review` | `sql-plan-enforcer`, review | restricted | disabled | core,performance | shared state path required for intent preparation |
 | `enforcer-apply` | `sql-plan-enforcer`, one apply | unrestricted, local stdio | apply | core,performance,admin | plan-apply permission and open kill switch |
-| `index-review` | `sql-index-manager`, capture/review | restricted | disabled for general SQL; separate index-history write policy for capture | index-review | local: six base tools plus `recall_lessons`; remote: six base tools |
+| `index-review` | `sql-index-manager` | restricted | disabled for general SQL; separate index-history write policy only for portfolio capture | index-review | none for `review_workload_indexes`; `allow_read` for portfolio tools; local adds `recall_lessons` |
 | unset (general DBA) | explicitly authorized DBA work | unrestricted, local stdio | apply | all | normal database allowlist; SQL permissions remain authoritative |
 
 The profile is a server-side tool filter. Access mode, tool groups, Azure SQL permissions, database policy, and workflow state are independent gates.
 
-### Index history capture and review
+### Workload index review
 
-The index-review workflow is recommend-only and initially inactive. Shipping
+`review_workload_indexes` is the index-review workflow's main tool. It is
+read-only, needs only `VIEW DATABASE STATE` and `VIEW DEFINITION`, and requires
+no policy entry, history table, or install step; the database allowlist still
+applies. It reads Query Store runtime totals and stored plans for a window,
+designs indexes from the queries' access patterns, reconciles them with
+existing indexes, reviews existing indexes for duplication and disuse, and
+returns recommend-only DDL with exact rollback. Query Store must be
+`READ_WRITE` or `READ_ONLY`; otherwise the tool returns `precondition` with
+the enabling statement and still reports catalog-only findings.
+
+For an end-to-end check against a disposable database, run:
+
+```bash
+uv run python scripts/azure_live_acceptance.py --database testdb --confirm-disposable-database --with-deadlock
+```
+
+It creates and drops only its own `mcp_accept` schema objects and restores the
+Query Store capture mode it changes.
+
+### Optional index history capture and review
+
+The portfolio history workflow is recommend-only and initially inactive. Shipping
 the source does not install the database contract, enable capture policy,
 restart the MCP host, or prove the runtime fingerprints.
 
@@ -183,7 +204,8 @@ database allowlist, and write-policy gate remain application-layer controls;
 they do not reduce the identity's SQL permissions outside MCP.
 
 This identity and permission behaviour requires package `2.3.1` or newer. The
-public MCP and history contract version remains `2.3.0`.
+history-table contract version remains `2.3.0`; the public MCP contract is
+`2.4.0`.
 
 The public tools are `capture_index_review_snapshot`, `review_index_portfolio`,
 and `get_index_review`. Capture requires both database-policy `allow_read` and
@@ -204,9 +226,9 @@ or snapshot manifests. Raw query text, parameters, module or hint text, and
 plan XML are never stored. Query Store and hint text are parsed transiently
 into hashes, ids, aggregates, and coverage blockers.
 
-V1 learning is scoped advisory recall only. Portfolio review, run, snapshot,
-and artifact ids are not learning evidence references, and review returns
-`evidence_id=null`. Do not call `record_decision`, `review_decision`, lesson
+Index learning is scoped advisory recall only (`sql-index-manager@2.0.0`).
+Recommendation, portfolio review, run, snapshot, and artifact ids are not
+learning evidence references, and review returns `evidence_id=null`. Do not call `record_decision`, `review_decision`, lesson
 proposal, or handoff lifecycle tools for this workflow, and never invent an
 `evidence-*` id or terminal link. A later recheck or explicit human resolution
 cannot become an `OutcomeReviewV1` until a future MCP-owned evidence and

@@ -72,6 +72,7 @@ TOOL_GROUPS: dict[str, ToolGroup] = {
     "get_table_stats": ToolGroup.CORE,
     "execute_sql": ToolGroup.CORE,
     "explain_query": ToolGroup.CORE,
+    "analyze_query_plan": ToolGroup.CORE,
     "tune_query": ToolGroup.CORE,
     "benchmark_query_rewrite": ToolGroup.CORE,
     "check_equivalence_preflight": ToolGroup.CORE,
@@ -96,6 +97,7 @@ TOOL_GROUPS: dict[str, ToolGroup] = {
     "capture_index_review_snapshot": ToolGroup.CORE,
     "review_index_portfolio": ToolGroup.CORE,
     "get_index_review": ToolGroup.CORE,
+    "review_workload_indexes": ToolGroup.CORE,
     **{tool_name: ToolGroup.CORE for tool_name in LEARNING_TOOL_NAMES},
     # performance: deep diagnostics & tuning
     "analyze_query_indexes": ToolGroup.PERFORMANCE,
@@ -109,6 +111,8 @@ TOOL_GROUPS: dict[str, ToolGroup] = {
     "get_deadlock_history": ToolGroup.PERFORMANCE,
     "get_tempdb_usage": ToolGroup.PERFORMANCE,
     "get_tempdb_space_breakdown": ToolGroup.PERFORMANCE,
+    "get_version_store_stats": ToolGroup.PERFORMANCE,
+    "diagnose_database": ToolGroup.PERFORMANCE,
     "get_memory_grants": ToolGroup.PERFORMANCE,
     "get_io_stats": ToolGroup.PERFORMANCE,
     "get_resource_limits": ToolGroup.PERFORMANCE,
@@ -125,6 +129,8 @@ TOOL_GROUPS: dict[str, ToolGroup] = {
     "get_query_compilation_stats": ToolGroup.PERFORMANCE,
     "detect_parameter_sniffing": ToolGroup.PERFORMANCE,
     "detect_regressed_queries": ToolGroup.PERFORMANCE,
+    "get_query_store_trend": ToolGroup.PERFORMANCE,
+    "get_query_store_regressions": ToolGroup.PERFORMANCE,
     "get_query_parameter_buckets": ToolGroup.PERFORMANCE,
     "compare_query_plans": ToolGroup.PERFORMANCE,
     "get_forced_plans": ToolGroup.PERFORMANCE,
@@ -175,6 +181,8 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "get_deadlock_history",
             "get_tempdb_usage",
             "get_tempdb_space_breakdown",
+            "get_version_store_stats",
+            "diagnose_database",
             "get_memory_grants",
             "get_resource_limits",
             "get_resource_stats_history",
@@ -184,11 +192,15 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "get_query_parameter_buckets",
             "detect_parameter_sniffing",
             "detect_regressed_queries",
+            "get_query_store_trend",
+            "get_query_store_regressions",
+            "analyze_query_plan",
             "get_forced_plans",
             "check_statistics_health",
             "get_plan_cache_analysis",
             "get_query_compilation_stats",
             "explain_query",
+            "review_workload_indexes",
         }
     )
     | frozenset(
@@ -211,14 +223,19 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "get_dependencies",
             "get_table_stats",
             "explain_query",
+            "diagnose_database",
             "get_top_queries",
             "get_query_parameter_buckets",
             "detect_parameter_sniffing",
             "detect_regressed_queries",
+            "get_query_store_trend",
+            "get_query_store_regressions",
+            "analyze_query_plan",
             "get_forced_plans",
             "analyze_query_indexes",
             "analyze_workload_indexes",
             "analyze_index_recommendations",
+            "review_workload_indexes",
             "check_equivalence_preflight",
             "start_performance_case",
             "collect_performance_evidence",
@@ -254,10 +271,14 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "get_query_parameter_buckets",
             "detect_parameter_sniffing",
             "detect_regressed_queries",
+            "get_query_store_trend",
+            "get_query_store_regressions",
+            "analyze_query_plan",
             "get_forced_plans",
             "analyze_query_indexes",
             "analyze_workload_indexes",
             "analyze_index_recommendations",
+            "review_workload_indexes",
             "check_equivalence_preflight",
             "start_performance_case",
             "collect_performance_evidence",
@@ -293,6 +314,9 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "get_query_parameter_buckets",
             "detect_parameter_sniffing",
             "detect_regressed_queries",
+            "get_query_store_trend",
+            "get_query_store_regressions",
+            "analyze_query_plan",
             "compare_query_plans",
             "get_forced_plans",
             "plan_health_review",
@@ -319,6 +343,9 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "get_query_parameter_buckets",
             "detect_parameter_sniffing",
             "detect_regressed_queries",
+            "get_query_store_trend",
+            "get_query_store_regressions",
+            "analyze_query_plan",
             "compare_query_plans",
             "get_forced_plans",
             "plan_health_review",
@@ -344,6 +371,10 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "capture_index_review_snapshot",
             "review_index_portfolio",
             "get_index_review",
+            "review_workload_indexes",
+            "check_statistics_health",
+            "get_top_queries",
+            "get_query_store_trend",
         }
     ) | INDEX_REVIEW_LEARNING_TOOL_NAMES,
 }
@@ -396,6 +427,7 @@ class ServerConfig:
     comparison_row_limit: int = 10_000
     persist_view_sql_state: bool = False
     legacy_state_server_binding: str | None = None
+    schema_profile: str = "portable"
 
     def validate_database_name(self, database_name: str | None) -> str:
         """Resolve a database against the allowlist, case-insensitively.
@@ -477,6 +509,7 @@ class ServerConfig:
             "legacy_state_server_binding_configured": (
                 self.legacy_state_server_binding is not None
             ),
+            "schema_profile": self.schema_profile,
             "database_policy_file_configured": self.database_policy_file is not None,
             "performance_state_store": (
                 "memory" if self.performance_state_dir == ":memory:" else "durable"
@@ -618,6 +651,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--azure-sql-legacy-state-server-binding",
         dest="azure_sql_legacy_state_server_binding",
     )
+    parser.add_argument(
+        "--azure-sql-schema-profile",
+        dest="azure_sql_schema_profile",
+        help="portable (default): strict-client tool schemas; full: raw Pydantic schemas.",
+    )
     return parser
 
 
@@ -718,6 +756,9 @@ def load_server_config(argv: list[str] | None = None) -> ServerConfig:
     log_format = args.log_format.lower()
     if log_format not in {"text", "json"}:
         raise ValueError("AZURE_SQL_LOG_FORMAT must be 'text' or 'json'.")
+    schema_profile = (env_or_arg(args, "azure_sql_schema_profile") or "portable").strip().lower()
+    if schema_profile not in {"portable", "full"}:
+        raise ValueError("AZURE_SQL_SCHEMA_PROFILE must be 'portable' or 'full'.")
 
     tool_groups_raw = env_or_arg(args, "azure_sql_tool_groups") or "all"
     tool_groups = frozenset(
@@ -836,4 +877,5 @@ def load_server_config(argv: list[str] | None = None) -> ServerConfig:
         comparison_row_limit=comparison_row_limit,
         persist_view_sql_state=persist_view_sql_state,
         legacy_state_server_binding=legacy_state_server_binding,
+        schema_profile=schema_profile,
     )

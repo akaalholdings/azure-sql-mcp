@@ -233,3 +233,24 @@ def test_validation_for_create_candidate_uses_escaped_table_literals() -> None:
     assert "-- Expected key columns: [Amount]]Gross DESC] ASC." in result
     assert "-- Expected included columns: [Status]]Code]." in result
     assert all(line.startswith("--") for line in result.splitlines())
+
+
+def test_real_catalog_filegroup_type_is_reversible() -> None:
+    # sys.data_spaces.type_desc reports an ordinary filegroup as ROWS_FILEGROUP.
+    index = _index(
+        filter_definition=None,
+        has_filter=False,
+        is_unique=False,
+        partition_columns=(),
+        data_space_name="PRIMARY",
+        data_space_type="ROWS_FILEGROUP",
+        partition_scheme_name=None,
+        partition_compression=((1, "NONE"),),
+        xml_compression=((1, "OFF"),),
+    )
+
+    rendered = render_reverse_index_ddl(index)
+
+    assert rendered["executable"] is True, rendered["blockers"]
+    assert rendered["drop_ddl"].startswith("DROP INDEX ")
+    assert "\nON [PRIMARY]" in rendered["ddl"]

@@ -1,0 +1,65 @@
+<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan" Version="1.2" Build="12.0.2000.8">
+  <BatchSequence>
+    <Batch>
+      <Statements>
+        <StmtSimple StatementText="SELECT p.ProductID FROM dbo.Products AS p WHERE p.CategoryID = @CategoryID AND p.Price BETWEEN @Low AND @High" StatementId="1" StatementCompId="1" StatementType="SELECT" StatementSubTreeCost="0.0066" StatementEstRows="20" QueryHash="0x9090909090909090" QueryPlanHash="0xA0A0A0A0A0A0A0A0">
+          <QueryPlan CachedPlanSize="16" CompileTime="1" CompileCPU="1" CompileMemory="200">
+            <RelOp NodeId="0" PhysicalOp="Index Seek" LogicalOp="Index Seek" EstimateRows="20" EstimateIO="0.003125" EstimateCPU="0.0001" AvgRowSize="11" EstimatedTotalSubtreeCost="0.0066" TableCardinality="5000" Parallel="0" EstimateRebinds="0" EstimateRewinds="0">
+              <OutputList>
+                <ColumnReference Database="[appdb]" Schema="[dbo]" Table="[Products]" Alias="[p]" Column="ProductID" />
+              </OutputList>
+              <IndexScan Ordered="1" ScanDirection="FORWARD" ForcedIndex="0" NoExpandHint="0">
+                <DefinedValues>
+                  <DefinedValue>
+                    <ColumnReference Database="[appdb]" Schema="[dbo]" Table="[Products]" Alias="[p]" Column="ProductID" />
+                  </DefinedValue>
+                </DefinedValues>
+                <Object Database="[appdb]" Schema="[dbo]" Table="[Products]" Index="[IX_Products_Category_Price]" Alias="[p]" IndexKind="NonClustered" />
+                <SeekPredicates>
+                  <SeekPredicate>
+                    <Prefix ScanType="EQ">
+                      <RangeColumns>
+                        <ColumnReference Database="[appdb]" Schema="[dbo]" Table="[Products]" Alias="[p]" Column="CategoryID" />
+                      </RangeColumns>
+                      <RangeExpressions>
+                        <ScalarOperator ScalarString="[@CategoryID]">
+                          <Identifier>
+                            <ColumnReference Column="@CategoryID" />
+                          </Identifier>
+                        </ScalarOperator>
+                      </RangeExpressions>
+                    </Prefix>
+                    <StartRange ScanType="GE">
+                      <RangeColumns>
+                        <ColumnReference Database="[appdb]" Schema="[dbo]" Table="[Products]" Alias="[p]" Column="Price" />
+                      </RangeColumns>
+                      <RangeExpressions>
+                        <ScalarOperator ScalarString="[@Low]">
+                          <Identifier>
+                            <ColumnReference Column="@Low" />
+                          </Identifier>
+                        </ScalarOperator>
+                      </RangeExpressions>
+                    </StartRange>
+                    <EndRange ScanType="LE">
+                      <RangeColumns>
+                        <ColumnReference Database="[appdb]" Schema="[dbo]" Table="[Products]" Alias="[p]" Column="Price" />
+                      </RangeColumns>
+                      <RangeExpressions>
+                        <ScalarOperator ScalarString="[@High]">
+                          <Identifier>
+                            <ColumnReference Column="@High" />
+                          </Identifier>
+                        </ScalarOperator>
+                      </RangeExpressions>
+                    </EndRange>
+                  </SeekPredicate>
+                </SeekPredicates>
+              </IndexScan>
+            </RelOp>
+          </QueryPlan>
+        </StmtSimple>
+      </Statements>
+    </Batch>
+  </BatchSequence>
+</ShowPlanXML>

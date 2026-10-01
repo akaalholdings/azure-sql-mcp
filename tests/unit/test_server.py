@@ -252,6 +252,12 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
         "analyze_workload_indexes",
         "analyze_index_recommendations",
         "optimize_indexes",
+        "review_workload_indexes",
+        "get_query_store_trend",
+        "get_query_store_regressions",
+        "analyze_query_plan",
+        "get_version_store_stats",
+        "diagnose_database",
         # Phase 9: Wait Statistics
         "get_wait_stats",
         "get_query_wait_stats",
@@ -432,6 +438,10 @@ def test_index_review_tool_list_is_recall_only(
         "capture_index_review_snapshot",
         "review_index_portfolio",
         "get_index_review",
+        "review_workload_indexes",
+        "check_statistics_health",
+        "get_top_queries",
+        "get_query_store_trend",
         "recall_lessons",
     }
     assert tools["recall_lessons"].annotations.readOnlyHint is True
@@ -594,7 +604,7 @@ async def test_runtime_status_is_db_free_stable_and_sanitized(
 
     assert first == second
     assert first["startup_timestamp"] == app._startup_timestamp
-    assert first["package_version"] == "2.3.1"
+    assert first["package_version"] == "2.4.0"
     assert first["profile"] is None
     assert first["transport"] == "stdio"
     assert first["tool_groups"] == ["all"]
@@ -683,7 +693,7 @@ async def test_successful_operation_links_terminal_outcome_and_learning_failure_
     decision = app.learning_service.record_decision(
         DecisionRecordV1(
             skill="sql-optimizer",
-            skill_version="2.3.1",
+            skill_version="2.4.0",
             case_id="case-1",
             learning_key="health-check",
             consumed_evidence_refs=(evidence.evidence_id,),
@@ -1122,7 +1132,7 @@ async def test_registered_query_regression_tools_forward_window_minutes(
         {"database_name": "appdb", "window_minutes": 90},
     )
 
-    assert payload == {"tool": tool_name}
+    assert payload == {"tool": tool_name, "result_status": "ok"}
     service_call.assert_awaited_once_with("appdb", 90)
 
 
@@ -1139,7 +1149,7 @@ async def test_registered_analyze_query_indexes_forwards_queries_array(
         {"database_name": "appdb", "queries": ["SELECT 1"]},
     )
 
-    assert payload == {"queries_analyzed": 1}
+    assert payload == {"queries_analyzed": 1, "result_status": "ok"}
     app._analyze_query_indexes.assert_awaited_once_with(
         "appdb", ["SELECT 1"], False, None, None
     )
@@ -2580,7 +2590,7 @@ async def test_capability_check_publishes_tuning_contract(
     result = await app._check_database_capabilities("appdb")
 
     assert result["mcp_contract"] == {
-        "contract_version": "2.3.0",
+        "contract_version": "2.4.0",
         "performance_tuning": 1,
         "durable_view_change": 1,
         "prepared_plan_action": 1,
@@ -2590,6 +2600,8 @@ async def test_capability_check_publishes_tuning_contract(
         "index_history_schema_fingerprint": CONTRACT_SCHEMA_FINGERPRINT,
         "index_review_min_observation_days": 90,
         "index_review_snapshot_reuse_hours": 48,
+        "workload_index_advisor": 1,
+        "result_status": 1,
     }
     assert result["local_tuning_policy"] == {
         "configured": False,
@@ -2666,12 +2678,208 @@ async def test_tune_history_is_inconclusive_when_exact_identity_is_ambiguous(
     app.query_store.get_query_history_by_text.assert_not_awaited()
 
 
-def test_index_manager_learning_registry_requires_skill_version_1_0_1() -> None:
+def test_index_manager_learning_registry_requires_skill_version_2_0_0() -> None:
+    # Skill 2.0.0 is the workload-driven index manager; recall is pinned to it.
     AzureSqlMcpApplication._validate_learning_skill_version(
-        "sql-index-manager", "1.0.1"
+        "sql-index-manager", "2.0.0"
     )
 
-    with pytest.raises(ValueError, match=r"requires version 1\.0\.1"):
+    with pytest.raises(ValueError, match=r"requires version 2\.0\.0"):
         AzureSqlMcpApplication._validate_learning_skill_version(
-            "sql-index-manager", "1.0.0"
+            "sql-index-manager", "1.0.1"
         )
+
+
+@pytest.mark.asyncio
+async def test_review_workload_indexes_forwards_arguments_and_is_read_only(
+    app: AzureSqlMcpApplication,
+) -> None:
+    app.workload_index_advisor.review = AsyncMock(  # type: ignore[method-assign]
+        return_value={"recommendations": [], "result_status": "empty"}
+    )
+    tool = app.mcp._tool_manager._tools["review_workload_indexes"]
+
+    payload = await app.mcp._tool_manager.call_tool(
+        "review_workload_indexes",
+        {
+            "database_name": "appdb",
+            "schema_name": "Sales",
+            "table_names": ["Orders"],
+            "lookback_days": 14,
+            "as_of_utc": "2026-09-30T00:00:00Z",
+            "objective": "logical_reads",
+            "top_queries": 50,
+            "plans_per_query": 2,
+            "min_table_rows": 0,
+            "max_recommendations_per_table": 3,
+            "include_existing_index_review": False,
+        },
+    )
+
+    assert tool.annotations.readOnlyHint is True
+    assert tool.annotations.destructiveHint is False
+    assert payload["result_status"] == "empty"
+    app.workload_index_advisor.review.assert_awaited_once_with(
+        "appdb",
+        schema_name="Sales",
+        table_names=["Orders"],
+        lookback_days=14,
+        as_of_utc="2026-09-30T00:00:00Z",
+        objective="logical_reads",
+        top_queries=50,
+        plans_per_query=2,
+        min_table_rows=0,
+        max_recommendations_per_table=3,
+        include_existing_index_review=False,
+    )
+
+
+def test_review_workload_indexes_needs_no_policy_file_and_gets_a_longer_timeout(
+    app: AzureSqlMcpApplication,
+) -> None:
+    from azure_sql_mcp.server import _CATALOG_READ_TOOLS
+
+    # Works with only the database allowlist: no policy file, no history tables.
+    assert "review_workload_indexes" not in _CATALOG_READ_TOOLS
+    assert app._timeout_for_tool("review_workload_indexes") >= (
+        app.config.query_timeout_seconds * 8
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_wait_stats_forwards_the_sample_window(app: AzureSqlMcpApplication) -> None:
+    app.wait_stats.get_wait_stats = AsyncMock(  # type: ignore[method-assign]
+        return_value={"top_waits": [{"wait_type": "WRITELOG"}]}
+    )
+
+    payload = await app.mcp._tool_manager.call_tool(
+        "get_wait_stats", {"database_name": "appdb", "sample_seconds": 15}
+    )
+
+    assert payload["result_status"] == "ok"
+    app.wait_stats.get_wait_stats.assert_awaited_once_with("appdb", 20, sample_seconds=15)
+    assert app._timeout_for_tool("get_wait_stats") >= 45
+
+
+@pytest.mark.asyncio
+async def test_query_store_time_tools_forward_their_windows(app: AzureSqlMcpApplication) -> None:
+    app.query_store_trends.trend = AsyncMock(return_value={"buckets": []})  # type: ignore[method-assign]
+    app.query_store_trends.regressions = AsyncMock(return_value={"regressions": []})  # type: ignore[method-assign]
+
+    trend = await app.mcp._tool_manager.call_tool(
+        "get_query_store_trend",
+        {"database_name": "appdb", "query_id": 42, "window_minutes": 720, "bucket_minutes": 30, "as_of_utc": "2026-09-30"},
+    )
+    regressions = await app.mcp._tool_manager.call_tool(
+        "get_query_store_regressions",
+        {"database_name": "appdb", "recent_minutes": 30, "baseline_minutes": 1440, "metric": "cpu", "top": 5},
+    )
+
+    assert trend["result_status"] == "empty"
+    assert regressions["result_status"] == "empty"
+    app.query_store_trends.trend.assert_awaited_once_with(
+        "appdb", query_id=42, window_minutes=720, bucket_minutes=30, as_of_utc="2026-09-30"
+    )
+    app.query_store_trends.regressions.assert_awaited_once_with(
+        "appdb",
+        recent_minutes=30,
+        baseline_minutes=1440,
+        as_of_utc=None,
+        metric="cpu",
+        min_executions=10,
+        min_regression_pct=25.0,
+        top=5,
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_top_queries_reads_a_past_window(app: AzureSqlMcpApplication) -> None:
+    app.query_store.get_status = AsyncMock(return_value={"actual_state": "READ_WRITE"})  # type: ignore[method-assign]
+    app.query_store.get_top_queries = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+    payload = await app.mcp._tool_manager.call_tool(
+        "get_top_queries",
+        {"database_name": "appdb", "sort_by": "cpu", "window_minutes": 60, "as_of_utc": "2026-09-30T05:00:00Z"},
+    )
+
+    kwargs = app.query_store.get_top_queries.await_args.kwargs
+    assert kwargs["window_end"] == datetime(2026, 9, 30, 5, 0, tzinfo=timezone.utc)
+    assert payload["window"] == {"start_utc": "2026-09-30T04:00:00Z", "end_utc": "2026-09-30T05:00:00Z"}
+
+
+@pytest.mark.asyncio
+async def test_analyze_query_plan_reads_query_store_or_raw_xml(app: AzureSqlMcpApplication) -> None:
+    fixture = (Path(__file__).resolve().parents[1] / "fixtures" / "showplans" / "heap_scan_nonsargable.xml").read_text(encoding="utf-8")
+    app.executor.fetch_all = AsyncMock(  # type: ignore[method-assign]
+        return_value=[{"plan_id": 7, "query_id": 3, "is_forced_plan": 0, "query_plan": fixture}]
+    )
+
+    by_query = await app.mcp._tool_manager.call_tool(
+        "analyze_query_plan", {"database_name": "appdb", "query_id": 3}
+    )
+    raw = await app.mcp._tool_manager.call_tool(
+        "analyze_query_plan", {"database_name": "appdb", "plan_xml": fixture}
+    )
+
+    assert by_query["plan_id"] == 7 and by_query["source"] == "query_store"
+    assert by_query["result_status"] == "ok"
+    assert {f["rule"] for f in by_query["findings"]} >= {"non_sargable_predicate", "implicit_conversion_on_column"}
+    assert "WHERE p.query_id = ?" in app.executor.fetch_all.await_args_list[0].args[1]
+    assert raw["source"] == "plan_xml"
+    assert app.executor.fetch_all.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_analyze_query_plan_requires_exactly_one_source(app: AzureSqlMcpApplication) -> None:
+    with pytest.raises(ToolError):
+        await app.mcp._tool_manager.call_tool(
+            "analyze_query_plan", {"database_name": "appdb", "plan_id": 1, "query_id": 2}
+        )
+
+
+@pytest.mark.asyncio
+async def test_analyze_query_plan_unknown_id_is_a_true_negative(app: AzureSqlMcpApplication) -> None:
+    app.executor.fetch_all = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+    payload = await app.mcp._tool_manager.call_tool(
+        "analyze_query_plan", {"database_name": "appdb", "plan_id": 999}
+    )
+
+    assert payload["result_status"] == "empty"
+
+
+@pytest.mark.asyncio
+async def test_explain_query_attaches_plan_findings(app: AzureSqlMcpApplication) -> None:
+    fixture = (Path(__file__).resolve().parents[1] / "fixtures" / "showplans" / "seek_residual_lookup_sort.xml").read_text(encoding="utf-8")
+    app.plans.explain_query = AsyncMock(
+        return_value=ExplainPlanArtifact(
+            database_name="appdb",
+            analyze=False,
+            summary={"statement_count": 1},
+            raw_xml=fixture,
+        )
+    )
+
+    payload = await app._explain_query("appdb", "SELECT 1", analyze=False)
+
+    findings = payload["plan_findings"]
+    assert findings["plan_kind"] == "estimated"
+    assert findings["findings"][0]["rule"] == "key_lookup"
+    assert findings["families"]["indexes"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_diagnose_database_forwards_window_and_master_access(app: AzureSqlMcpApplication) -> None:
+    app.database_diagnosis.diagnose = AsyncMock(  # type: ignore[method-assign]
+        return_value={"findings": [], "result_status": "ok", "result_status_reason": "Read 7 of 7 sources."}
+    )
+
+    payload = await app.mcp._tool_manager.call_tool(
+        "diagnose_database", {"database_name": "appdb", "window_minutes": 30, "sample_seconds": 5}
+    )
+
+    assert payload["result_status"] == "ok"
+    app.database_diagnosis.diagnose.assert_awaited_once_with(
+        "appdb", window_minutes=30, sample_seconds=5, master_available=False
+    )
+    assert app._timeout_for_tool("diagnose_database") >= app.config.query_timeout_seconds * 3

@@ -3,6 +3,49 @@ from __future__ import annotations
 from typing import Any
 
 from .connection import AzureSqlExecutor
+from .observability import sanitize_error_message
+from .result_status import ResultStatus
+from .result_status import status_payload
+
+
+MAX_RESOURCE_HISTORY_MINUTES = 14 * 24 * 60
+RECENT_RETENTION_MINUTES = 60
+
+RECENT_RESOURCE_SQL = """
+SELECT
+    end_time,
+    CAST(avg_cpu_percent AS DECIMAL(5, 2)) AS avg_cpu_percent,
+    CAST(avg_data_io_percent AS DECIMAL(5, 2)) AS avg_data_io_percent,
+    CAST(avg_log_write_percent AS DECIMAL(5, 2)) AS avg_log_write_percent,
+    CAST(avg_memory_usage_percent AS DECIMAL(5, 2)) AS avg_memory_usage_percent,
+    CAST(max_worker_percent AS DECIMAL(5, 2)) AS max_worker_percent,
+    CAST(max_session_percent AS DECIMAL(5, 2)) AS max_session_percent,
+    CAST(avg_instance_cpu_percent AS DECIMAL(5, 2)) AS avg_instance_cpu_percent
+FROM sys.dm_db_resource_stats
+WHERE end_time >= DATEADD(MINUTE, -{window_minutes}, GETUTCDATE())
+ORDER BY end_time DESC
+"""
+
+LONG_TERM_RESOURCE_SQL = """
+SELECT
+    DATEADD(HOUR, DATEDIFF(HOUR, 0, end_time), 0) AS hour_start_utc,
+    COUNT(*) AS samples,
+    CAST(AVG(avg_cpu_percent) AS DECIMAL(5, 2)) AS avg_cpu_percent,
+    CAST(MAX(avg_cpu_percent) AS DECIMAL(5, 2)) AS max_cpu_percent,
+    CAST(AVG(avg_data_io_percent) AS DECIMAL(5, 2)) AS avg_data_io_percent,
+    CAST(MAX(avg_data_io_percent) AS DECIMAL(5, 2)) AS max_data_io_percent,
+    CAST(AVG(avg_log_write_percent) AS DECIMAL(5, 2)) AS avg_log_write_percent,
+    CAST(MAX(avg_log_write_percent) AS DECIMAL(5, 2)) AS max_log_write_percent,
+    CAST(MAX(max_worker_percent) AS DECIMAL(5, 2)) AS max_worker_percent,
+    CAST(MAX(max_session_percent) AS DECIMAL(5, 2)) AS max_session_percent,
+    MAX(storage_in_megabytes) AS storage_in_megabytes,
+    MAX(sku) AS sku
+FROM sys.resource_stats
+WHERE database_name = ?
+  AND end_time >= DATEADD(MINUTE, -?, GETUTCDATE())
+GROUP BY DATEADD(HOUR, DATEDIFF(HOUR, 0, end_time), 0)
+ORDER BY hour_start_utc DESC
+"""
 
 
 class ResourceGovernanceService:
@@ -83,9 +126,12 @@ class ResourceGovernanceService:
         # significantly by service tier (GeneralPurpose vs BusinessCritical
         # vs Hyperscale) and across Azure SQL versions.  SELECT * returns
         # whatever the current tier exposes, and we expose it as-is.
+        # In an elastic pool the view returns a row per pool database, so the
+        # current database must be selected explicitly.
         governance_query = """
         SELECT TOP 1 *
         FROM sys.dm_user_db_resource_governance
+        WHERE database_id = DB_ID()
         """
         slo_query = """
         SELECT
@@ -97,10 +143,25 @@ class ResourceGovernanceService:
         """
 
         governance_rows = await self.executor.fetch_all(database_name, governance_query)
+        warnings: list[dict[str, Any]] = []
         try:
             slo_rows = await self.executor.fetch_all(database_name, slo_query)
-        except Exception:
+        except Exception as exc:
             slo_rows = []
+            warnings.append(
+                {
+                    "type": "service_objective_unavailable",
+                    "message": "sys.database_service_objectives could not be read: "
+                    + sanitize_error_message(str(exc)),
+                }
+            )
+        if not governance_rows:
+            warnings.append(
+                {
+                    "type": "governance_row_missing",
+                    "message": "sys.dm_user_db_resource_governance returned no row for this database.",
+                }
+            )
 
         governance = governance_rows[0] if governance_rows else {}
         slo = slo_rows[0] if slo_rows else {}
@@ -119,30 +180,52 @@ class ResourceGovernanceService:
             "database_name": database_name,
             "service_objective": slo,
             "governance_limits": governance,
+            "warnings": warnings,
         }
 
     async def get_resource_stats_history(
         self,
         database_name: str,
         window_minutes: int = 60,
+        *,
+        source: str = "auto",
+        master_available: bool = False,
     ) -> dict[str, Any]:
-        """Resource utilization history from sys.dm_db_resource_stats (15-sec granularity)."""
-        query = """
-        SELECT
-            end_time,
-            CAST(avg_cpu_percent AS DECIMAL(5, 2)) AS avg_cpu_percent,
-            CAST(avg_data_io_percent AS DECIMAL(5, 2)) AS avg_data_io_percent,
-            CAST(avg_log_write_percent AS DECIMAL(5, 2)) AS avg_log_write_percent,
-            CAST(avg_memory_usage_percent AS DECIMAL(5, 2)) AS avg_memory_usage_percent,
-            CAST(max_worker_percent AS DECIMAL(5, 2)) AS max_worker_percent,
-            CAST(max_session_percent AS DECIMAL(5, 2)) AS max_session_percent,
-            CAST(avg_instance_cpu_percent AS DECIMAL(5, 2)) AS avg_instance_cpu_percent
-        FROM sys.dm_db_resource_stats
-        WHERE end_time >= DATEADD(MINUTE, -{window_minutes}, GETUTCDATE())
-        ORDER BY end_time DESC
-        """.format(window_minutes=int(window_minutes))
+        """Resource utilization history against the database's governance limits.
 
-        rows = await self.executor.fetch_all(database_name, query)
+        ``recent`` reads sys.dm_db_resource_stats (15-second samples, about one
+        hour retained). ``long_term`` reads sys.resource_stats in master (5-minute
+        samples, about 14 days retained) and returns hourly average and maximum
+        buckets so long windows stay compact. ``auto`` picks recent for windows of
+        60 minutes or less and long_term beyond that.
+        """
+        window_minutes = max(1, min(int(window_minutes), MAX_RESOURCE_HISTORY_MINUTES))
+        if source not in {"auto", "recent", "long_term"}:
+            raise ValueError("source must be auto, recent, or long_term")
+        resolved = source
+        if source == "auto":
+            resolved = "recent" if window_minutes <= RECENT_RETENTION_MINUTES else "long_term"
+        status: dict[str, Any] = {}
+        if resolved == "long_term" and not master_available:
+            status = status_payload(
+                ResultStatus.PRECONDITION,
+                f"A {window_minutes}-minute window needs sys.resource_stats, which is read "
+                "from master. Returned the most recent hour from sys.dm_db_resource_stats "
+                "instead.",
+                remediation=(
+                    "Add master to AZURE_SQL_ALLOWED_DATABASES; the login needs access to master."
+                ),
+            )
+            resolved = "recent"
+        if resolved == "long_term":
+            rows = await self.executor.fetch_all(
+                "master", LONG_TERM_RESOURCE_SQL, params=[database_name, window_minutes]
+            )
+            granularity = "hourly_buckets_from_5_minute_samples"
+        else:
+            query = RECENT_RESOURCE_SQL.format(window_minutes=window_minutes)
+            rows = await self.executor.fetch_all(database_name, query)
+            granularity = "15_second_samples"
 
         # Compute summary stats
         summary: dict[str, Any] = {}
@@ -152,7 +235,10 @@ class ResourceGovernanceService:
                 "avg_data_io_percent",
                 "avg_log_write_percent",
                 "avg_memory_usage_percent",
+                "max_worker_percent",
             ):
+                if not any(metric in r for r in rows):
+                    continue
                 values = [float(r.get(metric, 0) or 0) for r in rows]
                 above_80 = sum(1 for v in values if v > 80)
                 summary[metric] = {
@@ -184,8 +270,11 @@ class ResourceGovernanceService:
         return {
             "database_name": database_name,
             "window_minutes": window_minutes,
+            "source": resolved,
+            "granularity": granularity,
             "sample_count": len(rows),
             "summary": summary,
             "warnings": warnings,
             "history": rows,
+            **status,
         }

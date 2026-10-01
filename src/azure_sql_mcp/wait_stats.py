@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable
+from collections.abc import Callable
 from typing import Any
 
 from .connection import AzureSqlExecutor
@@ -154,6 +157,75 @@ def classify_wait(wait_type: str) -> str:
     return "Other"
 
 
+MAX_WAIT_SAMPLE_SECONDS = 30
+
+WAIT_SNAPSHOT_SQL = """
+SELECT
+    wait_type,
+    waiting_tasks_count,
+    wait_time_ms,
+    max_wait_time_ms,
+    signal_wait_time_ms,
+    wait_time_ms - signal_wait_time_ms AS resource_wait_time_ms
+FROM sys.dm_db_wait_stats
+WHERE waiting_tasks_count > 0
+ORDER BY wait_time_ms DESC
+"""
+
+COUNTER_EPOCH_SQL = """
+SELECT CONVERT(varchar(33), sqlserver_start_time, 127) AS engine_start_time_utc
+FROM sys.dm_os_sys_info
+"""
+
+
+def wait_deltas(
+    first: list[dict[str, Any]], second: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], bool]:
+    """Return per-wait deltas between two snapshots, largest wait time first.
+
+    A counter that went backwards means the counters were reset between the
+    snapshots; the second snapshot is then the best available interval figure.
+    """
+
+    before = {row.get("wait_type"): row for row in first}
+    reset = False
+    deltas: list[dict[str, Any]] = []
+    for row in second:
+        wait_type = row.get("wait_type")
+        prior = before.get(wait_type, {})
+        tasks = int(row.get("waiting_tasks_count") or 0) - int(prior.get("waiting_tasks_count") or 0)
+        wait_ms = int(row.get("wait_time_ms") or 0) - int(prior.get("wait_time_ms") or 0)
+        signal_ms = int(row.get("signal_wait_time_ms") or 0) - int(prior.get("signal_wait_time_ms") or 0)
+        if tasks < 0 or wait_ms < 0 or signal_ms < 0:
+            reset = True
+            break
+        if tasks > 0 or wait_ms > 0:
+            deltas.append(
+                {
+                    "wait_type": wait_type,
+                    "waiting_tasks_count": tasks,
+                    "wait_time_ms": wait_ms,
+                    "signal_wait_time_ms": signal_ms,
+                    "resource_wait_time_ms": wait_ms - signal_ms,
+                }
+            )
+    if reset:
+        deltas = [
+            {
+                "wait_type": row.get("wait_type"),
+                "waiting_tasks_count": int(row.get("waiting_tasks_count") or 0),
+                "wait_time_ms": int(row.get("wait_time_ms") or 0),
+                "signal_wait_time_ms": int(row.get("signal_wait_time_ms") or 0),
+                "resource_wait_time_ms": int(row.get("wait_time_ms") or 0)
+                - int(row.get("signal_wait_time_ms") or 0),
+            }
+            for row in second
+            if int(row.get("waiting_tasks_count") or 0) > 0
+        ]
+    deltas.sort(key=lambda row: row["wait_time_ms"], reverse=True)
+    return deltas, reset
+
+
 class WaitStatsService:
     def __init__(self, executor: AzureSqlExecutor):
         self.executor = executor
@@ -162,21 +234,31 @@ class WaitStatsService:
         self,
         database_name: str,
         top_n: int = 20,
+        *,
+        sample_seconds: int = 0,
+        sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
     ) -> dict[str, Any]:
-        """Top waits from sys.dm_db_wait_stats with category mapping and recommendations."""
-        query = """
-        SELECT
-            wait_type,
-            waiting_tasks_count,
-            wait_time_ms,
-            max_wait_time_ms,
-            signal_wait_time_ms,
-            wait_time_ms - signal_wait_time_ms AS resource_wait_time_ms
-        FROM sys.dm_db_wait_stats
-        WHERE waiting_tasks_count > 0
-        ORDER BY wait_time_ms DESC
+        """Top waits from sys.dm_db_wait_stats with category mapping and recommendations.
+
+        ``sample_seconds=0`` returns counters accumulated since the last reset
+        (failover, scaling, restart, or a manual clear), which can dilute a recent
+        problem. A positive value takes two snapshots that many seconds apart and
+        returns only the waits that accrued in between.
         """
-        rows = await self.executor.fetch_all(database_name, query)
+        sample_seconds = max(0, min(int(sample_seconds), MAX_WAIT_SAMPLE_SECONDS))
+        if sample_seconds == 0:
+            rows = await self.executor.fetch_all(database_name, WAIT_SNAPSHOT_SQL)
+            window = await self._cumulative_window(database_name)
+        else:
+            first = await self.executor.fetch_all(database_name, WAIT_SNAPSHOT_SQL)
+            await sleep(sample_seconds)
+            second = await self.executor.fetch_all(database_name, WAIT_SNAPSHOT_SQL)
+            rows, reset = wait_deltas(first, second)
+            window = {
+                "mode": "interval",
+                "sample_seconds": sample_seconds,
+                "counter_reset_detected": reset,
+            }
 
         # Filter out benign waits
         filtered = [r for r in rows if r.get("wait_type") not in BENIGN_WAITS]
@@ -227,7 +309,26 @@ class WaitStatsService:
             "total_wait_time_ms": total_wait_ms,
             "top_waits": waits,
             "categories": categories_sorted,
+            "window": window,
         }
+
+    async def _cumulative_window(self, database_name: str) -> dict[str, Any]:
+        window: dict[str, Any] = {
+            "mode": "cumulative",
+            "since_utc": None,
+            "note": (
+                "Counters accumulate since the last reset (failover, scaling, restart, "
+                "or a manual clear) and can dilute a recent problem. Pass "
+                "sample_seconds for a live interval."
+            ),
+        }
+        try:
+            rows = await self.executor.fetch_all(database_name, COUNTER_EPOCH_SQL)
+        except Exception:
+            return window
+        if rows and rows[0].get("engine_start_time_utc"):
+            window["since_utc"] = rows[0]["engine_start_time_utc"]
+        return window
 
     async def get_query_wait_stats(
         self,

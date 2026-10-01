@@ -1,0 +1,131 @@
+<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan" Version="1.564" Build="16.0.1121.4">
+  <BatchSequence>
+    <Batch>
+      <Statements>
+        <StmtSimple StatementText="SELECT ol.OrderLineID, ol.Quantity FROM Sales.OrderLines AS ol WHERE ol.StockItemID = @StockItemID AND ol.PickingCompletedWhen IS NULL AND ol.PackageTypeID IN (1, 7, 9) AND (ol.Description LIKE N'%blue%' OR ol.UnitPrice &gt; @MinPrice)" StatementId="1" StatementCompId="1" StatementType="SELECT" StatementSubTreeCost="2.1" StatementEstRows="12" QueryHash="0x0F0E0D0C0B0A0908" QueryPlanHash="0x8877665544332211">
+          <QueryPlan CachedPlanSize="32" CompileTime="2" CompileCPU="2" CompileMemory="320">
+            <RelOp NodeId="0" PhysicalOp="Clustered Index Scan" LogicalOp="Clustered Index Scan" EstimateRows="12" EstimateIO="1.95" EstimateCPU="0.15" AvgRowSize="15" EstimatedTotalSubtreeCost="2.1" TableCardinality="231412" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row">
+              <OutputList>
+                <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[OrderLines]" Alias="[ol]" Column="OrderLineID" />
+                <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[OrderLines]" Alias="[ol]" Column="Quantity" />
+              </OutputList>
+              <IndexScan Ordered="0" ForcedIndex="0" ForceScan="0" NoExpandHint="0" Storage="RowStore">
+                <DefinedValues>
+                  <DefinedValue>
+                    <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[OrderLines]" Alias="[ol]" Column="OrderLineID" />
+                  </DefinedValue>
+                  <DefinedValue>
+                    <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[OrderLines]" Alias="[ol]" Column="Quantity" />
+                  </DefinedValue>
+                </DefinedValues>
+                <Object Database="[appdb]" Schema="[Sales]" Table="[OrderLines]" Index="[PK_Sales_OrderLines]" Alias="[ol]" IndexKind="Clustered" Storage="RowStore" />
+                <Predicate>
+                  <ScalarOperator ScalarString="residual">
+                    <Logical Operation="AND">
+                      <ScalarOperator>
+                        <Compare CompareOp="EQ">
+                          <ScalarOperator>
+                            <Identifier>
+                              <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[OrderLines]" Alias="[ol]" Column="StockItemID" />
+                            </Identifier>
+                          </ScalarOperator>
+                          <ScalarOperator>
+                            <Identifier>
+                              <ColumnReference Column="@StockItemID" />
+                            </Identifier>
+                          </ScalarOperator>
+                        </Compare>
+                      </ScalarOperator>
+                      <ScalarOperator>
+                        <Compare CompareOp="IS">
+                          <ScalarOperator>
+                            <Identifier>
+                              <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[OrderLines]" Alias="[ol]" Column="PickingCompletedWhen" />
+                            </Identifier>
+                          </ScalarOperator>
+                          <ScalarOperator>
+                            <Const ConstValue="NULL" />
+                          </ScalarOperator>
+                        </Compare>
+                      </ScalarOperator>
+                      <ScalarOperator>
+                        <Logical Operation="OR">
+                          <ScalarOperator>
+                            <Compare CompareOp="EQ">
+                              <ScalarOperator>
+                                <Identifier>
+                                  <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[OrderLines]" Alias="[ol]" Column="PackageTypeID" />
+                                </Identifier>
+                              </ScalarOperator>
+                              <ScalarOperator>
+                                <Const ConstValue="(1)" />
+                              </ScalarOperator>
+                            </Compare>
+                          </ScalarOperator>
+                          <ScalarOperator>
+                            <Compare CompareOp="EQ">
+                              <ScalarOperator>
+                                <Identifier>
+                                  <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[OrderLines]" Alias="[ol]" Column="PackageTypeID" />
+                                </Identifier>
+                              </ScalarOperator>
+                              <ScalarOperator>
+                                <Const ConstValue="(7)" />
+                              </ScalarOperator>
+                            </Compare>
+                          </ScalarOperator>
+                          <ScalarOperator>
+                            <Compare CompareOp="EQ">
+                              <ScalarOperator>
+                                <Identifier>
+                                  <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[OrderLines]" Alias="[ol]" Column="PackageTypeID" />
+                                </Identifier>
+                              </ScalarOperator>
+                              <ScalarOperator>
+                                <Const ConstValue="(9)" />
+                              </ScalarOperator>
+                            </Compare>
+                          </ScalarOperator>
+                        </Logical>
+                      </ScalarOperator>
+                      <ScalarOperator>
+                        <Logical Operation="OR">
+                          <ScalarOperator>
+                            <Intrinsic FunctionName="like">
+                              <ScalarOperator>
+                                <Identifier>
+                                  <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[OrderLines]" Alias="[ol]" Column="Description" />
+                                </Identifier>
+                              </ScalarOperator>
+                              <ScalarOperator>
+                                <Const ConstValue="N'%blue%'" />
+                              </ScalarOperator>
+                            </Intrinsic>
+                          </ScalarOperator>
+                          <ScalarOperator>
+                            <Compare CompareOp="GT">
+                              <ScalarOperator>
+                                <Identifier>
+                                  <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[OrderLines]" Alias="[ol]" Column="UnitPrice" />
+                                </Identifier>
+                              </ScalarOperator>
+                              <ScalarOperator>
+                                <Identifier>
+                                  <ColumnReference Column="@MinPrice" />
+                                </Identifier>
+                              </ScalarOperator>
+                            </Compare>
+                          </ScalarOperator>
+                        </Logical>
+                      </ScalarOperator>
+                    </Logical>
+                  </ScalarOperator>
+                </Predicate>
+              </IndexScan>
+            </RelOp>
+          </QueryPlan>
+        </StmtSimple>
+      </Statements>
+    </Batch>
+  </BatchSequence>
+</ShowPlanXML>

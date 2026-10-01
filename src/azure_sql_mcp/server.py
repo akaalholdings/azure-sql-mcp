@@ -46,6 +46,7 @@ from .config import TransportMode
 from .config import load_server_config
 from .connection import AzureSqlExecutor
 from .connection_pool import ConnectionPool
+from .database_diagnosis import DatabaseDiagnosisService
 from .database_policy import load_database_policy_or_deny
 from .diagnostics import DiagnosticQueryService
 from .equivalence_preflight import EquivalencePreflightService
@@ -100,6 +101,7 @@ from .performance_workflows import profile_result_fingerprint
 from .plan_action_service import PlanActionService
 from .plan_cache import PlanCacheService
 from .plan_enforcement import PlanEnforcementService
+from .plan_rules import analyze_plan
 from .plans import PlansService
 from .platform_capabilities import PlatformCapabilitiesService
 from .prompts import register_prompts
@@ -107,12 +109,21 @@ from .query_index_analysis import QueryIndexAnalysisService
 from .query_hints import validate_query_hints
 from .query_regression import QueryRegressionService
 from .query_store import QueryStoreService
+from .query_store_trends import QueryStoreTrendService
 from .resource_governance import ResourceGovernanceService
 from .resources import register_resources
+from .result_status import ResultStatus
+from .result_status import apply_result_status
+from .result_status import status_payload
 from .safe_sql import SafeSqlValidator
+from .schema_compat import portable_input_schema
+from .server_instructions import SERVER_INSTRUCTIONS
 from .schema_compare import SchemaCompareService
 from .sessions import SessionsService
 from .tempdb_memory import TempdbMemoryService
+from .time_windows import AS_OF_DESCRIPTION
+from .time_windows import iso_z
+from .time_windows import parse_as_of
 from .tool_contracts import add_tool_headline
 from .tool_contracts import BenchmarkPhase
 from .tool_contracts import BenchmarkToolOutput
@@ -127,7 +138,9 @@ from .tool_contracts import TuningStrategy
 from .tuning_sessions import InvalidTransitionError
 from .tuning_sessions import TuningSessionStateMachine
 from .transport_auth import StaticBearerTokenVerifier
+from .version_store import VersionStoreService
 from .wait_stats import WaitStatsService
+from .workload_index_advisor import WorkloadIndexAdvisor
 from .view_workflows import PreparedViewChange
 from .view_workflows import ViewChangeRequest
 from .view_workflows import ViewWorkflowService
@@ -171,9 +184,9 @@ _INDEX_OWNER_PROOF = re.compile(r"^[A-Za-z0-9_.:-]{16,200}$")
 _IDEMPOTENCY_DIGEST_PATTERN = re.compile(r"^idempotency-v1:[0-9a-f]{64}$")
 _LEARNING_SKILL_VERSIONS = {
     "sql-health-triage": "1.0.1",
-    "sql-optimizer": "2.3.1",
+    "sql-optimizer": "2.4.0",
     "sql-plan-enforcer": "1.0.1",
-    "sql-index-manager": "1.0.1",
+    "sql-index-manager": "2.0.0",
 }
 _PENDING_INDEX_OWNERSHIP_SQL = """
 SELECT
@@ -247,11 +260,11 @@ class _SanitizingToolManager(ToolManager):
         convert_result: bool = False,
     ) -> Any:
         try:
-            return await super().call_tool(
+            result = await super().call_tool(
                 name,
                 arguments,
                 context=context,
-                convert_result=convert_result,
+                convert_result=False,
             )
         except ToolError as exc:
             validation_error = exc.__cause__
@@ -284,6 +297,16 @@ class _SanitizingToolManager(ToolManager):
                     separators=(",", ":"),
                 )
             ) from None
+        result = apply_result_status(name, result)
+        if not convert_result:
+            return result
+        tool = self.get_tool(name)
+        if tool is None:  # pragma: no cover - super().call_tool already resolved it
+            raise ToolError(f"Unknown tool: {name}")
+        try:
+            return tool.fn_metadata.convert_result(result)
+        except Exception as exc:
+            raise ToolError(f"Error executing tool {name}: {exc}") from exc
 
 
 def _validation_issue_message(code: str) -> str:
@@ -349,6 +372,53 @@ def _auth_settings(config: ServerConfig) -> AuthSettings:
     )
 
 
+MAX_ANALYZED_PLAN_XML_CHARS = 8_000_000
+
+_PLAN_BY_ID_SQL = """
+SELECT
+    p.plan_id,
+    p.query_id,
+    p.is_forced_plan,
+    CAST(p.query_plan AS nvarchar(max)) AS query_plan
+FROM sys.query_store_plan AS p
+WHERE p.plan_id = ?
+"""
+
+_DOMINANT_PLAN_FOR_QUERY_SQL = """
+WITH ranked AS (
+    SELECT
+        p.plan_id,
+        SUM(rs.avg_duration * rs.count_executions) AS total_duration_us,
+        MAX(p.last_execution_time) AS last_execution_time
+    FROM sys.query_store_plan AS p
+    LEFT JOIN sys.query_store_runtime_stats AS rs
+        ON rs.plan_id = p.plan_id
+    WHERE p.query_id = ?
+    GROUP BY p.plan_id
+)
+SELECT TOP (1)
+    p.plan_id,
+    p.query_id,
+    p.is_forced_plan,
+    CAST(p.query_plan AS nvarchar(max)) AS query_plan
+FROM ranked AS r
+INNER JOIN sys.query_store_plan AS p
+    ON p.plan_id = r.plan_id
+ORDER BY r.total_duration_us DESC, r.last_execution_time DESC
+"""
+
+
+def _compact_plan_findings(analysis: dict[str, Any], *, limit: int = 15) -> dict[str, Any]:
+    findings = analysis.get("findings") or []
+    return {
+        "plan_kind": analysis.get("plan_kind"),
+        "finding_counts": analysis.get("finding_counts", {}),
+        "families": analysis.get("families", {}),
+        "findings": findings[:limit],
+        "truncated": bool(analysis.get("truncated")) or len(findings) > limit,
+    }
+
+
 class AzureSqlMcpApplication:
     def __init__(self, config: ServerConfig):
         self.config = config
@@ -366,6 +436,7 @@ class AzureSqlMcpApplication:
         )
         self.mcp = FastMCP(
             "azure-sql-mcp",
+            instructions=SERVER_INSTRUCTIONS,
             token_verifier=token_verifier,
             auth=_auth_settings(config) if token_verifier else None,
         )
@@ -394,6 +465,9 @@ class AzureSqlMcpApplication:
         self.sessions = SessionsService(executor)
         self.schema_compare = SchemaCompareService(executor)
         self.index_optimizer = IndexOptimizer(executor, validator)
+        self.workload_index_advisor = WorkloadIndexAdvisor(executor)
+        self.query_store_trends = QueryStoreTrendService(executor)
+        self.version_store = VersionStoreService(executor)
         self.wait_stats = WaitStatsService(executor)
         self.lock_diagnostics = LockDiagnosticsService(executor)
         self.tempdb_memory = TempdbMemoryService(executor)
@@ -486,6 +560,14 @@ class AzureSqlMcpApplication:
             self.recommendations,
         )
 
+        self.database_diagnosis = DatabaseDiagnosisService(
+            resource_governance=self.resource_governance,
+            wait_stats=self.wait_stats,
+            sessions=self.sessions,
+            query_store=self.query_store,
+            query_store_trends=self.query_store_trends,
+            version_store=self.version_store,
+        )
         self._register_tools()
         if self.learning_service is not None:
             self._register_learning_tools()
@@ -499,6 +581,21 @@ class AzureSqlMcpApplication:
             database_policy=self.database_policy,
         )
         register_prompts(self.mcp, self.config)
+        if self.config.schema_profile == "portable":
+            self._install_portable_tool_listing()
+
+    def _install_portable_tool_listing(self) -> None:
+        """Serve strict-client input schemas on tools/list without touching validation."""
+
+        list_raw_tools = self.mcp.list_tools
+
+        async def list_portable_tools() -> list[Any]:
+            return [
+                tool.model_copy(update={"inputSchema": portable_input_schema(tool.inputSchema)})
+                for tool in await list_raw_tools()
+            ]
+
+        self.mcp._mcp_server.list_tools()(list_portable_tools)
 
     def _prune_disabled_tools(self) -> None:
         """Remove tools that are not in the configured tool_groups."""
@@ -977,6 +1074,47 @@ class AzureSqlMcpApplication:
                         parameter_types,
                     ),
                 ),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Find plan anti-patterns with rule-based analysis: non-SARGable predicates, "
+                "implicit conversions, key and RID lookups, scans with seekable filters, "
+                "eager index spools, spills, memory-grant problems, estimate gaps, table "
+                "variables, scalar UDFs, multi-statement TVFs, heavy nested loops, "
+                "parallelism blockers, and optimizer timeouts. Each finding has a severity, "
+                "the plan node, evidence from the plan, the operator's share of estimated "
+                "cost, a pattern family, and a fix direction. Pass exactly one of plan_id "
+                "(Query Store), query_id (its most expensive Query Store plan), or plan_xml."
+            ),
+            annotations=ToolAnnotations(
+                title="Analyze Query Plan",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
+        async def analyze_query_plan(
+            plan_id: int | None = Field(default=None, ge=1, description="Query Store plan_id."),
+            query_id: int | None = Field(
+                default=None,
+                ge=1,
+                description="Query Store query_id; its most expensive stored plan is analysed.",
+            ),
+            plan_xml: str | None = Field(
+                default=None,
+                description="Raw showplan XML (estimated or actual) to analyse directly.",
+            ),
+            database_name: str | None = Field(
+                default=None,
+                description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
+            ),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "analyze_query_plan",
+                database_name,
+                lambda db: self._analyze_query_plan(db, plan_id, query_id, plan_xml),
             )
 
         @self.mcp.tool(
@@ -1821,6 +1959,7 @@ class AzureSqlMcpApplication:
                 description="How far back to look in Query Store, in minutes.",
             ),
             limit: int = Field(default=10, description="Maximum number of rows to return."),
+            as_of_utc: str | None = Field(default=None, description=AS_OF_DESCRIPTION),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -1834,6 +1973,124 @@ class AzureSqlMcpApplication:
                     sort_by,
                     window_minutes,
                     limit,
+                    as_of_utc=as_of_utc,
+                ),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Query Store over time: a bucketed series of executions, CPU, duration, "
+                "reads, and plan count for one query (query_id) or the whole workload, "
+                "plus a per-plan breakdown for one query. Query Store survives failovers "
+                "and plan-cache eviction, so this answers when a problem started and "
+                "whether a plan change lines up with it."
+            ),
+            annotations=ToolAnnotations(
+                title="Get Query Store Trend",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
+        async def get_query_store_trend(
+            query_id: int | None = Field(
+                default=None,
+                ge=1,
+                description="Query Store query_id; omit for the whole workload.",
+            ),
+            window_minutes: int = Field(
+                default=1440,
+                ge=5,
+                le=43200,
+                description="Window length in minutes (up to 30 days).",
+            ),
+            bucket_minutes: int = Field(
+                default=60,
+                ge=5,
+                le=1440,
+                description="Bucket width in minutes; raised automatically past 500 buckets.",
+            ),
+            as_of_utc: str | None = Field(default=None, description=AS_OF_DESCRIPTION),
+            database_name: str | None = Field(
+                default=None,
+                description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
+            ),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "get_query_store_trend",
+                database_name,
+                lambda db: self.query_store_trends.trend(
+                    db,
+                    query_id=query_id,
+                    window_minutes=window_minutes,
+                    bucket_minutes=bucket_minutes,
+                    as_of_utc=as_of_utc,
+                ),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Find queries whose Query Store performance got worse: the recent window's "
+                "per-execution average against the baseline window right before it, ranked "
+                "by weighted extra cost (recent executions x per-execution increase), with "
+                "new plan ids flagged. No baseline history returns unavailable, never a "
+                "clean bill of health."
+            ),
+            annotations=ToolAnnotations(
+                title="Get Query Store Regressions",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
+        async def get_query_store_regressions(
+            recent_minutes: int = Field(
+                default=60,
+                ge=5,
+                le=43200,
+                description="Length of the recent window, ending at as_of_utc or now.",
+            ),
+            baseline_minutes: int = Field(
+                default=10080,
+                ge=15,
+                le=43200,
+                description="Length of the baseline window immediately before the recent one.",
+            ),
+            metric: Literal["duration", "cpu", "logical_reads"] = Field(
+                default="duration",
+                description="Per-execution measure to compare.",
+            ),
+            min_executions: int = Field(
+                default=10,
+                ge=1,
+                description="Minimum executions in each window for a query to be compared.",
+            ),
+            min_regression_pct: float = Field(
+                default=25.0,
+                ge=0,
+                description="Report only queries at least this much worse.",
+            ),
+            top: int = Field(default=20, ge=1, le=200, description="Maximum regressions returned."),
+            as_of_utc: str | None = Field(default=None, description=AS_OF_DESCRIPTION),
+            database_name: str | None = Field(
+                default=None,
+                description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
+            ),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "get_query_store_regressions",
+                database_name,
+                lambda db: self.query_store_trends.regressions(
+                    db,
+                    recent_minutes=recent_minutes,
+                    baseline_minutes=baseline_minutes,
+                    as_of_utc=as_of_utc,
+                    metric=metric,
+                    min_executions=min_executions,
+                    min_regression_pct=min_regression_pct,
+                    top=top,
                 ),
             )
 
@@ -2003,6 +2260,106 @@ class AzureSqlMcpApplication:
                 ),
             )
 
+        @self.mcp.tool(
+            description=(
+                "Review a database's indexes against its real workload. Reads Query Store "
+                "runtime totals and each query's stored plan for a window, finds the queries "
+                "that hit each table and how (seek, scan, lookup, residual filters, sort "
+                "needs), and combines that with existing index definitions, usage counters, "
+                "statistics selectivity, and write activity. Returns per-table "
+                "recommendations to create, extend (add includes), widen, consolidate, or "
+                "drop indexes, or cluster a heap, each with supporting query ids, confidence, "
+                "inert DDL with exact rollback, and a validation path; plus predicates no "
+                "index can fix (route to sql-optimizer). Recommend-only: it never executes "
+                "DDL. Needs only VIEW DATABASE STATE and VIEW DEFINITION; no install step."
+            ),
+            annotations=ToolAnnotations(
+                title="Review Workload Indexes",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
+        async def review_workload_indexes(
+            schema_name: str | None = Field(
+                default=None,
+                description="Limit the review to one schema (required with table_names).",
+            ),
+            table_names: list[str] | None = Field(
+                default=None,
+                description="Limit the review to these tables in schema_name.",
+            ),
+            lookback_days: int = Field(
+                default=7,
+                ge=1,
+                le=90,
+                description="Query Store window length in days. Cover a full business cycle where possible.",
+            ),
+            as_of_utc: str | None = Field(
+                default=None,
+                description=(
+                    "Optional ISO-8601 UTC end of the window, for example "
+                    "2026-09-30T05:00:00Z. Defaults to now; future instants are refused."
+                ),
+            ),
+            objective: Literal["cpu", "duration", "logical_reads", "executions"] = Field(
+                default="cpu",
+                description="Which Query Store measure ranks the workload and attributes cost.",
+            ),
+            top_queries: int = Field(
+                default=100,
+                ge=1,
+                le=500,
+                description="How many top queries by the objective to analyse.",
+            ),
+            plans_per_query: int = Field(
+                default=1,
+                ge=1,
+                le=3,
+                description="Stored plans to analyse per query, most expensive first.",
+            ),
+            min_table_rows: int = Field(
+                default=10_000,
+                ge=0,
+                description="Tables with fewer rows get no create/extend advice.",
+            ),
+            max_recommendations_per_table: int = Field(
+                default=5,
+                ge=1,
+                le=20,
+                description="Cap on actionable recommendations per table.",
+            ),
+            include_existing_index_review: bool = Field(
+                default=True,
+                description=(
+                    "Also review existing indexes: duplicates, left-prefix redundancy, "
+                    "unused indexes, heaps, and unindexed foreign keys."
+                ),
+            ),
+            database_name: str | None = Field(
+                default=None,
+                description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
+            ),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "review_workload_indexes",
+                database_name,
+                lambda db: self.workload_index_advisor.review(
+                    db,
+                    schema_name=schema_name,
+                    table_names=table_names,
+                    lookback_days=lookback_days,
+                    as_of_utc=as_of_utc,
+                    objective=objective,
+                    top_queries=top_queries,
+                    plans_per_query=plans_per_query,
+                    min_table_rows=min_table_rows,
+                    max_recommendations_per_table=max_recommendations_per_table,
+                    include_existing_index_review=include_existing_index_review,
+                ),
+            )
+
         # --- Phase 9: Wait Statistics ---
 
         @self.mcp.tool(
@@ -2020,6 +2377,16 @@ class AzureSqlMcpApplication:
         )
         async def get_wait_stats(
             top_n: int = Field(default=20, description="Number of top waits to return."),
+            sample_seconds: int = Field(
+                default=0,
+                ge=0,
+                le=30,
+                description=(
+                    "0 returns counters accumulated since the last reset (window.since_utc). "
+                    "1-30 samples twice that many seconds apart and returns only the waits "
+                    "that accrued in between: use it for a live incident."
+                ),
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -2028,7 +2395,9 @@ class AzureSqlMcpApplication:
             return await self._run_tool(
                 "get_wait_stats",
                 database_name,
-                lambda db: self.wait_stats.get_wait_stats(db, top_n),
+                lambda db: self.wait_stats.get_wait_stats(
+                    db, top_n, sample_seconds=sample_seconds
+                ),
             )
 
         @self.mcp.tool(
@@ -2147,8 +2516,12 @@ class AzureSqlMcpApplication:
 
         @self.mcp.tool(
             description=(
-                "Get recent deadlock history from system_health extended events session. "
-                "Parses deadlock XML to show victim, participants, resources, and SQL text."
+                "Get recent deadlocks for an Azure SQL database from database-scoped "
+                "Extended Events ring buffers (database_xml_deadlock_report) and, when "
+                "master is allowlisted, Azure's file-backed deadlock telemetry. Returns "
+                "victims, participants, lock resources, objects, and SQL text. When no "
+                "source can capture deadlocks, result_status is precondition and "
+                "remediation holds the capture-session DDL; it never reports a false zero."
             ),
             annotations=ToolAnnotations(
                 title="Get Deadlock History",
@@ -2160,7 +2533,14 @@ class AzureSqlMcpApplication:
         )
         async def get_deadlock_history(
             max_events: int = Field(
-                default=10, description="Maximum number of deadlock events to return."
+                default=10,
+                ge=1,
+                le=200,
+                description="Maximum number of deadlock events to return, newest first.",
+            ),
+            include_graph_xml: bool = Field(
+                default=False,
+                description="Also return each raw deadlock graph XML (bounded).",
             ),
             database_name: str | None = Field(
                 default=None,
@@ -2170,7 +2550,12 @@ class AzureSqlMcpApplication:
             return await self._run_tool(
                 "get_deadlock_history",
                 database_name,
-                lambda db: self.lock_diagnostics.get_deadlock_history(db, max_events),
+                lambda db: self.lock_diagnostics.get_deadlock_history(
+                    db,
+                    max_events,
+                    master_available=self._master_allowlisted(),
+                    include_graph_xml=include_graph_xml,
+                ),
             )
 
         # --- Phase 11: Tempdb & Memory Grant Diagnostics ---
@@ -2332,8 +2717,11 @@ class AzureSqlMcpApplication:
 
         @self.mcp.tool(
             description=(
-                "Get resource utilization history (15-sec granularity) from sys.dm_db_resource_stats. "
-                "Shows CPU, data I/O, log write, memory trends with sustained pressure warnings."
+                "Get resource utilization history against the database's limits: CPU, data "
+                "I/O, log write, memory, and workers. Windows up to 60 minutes use "
+                "sys.dm_db_resource_stats (15-second samples); longer windows, up to 14 days, "
+                "use sys.resource_stats from master as hourly average and maximum buckets. "
+                "Includes sustained-pressure warnings."
             ),
             annotations=ToolAnnotations(
                 title="Get Resource Stats History",
@@ -2345,7 +2733,17 @@ class AzureSqlMcpApplication:
         )
         async def get_resource_stats_history(
             window_minutes: int = Field(
-                default=60, description="How far back to look, in minutes."
+                default=60,
+                ge=1,
+                le=20160,
+                description="How far back to look, in minutes (up to 14 days).",
+            ),
+            source: Literal["auto", "recent", "long_term"] = Field(
+                default="auto",
+                description=(
+                    "auto: recent for 60 minutes or less, long_term beyond. long_term "
+                    "needs master in the database allowlist."
+                ),
             ),
             database_name: str | None = Field(
                 default=None,
@@ -2355,7 +2753,86 @@ class AzureSqlMcpApplication:
             return await self._run_tool(
                 "get_resource_stats_history",
                 database_name,
-                lambda db: self.resource_governance.get_resource_stats_history(db, window_minutes),
+                lambda db: self.resource_governance.get_resource_stats_history(
+                    db,
+                    window_minutes,
+                    source=source,
+                    master_available=self._master_allowlisted(),
+                ),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Diagnose an Azure SQL database in one call: resource use against its limits, "
+                "waits (optionally a live interval sample), current blocking, the top Query "
+                "Store CPU consumers, regressions against a 7-day baseline, and version store "
+                "health. Returns findings ranked by severity, each with evidence and the next "
+                "tool calls (with arguments) to drill in. Unreadable sources are listed as "
+                "gaps, never treated as healthy. Start incident triage here."
+            ),
+            annotations=ToolAnnotations(
+                title="Diagnose Database",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=False,
+                openWorldHint=True,
+            ),
+        )
+        async def diagnose_database(
+            window_minutes: int = Field(
+                default=60,
+                ge=5,
+                le=10080,
+                description="Window for resource history, top queries, and the recent side of regressions.",
+            ),
+            sample_seconds: int = Field(
+                default=0,
+                ge=0,
+                le=30,
+                description="Seconds to sample waits for a live interval; 0 uses cumulative counters.",
+            ),
+            database_name: str | None = Field(
+                default=None,
+                description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
+            ),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "diagnose_database",
+                database_name,
+                lambda db: self.database_diagnosis.diagnose(
+                    db,
+                    window_minutes=window_minutes,
+                    sample_seconds=sample_seconds,
+                    master_available=self._master_allowlisted(),
+                ),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Get persistent version store (accelerated database recovery) health: PVS "
+                "size and share of used data space, cleaner times, aborted transactions "
+                "awaiting cleanup, and the oldest open and snapshot transactions that hold "
+                "cleanup back, with findings. ADR is always on in Azure SQL Database, so a "
+                "long open transaction can grow storage here."
+            ),
+            annotations=ToolAnnotations(
+                title="Get Version Store Stats",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
+        async def get_version_store_stats(
+            database_name: str | None = Field(
+                default=None,
+                description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
+            ),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "get_version_store_stats",
+                database_name,
+                self.version_store.get_version_store_stats,
             )
 
         # --- Phase 22: Azure SQL Diagnostic Query Parity ---
@@ -4595,7 +5072,7 @@ class AzureSqlMcpApplication:
             **checks,
             "azure_sql_database": platform,
             "mcp_contract": {
-                "contract_version": "2.3.0",
+                "contract_version": "2.4.0",
                 "performance_tuning": 1,
                 "durable_view_change": 1,
                 "prepared_plan_action": 1,
@@ -4605,6 +5082,8 @@ class AzureSqlMcpApplication:
                 "index_history_schema_fingerprint": CONTRACT_SCHEMA_FINGERPRINT,
                 "index_review_min_observation_days": 90,
                 "index_review_snapshot_reuse_hours": 48,
+                "workload_index_advisor": 1,
+                "result_status": 1,
             },
             "local_tuning_policy": {
                 "configured": policy.configured,
@@ -4750,6 +5229,7 @@ class AzureSqlMcpApplication:
             "resource_history": lambda: self.resource_governance.get_resource_stats_history(
                 database_name,
                 window_minutes,
+                master_available=self._master_allowlisted(),
             ),
             "query_store_status": lambda: self.query_store.get_status(database_name),
             "query_store_history": lambda effective_query_id=None: self._collect_query_store_evidence(
@@ -7200,6 +7680,24 @@ class AzureSqlMcpApplication:
             return self._session_workflow_timeout(database_name)
         if tool_name in _EVIDENCE_WORKFLOW_TOOLS:
             return self._evidence_workflow_timeout()
+        if tool_name == "diagnose_database":
+            # Sources run concurrently; allow a wait sample plus the slowest read.
+            return max(
+                float(self.config.tool_timeout_seconds),
+                self.config.query_timeout_seconds * 3 + 45.0,
+            )
+        if tool_name == "get_wait_stats":
+            # Two snapshots plus an optional sample of up to 30 seconds.
+            return max(
+                float(self.config.tool_timeout_seconds),
+                self.config.query_timeout_seconds * 2 + 45.0,
+            )
+        if tool_name == "review_workload_indexes":
+            # About eight bounded catalog and Query Store reads run in sequence.
+            return max(
+                float(self.config.tool_timeout_seconds),
+                self.config.query_timeout_seconds * 8 + 60.0,
+            )
         return self.config.tool_timeout_seconds
 
     def _evidence_workflow_timeout(self) -> float:
@@ -8315,6 +8813,49 @@ class AzureSqlMcpApplication:
         normalized = " ".join(sql.split()).lower()
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
+    async def _analyze_query_plan(
+        self,
+        database_name: str,
+        plan_id: int | None,
+        query_id: int | None,
+        plan_xml: str | None,
+    ) -> dict[str, Any]:
+        sources = [value is not None for value in (plan_id, query_id, plan_xml)]
+        if sum(sources) != 1:
+            raise ValueError("Pass exactly one of plan_id, query_id, or plan_xml.")
+        source: dict[str, Any]
+        if plan_xml is not None:
+            if len(plan_xml) > MAX_ANALYZED_PLAN_XML_CHARS:
+                raise ValueError("plan_xml is too large to analyse.")
+            source = {"source": "plan_xml"}
+            xml_text = plan_xml
+        else:
+            query = _PLAN_BY_ID_SQL if plan_id is not None else _DOMINANT_PLAN_FOR_QUERY_SQL
+            rows = await self.executor.fetch_all(
+                database_name, query, params=[int(plan_id or query_id or 0)]
+            )
+            if not rows:
+                return {
+                    "database_name": database_name,
+                    "plan_id": plan_id,
+                    "query_id": query_id,
+                    "findings": [],
+                    **status_payload(
+                        ResultStatus.EMPTY,
+                        "No Query Store plan matched; check the id and the Query Store retention window.",
+                    ),
+                }
+            row = rows[0]
+            source = {
+                "source": "query_store",
+                "plan_id": row.get("plan_id"),
+                "query_id": row.get("query_id"),
+                "is_forced_plan": bool(row.get("is_forced_plan")),
+            }
+            xml_text = str(row.get("query_plan") or "")
+        analysis = analyze_plan(xml_text)
+        return {"database_name": database_name, **source, **analysis}
+
     async def _explain_query(
         self,
         database_name: str,
@@ -8363,6 +8904,8 @@ class AzureSqlMcpApplication:
         result = self._artifact_to_dict(artifact, include_raw_xml=include_raw_xml)
         if binding_info is not None:
             result["parameter_binding"] = binding_info
+        if artifact.raw_xml:
+            result["plan_findings"] = _compact_plan_findings(analyze_plan(artifact.raw_xml))
         return result
 
     @staticmethod
@@ -8489,11 +9032,14 @@ class AzureSqlMcpApplication:
         sort_by: str,
         window_minutes: int,
         limit: int,
+        *,
+        as_of_utc: str | None = None,
     ) -> dict[str, Any]:
         if limit <= 0:
             raise ValueError("limit must be greater than 0.")
         if window_minutes <= 0:
             raise ValueError("window_minutes must be greater than 0.")
+        window_end = parse_as_of(as_of_utc)
 
         status = await self.query_store.get_status(database_name)
         rows = await self.query_store.get_top_queries(
@@ -8501,16 +9047,21 @@ class AzureSqlMcpApplication:
             sort_by,
             window_minutes,
             limit,
+            window_end=window_end,
         )
-        return self._truncate_rows(
-            {
-                "database_name": database_name,
-                "query_store_status": status,
-                "sort_by": sort_by,
-                "window_minutes": window_minutes,
-                "rows": rows,
+        payload: dict[str, Any] = {
+            "database_name": database_name,
+            "query_store_status": status,
+            "sort_by": sort_by,
+            "window_minutes": window_minutes,
+            "rows": rows,
+        }
+        if window_end is not None:
+            payload["window"] = {
+                "start_utc": iso_z(window_end - timedelta(minutes=window_minutes)),
+                "end_utc": iso_z(window_end),
             }
-        )
+        return self._truncate_rows(payload)
 
     def _artifact_to_dict(
         self,
@@ -8541,6 +9092,9 @@ class AzureSqlMcpApplication:
             payload["rows"] = rows[: self.config.row_limit]
             payload["row_count"] = len(payload["rows"])
         return payload
+
+    def _master_allowlisted(self) -> bool:
+        return any(name.casefold() == "master" for name in self.config.allowed_databases)
 
     def _format_response(self, payload: Any) -> ResponseType:
         if isinstance(payload, dict):

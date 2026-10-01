@@ -5,12 +5,15 @@ import math
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable, Mapping
+from datetime import datetime
+from datetime import timedelta
 from typing import Any
 
 from .connection import AzureSqlExecutor
 from .index_optimizer import INDEX_CANDIDATE_IMPACT_FLOOR_PCT
 from .index_optimizer import score_index_candidate
 from .plans import parse_showplan_index_evidence
+from .time_windows import sql_utc
 
 
 QUERY_STORE_SHOWPLAN_NAMESPACE = {
@@ -62,6 +65,13 @@ _WEIGHTED_AVG_LOGICAL_READS = _weighted_runtime_average("avg_logical_io_reads")
 _WEIGHTED_AVG_PHYSICAL_READS = _weighted_runtime_average("avg_physical_io_reads")
 _WEIGHTED_AVG_MEMORY = _weighted_runtime_average("avg_query_max_used_memory")
 _WEIGHTED_AVG_ROWS = _weighted_runtime_average("avg_rowcount")
+
+
+_RELATIVE_WINDOW_PREDICATE = "rsi.end_time >= DATEADD(MINUTE, -?, SYSUTCDATETIME())"
+_ABSOLUTE_WINDOW_PREDICATE = (
+    "rsi.end_time > TODATETIMEOFFSET(CAST(? AS datetime2), 0) "
+    "AND rsi.start_time < TODATETIMEOFFSET(CAST(? AS datetime2), 0)"
+)
 
 
 SORT_BY_EXPRESSIONS = {
@@ -628,9 +638,21 @@ class QueryStoreService:
         sort_by: str,
         window_minutes: int,
         limit: int,
+        *,
+        window_end: datetime | None = None,
     ) -> list[dict[str, Any]]:
         query = self._build_top_queries_query(sort_by)
-        params = [window_minutes, limit] if sort_by == "resource_blend" else [limit, window_minutes]
+        blend = sort_by == "resource_blend"
+        if window_end is None:
+            params: list[Any] = [window_minutes, limit] if blend else [limit, window_minutes]
+        else:
+            # A past window: replace "the last N minutes" with an explicit range.
+            if query.count(_RELATIVE_WINDOW_PREDICATE) != 1:
+                raise RuntimeError("top-queries window predicate not found")
+            query = query.replace(_RELATIVE_WINDOW_PREDICATE, _ABSOLUTE_WINDOW_PREDICATE)
+            start = sql_utc(window_end - timedelta(minutes=window_minutes))
+            end = sql_utc(window_end)
+            params = [start, end, limit] if blend else [limit, start, end]
         return await self.executor.fetch_all(
             database_name,
             query,

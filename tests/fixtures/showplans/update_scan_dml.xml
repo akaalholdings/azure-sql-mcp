@@ -1,0 +1,73 @@
+<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan" Version="1.564" Build="16.0.1121.4">
+  <BatchSequence>
+    <Batch>
+      <Statements>
+        <StmtSimple StatementText="UPDATE Sales.Orders SET Status = 2 WHERE CustomerID = @CustomerID AND Status = 1" StatementId="1" StatementCompId="1" StatementType="UPDATE" StatementSubTreeCost="1.4" StatementEstRows="5" QueryHash="0x5050505050505050" QueryPlanHash="0x6060606060606060">
+          <QueryPlan CachedPlanSize="40" CompileTime="2" CompileCPU="2" CompileMemory="300">
+            <RelOp NodeId="0" PhysicalOp="Clustered Index Update" LogicalOp="Update" EstimateRows="5" EstimateIO="0.02" EstimateCPU="0.000005" AvgRowSize="9" EstimatedTotalSubtreeCost="1.4" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row">
+              <OutputList />
+              <Update DMLRequestSort="0">
+                <Object Database="[appdb]" Schema="[Sales]" Table="[Orders]" Index="[PK_Sales_Orders]" IndexKind="Clustered" Storage="RowStore" />
+                <Object Database="[appdb]" Schema="[Sales]" Table="[Orders]" Index="[IX_Orders_Status]" IndexKind="NonClustered" Storage="RowStore" />
+                <SetPredicate>
+                  <ScalarOperator ScalarString="[appdb].[Sales].[Orders].[Status] = (2)">
+                    <ScalarExpressionList>
+                      <ScalarOperator>
+                        <Const ConstValue="(2)" />
+                      </ScalarOperator>
+                    </ScalarExpressionList>
+                  </ScalarOperator>
+                </SetPredicate>
+                <RelOp NodeId="1" PhysicalOp="Clustered Index Scan" LogicalOp="Clustered Index Scan" EstimateRows="5" EstimateIO="1.28" EstimateCPU="0.08" AvgRowSize="15" EstimatedTotalSubtreeCost="1.36" TableCardinality="73595" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row">
+                  <OutputList>
+                    <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[Orders]" Column="OrderID" />
+                  </OutputList>
+                  <IndexScan Ordered="0" ForcedIndex="0" ForceScan="0" NoExpandHint="0" Storage="RowStore">
+                    <DefinedValues>
+                      <DefinedValue>
+                        <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[Orders]" Column="OrderID" />
+                      </DefinedValue>
+                    </DefinedValues>
+                    <Object Database="[appdb]" Schema="[Sales]" Table="[Orders]" Index="[PK_Sales_Orders]" IndexKind="Clustered" Storage="RowStore" />
+                    <Predicate>
+                      <ScalarOperator ScalarString="residual">
+                        <Logical Operation="AND">
+                          <ScalarOperator>
+                            <Compare CompareOp="EQ">
+                              <ScalarOperator>
+                                <Identifier>
+                                  <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[Orders]" Column="CustomerID" />
+                                </Identifier>
+                              </ScalarOperator>
+                              <ScalarOperator>
+                                <Identifier>
+                                  <ColumnReference Column="@CustomerID" />
+                                </Identifier>
+                              </ScalarOperator>
+                            </Compare>
+                          </ScalarOperator>
+                          <ScalarOperator>
+                            <Compare CompareOp="EQ">
+                              <ScalarOperator>
+                                <Identifier>
+                                  <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[Orders]" Column="Status" />
+                                </Identifier>
+                              </ScalarOperator>
+                              <ScalarOperator>
+                                <Const ConstValue="(1)" />
+                              </ScalarOperator>
+                            </Compare>
+                          </ScalarOperator>
+                        </Logical>
+                      </ScalarOperator>
+                    </Predicate>
+                  </IndexScan>
+                </RelOp>
+              </Update>
+            </RelOp>
+          </QueryPlan>
+        </StmtSimple>
+      </Statements>
+    </Batch>
+  </BatchSequence>
+</ShowPlanXML>

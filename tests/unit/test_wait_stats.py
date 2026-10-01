@@ -137,3 +137,94 @@ async def test_get_currently_waiting_tasks():
     assert result["currently_waiting_count"] == 1
     assert result["waiting_tasks"][0]["category"] == "Lock"
     assert result["waiting_tasks"][0]["recommendation"] != ""
+
+
+class SequencedExecutor:
+    """Return one prepared result per wait snapshot, plus the counter epoch."""
+
+    def __init__(self, snapshots: list[list[dict]], epoch: str | None = "2026-09-01T00:00:00") -> None:
+        self.snapshots = list(snapshots)
+        self.epoch = epoch
+        self.queries: list[str] = []
+
+    async def fetch_all(self, database_name: str, query: str, *args, **kwargs) -> list[dict]:
+        self.queries.append(query)
+        if "dm_os_sys_info" in query:
+            return [{"engine_start_time_utc": self.epoch}] if self.epoch else []
+        return self.snapshots.pop(0)
+
+
+def _wait(wait_type: str, tasks: int, wait_ms: int, signal_ms: int = 0) -> dict:
+    return {
+        "wait_type": wait_type,
+        "waiting_tasks_count": tasks,
+        "wait_time_ms": wait_ms,
+        "max_wait_time_ms": wait_ms,
+        "signal_wait_time_ms": signal_ms,
+        "resource_wait_time_ms": wait_ms - signal_ms,
+    }
+
+
+@pytest.mark.asyncio
+async def test_interval_mode_reports_only_waits_that_accrued_during_the_sample():
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    executor = SequencedExecutor(
+        [
+            [_wait("PAGEIOLATCH_SH", 1000, 900_000, 1_000), _wait("WRITELOG", 50, 2_000, 100)],
+            [_wait("PAGEIOLATCH_SH", 1000, 900_000, 1_000), _wait("WRITELOG", 80, 9_000, 400), _wait("LCK_M_X", 3, 6_000, 0)],
+        ]
+    )
+    service = WaitStatsService(executor)
+
+    result = await service.get_wait_stats("testdb", sample_seconds=10, sleep=fake_sleep)
+
+    assert sleeps == [10]
+    # The huge lifetime PAGEIOLATCH total did not move, so it is absent.
+    assert [w["wait_type"] for w in result["top_waits"]] == ["WRITELOG", "LCK_M_X"]
+    assert result["top_waits"][0]["wait_time_ms"] == 7_000
+    assert result["top_waits"][0]["signal_wait_time_ms"] == 300
+    assert result["window"] == {"mode": "interval", "sample_seconds": 10, "counter_reset_detected": False}
+
+
+@pytest.mark.asyncio
+async def test_interval_mode_detects_a_counter_reset_between_snapshots():
+    async def fake_sleep(seconds: float) -> None:
+        return None
+
+    executor = SequencedExecutor(
+        [[_wait("WRITELOG", 500, 90_000)], [_wait("WRITELOG", 20, 1_000)]]
+    )
+
+    result = await WaitStatsService(executor).get_wait_stats("testdb", sample_seconds=5, sleep=fake_sleep)
+
+    assert result["window"]["counter_reset_detected"] is True
+    assert result["top_waits"][0]["wait_time_ms"] == 1_000
+
+
+@pytest.mark.asyncio
+async def test_cumulative_mode_discloses_the_counter_epoch():
+    executor = SequencedExecutor([[_wait("WRITELOG", 50, 2_000)]])
+
+    result = await WaitStatsService(executor).get_wait_stats("testdb")
+
+    assert result["window"]["mode"] == "cumulative"
+    assert result["window"]["since_utc"] == "2026-09-01T00:00:00"
+    assert "sample_seconds" in result["window"]["note"]
+
+
+@pytest.mark.asyncio
+async def test_sample_length_is_capped():
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    executor = SequencedExecutor([[], []])
+
+    await WaitStatsService(executor).get_wait_stats("testdb", sample_seconds=999, sleep=fake_sleep)
+
+    assert slept == [30]

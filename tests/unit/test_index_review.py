@@ -1169,7 +1169,7 @@ async def test_get_review_reconstructs_deterministically_after_restart() -> None
     assert restored.as_dict() == first.as_dict()
 
 
-def test_index_review_profile_contains_six_base_tools_and_recall_only_learning(server_config_factory) -> None:
+def test_index_review_profile_contains_base_tools_and_recall_only_learning(server_config_factory) -> None:
     config = server_config_factory(profile=McpProfile.INDEX_REVIEW)
     base = {
         "check_runtime_status",
@@ -1178,13 +1178,17 @@ def test_index_review_profile_contains_six_base_tools_and_recall_only_learning(s
         "capture_index_review_snapshot",
         "review_index_portfolio",
         "get_index_review",
+        "review_workload_indexes",
+        "check_statistics_health",
+        "get_top_queries",
+        "get_query_store_trend",
     }
     enabled = {name for name in base | set(LEARNING_TOOL_NAMES) if config.is_tool_enabled(name)}
     assert enabled == base | {"recall_lessons"}
     assert config.is_tool_enabled("execute_sql") is False
 
 
-def test_index_review_remote_surface_is_exactly_six_base_tools(monkeypatch) -> None:
+def test_index_review_remote_surface_is_exactly_the_base_tools(monkeypatch) -> None:
     monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
     monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "appdb")
     monkeypatch.setenv("AZURE_SQL_ALLOWED_DATABASES", "appdb")
@@ -1205,4 +1209,8 @@ def test_index_review_remote_surface_is_exactly_six_base_tools(monkeypatch) -> N
         "capture_index_review_snapshot",
         "review_index_portfolio",
         "get_index_review",
+        "review_workload_indexes",
+        "check_statistics_health",
+        "get_top_queries",
+        "get_query_store_trend",
     }

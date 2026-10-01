@@ -76,7 +76,7 @@ async def _lifecycle(server: StdioServerParameters):
                     "recall_lessons",
                     {
                         "skill": "sql-optimizer",
-                        "skill_version": "2.3.1",
+                        "skill_version": "2.4.0",
                         "runtime_compatibility_fingerprint": runtime[
                             "runtime_compatibility_fingerprint"
                         ],
@@ -88,6 +88,8 @@ async def _lifecycle(server: StdioServerParameters):
                     },
                 )
             )
+            assert recalled.pop("result_status") == "empty"
+            assert recalled.pop("result_status_reason")
             assert recalled == {"lessons": [], "count": 0, "max_results": 3}
             return runtime
 

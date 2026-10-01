@@ -4,6 +4,8 @@ import xml.etree.ElementTree as ET
 from typing import Any
 
 from .connection import AzureSqlExecutor
+from .deadlocks import DeadlockHistoryReader
+from .deadlocks import parse_deadlock_graph
 
 
 MAX_ROW_LIMIT = 1000
@@ -202,104 +204,29 @@ class LockDiagnosticsService:
         self,
         database_name: str,
         max_events: int = 10,
+        *,
+        master_available: bool = False,
+        include_graph_xml: bool = False,
     ) -> dict[str, Any]:
-        """Extract recent deadlock graphs from system_health XE session."""
-        query = """
-        SELECT TOP ({max_events})
-            CAST(xet.target_data AS XML).value(
-                '(event/@timestamp)[1]', 'DATETIME2'
-            ) AS deadlock_time,
-            CAST(
-                CAST(xet.target_data AS XML).query(
-                    'event/data[@name="xml_report"]/value/deadlock'
-                ) AS NVARCHAR(MAX)
-            ) AS deadlock_xml
-        FROM sys.dm_xe_sessions AS xes
-        INNER JOIN sys.dm_xe_session_targets AS xet
-            ON xes.address = xet.event_session_address
-        WHERE xes.name = 'system_health'
-          AND xet.target_name = 'ring_buffer'
-          AND CAST(xet.target_data AS XML).value(
-                '(event/@name)[1]', 'VARCHAR(100)'
-              ) = 'xml_deadlock_report'
-        ORDER BY deadlock_time DESC
-        """.format(max_events=int(max_events))
-
-        try:
-            rows = await self.executor.fetch_all(database_name, query)
-        except Exception:
-            # Fallback: the ring_buffer query shape varies across Azure SQL tiers
-            rows = []
-
-        deadlocks: list[dict[str, Any]] = []
-        for row in rows:
-            dl_xml = row.get("deadlock_xml") or ""
-            parsed = self._parse_deadlock_xml(dl_xml)
-            deadlocks.append(
-                {
-                    "deadlock_time": str(row.get("deadlock_time", "")),
-                    "participants": parsed.get("participants", []),
-                    "victim_session_id": parsed.get("victim_session_id"),
-                    "resources": parsed.get("resources", []),
-                }
-            )
-
-        return {
-            "database_name": database_name,
-            "deadlock_count": len(deadlocks),
-            "deadlocks": deadlocks,
-        }
+        """Deadlocks from database-scoped XE ring buffers and master telemetry."""
+        return await DeadlockHistoryReader(self.executor).read(
+            database_name,
+            max_events=max_events,
+            master_available=master_available,
+            include_graph_xml=include_graph_xml,
+        )
 
     @staticmethod
     def _parse_deadlock_xml(xml_str: str) -> dict[str, Any]:
-        """Best-effort parse of deadlock XML."""
+        """Parse one deadlock graph document; malformed input yields an empty graph."""
+        empty: dict[str, Any] = {"participants": [], "victim_session_id": None, "resources": []}
         if not xml_str or not xml_str.strip():
-            return {"participants": [], "victim_session_id": None, "resources": []}
+            return empty
         try:
             root = ET.fromstring(xml_str)
         except ET.ParseError:
-            return {"participants": [], "victim_session_id": None, "resources": []}
-
-        victim_id = None
-        participants: list[dict[str, Any]] = []
-        resources: list[dict[str, Any]] = []
-
-        # Find victim
-        victim_list = root.find(".//victim-list")
-        if victim_list is not None:
-            for v in victim_list:
-                victim_id = v.get("id")
-
-        # Find process-list
-        process_list = root.find(".//process-list")
-        if process_list is not None:
-            for proc in process_list:
-                participants.append(
-                    {
-                        "process_id": proc.get("id"),
-                        "session_id": proc.get("spid"),
-                        "is_victim": proc.get("id") == victim_id,
-                        "wait_resource": proc.get("waitresource", ""),
-                        "lock_mode": proc.get("lockMode", ""),
-                        "sql_text": (
-                            proc.findtext(".//inputbuf", default="").strip()
-                        ),
-                    }
-                )
-
-        # Find resource-list
-        resource_list = root.find(".//resource-list")
-        if resource_list is not None:
-            for res in resource_list:
-                resources.append(
-                    {
-                        "type": res.tag,
-                        "attributes": dict(res.attrib),
-                    }
-                )
-
-        return {
-            "participants": participants,
-            "victim_session_id": victim_id,
-            "resources": resources,
-        }
+            return empty
+        graph = root if root.tag == "deadlock" else root.find(".//deadlock")
+        if graph is None:
+            return empty
+        return parse_deadlock_graph(graph)
