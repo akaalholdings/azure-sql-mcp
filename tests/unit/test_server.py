@@ -691,7 +691,7 @@ async def test_successful_operation_links_terminal_outcome_and_learning_failure_
     decision = app.learning_service.record_decision(
         DecisionRecordV1(
             skill="sql-optimizer",
-            skill_version="2.3.1",
+            skill_version="2.4.0",
             case_id="case-1",
             learning_key="health-check",
             consumed_evidence_refs=(evidence.evidence_id,),

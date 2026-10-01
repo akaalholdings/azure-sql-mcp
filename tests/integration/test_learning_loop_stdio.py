@@ -76,7 +76,7 @@ async def _lifecycle(server: StdioServerParameters):
                     "recall_lessons",
                     {
                         "skill": "sql-optimizer",
-                        "skill_version": "2.3.1",
+                        "skill_version": "2.4.0",
                         "runtime_compatibility_fingerprint": runtime[
                             "runtime_compatibility_fingerprint"
                         ],
