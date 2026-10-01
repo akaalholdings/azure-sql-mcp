@@ -16,6 +16,7 @@ from .connection import QueryResult
 from .param_binding import ParameterExecutionContract
 from .plan_diagnostics import parse_statistics_io_messages
 from .plan_diagnostics import summarize_statistics_io_samples
+from .plan_tree import child_relops
 from .safe_sql import SafeSqlValidator
 
 SHOWPLAN_NAMESPACE = {"sp": "http://schemas.microsoft.com/sqlserver/2004/07/showplan"}
@@ -660,10 +661,20 @@ class PlansService:
             self._summarize_operator(node, parent_map)
             for node in operator_nodes
         ]
-        expensive_operators = list(operators)
-
-        expensive_operators.sort(
-            key=lambda item: float(item["estimated_subtree_cost"] or 0.0),
+        for operator, node in zip(operators, operator_nodes):
+            # Subtree cost is cumulative, so ranking by it always crowns the
+            # root. Self cost is still an estimate, in every plan.
+            operator["estimated_self_cost"] = max(
+                0.0,
+                (self._optional_float(node.attrib.get("EstimatedTotalSubtreeCost")) or 0.0)
+                - sum(
+                    self._optional_float(child.attrib.get("EstimatedTotalSubtreeCost")) or 0.0
+                    for child in child_relops(node)
+                ),
+            )
+        expensive_operators = sorted(
+            operators,
+            key=lambda item: item["estimated_self_cost"],
             reverse=True,
         )
 
