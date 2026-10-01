@@ -255,6 +255,7 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
         "review_workload_indexes",
         "get_query_store_trend",
         "get_query_store_regressions",
+        "analyze_query_plan",
         # Phase 9: Wait Statistics
         "get_wait_stats",
         "get_query_wait_stats",
@@ -2802,3 +2803,64 @@ async def test_get_top_queries_reads_a_past_window(app: AzureSqlMcpApplication) 
     kwargs = app.query_store.get_top_queries.await_args.kwargs
     assert kwargs["window_end"] == datetime(2026, 9, 30, 5, 0, tzinfo=timezone.utc)
     assert payload["window"] == {"start_utc": "2026-09-30T04:00:00Z", "end_utc": "2026-09-30T05:00:00Z"}
+
+
+@pytest.mark.asyncio
+async def test_analyze_query_plan_reads_query_store_or_raw_xml(app: AzureSqlMcpApplication) -> None:
+    fixture = (Path(__file__).resolve().parents[1] / "fixtures" / "showplans" / "heap_scan_nonsargable.xml").read_text(encoding="utf-8")
+    app.executor.fetch_all = AsyncMock(  # type: ignore[method-assign]
+        return_value=[{"plan_id": 7, "query_id": 3, "is_forced_plan": 0, "query_plan": fixture}]
+    )
+
+    by_query = await app.mcp._tool_manager.call_tool(
+        "analyze_query_plan", {"database_name": "appdb", "query_id": 3}
+    )
+    raw = await app.mcp._tool_manager.call_tool(
+        "analyze_query_plan", {"database_name": "appdb", "plan_xml": fixture}
+    )
+
+    assert by_query["plan_id"] == 7 and by_query["source"] == "query_store"
+    assert by_query["result_status"] == "ok"
+    assert {f["rule"] for f in by_query["findings"]} >= {"non_sargable_predicate", "implicit_conversion_on_column"}
+    assert "WHERE p.query_id = ?" in app.executor.fetch_all.await_args_list[0].args[1]
+    assert raw["source"] == "plan_xml"
+    assert app.executor.fetch_all.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_analyze_query_plan_requires_exactly_one_source(app: AzureSqlMcpApplication) -> None:
+    with pytest.raises(ToolError):
+        await app.mcp._tool_manager.call_tool(
+            "analyze_query_plan", {"database_name": "appdb", "plan_id": 1, "query_id": 2}
+        )
+
+
+@pytest.mark.asyncio
+async def test_analyze_query_plan_unknown_id_is_a_true_negative(app: AzureSqlMcpApplication) -> None:
+    app.executor.fetch_all = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+    payload = await app.mcp._tool_manager.call_tool(
+        "analyze_query_plan", {"database_name": "appdb", "plan_id": 999}
+    )
+
+    assert payload["result_status"] == "empty"
+
+
+@pytest.mark.asyncio
+async def test_explain_query_attaches_plan_findings(app: AzureSqlMcpApplication) -> None:
+    fixture = (Path(__file__).resolve().parents[1] / "fixtures" / "showplans" / "seek_residual_lookup_sort.xml").read_text(encoding="utf-8")
+    app.plans.explain_query = AsyncMock(
+        return_value=ExplainPlanArtifact(
+            database_name="appdb",
+            analyze=False,
+            summary={"statement_count": 1},
+            raw_xml=fixture,
+        )
+    )
+
+    payload = await app._explain_query("appdb", "SELECT 1", analyze=False)
+
+    findings = payload["plan_findings"]
+    assert findings["plan_kind"] == "estimated"
+    assert findings["findings"][0]["rule"] == "key_lookup"
+    assert findings["families"]["indexes"] >= 1

@@ -100,6 +100,7 @@ from .performance_workflows import profile_result_fingerprint
 from .plan_action_service import PlanActionService
 from .plan_cache import PlanCacheService
 from .plan_enforcement import PlanEnforcementService
+from .plan_rules import analyze_plan
 from .plans import PlansService
 from .platform_capabilities import PlatformCapabilitiesService
 from .prompts import register_prompts
@@ -110,7 +111,9 @@ from .query_store import QueryStoreService
 from .query_store_trends import QueryStoreTrendService
 from .resource_governance import ResourceGovernanceService
 from .resources import register_resources
+from .result_status import ResultStatus
 from .result_status import apply_result_status
+from .result_status import status_payload
 from .safe_sql import SafeSqlValidator
 from .server_instructions import SERVER_INSTRUCTIONS
 from .schema_compare import SchemaCompareService
@@ -364,6 +367,53 @@ def _auth_settings(config: ServerConfig) -> AuthSettings:
         resource_server_url=resource_url,
         required_scopes=["azure-sql-mcp"],
     )
+
+
+MAX_ANALYZED_PLAN_XML_CHARS = 8_000_000
+
+_PLAN_BY_ID_SQL = """
+SELECT
+    p.plan_id,
+    p.query_id,
+    p.is_forced_plan,
+    CAST(p.query_plan AS nvarchar(max)) AS query_plan
+FROM sys.query_store_plan AS p
+WHERE p.plan_id = ?
+"""
+
+_DOMINANT_PLAN_FOR_QUERY_SQL = """
+WITH ranked AS (
+    SELECT
+        p.plan_id,
+        SUM(rs.avg_duration * rs.count_executions) AS total_duration_us,
+        MAX(p.last_execution_time) AS last_execution_time
+    FROM sys.query_store_plan AS p
+    LEFT JOIN sys.query_store_runtime_stats AS rs
+        ON rs.plan_id = p.plan_id
+    WHERE p.query_id = ?
+    GROUP BY p.plan_id
+)
+SELECT TOP (1)
+    p.plan_id,
+    p.query_id,
+    p.is_forced_plan,
+    CAST(p.query_plan AS nvarchar(max)) AS query_plan
+FROM ranked AS r
+INNER JOIN sys.query_store_plan AS p
+    ON p.plan_id = r.plan_id
+ORDER BY r.total_duration_us DESC, r.last_execution_time DESC
+"""
+
+
+def _compact_plan_findings(analysis: dict[str, Any], *, limit: int = 15) -> dict[str, Any]:
+    findings = analysis.get("findings") or []
+    return {
+        "plan_kind": analysis.get("plan_kind"),
+        "finding_counts": analysis.get("finding_counts", {}),
+        "families": analysis.get("families", {}),
+        "findings": findings[:limit],
+        "truncated": bool(analysis.get("truncated")) or len(findings) > limit,
+    }
 
 
 class AzureSqlMcpApplication:
@@ -997,6 +1047,47 @@ class AzureSqlMcpApplication:
                         parameter_types,
                     ),
                 ),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Find plan anti-patterns with rule-based analysis: non-SARGable predicates, "
+                "implicit conversions, key and RID lookups, scans with seekable filters, "
+                "eager index spools, spills, memory-grant problems, estimate gaps, table "
+                "variables, scalar UDFs, multi-statement TVFs, heavy nested loops, "
+                "parallelism blockers, and optimizer timeouts. Each finding has a severity, "
+                "the plan node, evidence from the plan, the operator's share of estimated "
+                "cost, a pattern family, and a fix direction. Pass exactly one of plan_id "
+                "(Query Store), query_id (its most expensive Query Store plan), or plan_xml."
+            ),
+            annotations=ToolAnnotations(
+                title="Analyze Query Plan",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
+        async def analyze_query_plan(
+            plan_id: int | None = Field(default=None, ge=1, description="Query Store plan_id."),
+            query_id: int | None = Field(
+                default=None,
+                ge=1,
+                description="Query Store query_id; its most expensive stored plan is analysed.",
+            ),
+            plan_xml: str | None = Field(
+                default=None,
+                description="Raw showplan XML (estimated or actual) to analyse directly.",
+            ),
+            database_name: str | None = Field(
+                default=None,
+                description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
+            ),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "analyze_query_plan",
+                database_name,
+                lambda db: self._analyze_query_plan(db, plan_id, query_id, plan_xml),
             )
 
         @self.mcp.tool(
@@ -8615,6 +8706,49 @@ class AzureSqlMcpApplication:
         normalized = " ".join(sql.split()).lower()
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
+    async def _analyze_query_plan(
+        self,
+        database_name: str,
+        plan_id: int | None,
+        query_id: int | None,
+        plan_xml: str | None,
+    ) -> dict[str, Any]:
+        sources = [value is not None for value in (plan_id, query_id, plan_xml)]
+        if sum(sources) != 1:
+            raise ValueError("Pass exactly one of plan_id, query_id, or plan_xml.")
+        source: dict[str, Any]
+        if plan_xml is not None:
+            if len(plan_xml) > MAX_ANALYZED_PLAN_XML_CHARS:
+                raise ValueError("plan_xml is too large to analyse.")
+            source = {"source": "plan_xml"}
+            xml_text = plan_xml
+        else:
+            query = _PLAN_BY_ID_SQL if plan_id is not None else _DOMINANT_PLAN_FOR_QUERY_SQL
+            rows = await self.executor.fetch_all(
+                database_name, query, params=[int(plan_id or query_id or 0)]
+            )
+            if not rows:
+                return {
+                    "database_name": database_name,
+                    "plan_id": plan_id,
+                    "query_id": query_id,
+                    "findings": [],
+                    **status_payload(
+                        ResultStatus.EMPTY,
+                        "No Query Store plan matched; check the id and the Query Store retention window.",
+                    ),
+                }
+            row = rows[0]
+            source = {
+                "source": "query_store",
+                "plan_id": row.get("plan_id"),
+                "query_id": row.get("query_id"),
+                "is_forced_plan": bool(row.get("is_forced_plan")),
+            }
+            xml_text = str(row.get("query_plan") or "")
+        analysis = analyze_plan(xml_text)
+        return {"database_name": database_name, **source, **analysis}
+
     async def _explain_query(
         self,
         database_name: str,
@@ -8663,6 +8797,8 @@ class AzureSqlMcpApplication:
         result = self._artifact_to_dict(artifact, include_raw_xml=include_raw_xml)
         if binding_info is not None:
             result["parameter_binding"] = binding_info
+        if artifact.raw_xml:
+            result["plan_findings"] = _compact_plan_findings(analyze_plan(artifact.raw_xml))
         return result
 
     @staticmethod
