@@ -24,7 +24,16 @@ async def test_every_tool_named_in_the_instructions_exists(tmp_path: Path) -> No
     app = AzureSqlMcpApplication(make_config(tmp_path, tool_groups=frozenset({ToolGroup.ALL})))
     registered = {tool.name for tool in await app.mcp.list_tools()}
     named = set(re.findall(r"\b([a-z]+(?:_[a-z]+)+)\b", SERVER_INSTRUCTIONS))
-    candidates = {name for name in named if name.startswith(("get_", "check_", "list_", "start_", "add_", "benchmark_", "finalize_", "review_", "detect_", "explain_", "collect_", "plan_", "prepare_"))}
+    tool_prefixes = (
+        "get_", "check_", "list_", "start_", "add_", "benchmark_", "finalize_",
+        "review_", "detect_", "explain_", "collect_", "plan_", "prepare_", "analyze_",
+    )
+    parameter_suffixes = ("_id", "_utc", "_minutes", "_seconds", "_pct", "_percent")
+    candidates = {
+        name
+        for name in named
+        if name.startswith(tool_prefixes) and not name.endswith(parameter_suffixes)
+    }
 
     missing = sorted(candidates - registered)
     assert missing == []
