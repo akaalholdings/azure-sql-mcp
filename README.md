@@ -7,6 +7,11 @@ The supported tuning path is evidence-first but rewrite-active: a missing plan l
 ## What it owns
 
 - Read-only SQL execution, metadata, plans, Query Store, waits, blocking, resource, statistics, and parameter-sensitivity evidence.
+- A `result_status` on every tool result (`ok`, `empty`, `unavailable`, `not_supported`, `precondition`) so an agent can tell a true negative from a read that failed or a setup step that is missing; `precondition` carries the exact `remediation` statement.
+- Workload-driven index design (`review_workload_indexes`): Query Store runtime history and stored plans, per-table access patterns, existing-index reconciliation, and inert DDL with exact rollback. No install step.
+- Rule-based plan analysis (`analyze_query_plan`, and `plan_findings` on `explain_query`) for estimated and actual plans.
+- Query Store over time: trends, regressions against a baseline window, and past windows through `as_of_utc`.
+- Azure SQL Database server instructions sent at MCP initialization.
 - Versioned `EvidenceEnvelopeV1`, `PerformanceCaseV1`, `TuningSessionV1`, `TuningCandidateV1`, and `PlanActionIntentV1` contracts.
 - Redacted SQLite state under `~/.azure-sql-mcp/state` by default.
 - Exactly-once measured query samples with the result sample and actual plan from the same execution.
@@ -18,7 +23,7 @@ The supported tuning path is evidence-first but rewrite-active: a missing plan l
 - Prepared Query Store plan actions with prior-state capture, policy checks, verification, and exact rollback.
 - Evidence-linked decisions, terminal outcome reviews, reviewed lessons, and typed cross-skill handoffs.
 - Audited general DBA T-SQL execution that rejects direct or statically recoverable `DROP DATABASE` statements.
-- Deterministic, recommend-only index portfolio reviews over two manually installed `dbatools` history tables. The index workflow never creates the schema or executes index DDL.
+- Optional long-term index portfolio history over two manually installed `dbatools` tables, for removal decisions across usage-counter resets. Neither index workflow creates schema or executes index DDL.
 
 The Copilot operating instructions live in the [`akaalholdings/SQL` skills](https://github.com/akaalholdings/SQL/tree/main/skills). The skills decide what to investigate and how to present the result; this package owns database execution, policy, durable state, and deterministic workflow transitions.
 
@@ -141,7 +146,7 @@ Reload VS Code, enable the server in Copilot Chat, then call `list_databases` an
 | `sandbox` | Disposable non-production index and view tests | local stdio, unrestricted, write apply, sandbox policy | optimizer tools plus leased index benchmark and prepared view apply/verify/rollback |
 | `enforcer-review` | Query Store review and intent preparation | restricted, write disabled | plan health, preview-only review, `prepare_plan_action` |
 | `enforcer-apply` | One authorized prepared plan action | local stdio, unrestricted, write apply, apply policy, kill switch open | apply, verify, and rollback prepared intents |
-| `index-review` | Capture and review index lifecycle history | restricted; separate index-history write policy for capture | six base tools plus `recall_lessons` locally; six base tools remotely |
+| `index-review` | Workload-driven index review, plus optional portfolio history | restricted; separate index-history write policy only for portfolio capture | `review_workload_indexes`, `get_query_store_trend`, `get_top_queries`, `check_statistics_health`, the three portfolio tools, and local `recall_lessons` |
 
 Named profiles always hide direct force, hint, raw plan-apply, and direct test-index mutation tools. The compatibility implementations of those tools are preview-only even when a server is started without a profile.
 
@@ -240,6 +245,61 @@ Session responses derive `deadline_exceeded`, `accepts_new_work`, and
 `accepts_finalization` without rewriting the durable lifecycle state.
 
 `collect_performance_evidence` focuses on Azure SQL resource history, Query Store state/history, waits, blocking/open transactions, statistics, parameter sensitivity, and regressions. `analyze_db_health` remains available for operational checks such as connections, constraints, replication, identity, Query Store configuration, storage, and statistics; it no longer grades PLE, buffer-cache ratio, or fragmentation as query health.
+
+## Result status
+
+Every tool result carries `result_status`:
+
+| Value | Meaning | What to do |
+| --- | --- | --- |
+| `ok` | The source was read and returned data. | Use it. |
+| `empty` | The source was read and held nothing in its window. | Treat it as a true negative for that window. |
+| `unavailable` | The source exists but could not be read (permission, timeout). | Report the reason; it is not an all-clear. |
+| `not_supported` | The source does not exist on Azure SQL Database. | Do not ask anyone to enable it. |
+| `precondition` | A setup step is missing. | Show `remediation` to a DBA; tools never run it. |
+
+`empty` is inferred only from a tool's primary rows, never from incidental lists
+such as `warnings`. Services set the other values explicitly.
+
+## Live diagnostics notes
+
+- `get_wait_stats` returns counters accumulated since the last reset and
+  reports `window.since_utc`. Pass `sample_seconds` (1-30) during a live
+  incident to get only the waits that accrued between two snapshots.
+- `get_resource_stats_history` reads `sys.dm_db_resource_stats` (15-second
+  samples, about one hour) for windows up to 60 minutes and `sys.resource_stats`
+  in master (hourly buckets, about 14 days) for longer windows. Longer windows
+  need `master` in `AZURE_SQL_ALLOWED_DATABASES`; otherwise the tool returns
+  the recent hour with `result_status=precondition`.
+- `get_resource_limits` reads governance limits for the current database only
+  (`WHERE database_id = DB_ID()`), which matters in elastic pools.
+- `get_deadlock_history` reads database-scoped Extended Events ring buffers for
+  `database_xml_deadlock_report` and, when `master` is allowlisted, Azure's
+  file-backed deadlock telemetry. With no capture source it returns
+  `precondition` and the `CREATE EVENT SESSION ... ON DATABASE` statement.
+
+## Query Store over time
+
+- `get_query_store_trend` returns a bucketed series (executions, CPU, duration,
+  reads, plan count) for one `query_id` or the whole workload, plus a per-plan
+  breakdown for one query.
+- `get_query_store_regressions` compares a recent window with the baseline
+  window right before it, ranks queries by weighted extra cost, and flags new
+  plans. Missing baseline history is `unavailable`, never a clean result.
+- `get_top_queries` accepts `as_of_utc`. To study a past incident, keep the
+  window length and move `as_of_utc` instead of widening the window.
+
+## Plan analysis
+
+`analyze_query_plan` analyses a Query Store plan (`plan_id`), the most
+expensive stored plan of a `query_id`, or raw showplan XML. About twenty rules
+cover predicates (non-SARGable predicates, implicit conversions, NOT IN on a
+nullable column), indexes (key and RID lookups, scans with seekable filters,
+missing-index hint quality, eager index spools), joins, memory, cardinality,
+UDFs, parallelism, and compilation; actual plans add spills, estimate gaps,
+thread skew, and grant waits. Each finding has a severity, plan node, evidence,
+estimated cost share, pattern family, and fix direction. `explain_query`
+attaches the top findings as `plan_findings`. Findings are leads to measure.
 
 ## Iterative optimizer workflow
 
@@ -466,6 +526,7 @@ Keep credentials in the operating-system credential store, managed identity, or 
 | `AZURE_SQL_TRUST_SERVER_CERTIFICATE` | `false` | Keep false for Azure SQL Database |
 | `AZURE_SQL_LOG_LEVEL` | `INFO` | Logging level |
 | `AZURE_SQL_LOG_FORMAT` | `text` | `text` or `json` |
+| `AZURE_SQL_SCHEMA_PROFILE` | `portable` | `portable` serves strict-client tool schemas (inlined references, collapsed nullable unions, defaults in descriptions); `full` serves raw Pydantic schemas |
 
 Equivalent `--azure-sql-*` flags are available in `uv run azure-sql-mcp --help`.
 
@@ -493,16 +554,15 @@ Resources include schema views and token-safe plan artifacts under `azuresql-art
 ## Evidence-governed learning
 
 Local stdio servers expose advisory learning tools for `sql-health-triage@1.0.1`,
-`sql-optimizer@2.3.1`, `sql-plan-enforcer@1.0.1`, and
-`sql-index-manager@1.0.1`. They persist redacted
+`sql-optimizer@2.4.0`, `sql-plan-enforcer@1.0.1`, and
+`sql-index-manager@2.0.0`. They persist redacted
 `DecisionRecordV1`, `OutcomeReviewV1`, `LessonV1`, and `HandoffV1` contracts in
 the existing owner-only `performance.sqlite3`. Remote transports do not expose
 these tools, and an unavailable learning store leaves the normal static and
 database-operation surfaces unchanged.
 
 The `index-review` profile narrows that local surface to `recall_lessons`
-only. V1 does not expose decision, lesson, or handoff writes to the index
-manager workflow.
+only. The index manager does not get decision, lesson, or handoff writes.
 
 Lessons never authorize database changes or modify a skill. Normal lessons need
 three aligned terminal reviews across at least two sessions and two subject
@@ -522,22 +582,59 @@ source-pack provenance and require fresh local approval. Learning contracts and
 packs reject raw SQL, parameters, result rows, credentials, environment values,
 and hidden reasoning.
 
-`sql-index-manager@1.0.1` is recall-only in V1. Index review, run, snapshot,
-and artifact identifiers are portfolio selectors, not valid
-`consumed_evidence_refs`; review responses deliberately return
-`evidence_id=null`. Clients must not invent an `evidence-*` identifier,
-terminal link, decision, handoff, or outcome review. A later recheck or explicit
-human resolution is necessary evidence for a future learning outcome, but is
-not sufficient until an MCP-owned evidence and terminal-link bridge exists.
+`sql-index-manager@2.0.0` is recall-only. Recommendation, review, run,
+snapshot, and artifact identifiers are tracking selectors, not valid
+`consumed_evidence_refs`; index responses return no evidence id. Clients must
+not invent an `evidence-*` identifier, terminal link, decision, handoff, or
+outcome review until an MCP-owned index evidence and terminal-link bridge
+exists.
 
-## Index portfolio review
+## Workload index review
+
+`review_workload_indexes` is the index design tool. It is read-only and needs
+only `VIEW DATABASE STATE` and `VIEW DEFINITION`: no policy file, history
+tables, or install step.
+
+1. It reads Query Store runtime totals for a window (`lookback_days`, optional
+   `as_of_utc`, `objective` of `cpu`, `duration`, `logical_reads`, or
+   `executions`) and the stored plan of each top query.
+2. It extracts how each query reaches each table: index and operation (seek,
+   scan, key or RID lookup), seek keys, residual filters (equality, range, or
+   non-SARGable), output columns, sort and group-by needs, and join keys, and
+   attributes each query's measured cost to operators by their estimated cost
+   share.
+3. It designs candidates from those access patterns: equality keys ordered by
+   query popularity and then selectivity from statistics histograms, one range
+   key that also satisfies sort order where possible, includes for residual and
+   output columns, and one covering design for a seek plus the lookup it needs.
+4. It merges candidates on key prefixes and reconciles them with existing
+   indexes: already covered (flagged for plan investigation), extend with
+   includes, widen in place, or create. It never proposes a duplicate.
+5. It reviews existing indexes: exact duplicates, left-prefix redundancy,
+   unused indexes (gated by usage-counter age, Query Store plan references,
+   and capture mode), heaps with RID lookups or forwarded records, disabled
+   indexes, and unindexed foreign keys. Indexes that enforce uniqueness, back a
+   constraint or foreign key, or support partition switching are never removal
+   candidates.
+
+Each recommendation carries supporting query ids and their workload share, an
+upper-bound benefit estimate, write penalty, confidence, reason codes,
+blockers, inert DDL (`DROP_EXISTING` with preserved options and compression for
+changes to existing indexes) with exact rollback, and a validation path.
+Non-SARGable predicates and implicit conversions are reported separately for
+`sql-optimizer`. Prove candidates with `benchmark_index_candidate` on a
+non-production copy before change control.
+
+## Optional index portfolio history
 
 This contract is staged but inactive. Source availability does not mean the
 database contract has been installed, policy has been enabled, the MCP host has
 been restarted, or a non-production smoke test has passed.
 
-Current-user Entra permission handling requires package `2.3.1` or newer. The
-additive public contract remains version `2.3.0` and exposes only:
+Current-user Entra permission handling requires package `2.3.1` or newer, and
+the portfolio tools need a database policy entry with `allow_read=true`. The
+history-table contract stays at version `2.3.0` (the installed tables check
+it); the portfolio surface is:
 
 - `capture_index_review_snapshot(database_name, idempotency_key?)`
 - `review_index_portfolio(database_name, as_of_run_id?, prior_review_id?)`
@@ -546,8 +643,9 @@ additive public contract remains version `2.3.0` and exposes only:
 Capture writes only to the manually installed `dbatools.IndexReviewRun` and
 `dbatools.IndexReviewSnapshot` tables. It uses a UTC-day idempotency key by
 default, stores only its hash, and rejects a conflicting request. The
-`index-review` profile has six base tools plus `recall_lessons` locally;
-remote transports expose the six base tools only. Capabilities advertise
+`index-review` profile exposes these three portfolio tools together with the
+workload index tools listed under named profiles, plus `recall_lessons`
+locally. Capabilities advertise
 `index_learning_mode=recall_only`.
 
 Install the approved two-table contract separately with
@@ -662,6 +760,19 @@ Stop further index tests. Restart the approved sandbox profile to retry expired-
 ### Plan apply is blocked
 
 Check the prepared intent, current prior-state match, ownership, `enforcer-apply` profile, local stdio transport, unrestricted access, write policy, database policy, authorization reference, and kill switch. Do not fall back to a direct force or hint tool.
+
+### A tool returns `precondition`
+
+Read `result_status_reason` and show `remediation` to a DBA. Common cases:
+Query Store is off or READ_ONLY (index review, trends, regressions), no
+database-scoped Extended Events session captures deadlocks, or a long resource
+window needs `master` in `AZURE_SQL_ALLOWED_DATABASES`.
+
+### Index review returns no recommendations
+
+Check `workload.analyzed_share_pct`, `gaps`, and `query_store.query_capture_mode`.
+Raise `top_queries`, lengthen `lookback_days`, or lower `min_table_rows` for small
+tables. An empty result with complete coverage is a true negative for that window.
 
 ### A diagnostic is partial
 

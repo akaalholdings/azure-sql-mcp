@@ -602,7 +602,7 @@ async def test_runtime_status_is_db_free_stable_and_sanitized(
 
     assert first == second
     assert first["startup_timestamp"] == app._startup_timestamp
-    assert first["package_version"] == "2.3.1"
+    assert first["package_version"] == "2.4.0"
     assert first["profile"] is None
     assert first["transport"] == "stdio"
     assert first["tool_groups"] == ["all"]
@@ -2588,7 +2588,7 @@ async def test_capability_check_publishes_tuning_contract(
     result = await app._check_database_capabilities("appdb")
 
     assert result["mcp_contract"] == {
-        "contract_version": "2.3.0",
+        "contract_version": "2.4.0",
         "performance_tuning": 1,
         "durable_view_change": 1,
         "prepared_plan_action": 1,

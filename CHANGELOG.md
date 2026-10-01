@@ -6,6 +6,55 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-10-01
+
+### Added
+
+- `review_workload_indexes`: workload-driven index design from Query Store
+  runtime history and stored plans. It extracts per-table access patterns,
+  designs keys and includes, reconciles candidates with existing indexes
+  (covered, extend, widen, create), reviews existing indexes (duplicates,
+  left-prefix redundancy, unused with counter-age and Query Store reference
+  gates, heaps, disabled, unindexed foreign keys), and returns inert DDL with
+  exact rollback, confidence, and a validation path. No install step.
+- `result_status` (`ok`, `empty`, `unavailable`, `not_supported`,
+  `precondition`) and, where relevant, `remediation` on every tool result.
+- `analyze_query_plan` and `plan_findings` on `explain_query`: about twenty
+  rule-based anti-pattern checks over estimated and actual plans.
+- `get_query_store_trend`, `get_query_store_regressions`, and `as_of_utc` on
+  `get_top_queries`.
+- `sample_seconds` interval mode for `get_wait_stats`; 14-day hourly resource
+  history from `sys.resource_stats` when `master` is allowlisted.
+- Azure SQL Database server instructions in the MCP initialize response.
+- Portable tool input schemas for strict function-calling clients
+  (`AZURE_SQL_SCHEMA_PROFILE`, default `portable`).
+- `scripts/azure_live_acceptance.py` for an end-to-end run on a disposable
+  database.
+
+### Fixed
+
+- `get_deadlock_history` queried a server-scoped `system_health` session that
+  Azure SQL Database does not have, used an XPath that skipped the ring-buffer
+  root, and reported zero deadlocks on any failure. It now reads
+  database-scoped XE ring buffers and master deadlock telemetry and returns
+  `precondition` with capture DDL when nothing can capture deadlocks.
+- Reverse index DDL rejected the real `ROWS_FILEGROUP` data space type, so
+  drop and rollback DDL was withheld for every non-partitioned index on a live
+  database.
+- `get_resource_limits` read resource governance without a database filter and
+  could report a sibling database in an elastic pool.
+
+### Changed
+
+- Package and public MCP contract `2.4.0`; the index history-table contract
+  stays `2.3.0`.
+- Learning recall is pinned to `sql-index-manager@2.0.0` and
+  `sql-optimizer@2.4.0`.
+- The `index-review` profile adds `review_workload_indexes`,
+  `get_query_store_trend`, `get_top_queries`, and `check_statistics_health`.
+
+## [2.3.1]
+
 ### Added
 
 - Staged the `2.3.0` recommend-only index portfolio contract with deterministic
