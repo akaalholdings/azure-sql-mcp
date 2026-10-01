@@ -2158,8 +2158,12 @@ class AzureSqlMcpApplication:
 
         @self.mcp.tool(
             description=(
-                "Get recent deadlock history from system_health extended events session. "
-                "Parses deadlock XML to show victim, participants, resources, and SQL text."
+                "Get recent deadlocks for an Azure SQL database from database-scoped "
+                "Extended Events ring buffers (database_xml_deadlock_report) and, when "
+                "master is allowlisted, Azure's file-backed deadlock telemetry. Returns "
+                "victims, participants, lock resources, objects, and SQL text. When no "
+                "source can capture deadlocks, result_status is precondition and "
+                "remediation holds the capture-session DDL; it never reports a false zero."
             ),
             annotations=ToolAnnotations(
                 title="Get Deadlock History",
@@ -2171,7 +2175,14 @@ class AzureSqlMcpApplication:
         )
         async def get_deadlock_history(
             max_events: int = Field(
-                default=10, description="Maximum number of deadlock events to return."
+                default=10,
+                ge=1,
+                le=200,
+                description="Maximum number of deadlock events to return, newest first.",
+            ),
+            include_graph_xml: bool = Field(
+                default=False,
+                description="Also return each raw deadlock graph XML (bounded).",
             ),
             database_name: str | None = Field(
                 default=None,
@@ -2181,7 +2192,12 @@ class AzureSqlMcpApplication:
             return await self._run_tool(
                 "get_deadlock_history",
                 database_name,
-                lambda db: self.lock_diagnostics.get_deadlock_history(db, max_events),
+                lambda db: self.lock_diagnostics.get_deadlock_history(
+                    db,
+                    max_events,
+                    master_available=self._master_allowlisted(),
+                    include_graph_xml=include_graph_xml,
+                ),
             )
 
         # --- Phase 11: Tempdb & Memory Grant Diagnostics ---
@@ -8552,6 +8568,9 @@ class AzureSqlMcpApplication:
             payload["rows"] = rows[: self.config.row_limit]
             payload["row_count"] = len(payload["rows"])
         return payload
+
+    def _master_allowlisted(self) -> bool:
+        return any(name.casefold() == "master" for name in self.config.allowed_databases)
 
     def _format_response(self, payload: Any) -> ResponseType:
         if isinstance(payload, dict):

@@ -111,6 +111,8 @@ async def test_get_deadlock_history():
     result = await service.get_deadlock_history("testdb", max_events=5)
     assert result["deadlock_count"] == 0
     assert result["deadlocks"] == []
+    # No capture session exists, so zero deadlocks is not a clean bill of health.
+    assert result["result_status"] == "precondition"
 
 
 @pytest.mark.asyncio

@@ -113,7 +113,11 @@ async def test_every_argument_free_tool_reports_a_valid_status(
     empty_reads = {name for name in checked if name in PRIMARY_ROW_KEYS}
     assert empty_reads, "expected at least one row tool to be exercised"
     for name in empty_reads:
-        assert checked[name] == "empty", name
+        # No rows is never "ok": it is a true negative, or an explicit
+        # precondition/unavailable/not_supported status from the service.
+        assert checked[name] != "ok", name
+    assert checked["get_wait_stats"] == "empty"
+    assert checked["get_deadlock_history"] == "precondition"
     assert checked["check_runtime_status"] == "ok"
 
 
