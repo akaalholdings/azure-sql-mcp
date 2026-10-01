@@ -2473,8 +2473,11 @@ class AzureSqlMcpApplication:
 
         @self.mcp.tool(
             description=(
-                "Get resource utilization history (15-sec granularity) from sys.dm_db_resource_stats. "
-                "Shows CPU, data I/O, log write, memory trends with sustained pressure warnings."
+                "Get resource utilization history against the database's limits: CPU, data "
+                "I/O, log write, memory, and workers. Windows up to 60 minutes use "
+                "sys.dm_db_resource_stats (15-second samples); longer windows, up to 14 days, "
+                "use sys.resource_stats from master as hourly average and maximum buckets. "
+                "Includes sustained-pressure warnings."
             ),
             annotations=ToolAnnotations(
                 title="Get Resource Stats History",
@@ -2486,7 +2489,17 @@ class AzureSqlMcpApplication:
         )
         async def get_resource_stats_history(
             window_minutes: int = Field(
-                default=60, description="How far back to look, in minutes."
+                default=60,
+                ge=1,
+                le=20160,
+                description="How far back to look, in minutes (up to 14 days).",
+            ),
+            source: Literal["auto", "recent", "long_term"] = Field(
+                default="auto",
+                description=(
+                    "auto: recent for 60 minutes or less, long_term beyond. long_term "
+                    "needs master in the database allowlist."
+                ),
             ),
             database_name: str | None = Field(
                 default=None,
@@ -2496,7 +2509,12 @@ class AzureSqlMcpApplication:
             return await self._run_tool(
                 "get_resource_stats_history",
                 database_name,
-                lambda db: self.resource_governance.get_resource_stats_history(db, window_minutes),
+                lambda db: self.resource_governance.get_resource_stats_history(
+                    db,
+                    window_minutes,
+                    source=source,
+                    master_available=self._master_allowlisted(),
+                ),
             )
 
         # --- Phase 22: Azure SQL Diagnostic Query Parity ---
@@ -4893,6 +4911,7 @@ class AzureSqlMcpApplication:
             "resource_history": lambda: self.resource_governance.get_resource_stats_history(
                 database_name,
                 window_minutes,
+                master_available=self._master_allowlisted(),
             ),
             "query_store_status": lambda: self.query_store.get_status(database_name),
             "query_store_history": lambda effective_query_id=None: self._collect_query_store_evidence(

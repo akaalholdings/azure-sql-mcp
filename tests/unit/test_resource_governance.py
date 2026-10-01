@@ -96,3 +96,94 @@ async def test_get_resource_stats_history_no_warnings():
     service = ResourceGovernanceService(FakeExecutor([rows]))
     result = await service.get_resource_stats_history("testdb")
     assert result["warnings"] == []
+
+
+class RecordingExecutor:
+    def __init__(self, responses: dict[str, object] | None = None) -> None:
+        self.responses = responses or {}
+        self.calls: list[tuple[str, str, list | None]] = []
+
+    async def fetch_all(self, database_name, query, params=None, **kwargs):
+        self.calls.append((database_name, query, list(params) if params is not None else None))
+        for marker, result in self.responses.items():
+            if marker in query:
+                if isinstance(result, Exception):
+                    raise result
+                return result
+        return []
+
+
+@pytest.mark.asyncio
+async def test_governance_limits_are_scoped_to_the_current_database():
+    executor = RecordingExecutor({"dm_user_db_resource_governance": [{"database_id": 5, "slo_name": "GP_S_Gen5_2"}]})
+
+    result = await ResourceGovernanceService(executor).get_resource_limits("appdb")
+
+    governance_query = next(q for _, q, _ in executor.calls if "dm_user_db_resource_governance" in q)
+    # In an elastic pool the view lists every pool database.
+    assert "WHERE database_id = DB_ID()" in governance_query
+    assert result["governance_limits"]["slo_name"] == "GP_S_Gen5_2"
+
+
+@pytest.mark.asyncio
+async def test_unreadable_service_objective_is_a_warning_not_silence():
+    executor = RecordingExecutor(
+        {
+            "dm_user_db_resource_governance": [{"database_id": 5}],
+            "database_service_objectives": PermissionError("denied"),
+        }
+    )
+
+    result = await ResourceGovernanceService(executor).get_resource_limits("appdb")
+
+    assert [w["type"] for w in result["warnings"]] == ["service_objective_unavailable"]
+
+
+@pytest.mark.asyncio
+async def test_short_windows_read_recent_samples_from_the_database():
+    executor = RecordingExecutor({"dm_db_resource_stats": [{"avg_cpu_percent": 12.5}]})
+
+    result = await ResourceGovernanceService(executor).get_resource_stats_history("appdb", 45)
+
+    assert result["source"] == "recent"
+    assert result["granularity"] == "15_second_samples"
+    assert executor.calls[0][0] == "appdb"
+    assert "result_status" not in result
+
+
+@pytest.mark.asyncio
+async def test_long_windows_read_hourly_buckets_from_master():
+    executor = RecordingExecutor({"sys.resource_stats": [{"hour_start_utc": "2026-09-30T10:00:00", "avg_cpu_percent": 40.0, "max_worker_percent": 12.0}]})
+
+    result = await ResourceGovernanceService(executor).get_resource_stats_history(
+        "appdb", 7 * 24 * 60, master_available=True
+    )
+
+    database, query, params = executor.calls[0]
+    assert database == "master"
+    assert "GROUP BY DATEADD(HOUR" in query
+    assert params == ["appdb", 10080]
+    assert result["source"] == "long_term"
+    assert result["summary"]["max_worker_percent"]["max"] == 12.0
+
+
+@pytest.mark.asyncio
+async def test_long_window_without_master_is_a_precondition_with_recent_data():
+    executor = RecordingExecutor({"dm_db_resource_stats": [{"avg_cpu_percent": 5.0}]})
+
+    result = await ResourceGovernanceService(executor).get_resource_stats_history("appdb", 1440)
+
+    assert result["result_status"] == "precondition"
+    assert "master" in result["remediation"]
+    assert result["source"] == "recent"
+    assert all(database == "appdb" for database, _, _ in executor.calls)
+
+
+@pytest.mark.asyncio
+async def test_resource_history_rejects_unknown_sources_and_clamps_windows():
+    service = ResourceGovernanceService(RecordingExecutor())
+    with pytest.raises(ValueError):
+        await service.get_resource_stats_history("appdb", 60, source="weekly")
+
+    result = await service.get_resource_stats_history("appdb", 10**9, master_available=True)
+    assert result["window_minutes"] == 20160
