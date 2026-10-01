@@ -9,7 +9,7 @@ The supported tuning path is evidence-first but rewrite-active: a missing plan l
 - Read-only SQL execution, metadata, plans, Query Store, waits, blocking, resource, statistics, and parameter-sensitivity evidence.
 - A `result_status` on every tool result (`ok`, `empty`, `unavailable`, `not_supported`, `precondition`) so an agent can tell a true negative from a read that failed or a setup step that is missing; `precondition` carries the exact `remediation` statement.
 - Workload-driven index design (`review_workload_indexes`): Query Store runtime history and stored plans, per-table access patterns, existing-index reconciliation, and inert DDL with exact rollback. No install step.
-- Rule-based plan analysis (`analyze_query_plan`, and `plan_findings` on `explain_query`) for estimated and actual plans.
+- Plan reading (`analyze_query_plan`, and `plan_digest` with `plan_findings` on `explain_query`): self-time ranking, per-execution estimate checks, a node drill-down, and Azure plan sources (Query Store, last actual plan, live in-flight plan).
 - Query Store over time: trends, regressions against a baseline window, and past windows through `as_of_utc`.
 - One-call database triage (`diagnose_database`) and ADR version store health (`get_version_store_stats`).
 - Azure SQL Database server instructions sent at MCP initialization.
@@ -300,15 +300,40 @@ such as `warnings`. Services set the other values explicitly.
 
 ## Plan analysis
 
-`analyze_query_plan` analyses a Query Store plan (`plan_id`), the most
-expensive stored plan of a `query_id`, or raw showplan XML. About twenty rules
-cover predicates (non-SARGable predicates, implicit conversions, NOT IN on a
-nullable column), indexes (key and RID lookups, scans with seekable filters,
-missing-index hint quality, eager index spools), joins, memory, cardinality,
-UDFs, parallelism, and compilation; actual plans add spills, estimate gaps,
-thread skew, and grant waits. Each finding has a severity, plan node, evidence,
-estimated cost share, pattern family, and fix direction. `explain_query`
-attaches the top findings as `plan_findings`. Findings are leads to measure.
+`analyze_query_plan` reads one plan from one of these sources:
+
+| Source | Argument | What it can show |
+| --- | --- | --- |
+| Query Store | `plan_id`, or `query_id` (its most expensive plan) | Estimated plan, plus measured runtime and wait categories for that plan |
+| Plan cache, last run | `plan_id` or `query_id` with `last_actual=true` | Actual row counts of the last execution (`sys.dm_exec_query_plan_stats`; needs `LAST_QUERY_PLAN_STATS = ON`, else `precondition`) |
+| Running request | `session_id` | The in-flight plan with partial counts (`sys.dm_exec_query_statistics_xml`) |
+| Supplied XML | `plan_xml` | Whatever the plan holds |
+
+The result has two parts:
+
+- `digest`: the plan kind and what it can show, statement time and scalar UDF
+  share, warnings by node, memory grant use, parameter and local-variable tells,
+  top operators by self time (estimated self cost on estimated plans),
+  per-execution estimate errors with fixed-guess fingerprints, repeated table
+  access, thread skew, plan waits, eager index spools (the index the optimizer
+  wanted), missing-index hints labelled as hints, predicates on cited nodes, and
+  an operator tree capped at 80 nodes. Plan text is flattened and labelled as
+  untrusted data.
+- `findings`: about twenty-five rules over predicates, indexes, joins, memory,
+  cardinality, UDFs, parallelism, and compilation. On actual plans with operator
+  times they rank by their operator's share of elapsed time; otherwise by its
+  share of estimated cost. Estimates are compared per execution, and a
+  NoJoinPredicate warning is graded from the join's inputs.
+
+`node_id` returns one operator in full, with per-thread counters. `explain_query`
+attaches a compact `plan_digest` and the top `plan_findings`. Findings are leads
+to measure.
+
+Self time follows the rules in Erik Darling's
+[`sqlserver-query-plans`](https://github.com/erikdarlingdata/claude-plugins)
+plugin: row mode reports cumulative time, batch mode reports each operator on
+its own, exchanges and the coordinator thread are excluded, and parallel
+operators are subtracted per thread. See [NOTICE](NOTICE).
 
 ## Iterative optimizer workflow
 

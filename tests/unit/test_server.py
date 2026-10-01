@@ -605,7 +605,7 @@ async def test_runtime_status_is_db_free_stable_and_sanitized(
 
     assert first == second
     assert first["startup_timestamp"] == app._startup_timestamp
-    assert first["package_version"] == "2.4.0"
+    assert first["package_version"] == "2.5.0"
     assert first["profile"] is None
     assert first["transport"] == "stdio"
     assert first["tool_groups"] == ["all"]
@@ -694,7 +694,7 @@ async def test_successful_operation_links_terminal_outcome_and_learning_failure_
     decision = app.learning_service.record_decision(
         DecisionRecordV1(
             skill="sql-optimizer",
-            skill_version="2.4.0",
+            skill_version="2.5.0",
             case_id="case-1",
             learning_key="health-check",
             consumed_evidence_refs=(evidence.evidence_id,),
@@ -2591,7 +2591,7 @@ async def test_capability_check_publishes_tuning_contract(
     result = await app._check_database_capabilities("appdb")
 
     assert result["mcp_contract"] == {
-        "contract_version": "2.4.0",
+        "contract_version": "2.5.0",
         "performance_tuning": 1,
         "durable_view_change": 1,
         "prepared_plan_action": 1,
@@ -2603,6 +2603,7 @@ async def test_capability_check_publishes_tuning_contract(
         "index_review_snapshot_reuse_hours": 48,
         "workload_index_advisor": 1,
         "result_status": 1,
+        "plan_digest": 1,
     }
     assert result["local_tuning_policy"] == {
         "configured": False,

@@ -189,7 +189,7 @@ _INDEX_OWNER_PROOF = re.compile(r"^[A-Za-z0-9_.:-]{16,200}$")
 _IDEMPOTENCY_DIGEST_PATTERN = re.compile(r"^idempotency-v1:[0-9a-f]{64}$")
 _LEARNING_SKILL_VERSIONS = {
     "sql-health-triage": "1.0.1",
-    "sql-optimizer": "2.4.0",
+    "sql-optimizer": "2.5.0",
     "sql-plan-enforcer": "1.0.1",
     "sql-index-manager": "2.0.0",
 }
@@ -5083,7 +5083,7 @@ class AzureSqlMcpApplication:
             **checks,
             "azure_sql_database": platform,
             "mcp_contract": {
-                "contract_version": "2.4.0",
+                "contract_version": "2.5.0",
                 "performance_tuning": 1,
                 "durable_view_change": 1,
                 "prepared_plan_action": 1,
@@ -5095,6 +5095,7 @@ class AzureSqlMcpApplication:
                 "index_review_snapshot_reuse_hours": 48,
                 "workload_index_advisor": 1,
                 "result_status": 1,
+                "plan_digest": 1,
             },
             "local_tuning_policy": {
                 "configured": policy.configured,
