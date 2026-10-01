@@ -252,6 +252,7 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
         "analyze_workload_indexes",
         "analyze_index_recommendations",
         "optimize_indexes",
+        "review_workload_indexes",
         # Phase 9: Wait Statistics
         "get_wait_stats",
         "get_query_wait_stats",
@@ -432,6 +433,9 @@ def test_index_review_tool_list_is_recall_only(
         "capture_index_review_snapshot",
         "review_index_portfolio",
         "get_index_review",
+        "review_workload_indexes",
+        "check_statistics_health",
+        "get_top_queries",
         "recall_lessons",
     }
     assert tools["recall_lessons"].annotations.readOnlyHint is True
@@ -2590,6 +2594,8 @@ async def test_capability_check_publishes_tuning_contract(
         "index_history_schema_fingerprint": CONTRACT_SCHEMA_FINGERPRINT,
         "index_review_min_observation_days": 90,
         "index_review_snapshot_reuse_hours": 48,
+        "workload_index_advisor": 1,
+        "result_status": 1,
     }
     assert result["local_tuning_policy"] == {
         "configured": False,
@@ -2675,3 +2681,59 @@ def test_index_manager_learning_registry_requires_skill_version_1_0_1() -> None:
         AzureSqlMcpApplication._validate_learning_skill_version(
             "sql-index-manager", "1.0.0"
         )
+
+
+@pytest.mark.asyncio
+async def test_review_workload_indexes_forwards_arguments_and_is_read_only(
+    app: AzureSqlMcpApplication,
+) -> None:
+    app.workload_index_advisor.review = AsyncMock(  # type: ignore[method-assign]
+        return_value={"recommendations": [], "result_status": "empty"}
+    )
+    tool = app.mcp._tool_manager._tools["review_workload_indexes"]
+
+    payload = await app.mcp._tool_manager.call_tool(
+        "review_workload_indexes",
+        {
+            "database_name": "appdb",
+            "schema_name": "Sales",
+            "table_names": ["Orders"],
+            "lookback_days": 14,
+            "as_of_utc": "2026-09-30T00:00:00Z",
+            "objective": "logical_reads",
+            "top_queries": 50,
+            "plans_per_query": 2,
+            "min_table_rows": 0,
+            "max_recommendations_per_table": 3,
+            "include_existing_index_review": False,
+        },
+    )
+
+    assert tool.annotations.readOnlyHint is True
+    assert tool.annotations.destructiveHint is False
+    assert payload["result_status"] == "empty"
+    app.workload_index_advisor.review.assert_awaited_once_with(
+        "appdb",
+        schema_name="Sales",
+        table_names=["Orders"],
+        lookback_days=14,
+        as_of_utc="2026-09-30T00:00:00Z",
+        objective="logical_reads",
+        top_queries=50,
+        plans_per_query=2,
+        min_table_rows=0,
+        max_recommendations_per_table=3,
+        include_existing_index_review=False,
+    )
+
+
+def test_review_workload_indexes_needs_no_policy_file_and_gets_a_longer_timeout(
+    app: AzureSqlMcpApplication,
+) -> None:
+    from azure_sql_mcp.server import _CATALOG_READ_TOOLS
+
+    # Works with only the database allowlist: no policy file, no history tables.
+    assert "review_workload_indexes" not in _CATALOG_READ_TOOLS
+    assert app._timeout_for_tool("review_workload_indexes") >= (
+        app.config.query_timeout_seconds * 8
+    )

@@ -96,6 +96,7 @@ TOOL_GROUPS: dict[str, ToolGroup] = {
     "capture_index_review_snapshot": ToolGroup.CORE,
     "review_index_portfolio": ToolGroup.CORE,
     "get_index_review": ToolGroup.CORE,
+    "review_workload_indexes": ToolGroup.CORE,
     **{tool_name: ToolGroup.CORE for tool_name in LEARNING_TOOL_NAMES},
     # performance: deep diagnostics & tuning
     "analyze_query_indexes": ToolGroup.PERFORMANCE,
@@ -189,6 +190,7 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "get_plan_cache_analysis",
             "get_query_compilation_stats",
             "explain_query",
+            "review_workload_indexes",
         }
     )
     | frozenset(
@@ -219,6 +221,7 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "analyze_query_indexes",
             "analyze_workload_indexes",
             "analyze_index_recommendations",
+            "review_workload_indexes",
             "check_equivalence_preflight",
             "start_performance_case",
             "collect_performance_evidence",
@@ -258,6 +261,7 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "analyze_query_indexes",
             "analyze_workload_indexes",
             "analyze_index_recommendations",
+            "review_workload_indexes",
             "check_equivalence_preflight",
             "start_performance_case",
             "collect_performance_evidence",
@@ -344,6 +348,9 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "capture_index_review_snapshot",
             "review_index_portfolio",
             "get_index_review",
+            "review_workload_indexes",
+            "check_statistics_health",
+            "get_top_queries",
         }
     ) | INDEX_REVIEW_LEARNING_TOOL_NAMES,
 }

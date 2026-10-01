@@ -129,6 +129,7 @@ from .tuning_sessions import InvalidTransitionError
 from .tuning_sessions import TuningSessionStateMachine
 from .transport_auth import StaticBearerTokenVerifier
 from .wait_stats import WaitStatsService
+from .workload_index_advisor import WorkloadIndexAdvisor
 from .view_workflows import PreparedViewChange
 from .view_workflows import ViewChangeRequest
 from .view_workflows import ViewWorkflowService
@@ -405,6 +406,7 @@ class AzureSqlMcpApplication:
         self.sessions = SessionsService(executor)
         self.schema_compare = SchemaCompareService(executor)
         self.index_optimizer = IndexOptimizer(executor, validator)
+        self.workload_index_advisor = WorkloadIndexAdvisor(executor)
         self.wait_stats = WaitStatsService(executor)
         self.lock_diagnostics = LockDiagnosticsService(executor)
         self.tempdb_memory = TempdbMemoryService(executor)
@@ -2011,6 +2013,106 @@ class AzureSqlMcpApplication:
                 database_name,
                 lambda db: self.index_optimizer.optimize(
                     db, window_minutes, top_n, budget_mb, alpha, beta, min_improvement_pct,
+                ),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Review a database's indexes against its real workload. Reads Query Store "
+                "runtime totals and each query's stored plan for a window, finds the queries "
+                "that hit each table and how (seek, scan, lookup, residual filters, sort "
+                "needs), and combines that with existing index definitions, usage counters, "
+                "statistics selectivity, and write activity. Returns per-table "
+                "recommendations to create, extend (add includes), widen, consolidate, or "
+                "drop indexes, or cluster a heap, each with supporting query ids, confidence, "
+                "inert DDL with exact rollback, and a validation path; plus predicates no "
+                "index can fix (route to sql-optimizer). Recommend-only: it never executes "
+                "DDL. Needs only VIEW DATABASE STATE and VIEW DEFINITION; no install step."
+            ),
+            annotations=ToolAnnotations(
+                title="Review Workload Indexes",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
+        async def review_workload_indexes(
+            schema_name: str | None = Field(
+                default=None,
+                description="Limit the review to one schema (required with table_names).",
+            ),
+            table_names: list[str] | None = Field(
+                default=None,
+                description="Limit the review to these tables in schema_name.",
+            ),
+            lookback_days: int = Field(
+                default=7,
+                ge=1,
+                le=90,
+                description="Query Store window length in days. Cover a full business cycle where possible.",
+            ),
+            as_of_utc: str | None = Field(
+                default=None,
+                description=(
+                    "Optional ISO-8601 UTC end of the window, for example "
+                    "2026-09-30T05:00:00Z. Defaults to now; future instants are refused."
+                ),
+            ),
+            objective: Literal["cpu", "duration", "logical_reads", "executions"] = Field(
+                default="cpu",
+                description="Which Query Store measure ranks the workload and attributes cost.",
+            ),
+            top_queries: int = Field(
+                default=100,
+                ge=1,
+                le=500,
+                description="How many top queries by the objective to analyse.",
+            ),
+            plans_per_query: int = Field(
+                default=1,
+                ge=1,
+                le=3,
+                description="Stored plans to analyse per query, most expensive first.",
+            ),
+            min_table_rows: int = Field(
+                default=10_000,
+                ge=0,
+                description="Tables with fewer rows get no create/extend advice.",
+            ),
+            max_recommendations_per_table: int = Field(
+                default=5,
+                ge=1,
+                le=20,
+                description="Cap on actionable recommendations per table.",
+            ),
+            include_existing_index_review: bool = Field(
+                default=True,
+                description=(
+                    "Also review existing indexes: duplicates, left-prefix redundancy, "
+                    "unused indexes, heaps, and unindexed foreign keys."
+                ),
+            ),
+            database_name: str | None = Field(
+                default=None,
+                description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
+            ),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "review_workload_indexes",
+                database_name,
+                lambda db: self.workload_index_advisor.review(
+                    db,
+                    schema_name=schema_name,
+                    table_names=table_names,
+                    lookback_days=lookback_days,
+                    as_of_utc=as_of_utc,
+                    objective=objective,
+                    top_queries=top_queries,
+                    plans_per_query=plans_per_query,
+                    min_table_rows=min_table_rows,
+                    max_recommendations_per_table=max_recommendations_per_table,
+                    include_existing_index_review=include_existing_index_review,
                 ),
             )
 
@@ -4632,6 +4734,8 @@ class AzureSqlMcpApplication:
                 "index_history_schema_fingerprint": CONTRACT_SCHEMA_FINGERPRINT,
                 "index_review_min_observation_days": 90,
                 "index_review_snapshot_reuse_hours": 48,
+                "workload_index_advisor": 1,
+                "result_status": 1,
             },
             "local_tuning_policy": {
                 "configured": policy.configured,
@@ -7227,6 +7331,12 @@ class AzureSqlMcpApplication:
             return self._session_workflow_timeout(database_name)
         if tool_name in _EVIDENCE_WORKFLOW_TOOLS:
             return self._evidence_workflow_timeout()
+        if tool_name == "review_workload_indexes":
+            # About eight bounded catalog and Query Store reads run in sequence.
+            return max(
+                float(self.config.tool_timeout_seconds),
+                self.config.query_timeout_seconds * 8 + 60.0,
+            )
         return self.config.tool_timeout_seconds
 
     def _evidence_workflow_timeout(self) -> float:
