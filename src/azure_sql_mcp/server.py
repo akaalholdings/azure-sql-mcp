@@ -111,6 +111,7 @@ from .resource_governance import ResourceGovernanceService
 from .resources import register_resources
 from .result_status import apply_result_status
 from .safe_sql import SafeSqlValidator
+from .server_instructions import SERVER_INSTRUCTIONS
 from .schema_compare import SchemaCompareService
 from .sessions import SessionsService
 from .tempdb_memory import TempdbMemoryService
@@ -378,6 +379,7 @@ class AzureSqlMcpApplication:
         )
         self.mcp = FastMCP(
             "azure-sql-mcp",
+            instructions=SERVER_INSTRUCTIONS,
             token_verifier=token_verifier,
             auth=_auth_settings(config) if token_verifier else None,
         )
