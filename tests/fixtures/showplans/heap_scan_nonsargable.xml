@@ -1,0 +1,74 @@
+<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan" Version="1.564" Build="16.0.1121.4">
+  <BatchSequence>
+    <Batch>
+      <Statements>
+        <StmtSimple StatementText="SELECT e.EventID, e.Payload FROM dbo.EventLog AS e WHERE CONVERT(date, e.CreatedAt) = @Day AND e.AccountNumber = @Account" StatementId="1" StatementCompId="1" StatementType="SELECT" StatementSubTreeCost="4.5" StatementEstRows="3" QueryHash="0x1010101010101010" QueryPlanHash="0x2020202020202020">
+          <QueryPlan CachedPlanSize="24" CompileTime="1" CompileCPU="1" CompileMemory="256">
+            <Warnings>
+              <PlanAffectingConvert ConvertIssue="Seek Plan" Expression="CONVERT_IMPLICIT(nvarchar(20),[e].[AccountNumber],0)=[@Account]" />
+            </Warnings>
+            <RelOp NodeId="0" PhysicalOp="Table Scan" LogicalOp="Table Scan" EstimateRows="3" EstimateIO="4.2" EstimateCPU="0.3" AvgRowSize="512" EstimatedTotalSubtreeCost="4.5" TableCardinality="500000" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row">
+              <OutputList>
+                <ColumnReference Database="[appdb]" Schema="[dbo]" Table="[EventLog]" Alias="[e]" Column="EventID" />
+                <ColumnReference Database="[appdb]" Schema="[dbo]" Table="[EventLog]" Alias="[e]" Column="Payload" />
+              </OutputList>
+              <TableScan Ordered="0" ForcedIndex="0" ForceScan="0" NoExpandHint="0" Storage="RowStore">
+                <DefinedValues>
+                  <DefinedValue>
+                    <ColumnReference Database="[appdb]" Schema="[dbo]" Table="[EventLog]" Alias="[e]" Column="EventID" />
+                  </DefinedValue>
+                  <DefinedValue>
+                    <ColumnReference Database="[appdb]" Schema="[dbo]" Table="[EventLog]" Alias="[e]" Column="Payload" />
+                  </DefinedValue>
+                </DefinedValues>
+                <Object Database="[appdb]" Schema="[dbo]" Table="[EventLog]" Alias="[e]" IndexKind="Heap" Storage="RowStore" />
+                <Predicate>
+                  <ScalarOperator ScalarString="residual">
+                    <Logical Operation="AND">
+                      <ScalarOperator>
+                        <Compare CompareOp="EQ">
+                          <ScalarOperator>
+                            <Convert DataType="date" Style="0" Implicit="0">
+                              <ScalarOperator>
+                                <Identifier>
+                                  <ColumnReference Database="[appdb]" Schema="[dbo]" Table="[EventLog]" Alias="[e]" Column="CreatedAt" />
+                                </Identifier>
+                              </ScalarOperator>
+                            </Convert>
+                          </ScalarOperator>
+                          <ScalarOperator>
+                            <Identifier>
+                              <ColumnReference Column="@Day" />
+                            </Identifier>
+                          </ScalarOperator>
+                        </Compare>
+                      </ScalarOperator>
+                      <ScalarOperator>
+                        <Compare CompareOp="EQ">
+                          <ScalarOperator>
+                            <Convert DataType="nvarchar" Length="40" Style="0" Implicit="1">
+                              <ScalarOperator>
+                                <Identifier>
+                                  <ColumnReference Database="[appdb]" Schema="[dbo]" Table="[EventLog]" Alias="[e]" Column="AccountNumber" />
+                                </Identifier>
+                              </ScalarOperator>
+                            </Convert>
+                          </ScalarOperator>
+                          <ScalarOperator>
+                            <Identifier>
+                              <ColumnReference Column="@Account" />
+                            </Identifier>
+                          </ScalarOperator>
+                        </Compare>
+                      </ScalarOperator>
+                    </Logical>
+                  </ScalarOperator>
+                </Predicate>
+              </TableScan>
+            </RelOp>
+          </QueryPlan>
+        </StmtSimple>
+      </Statements>
+    </Batch>
+  </BatchSequence>
+</ShowPlanXML>

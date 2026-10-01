@@ -1,0 +1,89 @@
+<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan" Version="1.564" Build="16.0.1121.4">
+  <BatchSequence>
+    <Batch>
+      <Statements>
+        <StmtSimple StatementText="SELECT c.CustomerName, COUNT(*) AS OrderCount FROM Sales.Customers AS c JOIN Sales.Orders AS o ON o.CustomerID = c.CustomerID WHERE o.OrderDate &gt;= @FromDate GROUP BY c.CustomerName" StatementId="1" StatementCompId="1" StatementType="SELECT" StatementSubTreeCost="3.0" StatementEstRows="660" QueryHash="0x7070707070707070" QueryPlanHash="0x8080808080808080">
+          <QueryPlan CachedPlanSize="56" CompileTime="5" CompileCPU="5" CompileMemory="720">
+            <RelOp NodeId="0" PhysicalOp="Stream Aggregate" LogicalOp="Aggregate" EstimateRows="660" EstimateIO="0" EstimateCPU="0.01" AvgRowSize="60" EstimatedTotalSubtreeCost="3.0" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row">
+              <OutputList>
+                <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[Customers]" Alias="[c]" Column="CustomerName" />
+                <ColumnReference Column="Expr1002" />
+              </OutputList>
+              <StreamAggregate>
+                <DefinedValues>
+                  <DefinedValue>
+                    <ColumnReference Column="Expr1002" />
+                  </DefinedValue>
+                </DefinedValues>
+                <GroupBy>
+                  <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[Customers]" Alias="[c]" Column="CustomerName" />
+                </GroupBy>
+                <RelOp NodeId="1" PhysicalOp="Sort" LogicalOp="Sort" EstimateRows="40000" EstimateIO="0.01" EstimateCPU="0.6" AvgRowSize="58" EstimatedTotalSubtreeCost="2.99" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row">
+                  <OutputList>
+                    <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[Customers]" Alias="[c]" Column="CustomerName" />
+                  </OutputList>
+                  <Sort Distinct="0">
+                    <OrderBy>
+                      <OrderByColumn Ascending="1">
+                        <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[Customers]" Alias="[c]" Column="CustomerName" />
+                      </OrderByColumn>
+                    </OrderBy>
+                    <RelOp NodeId="2" PhysicalOp="Hash Match" LogicalOp="Inner Join" EstimateRows="40000" EstimateIO="0" EstimateCPU="0.4" AvgRowSize="58" EstimatedTotalSubtreeCost="2.38" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row">
+                      <OutputList>
+                        <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[Customers]" Alias="[c]" Column="CustomerName" />
+                      </OutputList>
+                      <Hash>
+                        <DefinedValues />
+                        <HashKeysBuild>
+                          <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[Customers]" Alias="[c]" Column="CustomerID" />
+                        </HashKeysBuild>
+                        <HashKeysProbe>
+                          <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[Orders]" Alias="[o]" Column="CustomerID" />
+                        </HashKeysProbe>
+                        <RelOp NodeId="3" PhysicalOp="Clustered Index Scan" LogicalOp="Clustered Index Scan" EstimateRows="663" EstimateIO="0.06" EstimateCPU="0.0009" AvgRowSize="60" EstimatedTotalSubtreeCost="0.0609" TableCardinality="663" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row">
+                          <OutputList>
+                            <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[Customers]" Alias="[c]" Column="CustomerID" />
+                            <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[Customers]" Alias="[c]" Column="CustomerName" />
+                          </OutputList>
+                          <IndexScan Ordered="0" ForcedIndex="0" ForceScan="0" NoExpandHint="0" Storage="RowStore">
+                            <DefinedValues />
+                            <Object Database="[appdb]" Schema="[Sales]" Table="[Customers]" Index="[PK_Sales_Customers]" Alias="[c]" IndexKind="Clustered" Storage="RowStore" />
+                          </IndexScan>
+                        </RelOp>
+                        <RelOp NodeId="4" PhysicalOp="Clustered Index Scan" LogicalOp="Clustered Index Scan" EstimateRows="40000" EstimateIO="1.8" EstimateCPU="0.12" AvgRowSize="11" EstimatedTotalSubtreeCost="1.92" TableCardinality="73595" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row">
+                          <OutputList>
+                            <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[Orders]" Alias="[o]" Column="CustomerID" />
+                          </OutputList>
+                          <IndexScan Ordered="0" ForcedIndex="0" ForceScan="0" NoExpandHint="0" Storage="RowStore">
+                            <DefinedValues />
+                            <Object Database="[appdb]" Schema="[Sales]" Table="[Orders]" Index="[PK_Sales_Orders]" Alias="[o]" IndexKind="Clustered" Storage="RowStore" />
+                            <Predicate>
+                              <ScalarOperator ScalarString="[o].[OrderDate]&gt;=[@FromDate]">
+                                <Compare CompareOp="GE">
+                                  <ScalarOperator>
+                                    <Identifier>
+                                      <ColumnReference Database="[appdb]" Schema="[Sales]" Table="[Orders]" Alias="[o]" Column="OrderDate" />
+                                    </Identifier>
+                                  </ScalarOperator>
+                                  <ScalarOperator>
+                                    <Identifier>
+                                      <ColumnReference Column="@FromDate" />
+                                    </Identifier>
+                                  </ScalarOperator>
+                                </Compare>
+                              </ScalarOperator>
+                            </Predicate>
+                          </IndexScan>
+                        </RelOp>
+                      </Hash>
+                    </RelOp>
+                  </Sort>
+                </RelOp>
+              </StreamAggregate>
+            </RelOp>
+          </QueryPlan>
+        </StmtSimple>
+      </Statements>
+    </Batch>
+  </BatchSequence>
+</ShowPlanXML>
