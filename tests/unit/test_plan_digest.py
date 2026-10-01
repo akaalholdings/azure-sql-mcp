@@ -161,6 +161,7 @@ def test_parameter_tells_and_local_variables(showplan) -> None:
         "@c": "compiled_only",
     }
     assert statement["local_variables"] == ["@local"]
+    assert "unknown when the plan compiled" in statement["local_variables_note"]
 
 
 def test_same_object_accessed_twice_is_reported_without_naming_a_cause(showplan) -> None:

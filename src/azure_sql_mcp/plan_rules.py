@@ -214,7 +214,7 @@ def _statement_findings(
         )
 
     _access_rules(accesses, add, impact)
-    _statement_warning_rules(statement, query_plan, nodes, add, actual)
+    _statement_warning_rules(statement, query_plan, add, actual)
     for node in nodes:
         _operator_rules(node, add, actual)
     if actual:
@@ -296,9 +296,7 @@ def _access_rules(accesses: list[Any], add, impact) -> None:
             )
 
 
-def _statement_warning_rules(
-    statement: ET.Element, query_plan: ET.Element, nodes: list[PlanNode], add, actual: bool
-) -> None:
+def _statement_warning_rules(statement: ET.Element, query_plan: ET.Element, add, actual: bool) -> None:
     for convert in query_plan.findall(f"{_Q}Warnings/{_Q}PlanAffectingConvert"):
         issue = clean_text(convert.get("ConvertIssue"), 60) or ""
         expression = clean_text(convert.get("Expression"), 300)
