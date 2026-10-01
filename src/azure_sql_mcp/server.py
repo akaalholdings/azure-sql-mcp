@@ -137,6 +137,7 @@ from .tool_contracts import TuningStrategy
 from .tuning_sessions import InvalidTransitionError
 from .tuning_sessions import TuningSessionStateMachine
 from .transport_auth import StaticBearerTokenVerifier
+from .version_store import VersionStoreService
 from .wait_stats import WaitStatsService
 from .workload_index_advisor import WorkloadIndexAdvisor
 from .view_workflows import PreparedViewChange
@@ -465,6 +466,7 @@ class AzureSqlMcpApplication:
         self.index_optimizer = IndexOptimizer(executor, validator)
         self.workload_index_advisor = WorkloadIndexAdvisor(executor)
         self.query_store_trends = QueryStoreTrendService(executor)
+        self.version_store = VersionStoreService(executor)
         self.wait_stats = WaitStatsService(executor)
         self.lock_diagnostics = LockDiagnosticsService(executor)
         self.tempdb_memory = TempdbMemoryService(executor)
@@ -2748,6 +2750,34 @@ class AzureSqlMcpApplication:
                     source=source,
                     master_available=self._master_allowlisted(),
                 ),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Get persistent version store (accelerated database recovery) health: PVS "
+                "size and share of used data space, cleaner times, aborted transactions "
+                "awaiting cleanup, and the oldest open and snapshot transactions that hold "
+                "cleanup back, with findings. ADR is always on in Azure SQL Database, so a "
+                "long open transaction can grow storage here."
+            ),
+            annotations=ToolAnnotations(
+                title="Get Version Store Stats",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
+        async def get_version_store_stats(
+            database_name: str | None = Field(
+                default=None,
+                description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
+            ),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "get_version_store_stats",
+                database_name,
+                self.version_store.get_version_store_stats,
             )
 
         # --- Phase 22: Azure SQL Diagnostic Query Parity ---

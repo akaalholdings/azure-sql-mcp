@@ -256,6 +256,7 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
         "get_query_store_trend",
         "get_query_store_regressions",
         "analyze_query_plan",
+        "get_version_store_stats",
         # Phase 9: Wait Statistics
         "get_wait_stats",
         "get_query_wait_stats",
