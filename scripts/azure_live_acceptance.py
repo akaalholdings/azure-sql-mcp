@@ -11,10 +11,13 @@ What it does, in order:
 3. Runs a parameterized workload: a seek plus key lookup, a scan with residual
    filters, a non-SARGable predicate on the heap, and an update.
 4. Calls the real MCP tools through the tool manager: review_workload_indexes,
-   get_deadlock_history, get_wait_stats; optionally provokes one deadlock
-   through a temporary database-scoped XE session.
-5. Checks the advisor's expected findings, prints a JSON summary, restores Query
-   Store settings, and drops every object it created.
+   analyze_query_plan (Query Store plan, then the last actual plan),
+   explain_query with an actual plan, get_deadlock_history, get_wait_stats;
+   optionally provokes one deadlock through a temporary database-scoped XE
+   session. LAST_QUERY_PLAN_STATS is turned on for the run.
+5. Checks the advisor's expected findings and the plan digests, prints a JSON
+   summary, restores the Query Store and LAST_QUERY_PLAN_STATS settings, and
+   drops every object it created.
 
 It writes to the database. It refuses to run without ``--database`` (which
 must be allowlisted) and ``--confirm-disposable-database``. Connection settings
@@ -140,6 +143,14 @@ WORKLOAD = (
     ),
 )
 UPDATE_SQL = f"UPDATE [{SCHEMA}].[Orders] SET Status = 2 WHERE OrderID = ?"
+EXPLAIN_SQL = (
+    f"SELECT o.OrderID, o.OrderDate, o.Comments FROM [{SCHEMA}].[Orders] AS o "
+    "WHERE o.CustomerID = 42 AND o.OrderDate >= '2026-01-01' AND o.Status = 1 ORDER BY o.OrderDate"
+)
+LAST_QUERY_PLAN_STATS_SQL = (
+    "SELECT CAST(value AS nvarchar(20)) AS value FROM sys.database_scoped_configurations "
+    "WHERE name = N'LAST_QUERY_PLAN_STATS'"
+)
 
 
 async def admin(app: AzureSqlMcpApplication, database: str, sql: str) -> None:
@@ -195,12 +206,84 @@ def check(results: list[dict[str, Any]], name: str, passed: bool, detail: str = 
     results.append({"check": name, "passed": bool(passed), "detail": detail})
 
 
+async def guarded_call(
+    results: list[dict[str, Any]], name: str, app: AzureSqlMcpApplication, tool: str, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Record a refused or failed call as a failed check and keep the run going to cleanup."""
+
+    try:
+        return await call(app, tool, arguments)
+    except Exception as exc:
+        check(results, name, False, f"{type(exc).__name__}: {exc}")
+        return {}
+
+
+async def plan_checks(
+    app: AzureSqlMcpApplication, database: str, results: list[dict[str, Any]], query_id: int | None
+) -> None:
+    if query_id is None:
+        check(results, "workload query found for plan reading", False, "no supporting query on an Orders recommendation")
+    else:
+        stored = await guarded_call(
+            results, "query store plan digest", app, "analyze_query_plan", {"database_name": database, "query_id": query_id}
+        )
+        if stored:
+            check(
+                results,
+                "query store plan digest",
+                stored.get("result_status") == "ok" and stored.get("digest", {}).get("plan_kind") == "estimated",
+                str(stored.get("result_status")),
+            )
+            runtime = stored.get("query_store_runtime") or {}
+            check(
+                results,
+                "query store runtime attached",
+                (runtime.get("executions") or 0) >= 1,
+                json.dumps({key: runtime.get(key) for key in ("executions", "avg_rowcount", "rows_estimate_check")}),
+            )
+        last = await guarded_call(
+            results,
+            "last actual plan read",
+            app,
+            "analyze_query_plan",
+            {"database_name": database, "query_id": query_id, "last_actual": True},
+        )
+        if last:
+            check(
+                results,
+                "last actual plan read",
+                last.get("result_status") == "ok" and last.get("plan_kind") == "actual",
+                f"{last.get('result_status')}: {last.get('result_status_reason')}",
+            )
+    explained = await guarded_call(
+        results, "actual plan ranked by self time", app, "explain_query", {"database_name": database, "sql": EXPLAIN_SQL, "analyze": True}
+    )
+    if explained:
+        digest = explained.get("plan_digest") or {}
+        statement = (digest.get("statements") or [{}])[0]
+        tops = statement.get("top_operators") or []
+        elapsed = (statement.get("time") or {}).get("elapsed_ms")
+        check(
+            results,
+            "actual plan ranked by self time",
+            digest.get("ranking_basis") == "self_elapsed_ms" and bool(tops),
+            json.dumps([(item.get("node_id"), item.get("operator"), item.get("self_elapsed_ms")) for item in tops[:3]]),
+        )
+        check(
+            results,
+            "self time never exceeds the statement",
+            elapsed is None or all((item.get("self_elapsed_ms") or 0) <= elapsed + 1 for item in tops),
+            f"statement elapsed_ms={elapsed}",
+        )
+
+
 async def run(args: argparse.Namespace) -> int:
     config = load_server_config([])
     database = config.validate_database_name(args.database)
     app = AzureSqlMcpApplication(config)
     results: list[dict[str, Any]] = []
     original_qs: dict[str, Any] = {}
+    original_last_plan_stats: str | None = None
     started = time.monotonic()
     try:
         await cleanup(app, database)
@@ -209,6 +292,9 @@ async def run(args: argparse.Namespace) -> int:
         await admin(app, database, LOAD_SQL)
         rows = await app.executor.fetch_all(database, QUERY_STORE_OPTIONS_SQL)
         original_qs = dict(rows[0]) if rows else {}
+        rows = await app.executor.fetch_all(database, LAST_QUERY_PLAN_STATS_SQL)
+        original_last_plan_stats = str(rows[0]["value"]) if rows else None
+        await admin(app, database, "ALTER DATABASE SCOPED CONFIGURATION SET LAST_QUERY_PLAN_STATS = ON;")
         await admin(
             app,
             database,
@@ -276,6 +362,11 @@ async def run(args: argparse.Namespace) -> int:
             "rollback ddl renderable",
             all(r["rollback_ddl"] for r in recs if r["action"] in {"widen_index", "extend_index", "consolidate_index"}),
         )
+        seek_query = next(
+            (query["query_id"] for r in orders for query in r.get("supporting_queries", []) if query.get("query_id")),
+            None,
+        )
+        await plan_checks(app, database, results, seek_query)
 
         deadlocks = await call(app, "get_deadlock_history", {"database_name": database})
         status = deadlocks.get("result_status")
@@ -286,6 +377,8 @@ async def run(args: argparse.Namespace) -> int:
         waits = await call(app, "get_wait_stats", {"database_name": database})
         check(results, "wait stats carry result_status", "result_status" in waits, str(waits.get("result_status")))
     finally:
+        if original_last_plan_stats is not None and original_last_plan_stats.strip().upper() in {"0", "OFF", "FALSE"}:
+            await admin(app, database, "ALTER DATABASE SCOPED CONFIGURATION SET LAST_QUERY_PLAN_STATS = OFF;")
         if original_qs.get("query_capture_mode_desc"):
             await admin(
                 app,
