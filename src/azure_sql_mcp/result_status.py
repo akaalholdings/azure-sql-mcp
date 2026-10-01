@@ -67,6 +67,8 @@ PRIMARY_ROW_KEYS: dict[str, tuple[str, ...]] = {
     "review_plan_enforcement": ("recommended_actions",),
     "list_learning_candidates": ("candidates",),
     "recall_lessons": ("lessons",),
+    "get_query_store_trend": ("buckets",),
+    "get_query_store_regressions": ("regressions",),
 }
 
 _DEFAULT_EMPTY_REASON = (

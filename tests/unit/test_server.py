@@ -253,6 +253,8 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
         "analyze_index_recommendations",
         "optimize_indexes",
         "review_workload_indexes",
+        "get_query_store_trend",
+        "get_query_store_regressions",
         # Phase 9: Wait Statistics
         "get_wait_stats",
         "get_query_wait_stats",
@@ -436,6 +438,7 @@ def test_index_review_tool_list_is_recall_only(
         "review_workload_indexes",
         "check_statistics_health",
         "get_top_queries",
+        "get_query_store_trend",
         "recall_lessons",
     }
     assert tools["recall_lessons"].annotations.readOnlyHint is True
@@ -2753,3 +2756,49 @@ async def test_get_wait_stats_forwards_the_sample_window(app: AzureSqlMcpApplica
     assert payload["result_status"] == "ok"
     app.wait_stats.get_wait_stats.assert_awaited_once_with("appdb", 20, sample_seconds=15)
     assert app._timeout_for_tool("get_wait_stats") >= 45
+
+
+@pytest.mark.asyncio
+async def test_query_store_time_tools_forward_their_windows(app: AzureSqlMcpApplication) -> None:
+    app.query_store_trends.trend = AsyncMock(return_value={"buckets": []})  # type: ignore[method-assign]
+    app.query_store_trends.regressions = AsyncMock(return_value={"regressions": []})  # type: ignore[method-assign]
+
+    trend = await app.mcp._tool_manager.call_tool(
+        "get_query_store_trend",
+        {"database_name": "appdb", "query_id": 42, "window_minutes": 720, "bucket_minutes": 30, "as_of_utc": "2026-09-30"},
+    )
+    regressions = await app.mcp._tool_manager.call_tool(
+        "get_query_store_regressions",
+        {"database_name": "appdb", "recent_minutes": 30, "baseline_minutes": 1440, "metric": "cpu", "top": 5},
+    )
+
+    assert trend["result_status"] == "empty"
+    assert regressions["result_status"] == "empty"
+    app.query_store_trends.trend.assert_awaited_once_with(
+        "appdb", query_id=42, window_minutes=720, bucket_minutes=30, as_of_utc="2026-09-30"
+    )
+    app.query_store_trends.regressions.assert_awaited_once_with(
+        "appdb",
+        recent_minutes=30,
+        baseline_minutes=1440,
+        as_of_utc=None,
+        metric="cpu",
+        min_executions=10,
+        min_regression_pct=25.0,
+        top=5,
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_top_queries_reads_a_past_window(app: AzureSqlMcpApplication) -> None:
+    app.query_store.get_status = AsyncMock(return_value={"actual_state": "READ_WRITE"})  # type: ignore[method-assign]
+    app.query_store.get_top_queries = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+    payload = await app.mcp._tool_manager.call_tool(
+        "get_top_queries",
+        {"database_name": "appdb", "sort_by": "cpu", "window_minutes": 60, "as_of_utc": "2026-09-30T05:00:00Z"},
+    )
+
+    kwargs = app.query_store.get_top_queries.await_args.kwargs
+    assert kwargs["window_end"] == datetime(2026, 9, 30, 5, 0, tzinfo=timezone.utc)
+    assert payload["window"] == {"start_utc": "2026-09-30T04:00:00Z", "end_utc": "2026-09-30T05:00:00Z"}

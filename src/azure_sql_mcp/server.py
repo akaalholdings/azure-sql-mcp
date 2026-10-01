@@ -107,6 +107,7 @@ from .query_index_analysis import QueryIndexAnalysisService
 from .query_hints import validate_query_hints
 from .query_regression import QueryRegressionService
 from .query_store import QueryStoreService
+from .query_store_trends import QueryStoreTrendService
 from .resource_governance import ResourceGovernanceService
 from .resources import register_resources
 from .result_status import apply_result_status
@@ -115,6 +116,9 @@ from .server_instructions import SERVER_INSTRUCTIONS
 from .schema_compare import SchemaCompareService
 from .sessions import SessionsService
 from .tempdb_memory import TempdbMemoryService
+from .time_windows import AS_OF_DESCRIPTION
+from .time_windows import iso_z
+from .time_windows import parse_as_of
 from .tool_contracts import add_tool_headline
 from .tool_contracts import BenchmarkPhase
 from .tool_contracts import BenchmarkToolOutput
@@ -409,6 +413,7 @@ class AzureSqlMcpApplication:
         self.schema_compare = SchemaCompareService(executor)
         self.index_optimizer = IndexOptimizer(executor, validator)
         self.workload_index_advisor = WorkloadIndexAdvisor(executor)
+        self.query_store_trends = QueryStoreTrendService(executor)
         self.wait_stats = WaitStatsService(executor)
         self.lock_diagnostics = LockDiagnosticsService(executor)
         self.tempdb_memory = TempdbMemoryService(executor)
@@ -1836,6 +1841,7 @@ class AzureSqlMcpApplication:
                 description="How far back to look in Query Store, in minutes.",
             ),
             limit: int = Field(default=10, description="Maximum number of rows to return."),
+            as_of_utc: str | None = Field(default=None, description=AS_OF_DESCRIPTION),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -1849,6 +1855,124 @@ class AzureSqlMcpApplication:
                     sort_by,
                     window_minutes,
                     limit,
+                    as_of_utc=as_of_utc,
+                ),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Query Store over time: a bucketed series of executions, CPU, duration, "
+                "reads, and plan count for one query (query_id) or the whole workload, "
+                "plus a per-plan breakdown for one query. Query Store survives failovers "
+                "and plan-cache eviction, so this answers when a problem started and "
+                "whether a plan change lines up with it."
+            ),
+            annotations=ToolAnnotations(
+                title="Get Query Store Trend",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
+        async def get_query_store_trend(
+            query_id: int | None = Field(
+                default=None,
+                ge=1,
+                description="Query Store query_id; omit for the whole workload.",
+            ),
+            window_minutes: int = Field(
+                default=1440,
+                ge=5,
+                le=43200,
+                description="Window length in minutes (up to 30 days).",
+            ),
+            bucket_minutes: int = Field(
+                default=60,
+                ge=5,
+                le=1440,
+                description="Bucket width in minutes; raised automatically past 500 buckets.",
+            ),
+            as_of_utc: str | None = Field(default=None, description=AS_OF_DESCRIPTION),
+            database_name: str | None = Field(
+                default=None,
+                description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
+            ),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "get_query_store_trend",
+                database_name,
+                lambda db: self.query_store_trends.trend(
+                    db,
+                    query_id=query_id,
+                    window_minutes=window_minutes,
+                    bucket_minutes=bucket_minutes,
+                    as_of_utc=as_of_utc,
+                ),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Find queries whose Query Store performance got worse: the recent window's "
+                "per-execution average against the baseline window right before it, ranked "
+                "by weighted extra cost (recent executions x per-execution increase), with "
+                "new plan ids flagged. No baseline history returns unavailable, never a "
+                "clean bill of health."
+            ),
+            annotations=ToolAnnotations(
+                title="Get Query Store Regressions",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
+        async def get_query_store_regressions(
+            recent_minutes: int = Field(
+                default=60,
+                ge=5,
+                le=43200,
+                description="Length of the recent window, ending at as_of_utc or now.",
+            ),
+            baseline_minutes: int = Field(
+                default=10080,
+                ge=15,
+                le=43200,
+                description="Length of the baseline window immediately before the recent one.",
+            ),
+            metric: Literal["duration", "cpu", "logical_reads"] = Field(
+                default="duration",
+                description="Per-execution measure to compare.",
+            ),
+            min_executions: int = Field(
+                default=10,
+                ge=1,
+                description="Minimum executions in each window for a query to be compared.",
+            ),
+            min_regression_pct: float = Field(
+                default=25.0,
+                ge=0,
+                description="Report only queries at least this much worse.",
+            ),
+            top: int = Field(default=20, ge=1, le=200, description="Maximum regressions returned."),
+            as_of_utc: str | None = Field(default=None, description=AS_OF_DESCRIPTION),
+            database_name: str | None = Field(
+                default=None,
+                description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
+            ),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "get_query_store_regressions",
+                database_name,
+                lambda db: self.query_store_trends.regressions(
+                    db,
+                    recent_minutes=recent_minutes,
+                    baseline_minutes=baseline_minutes,
+                    as_of_utc=as_of_utc,
+                    metric=metric,
+                    min_executions=min_executions,
+                    min_regression_pct=min_regression_pct,
+                    top=top,
                 ),
             )
 
@@ -8665,11 +8789,14 @@ class AzureSqlMcpApplication:
         sort_by: str,
         window_minutes: int,
         limit: int,
+        *,
+        as_of_utc: str | None = None,
     ) -> dict[str, Any]:
         if limit <= 0:
             raise ValueError("limit must be greater than 0.")
         if window_minutes <= 0:
             raise ValueError("window_minutes must be greater than 0.")
+        window_end = parse_as_of(as_of_utc)
 
         status = await self.query_store.get_status(database_name)
         rows = await self.query_store.get_top_queries(
@@ -8677,16 +8804,21 @@ class AzureSqlMcpApplication:
             sort_by,
             window_minutes,
             limit,
+            window_end=window_end,
         )
-        return self._truncate_rows(
-            {
-                "database_name": database_name,
-                "query_store_status": status,
-                "sort_by": sort_by,
-                "window_minutes": window_minutes,
-                "rows": rows,
+        payload: dict[str, Any] = {
+            "database_name": database_name,
+            "query_store_status": status,
+            "sort_by": sort_by,
+            "window_minutes": window_minutes,
+            "rows": rows,
+        }
+        if window_end is not None:
+            payload["window"] = {
+                "start_utc": iso_z(window_end - timedelta(minutes=window_minutes)),
+                "end_utc": iso_z(window_end),
             }
-        )
+        return self._truncate_rows(payload)
 
     def _artifact_to_dict(
         self,

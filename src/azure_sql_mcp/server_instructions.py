@@ -61,6 +61,13 @@ Every tool result has result_status:
 - PAGELATCH_* on tempdb pages: tempdb contention. get_tempdb_usage,
   get_tempdb_space_breakdown.
 
+## Time windows
+Query Store keeps history for weeks. get_query_store_trend shows when a query or the
+whole workload changed (with plan changes), get_query_store_regressions compares a recent
+window with the baseline before it, and get_top_queries accepts as_of_utc. To study a
+past incident, keep the window length and move as_of_utc to the incident's end instead of
+widening the window: a wider window changes every top-N and average.
+
 ## What resets and what persists
 Wait stats, plan-cache stats, and index usage counters reset on failover, scaling, and
 restarts; results say when (window.since_utc, usage_counters.days_since_reset). Query

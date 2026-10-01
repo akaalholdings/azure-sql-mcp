@@ -1181,6 +1181,7 @@ def test_index_review_profile_contains_base_tools_and_recall_only_learning(serve
         "review_workload_indexes",
         "check_statistics_health",
         "get_top_queries",
+        "get_query_store_trend",
     }
     enabled = {name for name in base | set(LEARNING_TOOL_NAMES) if config.is_tool_enabled(name)}
     assert enabled == base | {"recall_lessons"}
@@ -1211,4 +1212,5 @@ def test_index_review_remote_surface_is_exactly_the_base_tools(monkeypatch) -> N
         "review_workload_indexes",
         "check_statistics_health",
         "get_top_queries",
+        "get_query_store_trend",
     }

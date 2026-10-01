@@ -10,7 +10,6 @@ checks) degrades to a reported gap instead of failing the review.
 from __future__ import annotations
 
 from datetime import datetime
-from datetime import timedelta
 from datetime import timezone
 from typing import Any
 
@@ -30,6 +29,8 @@ from .observability import sanitize_error_message
 from .result_status import ResultStatus
 from .result_status import status_payload
 from .showplan_access import parse_plan_access
+from .time_windows import sql_utc
+from .time_windows import window_bounds
 
 MAX_LOOKBACK_DAYS = 90
 MAX_TOP_QUERIES = 500
@@ -262,27 +263,11 @@ def workload_sql(objective: str) -> str:
 
 
 def resolve_window(lookback_days: int, as_of_utc: str | None, *, now: datetime | None = None) -> tuple[datetime, datetime]:
-    current = now or datetime.now(timezone.utc)
-    if as_of_utc:
-        text = as_of_utc.strip()
-        if len(text) == 10:
-            text += "T00:00:00"
-        try:
-            end = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise ValueError(
-                "as_of_utc must be an ISO-8601 UTC instant such as 2026-09-30T05:00:00Z"
-            ) from exc
-        end = end.astimezone(timezone.utc) if end.tzinfo else end.replace(tzinfo=timezone.utc)
-        if end > current + timedelta(minutes=1):
-            raise ValueError("as_of_utc must not be in the future")
-    else:
-        end = current
-    return end - timedelta(days=lookback_days), end
+    return window_bounds(lookback_days * 24 * 60, as_of_utc, now=now)
 
 
 def _iso(value: datetime) -> str:
-    return value.astimezone(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
+    return sql_utc(value)
 
 
 def _norm(value: str) -> str:
