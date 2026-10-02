@@ -30,6 +30,7 @@ _READ_ONLY_PREFIX_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _CODE_WORD_PATTERN = re.compile(r"[\w@#$]+")
+_LINE_COMMENT_ENDS = "\r\n\x0b\x0c\x85  "
 
 # Table hints that take or hold locks a plain read does not. Under RCSI (the
 # Azure SQL Database default) an unhinted SELECT takes no shared locks; these
@@ -124,8 +125,10 @@ def _lex(sql: str) -> _LexedSql:
     i, n = 0, len(sql)
     while i < n:
         if sql.startswith("--", i):
+            # SQL Server ends a line comment at CR or LF. Ending it at other
+            # line separators too only exposes more text to the keyword gate.
             end = i + 2
-            while end < n and sql[end] not in "\r\n":
+            while end < n and sql[end] not in _LINE_COMMENT_ENDS:
                 end += 1
             code.append(" ")
             words.append(" ")
@@ -484,6 +487,12 @@ class SafeSqlValidator:
             if isinstance(node, exp.NextValueFor):
                 raise ValueError(
                     "NEXT VALUE FOR changes sequence state and is not allowed in restricted mode."
+                )
+
+            if isinstance(node, exp.Rand) and node.this is not None:
+                raise ValueError(
+                    "RAND(seed) reseeds the connection's random number generator and is not "
+                    "allowed in restricted mode."
                 )
 
             if isinstance(node, exp.Table):

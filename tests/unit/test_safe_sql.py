@@ -314,6 +314,33 @@ def test_rejects_sequence_side_effects(validator):
 @pytest.mark.parametrize(
     "sql",
     [
+        "SELECT RAND(42)",
+        "SELECT c FROM dbo.t WHERE RAND(123) < 0.1",
+        "WITH x AS (SELECT RAND(9) AS r) SELECT r FROM x",
+        "DECLARE @s int = 7; SELECT RAND(@s)",
+    ],
+)
+def test_rejects_seeded_rand(validator, sql):
+    # A seed resets the connection's generator, and pooled connections are reused.
+    with pytest.raises(ValueError, match="RAND\\(seed\\)"):
+        validator.validate_read_only(sql)
+
+
+def test_allows_unseeded_rand(validator):
+    assert validator.validate_read_only("SELECT RAND() AS r").normalized_sql
+
+
+@pytest.mark.parametrize("separator", ["\x0b", "\x0c", "\x85", " ", " "])
+def test_unusual_line_separators_do_not_hide_code_in_line_comments(validator, separator):
+    # SQL Server ends a -- comment at CR or LF. Ending it earlier as well only
+    # exposes more text to the keyword gate, so it can never admit more.
+    with pytest.raises(ValueError, match="Statement keyword 'DROP'"):
+        validator.validate_read_only(f"SELECT 1 --c{separator}DROP TABLE dbo.t")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
         "SELECT * FROM dbo.t ORDER BY id OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY",
         "SELECT * FROM dbo.a INNER MERGE JOIN dbo.b ON a.id = b.id",
         "SELECT id FROM dbo.a UNION SELECT id FROM dbo.b OPTION (MERGE UNION)",
