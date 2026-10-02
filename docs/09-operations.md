@@ -542,12 +542,25 @@ Run only against an allowlisted dedicated non-production Azure SQL database. Val
 Default locations:
 
 - performance contracts: `~/.azure-sql-mcp/state/performance.sqlite3`;
+- incident log: `~/.azure-sql-mcp/state/incidents/` (or `AZURE_SQL_INCIDENT_DIR`);
 - admin audit: `~/.azure-sql-mcp/audit/`;
 - prior and retired skill backups: `~/.azure-sql-mcp/backups/retired-skills/`.
 
 These directories may contain private operational metadata. Keep them outside Git, owner-readable only, and under the workstation's normal backup/encryption policy.
 
 Performance state omits raw SQL. Admin audit stores SQL hashes and previews by default; `AZURE_SQL_AUDIT_FULL_SQL=1` is a separate explicit opt-in.
+
+### Incident backlog
+
+The incident log is on by default. It writes redacted, owner-only daily files and never connects to a database. To turn it off, set `AZURE_SQL_INCIDENT_LOG=off` and restart the server. `check_runtime_status` shows `incident_log.enabled` and, when off, the reason (`disabled_by_config`, `invalid_config`, `no_durable_state_dir`, `insecure_dir`, or `write_failed`). An invalid `AZURE_SQL_INCIDENT_*` value turns the log off with `invalid_config` and a startup warning that names the variable; the server still starts.
+
+To produce the fix backlog:
+
+1. On the host that runs the server, run `uv run azure-sql-mcp-incidents export --output incident-backlog.md`. Add `--min-priority P4` to include caller errors and agent friction. Add `--include-summaries` only for your own review: agent summaries are free text.
+2. Read every item. Redaction is pattern-based; remove anything that names a customer system before you share the file.
+3. Search existing issues for each item's fingerprint before you file it.
+
+An agent that calls `report_stuck` gets an `incident_id`. The export drops ids; find the record with `grep <incident_id> ~/.azure-sql-mcp/state/incidents/incidents-*.jsonl`. To delete the log, remove the incidents directory; a running server recreates it at its next record.
 
 ## Troubleshooting
 

@@ -6,6 +6,7 @@ from typing import Awaitable
 from typing import Callable
 
 from .connection import AzureSqlExecutor
+from .incident_log import note_exception
 from .observability import sanitize_error_message
 from .query_store import QueryStoreService
 
@@ -99,6 +100,7 @@ class HealthService:
         try:
             return await callback(database_name)
         except Exception as exc:
+            note_exception(exc, "health.check")
             return self._build_check(
                 status="warning",
                 details={"available": False, "error": sanitize_error_message(str(exc))},
@@ -956,7 +958,9 @@ class HealthService:
         query = "SELECT TOP 1 * FROM sys.dm_user_db_resource_governance"
         try:
             rows = await self.executor.fetch_all(database_name, query)
-        except Exception:
+        except Exception as exc:
+            # WARNING is below the ERROR-level swallow handler: record it here.
+            note_exception(exc, "health.governance_limits")
             logger.warning(
                 "Failed to fetch resource governance limits for '%s'",
                 database_name,
@@ -1172,6 +1176,7 @@ class HealthService:
         try:
             return await self.executor.fetch_all(database_name, query), None
         except Exception as exc:
+            note_exception(exc, "health.optional_rows")
             return [], sanitize_error_message(str(exc))
 
     def _build_check(

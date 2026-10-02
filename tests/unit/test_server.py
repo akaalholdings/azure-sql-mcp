@@ -310,6 +310,8 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
         "create_handoff",
         "get_handoff",
         "resolve_handoff",
+        "report_stuck",
+        "export_incident_backlog",
     }
 
     assert tools["list_databases"].annotations.readOnlyHint is True
@@ -444,6 +446,8 @@ def test_index_review_tool_list_is_recall_only(
         "get_top_queries",
         "get_query_store_trend",
         "recall_lessons",
+        "report_stuck",
+        "export_incident_backlog",
     }
     assert tools["recall_lessons"].annotations.readOnlyHint is True
 
@@ -605,7 +609,7 @@ async def test_runtime_status_is_db_free_stable_and_sanitized(
 
     assert first == second
     assert first["startup_timestamp"] == app._startup_timestamp
-    assert first["package_version"] == "2.5.1"
+    assert first["package_version"] == "2.6.0"
     assert first["profile"] is None
     assert first["transport"] == "stdio"
     assert first["tool_groups"] == ["all"]
@@ -1400,6 +1404,37 @@ async def test_schema_pair_tools_run_when_both_databases_allow_read(
 
     assert result == {"ok": True}
     callback.assert_awaited_once_with("appdb", "reportingdb")
+
+
+@pytest.mark.asyncio
+async def test_schema_pair_tool_errors_mark_retryable_failures_as_transient(
+    tmp_path: Path,
+) -> None:
+    # A failover during compare_schemas is retried, not reported as a blocker.
+    from mssql_python.exceptions import OperationalError, ProgrammingError
+
+    config = replace(make_config(tmp_path), allowed_databases=("appdb", "reportingdb"))
+    app = AzureSqlMcpApplication(config)
+    app.database_policy = make_read_policy("appdb", "reportingdb")
+    diagnostics = []
+    for failure in (
+        OperationalError(
+            "Communication link failure",
+            "[Microsoft][SQL Server]Database 'x' is not currently available. (40613)",
+        ),
+        ProgrammingError(
+            "Base table or view not found",
+            "[Microsoft][SQL Server]Invalid object name 't'. (208)",
+        ),
+    ):
+        with pytest.raises(ToolError) as error:
+            await app._run_database_pair_tool(
+                "compare_schemas", "appdb", "reportingdb", AsyncMock(side_effect=failure)
+            )
+        diagnostics.append(json.loads(str(error.value))["details"]["failure_diagnostic"])
+
+    assert diagnostics[0]["transient"] is True
+    assert "transient" not in diagnostics[1]
 
 
 @pytest.mark.asyncio
@@ -2591,7 +2626,7 @@ async def test_capability_check_publishes_tuning_contract(
     result = await app._check_database_capabilities("appdb")
 
     assert result["mcp_contract"] == {
-        "contract_version": "2.5.1",
+        "contract_version": "2.6.0",
         "performance_tuning": 1,
         "durable_view_change": 1,
         "prepared_plan_action": 1,
@@ -3068,3 +3103,40 @@ async def test_diagnose_database_forwards_window_and_master_access(app: AzureSql
         "appdb", window_minutes=30, sample_seconds=5, master_available=False
     )
     assert app._timeout_for_tool("diagnose_database") >= app.config.query_timeout_seconds * 3
+
+
+@pytest.mark.asyncio
+async def test_tool_error_marks_failures_the_server_would_retry_as_transient(
+    tmp_path: Path,
+) -> None:
+    # Skills tell agents to retry a transient failure before they report a blocker.
+    from mssql_python.exceptions import OperationalError, ProgrammingError
+
+    app = AzureSqlMcpApplication(make_config(tmp_path))
+    app.database_policy = DatabasePolicySet.from_mapping(
+        {
+            "version": 1,
+            "databases": {app.config.default_database: {"environment": "test", "allow_read": True}},
+        }
+    )
+    app.executor.fetch_all = AsyncMock(
+        side_effect=[
+            OperationalError(
+                "Communication link failure",
+                "[Microsoft][SQL Server]Database 'x' is not currently available. (40613)",
+            ),
+            ProgrammingError(
+                "Base table or view not found",
+                "[Microsoft][SQL Server]Invalid object name 't'. (208)",
+            ),
+        ]
+    )
+    diagnostics = []
+    for _ in range(2):
+        with pytest.raises(ToolError) as error:
+            await app.mcp._tool_manager.call_tool("execute_sql", {"sql": "SELECT 1 AS n"})
+        payload = json.loads(str(error.value).split(": ", 1)[1])
+        diagnostics.append(payload["details"]["failure_diagnostic"])
+
+    assert diagnostics[0]["transient"] is True
+    assert "transient" not in diagnostics[1]

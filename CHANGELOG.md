@@ -6,6 +6,69 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-10-02
+
+### Added
+
+- Local incident log, on by default. Every tool call goes through one hook that
+  records tool errors, timeouts, cancels (`client` only for the client's own
+  `notifications/cancelled`; `shutdown` or `unknown` otherwise), `unavailable`
+  results, slow calls (`AZURE_SQL_INCIDENT_SLOW_SECONDS`, default 60, recorded
+  while still running and again with the final duration and outcome), and
+  stuck calls (past the tool's own timeout plus 30 seconds), with the package
+  frames the call waits in. It also records calls a crashed or killed process
+  never finished, agents that repeat the same call with the same error or
+  `unavailable`/`precondition`/`not_supported` status three times (transient
+  errors excepted) or with the same `ok`/`empty` result ten times (live-state
+  tools excepted), errors the server catches inside an `ok` or `unavailable`
+  result (optional sections, source gaps, diagnosis sources, learning links,
+  evidence collectors, benchmarks, snapshot comparisons, health checks,
+  parameter binding and metadata lookups), circuit-breaker opens, connections
+  held over 5 minutes (found by the watchdog), unknown tool names, and startup
+  or server-exit failures.
+  Records are owner-only daily JSON Lines files under
+  `<AZURE_SQL_PERFORMANCE_STATE_DIR>/incidents/`, kept 30 days and capped at
+  5 MB a day (P3 and P4 records stop at 80%, so a later P1 or P2 still fits)
+  and 20 MB in total. They hold no SQL, literals, argument values, result rows,
+  server, database or host names, paths, or tokens. On SIGTERM the server marks
+  calls still open as a shutdown, then exits as before.
+- `report_stuck`: an agent records that it is blocked, once, with its skill,
+  skill version, last tool, related ids the server issued, and a redacted
+  one-sentence summary, and gets an `incident_id` to give the user (a repeat
+  gets the first report's id). A report the log could not write returns the
+  reason and is never coalesced.
+- `export_incident_backlog`: titles, counts, priorities, and fingerprints of
+  the grouped backlog; `include_details=true` adds redacted examples and agent
+  summaries. Both incident tools are local stdio only, in every profile, and
+  never touch the database.
+- `azure-sql-mcp-incidents export|summary`: the full Markdown or JSON backlog,
+  grouped by fingerprint with counts, sessions, versions, priority, a suggested
+  title, and a next step. Agent summaries need `export --include-summaries`. It adds stalled durable work (leases in
+  `cleanup_required`, intents left mid-apply, abandoned sessions and cases)
+  read through a read-only SQLite connection.
+- `check_runtime_status.incident_log`: enabled, reason when off, retention,
+  slow threshold, records written by this process, and `capped_day` once the
+  daily cap was hit.
+- Settings `AZURE_SQL_INCIDENT_LOG` (`on`/`off`), `AZURE_SQL_INCIDENT_DIR`,
+  `AZURE_SQL_INCIDENT_RETENTION_DAYS`, `AZURE_SQL_INCIDENT_SLOW_SECONDS`, and the
+  matching `--azure-sql-incident-*` flags. A `:memory:` state directory turns
+  the log off unless `AZURE_SQL_INCIDENT_DIR` is set. An invalid value never
+  stops the server: it turns the log off (reason `invalid_config`) and logs a
+  warning that names the variable.
+- Server instructions: "When you are blocked".
+- `tool_error` payloads, including `compare_schemas` and
+  `generate_migration_script`, carry `failure_diagnostic.transient: true` when
+  the server's retry policy treats the failure as transient (for example 40613).
+
+### Changed
+
+- The two new tools change `tool_schema_fingerprint`, so learning recall scopes
+  rotate as in any release that adds tools. `mcp_contract.contract_version` is
+  `2.6.0`.
+- The incident settings are deliberately left out of
+  `sanitized_config_fingerprint` (unlike log level and format): turning the log
+  on or off must not rotate learning scopes.
+
 ## [2.5.1] - 2026-10-02
 
 ### Security

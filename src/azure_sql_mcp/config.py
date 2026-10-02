@@ -6,6 +6,7 @@ import json
 import os
 from dataclasses import dataclass
 from enum import Enum
+from typing import Mapping
 
 
 class AuthMode(str, Enum):
@@ -56,6 +57,8 @@ LEARNING_TOOL_NAMES = frozenset(
     }
 )
 INDEX_REVIEW_LEARNING_TOOL_NAMES = frozenset({"recall_lessons"})
+# Local, DB-free incident tools: every profile and group on stdio, never remote.
+INCIDENT_TOOL_NAMES = frozenset({"report_stuck", "export_incident_backlog"})
 
 
 # Tool name → group mapping.  Tools not listed here are always registered.
@@ -393,6 +396,21 @@ class TransportConfig:
     port: int
 
 
+INCIDENT_ENV_ENABLED = "AZURE_SQL_INCIDENT_LOG"
+INCIDENT_ENV_DIR = "AZURE_SQL_INCIDENT_DIR"
+INCIDENT_ENV_RETENTION_DAYS = "AZURE_SQL_INCIDENT_RETENTION_DAYS"
+INCIDENT_ENV_SLOW_SECONDS = "AZURE_SQL_INCIDENT_SLOW_SECONDS"
+
+
+@dataclass(frozen=True)
+class IncidentSettings:
+    enabled: bool = True
+    directory: str | None = None  # None: <performance state dir>/incidents
+    retention_days: int = 30
+    slow_seconds: int = 60
+    invalid: str | None = None  # the variable whose bad value turned the log off
+
+
 @dataclass(frozen=True)
 class ServerConfig:
     server: str
@@ -428,6 +446,7 @@ class ServerConfig:
     persist_view_sql_state: bool = False
     legacy_state_server_binding: str | None = None
     schema_profile: str = "portable"
+    incident: IncidentSettings = IncidentSettings()
 
     def validate_database_name(self, database_name: str | None) -> str:
         """Resolve a database against the allowlist, case-insensitively.
@@ -447,6 +466,8 @@ class ServerConfig:
         """Check whether a tool should be registered based on configured tool_groups."""
         if tool_name == "check_runtime_status":
             return True
+        if tool_name in INCIDENT_TOOL_NAMES:
+            return self.transport.mode == TransportMode.STDIO
         if tool_name in LEARNING_TOOL_NAMES:
             if self.transport.mode != TransportMode.STDIO:
                 return False
@@ -476,6 +497,7 @@ class ServerConfig:
     def sanitized_config_fingerprint(self) -> str:
         """Return a stable identity hash without embedding credential values."""
 
+        # Incident settings stay out: toggling the log must not rotate learning scopes.
         sanitized = {
             "server": self.server,
             "default_database": self.default_database,
@@ -564,6 +586,44 @@ def parse_bool(raw_value: str | None, default: bool = False) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"Invalid boolean value: {raw_value!r}.")
+
+
+def parse_incident_settings(values: Mapping[str, str | None]) -> IncidentSettings:
+    """Parse raw env/flag strings. A bad value turns the log off and is named
+    in `invalid`: an optional knob never stops the server."""
+
+    directory = (values.get(INCIDENT_ENV_DIR) or "").strip() or None
+    try:
+        enabled = parse_bool(values.get(INCIDENT_ENV_ENABLED), default=True)
+    except ValueError:
+        return IncidentSettings(enabled=False, directory=directory, invalid=INCIDENT_ENV_ENABLED)
+    retention_days = _bounded_int(values.get(INCIDENT_ENV_RETENTION_DAYS), 30, 1, 365)
+    slow_seconds = _bounded_int(values.get(INCIDENT_ENV_SLOW_SECONDS), 60, 5, 3600)
+    for name, value in (
+        (INCIDENT_ENV_RETENTION_DAYS, retention_days),
+        (INCIDENT_ENV_SLOW_SECONDS, slow_seconds),
+    ):
+        if value is None:
+            return IncidentSettings(enabled=False, directory=directory, invalid=name)
+    assert retention_days is not None and slow_seconds is not None
+    return IncidentSettings(
+        enabled=enabled,
+        directory=directory,
+        retention_days=retention_days,
+        slow_seconds=slow_seconds,
+    )
+
+
+def _bounded_int(raw: str | None, default: int, low: int, high: int) -> int | None:
+    """The value, the default when unset, or None when out of range."""
+
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if low <= value <= high else None
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -655,6 +715,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--azure-sql-schema-profile",
         dest="azure_sql_schema_profile",
         help="portable (default): strict-client tool schemas; full: raw Pydantic schemas.",
+    )
+    parser.add_argument("--azure-sql-incident-log", dest="azure_sql_incident_log")
+    parser.add_argument("--azure-sql-incident-dir", dest="azure_sql_incident_dir")
+    parser.add_argument(
+        "--azure-sql-incident-retention-days",
+        dest="azure_sql_incident_retention_days",
+    )
+    parser.add_argument(
+        "--azure-sql-incident-slow-seconds",
+        dest="azure_sql_incident_slow_seconds",
     )
     return parser
 
@@ -809,6 +879,17 @@ def load_server_config(argv: list[str] | None = None) -> ServerConfig:
                 "AZURE_SQL_LEGACY_STATE_SERVER_BINDING must exactly match "
                 "AZURE_SQL_SERVER. It is an explicit one-server migration attestation."
             )
+    incident = parse_incident_settings(
+        {
+            name: env_or_arg(args, name.lower())
+            for name in (
+                INCIDENT_ENV_ENABLED,
+                INCIDENT_ENV_DIR,
+                INCIDENT_ENV_RETENTION_DAYS,
+                INCIDENT_ENV_SLOW_SECONDS,
+            )
+        }
+    )
     if persist_view_sql_state and performance_state_dir == ":memory:":
         raise ValueError(
             "AZURE_SQL_PERSIST_VIEW_SQL_STATE requires a durable "
@@ -878,4 +959,5 @@ def load_server_config(argv: list[str] | None = None) -> ServerConfig:
         persist_view_sql_state=persist_view_sql_state,
         legacy_state_server_binding=legacy_state_server_binding,
         schema_profile=schema_profile,
+        incident=incident,
     )

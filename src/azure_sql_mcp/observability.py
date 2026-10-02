@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Any
+from typing import Any, Callable
 
 
 # Patterns to strip from user-facing error messages
@@ -156,7 +156,10 @@ def redact_sql_literals(sql: str) -> str:
     return "".join(redacted)
 
 
-def _redact_quoted_content(text: str) -> str:
+def _redact_quoted_content(
+    text: str,
+    keep_quoted: Callable[[str], bool] | None = None,
+) -> str:
     redacted: list[str] = []
     index = 0
     while index < len(text):
@@ -167,7 +170,8 @@ def _redact_quoted_content(text: str) -> str:
             redacted.append(text[index])
             index += 1
             continue
-        redacted.append(f"{quote}[REDACTED]{quote}")
+        start = index
+        closed = False
         index += 1
         while index < len(text):
             if text[index] != quote:
@@ -176,7 +180,16 @@ def _redact_quoted_content(text: str) -> str:
                 index += 2
             else:
                 index += 1
+                closed = True
                 break
+        if (
+            closed
+            and keep_quoted is not None
+            and keep_quoted(text[start + 1 : index - 1])
+        ):
+            redacted.append(text[start:index])
+        else:
+            redacted.append(f"{quote}[REDACTED]{quote}")
     return "".join(redacted)
 
 
@@ -195,9 +208,17 @@ def _is_sql_identifier_character(character: str) -> bool:
     return character.isalnum() or character in "_@$#"
 
 
-def sanitize_error_message(message: str) -> str:
-    """Strip SQL literals, connection strings, server names, and IPs."""
-    sanitized = _redact_quoted_content(message)
+def sanitize_error_message(
+    message: str,
+    *,
+    keep_quoted: Callable[[str], bool] | None = None,
+) -> str:
+    """Strip SQL literals, connection strings, server names, and IPs.
+
+    ``keep_quoted`` may keep a quoted token the caller knows comes from code,
+    such as a T-SQL function name; every other quoted token is redacted.
+    """
+    sanitized = _redact_quoted_content(message, keep_quoted)
     sanitized = _CONN_STRING_PATTERN.sub("[REDACTED];", sanitized)
     sanitized = _SERVER_NAME_PATTERN.sub("[server]", sanitized)
     sanitized = _IP_PATTERN.sub("[ip]", sanitized)

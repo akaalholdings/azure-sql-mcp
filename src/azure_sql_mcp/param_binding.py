@@ -15,6 +15,7 @@ from uuid import UUID
 from mssql_python.constants import ConstantsDDBC
 
 from .connection import AzureSqlExecutor
+from .incident_log import note_exception
 from .query_text import strip_query_store_parameter_declarations
 from .safe_sql import strip_literals_and_comments
 
@@ -1140,7 +1141,9 @@ class ParameterBindingService:
                 type_rows = await self.executor.fetch_all(
                     database_name, unhinted_query, params=[column_name],
                 )
-        except Exception:
+        except Exception as exc:
+            # WARNING is below the ERROR-level swallow handler: record it here.
+            note_exception(exc, "param_binding.column_type")
             logger.warning(
                 "Failed to resolve column type for parameter '%s'",
                 column_name,
@@ -1188,7 +1191,8 @@ class ParameterBindingService:
             hist_rows = await self.executor.fetch_all(
                 database_name, histogram_query, params=[object_name, stats_id],
             )
-        except Exception:
+        except Exception as exc:
+            note_exception(exc, "param_binding.histogram")
             logger.warning(
                 "Failed to query histogram for %s (stats_id=%s), falling back to type default",
                 object_name,

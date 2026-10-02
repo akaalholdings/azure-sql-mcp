@@ -228,6 +228,93 @@ persisted evidence sections.
 
 Performance state does not persist raw query SQL by default. Secret-like metadata and SQL-shaped metadata fields are dropped at the normal persistence boundary. Sandbox view apply is the deliberate exception: exact crash recovery requires the target and prior view definitions, so it is disabled unless `AZURE_SQL_PERSIST_VIEW_SQL_STATE=true`. With that explicit opt-in, only durable view intents store raw view SQL in the same owner-only state directory and mode-0600 SQLite file. The separate admin audit can include full generated SQL only when `AZURE_SQL_AUDIT_FULL_SQL=1`; leave it disabled unless an approved local audit process requires it.
 
+## Incident log
+
+The server keeps a local, redacted log of failures and stuck work, so real
+sessions become a fix backlog. It is on by default and never connects to a
+database.
+
+It records:
+
+- tool errors, timeouts, cancels, and `unavailable` results;
+- slow calls (past `AZURE_SQL_INCIDENT_SLOW_SECONDS`, recorded while they still
+  run and again when they end, with the final duration and outcome) and stuck
+  calls (past the tool's own timeout plus 30 seconds), with the package frames
+  the call waits in;
+- calls a crashed or killed process never finished, found at the next start;
+- an agent that repeats the same call (same arguments) in one session within
+  15 minutes: three times with the same error, or with `unavailable`,
+  `precondition`, or `not_supported` (transient errors do not count), or ten
+  times with the same `ok` or `empty` result (P3; live-state tools such as
+  `get_active_sessions` and `get_wait_stats` do not count);
+- errors the server catches inside an `ok` or `unavailable` result (optional
+  sections, source gaps, diagnosis sources, learning links, evidence
+  collectors, benchmarks, snapshot comparisons, health checks, parameter
+  binding and metadata lookups), circuit-breaker opens, connections held over
+  5 minutes (found by the watchdog), unknown tool names, and startup or
+  server-exit failures;
+- `report_stuck` reports from agents.
+
+Files are `incidents-YYYY-MM-DD.jsonl` (one per UTC day) in
+`<AZURE_SQL_PERFORMANCE_STATE_DIR>/incidents/`, by default
+`~/.azure-sql-mcp/state/incidents/`. The directory is mode 0700 and the files
+0600. Files older than the retention period are deleted; each day is capped at
+5 MB and the directory at 20 MB. P3 and P4 records stop at 80% of the day, so
+routine noise never crowds out a later P1 or P2; `incident_log.capped_day` in
+`check_runtime_status` shows a day that hit the cap.
+
+Records hold tool names, argument names (never values), exception classes,
+package frames, native error codes and SQLSTATE, durations, and redacted
+messages. They never hold SQL text, literals, parameter values, result rows,
+server, database, or host names, file paths, tokens, or connection strings.
+Redaction is pattern-based, plus exact removal of the configured server,
+databases, and principals. Read each item before you file it in a public
+repository.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `AZURE_SQL_INCIDENT_LOG` | `on` | `off` stops all capture; the incident tools then return `unavailable` |
+| `AZURE_SQL_INCIDENT_DIR` | `<state dir>/incidents` | Incident directory; required for a log when the state directory is `:memory:` |
+| `AZURE_SQL_INCIDENT_RETENTION_DAYS` | `30` | Days of files to keep, 1 to 365 |
+| `AZURE_SQL_INCIDENT_SLOW_SECONDS` | `60` | Seconds before a call counts as slow, 5 to 3600 |
+
+An invalid value never stops the server: it turns the log off
+(`incident_log.reason` is `invalid_config`) and logs a warning that names the
+variable.
+
+`check_runtime_status` shows the state in `incident_log`. On local stdio,
+agents can call `report_stuck` when they are blocked and
+`export_incident_backlog` for titles, counts, priorities, and fingerprints.
+
+Export the backlog on the host that runs the server:
+
+```bash
+uv run azure-sql-mcp-incidents export --output incident-backlog.md
+uv run azure-sql-mcp-incidents export --format json --min-priority P4 --since-days 30
+uv run azure-sql-mcp-incidents export --include-summaries --output with-agent-text.md
+uv run azure-sql-mcp-incidents summary
+uv run azure-sql-mcp-incidents --incident-dir ./copied-incidents export
+```
+
+The export groups incidents by fingerprint, with counts, sessions, first and
+last seen, versions, clients, a redacted example, a priority from P1 to P4, a
+suggested title, and a next step. It also lists stalled durable work read from
+`performance.sqlite3` through a read-only connection. The default
+`--min-priority P3` hides caller errors, policy rejections, degraded results,
+short client cancels, and abandoned work; volume lifts a P3 item to P2 but never
+lifts a P4 item. Agents' `report_stuck` summaries are left out unless you add
+`--include-summaries`: they are free text and can name people or objects. Each
+item ends with its fingerprint: search existing issues for it before you file a
+new one.
+
+On SIGTERM the server first marks the calls still open as a shutdown, then exits
+as before; on Ctrl+C or SIGINT their cancels are tagged `shutdown`. A cancel is
+tagged `client` only when the client sent `notifications/cancelled`; any other
+cancel (for example an HTTP transport stopping) is `unknown`, at P4.
+
+Not captured: failures inside MCP resource reads, and MCP output-schema
+validation after a tool returns.
+
 ## Read-only triage workflow
 
 1. `check_equivalence_preflight` with the affected SELECT and database.
@@ -561,6 +648,8 @@ Keep credentials in the operating-system credential store, managed identity, or 
 | `AZURE_SQL_LOG_LEVEL` | `INFO` | Logging level |
 | `AZURE_SQL_LOG_FORMAT` | `text` | `text` or `json` |
 | `AZURE_SQL_SCHEMA_PROFILE` | `portable` | `portable` serves strict-client tool schemas (inlined references, collapsed nullable unions, defaults in descriptions); `full` serves raw Pydantic schemas |
+
+The incident log settings are in [Incident log](#incident-log).
 
 Equivalent `--azure-sql-*` flags are available in `uv run azure-sql-mcp --help`.
 

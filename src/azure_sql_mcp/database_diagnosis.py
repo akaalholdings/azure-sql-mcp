@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from .incident_log import note_exception
 from .observability import sanitize_error_message
 from .result_status import ResultStatus
 from .result_status import status_payload
@@ -116,6 +117,7 @@ class DatabaseDiagnosisService:
         gaps: list[str] = []
         for name, result in zip(sources, results, strict=True):
             if isinstance(result, BaseException):
+                note_exception(result, f"database_diagnosis.{name}")
                 source_status[name] = "unavailable"
                 gaps.append(f"{name}: {sanitize_error_message(str(result))}")
                 continue

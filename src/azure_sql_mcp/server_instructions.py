@@ -95,6 +95,14 @@ restarts; results say when (window.since_utc, usage_counters.days_since_reset). 
 Store persists across those events and is the source for history, regressions, and
 index design. Absent Query Store history is unknown, not zero.
 
+## When you are blocked
+If a skill or these instructions contradict a tool, the same call fails the same way
+twice, or a call hangs, call report_stuck once (local stdio servers) with skill,
+skill_version, last_tool, and a one-sentence summary that holds no SQL, literals,
+names, or result data. Then stop retrying that exact call and give the user the
+incident_id. A tool error with failure_diagnostic.transient true is not a blocker:
+retry it after a delay.
+
 ## Safety
 - Restricted profiles are read-only. Writes happen only through gated tools in the
   sandbox, enforcer-apply, or unprofiled DBA configurations, and each needs the user's

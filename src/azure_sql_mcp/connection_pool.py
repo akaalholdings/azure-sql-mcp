@@ -11,6 +11,7 @@ from typing import cast
 
 from .auth import AzureSqlAuthenticator
 from .config import ServerConfig
+from .incident_log import note_condition
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +100,7 @@ class ConnectionPool:
             CircuitBreakerState
         )
         self._leases: dict[int, tuple[str, float, str]] = {}  # conn_id -> (db, time, stack)
+        self._noted_leaks: set[int] = set()
         self._idle_since: dict[int, float] = {}  # conn_id -> release time
 
     def _create_connection(self, database_name: str):
@@ -140,6 +142,7 @@ class ConnectionPool:
         cb.last_failure_time = time.monotonic()
         if cb.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD:
             cb.is_open = True
+            note_condition("connection_pool.circuit_open")
             logger.warning(
                 "Circuit breaker opened",
                 extra={
@@ -156,8 +159,22 @@ class ConnectionPool:
     def _release_lease(self, connection) -> None:
         self._leases.pop(id(connection), None)
 
+    def note_leaked_connections(self) -> None:
+        """Record each connection held past LEASE_TIMEOUT_SECONDS once.
+
+        The incident watchdog thread calls this: it reads a snapshot only.
+        """
+        now = time.monotonic()
+        held = list(self._leases.items())
+        self._noted_leaks &= {conn_id for conn_id, _lease in held}
+        for conn_id, (_db, acquired_at, _stack) in held:
+            if now - acquired_at > LEASE_TIMEOUT_SECONDS and conn_id not in self._noted_leaks:
+                self._noted_leaks.add(conn_id)
+                note_condition("connection_pool.leaked_connection", category="product_bug")
+
     def check_leaked_connections(self) -> list[dict[str, Any]]:
         """Return info about connections held longer than LEASE_TIMEOUT_SECONDS."""
+        self.note_leaked_connections()
         now = time.monotonic()
         leaked: list[dict[str, Any]] = []
         for conn_id, (db, acquired_at, stack) in self._leases.items():

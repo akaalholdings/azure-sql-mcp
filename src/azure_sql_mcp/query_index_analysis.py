@@ -12,6 +12,7 @@ from .index_metadata import collect_existing_indexes
 from .index_metadata import existing_index_covers_candidate
 from .index_recommendations import build_create_index_statement
 from .index_recommendations import split_index_columns
+from .incident_log import note_exception
 from .observability import sanitize_error_message
 from .param_binding import ParameterBindingService
 from .param_binding import ParameterExecutionContract
@@ -182,6 +183,7 @@ class QueryIndexAnalysisService:
                     "missing_index_provenance": dict(MISSING_INDEX_PROVENANCE),
                 })
             except Exception as exc:
+                note_exception(exc, "query_index_analysis.query")
                 analyzed_queries.append({
                     "query_id": row.get("query_id"),
                     "sql": sql_text[:200],

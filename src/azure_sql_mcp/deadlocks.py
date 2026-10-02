@@ -24,6 +24,7 @@ from dataclasses import field
 from typing import Any
 
 from .connection import AzureSqlExecutor
+from .incident_log import note_exception
 from .observability import sanitize_error_message
 from .result_status import ResultStatus
 from .result_status import status_payload
@@ -142,6 +143,7 @@ class DeadlockHistoryReader:
         try:
             rows = await self.executor.fetch_all(database_name, RUNNING_SESSIONS_SQL)
         except Exception as exc:  # permission or transient failure
+            note_exception(exc, "deadlocks.database_sessions")
             return (
                 _SourceResult(
                     source,
@@ -228,6 +230,7 @@ class DeadlockHistoryReader:
         try:
             rows = await self.executor.fetch_all("master", MASTER_TELEMETRY_SQL)
         except Exception as exc:
+            note_exception(exc, "deadlocks.master_telemetry")
             return (
                 _SourceResult(
                     source,

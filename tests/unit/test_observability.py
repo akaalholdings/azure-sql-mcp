@@ -189,6 +189,16 @@ class TestSanitizeErrorMessage:
         assert "SuperSecret-123!" not in sanitized
         assert "N'[REDACTED]'" in sanitized
 
+    def test_keep_quoted_keeps_only_tokens_the_caller_vouches_for(self):
+        msg = "Function 'xp_cmdshell' rejected near 'Secret Value' and \"other\""
+        sanitized = sanitize_error_message(
+            msg, keep_quoted=lambda token: token == "xp_cmdshell"
+        )
+        assert sanitized == (
+            "Function 'xp_cmdshell' rejected near '[REDACTED]' and \"[REDACTED]\""
+        )
+        assert "xp_cmdshell" not in sanitize_error_message(msg)
+
 
 class TestRedactSqlLiterals:
     def test_redacts_quoted_values_and_preserves_identifiers(self):

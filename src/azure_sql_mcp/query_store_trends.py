@@ -14,6 +14,7 @@ from datetime import timedelta
 from typing import Any
 
 from .connection import AzureSqlExecutor
+from .incident_log import note_exception
 from .observability import sanitize_error_message
 from .result_status import ResultStatus
 from .result_status import status_payload
@@ -308,6 +309,7 @@ class QueryStoreTrendService:
         try:
             rows = await self.executor.fetch_all(database_name, QUERY_STORE_STATE_SQL)
         except Exception as exc:
+            note_exception(exc, "query_store_trends.query_store_state")
             return status_payload(
                 ResultStatus.UNAVAILABLE,
                 "Query Store options could not be read: " + sanitize_error_message(str(exc)),

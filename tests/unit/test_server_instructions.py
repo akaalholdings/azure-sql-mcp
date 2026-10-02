@@ -19,6 +19,18 @@ def test_initialize_carries_the_azure_instructions(tmp_path: Path) -> None:
         assert f"- {status}:" in SERVER_INSTRUCTIONS
 
 
+def test_blocked_agents_report_once_and_stop_retrying_that_call() -> None:
+    blocked = SERVER_INSTRUCTIONS.split("## When you are blocked", 1)[1].split("##", 1)[0]
+
+    assert "report_stuck" in blocked
+    assert "stop retrying that exact call" in blocked
+    # A delayed retry of a failure the server marks transient is correct.
+    assert "failure_diagnostic.transient" in blocked
+    # Without these the report cannot be matched to a skill release or a tool.
+    for argument in ("skill", "skill_version", "last_tool"):
+        assert argument in " ".join(blocked.split())
+
+
 @pytest.mark.asyncio
 async def test_every_tool_named_in_the_instructions_exists(tmp_path: Path) -> None:
     app = AzureSqlMcpApplication(make_config(tmp_path, tool_groups=frozenset({ToolGroup.ALL})))

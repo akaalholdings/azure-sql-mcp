@@ -25,6 +25,7 @@ from .index_advisor import WorkloadQuery
 from .index_advisor import build_index_advice
 from .index_metadata import ExistingIndex
 from .index_metadata import collect_existing_indexes
+from .incident_log import note_exception
 from .observability import sanitize_error_message
 from .result_status import ResultStatus
 from .result_status import status_payload
@@ -313,6 +314,7 @@ class WorkloadIndexAdvisor:
                     database_name, objective, start, end, top_queries, plans_per_query
                 )
             except Exception as exc:
+                note_exception(exc, "workload_index_advisor.workload")
                 gaps.append(
                     "Query Store workload could not be read: "
                     + sanitize_error_message(str(exc))
@@ -322,6 +324,7 @@ class WorkloadIndexAdvisor:
         try:
             existing = await collect_existing_indexes(self.executor, database_name)
         except Exception as exc:
+            note_exception(exc, "workload_index_advisor.existing_indexes")
             return {
                 "database_name": database_name,
                 "recommend_only": True,
@@ -418,6 +421,7 @@ class WorkloadIndexAdvisor:
         try:
             rows = await self.executor.fetch_all(database_name, QUERY_STORE_OPTIONS_SQL)
         except Exception as exc:
+            note_exception(exc, "workload_index_advisor.query_store_options")
             gaps.append("Query Store options could not be read: " + sanitize_error_message(str(exc)))
             return {"actual_state": None}, False
         if not rows:
@@ -496,6 +500,7 @@ class WorkloadIndexAdvisor:
         try:
             rows = await self.executor.fetch_all(database_name, TABLES_SQL)
         except Exception as exc:
+            note_exception(exc, "workload_index_advisor.tables")
             gaps.append("Table sizes could not be read: " + sanitize_error_message(str(exc)))
             return {}
         tables: dict[tuple[str, str], TableInfo] = {}
@@ -552,6 +557,7 @@ class WorkloadIndexAdvisor:
         try:
             rows = await self.executor.fetch_all(database_name, _COLUMNS_SQL_TEMPLATE.format(ids=ids))
         except Exception as exc:
+            note_exception(exc, "workload_index_advisor.columns")
             gaps.append("Column metadata could not be read: " + sanitize_error_message(str(exc)))
             return {}
         columns: dict[tuple[str, str], dict[str, ColumnInfo]] = {}
@@ -585,6 +591,7 @@ class WorkloadIndexAdvisor:
                 database_name, _OPERATIONAL_SQL_TEMPLATE.format(ids=ids)
             )
         except Exception as exc:
+            note_exception(exc, "workload_index_advisor.operational_stats")
             gaps.append("Heap forwarded-record counters could not be read: " + sanitize_error_message(str(exc)))
             return
         for row in rows:
@@ -607,6 +614,7 @@ class WorkloadIndexAdvisor:
                 database_name, _SELECTIVITY_SQL_TEMPLATE.format(ids=ids)
             )
         except Exception as exc:
+            note_exception(exc, "workload_index_advisor.selectivity")
             gaps.append("Statistics histograms could not be read: " + sanitize_error_message(str(exc)))
             return {}
         best: dict[tuple[str, str, str], tuple[float, str, ColumnSelectivity]] = {}
@@ -634,6 +642,7 @@ class WorkloadIndexAdvisor:
         try:
             rows = await self.executor.fetch_all(database_name, FOREIGN_KEYS_SQL)
         except Exception as exc:
+            note_exception(exc, "workload_index_advisor.foreign_keys")
             gaps.append("Foreign keys could not be read: " + sanitize_error_message(str(exc)))
             return []
         grouped: dict[Any, dict[str, Any]] = {}
@@ -701,6 +710,7 @@ class WorkloadIndexAdvisor:
                 database_name, _INDEX_REFERENCE_SQL_TEMPLATE.format(values=values), params=params
             )
         except Exception as exc:
+            note_exception(exc, "workload_index_advisor.index_references")
             gaps.append(
                 "Query Store index references could not be checked: " + sanitize_error_message(str(exc))
             )

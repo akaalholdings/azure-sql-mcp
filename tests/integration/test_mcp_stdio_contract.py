@@ -77,7 +77,7 @@ async def test_stdio_publishes_and_executes_optimizer_contracts(
             runtime = _payload(
                 await session.call_tool("check_runtime_status", {})
             )
-            assert runtime["package_version"] == "2.5.1"
+            assert runtime["package_version"] == "2.6.0"
             assert runtime["tool_groups"] == ["core", "performance"]
             assert "check_equivalence_preflight" in runtime["tool_names"]
 
@@ -103,3 +103,25 @@ async def test_stdio_publishes_and_executes_optimizer_contracts(
             assert json.loads(invalid_text)["code"] == "invalid_arguments"
             assert "caller-secret-value" not in invalid_text
             assert "pydantic" not in invalid_text.casefold()
+
+            stuck = _payload(
+                await session.call_tool(
+                    "report_stuck",
+                    {
+                        "skill": "sql-optimizer",
+                        "blocker_kind": "other",
+                        "summary": "Contract test: the blocker report path works.",
+                    },
+                )
+            )
+            assert (stuck["result_status"], stuck["recorded"]) == ("ok", True)
+
+    # The real stdio handler passes the session: the report carries the client.
+    lines = [
+        line
+        for path in (tmp_path / "state" / "incidents").glob("incidents-*.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    [report] = [json.loads(line) for line in lines if '"agent_report"' in line]
+    assert report["session"]["client"]["name"]
+    assert not any("caller-secret-value" in line for line in lines)

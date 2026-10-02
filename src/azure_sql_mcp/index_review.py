@@ -20,6 +20,7 @@ from typing import Any, cast
 from .connection import SqlTransactionSession
 from .connection import TransactionCommitOutcomeUnknownError
 from .database_policy import DatabasePolicySet
+from .incident_log import note_exception
 from .index_ddl import render_reverse_index_definition
 from .index_ddl import render_inert_candidate_rollback
 from .index_ddl import render_inert_proposed_drop
@@ -251,6 +252,10 @@ class IndexReviewPolicyError(IndexReviewError):
 
 class IndexReviewSchemaError(IndexReviewError):
     """The manually installed history contract is absent or invalid."""
+
+
+class IndexReviewSetupError(IndexReviewSchemaError):
+    """The optional history tables, or the identity's rights on them, are absent."""
 
 
 class IndexReviewIntegrityError(IndexReviewError):
@@ -1950,7 +1955,7 @@ def validate_contract_probe(result_sets: Sequence[Any]) -> ContractProbeResult:
     ]
     if missing_tables:
         noun = "table is" if len(missing_tables) == 1 else "tables are"
-        raise IndexReviewSchemaError(
+        raise IndexReviewSetupError(
             f"Index history {noun} missing: {', '.join(missing_tables)}."
         )
     if actual != expected_columns:
@@ -2377,7 +2382,7 @@ class SqlIndexHistoryRepository:
         permission_allowed = probe.allow_write if for_write else probe.allow_read
         if not permission_allowed:
             required = "SELECT and INSERT" if for_write else "SELECT"
-            raise IndexReviewSchemaError(
+            raise IndexReviewSetupError(
                 "Current database identity lacks the required "
                 f"{required} permissions on both index history tables."
             )
@@ -3049,6 +3054,7 @@ class IndexReviewService:
             )
             status = status_rows[0] if status_rows else {}
         except Exception as exc:
+            note_exception(exc, "index_review.query_store_status")
             return (
                 {
                     "state": "unavailable",
@@ -3066,6 +3072,7 @@ class IndexReviewService:
         try:
             runtime_rows = session.fetch_all(QUERY_STORE_WINDOW_SQL, [window_minutes])
         except Exception as exc:
+            note_exception(exc, "index_review.query_store_window")
             runtime_rows = []
             runtime_error = type(exc).__name__.lower()
         else:
@@ -3103,6 +3110,7 @@ class IndexReviewService:
         try:
             rows = session.fetch_all(INDEX_EVIDENCE_QUERY, [MAX_CAPTURE_ROWS + 1, window_minutes])
         except Exception as exc:
+            note_exception(exc, "index_review.index_evidence")
             return (
                 {
                     "state": status.get("actual_state_desc", "unknown"),
@@ -3416,6 +3424,7 @@ class IndexReviewService:
         try:
             rows = session.fetch_all(MISSING_INDEX_DMV_SQL, [MAX_CAPTURE_ROWS + 1])
         except Exception as exc:
+            note_exception(exc, "index_review.missing_index_dmv")
             return [], {
                 **coverage,
                 "status": "incomplete",
@@ -3569,6 +3578,7 @@ class IndexReviewService:
                 """
             )
         except Exception as exc:
+            note_exception(exc, "index_review.storage")
             return {"coverage": "incomplete", "blocker": "storage_unavailable", "error_type": type(exc).__name__}
         row = rows[0] if rows else {}
         max_size = _as_optional_int(row.get("max_size_bytes"))
@@ -3615,6 +3625,7 @@ class IndexReviewService:
             try:
                 rows = session.fetch_all(query, params)
             except Exception as exc:
+                note_exception(exc, "index_review.hint_sources")
                 blockers.append(f"{source}_unavailable")
                 source_coverage[source] = {
                     "status": "incomplete",
@@ -4690,6 +4701,7 @@ __all__ = [
     "IndexReviewRunV1",
     "IndexReviewSchemaError",
     "IndexReviewService",
+    "IndexReviewSetupError",
     "IndexReviewSnapshotV1",
     "IndexReviewV1",
     "IndexReviewWriteError",

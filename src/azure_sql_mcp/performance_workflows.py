@@ -25,6 +25,7 @@ from .connection import StatementDispatchPrevented
 from .database_policy import DatabasePolicySet
 from .equivalence_contract import analyze_equivalence_preflight
 from .equivalence_contract import has_outer_literal_top_zero
+from .incident_log import note_exception
 from .observability import extract_failure_diagnostic
 from .performance_contracts import (
     EvidenceEnvelopeV1,
@@ -1399,6 +1400,7 @@ class PerformanceWorkflowService:
                     "data": data,
                 }
             except Exception as exc:
+                note_exception(exc, "performance_workflows.evidence_collector")
                 section = {
                     "available": False,
                     "complete": False,
@@ -2027,6 +2029,7 @@ class PerformanceWorkflowService:
                 "execution_count_is_conservative": False,
             }
         except Exception as exc:
+            note_exception(exc, "performance_workflows.snapshot_comparison")
             execution_count_is_conservative = last_statement_index is None
             return {
                 "status": "inconclusive",
@@ -2869,6 +2872,7 @@ class PerformanceWorkflowService:
             )
             raise
         except Exception as exc:
+            note_exception(exc, "performance_workflows.benchmark")
             return self._persist_benchmark_failure_receipt(
                 session_id=session_id,
                 candidate_id=candidate_id,

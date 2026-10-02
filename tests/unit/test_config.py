@@ -1,19 +1,26 @@
 from __future__ import annotations
 
+import logging
 import re
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from azure_sql_mcp.config import AccessMode
 from azure_sql_mcp.config import AuthMode
+from azure_sql_mcp.config import INCIDENT_TOOL_NAMES
+from azure_sql_mcp.config import IncidentSettings
 from azure_sql_mcp.config import LEARNING_TOOL_NAMES
 from azure_sql_mcp.config import McpProfile
 from azure_sql_mcp.config import PROFILE_TOOL_ALLOWLISTS
 from azure_sql_mcp.config import TOOL_GROUPS
+from azure_sql_mcp.config import ToolGroup
+from azure_sql_mcp.config import TransportConfig
 from azure_sql_mcp.config import TransportMode
 from azure_sql_mcp.config import WritePolicy
 from azure_sql_mcp.config import load_server_config
+from azure_sql_mcp.incident_log import IncidentLog
 
 
 def test_diagnostic_coverage_names_only_registered_tools() -> None:
@@ -68,6 +75,108 @@ def test_sanitized_config_fingerprint_excludes_credential_values(
 
     assert first.sanitized_config_fingerprint() == second.sanitized_config_fingerprint()
     assert len(first.sanitized_config_fingerprint()) == 64
+
+
+INCIDENT_ENV = (
+    "AZURE_SQL_INCIDENT_LOG",
+    "AZURE_SQL_INCIDENT_DIR",
+    "AZURE_SQL_INCIDENT_RETENTION_DAYS",
+    "AZURE_SQL_INCIDENT_SLOW_SECONDS",
+)
+
+
+def test_incident_settings_load_from_environment_and_flags(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
+    monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "appdb")
+    monkeypatch.setenv("AZURE_SQL_ALLOWED_DATABASES", "appdb")
+    for name in INCIDENT_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+    assert load_server_config([]).incident == IncidentSettings()
+
+    monkeypatch.setenv("AZURE_SQL_INCIDENT_LOG", "off")
+    monkeypatch.setenv("AZURE_SQL_INCIDENT_RETENTION_DAYS", "7")
+    config = load_server_config(
+        [
+            "--azure-sql-incident-dir",
+            str(tmp_path),
+            "--azure-sql-incident-slow-seconds",
+            "20",
+        ]
+    )
+    assert config.incident == IncidentSettings(
+        enabled=False,
+        directory=str(tmp_path),
+        retention_days=7,
+        slow_seconds=20,
+    )
+
+    monkeypatch.setenv("AZURE_SQL_INCIDENT_RETENTION_DAYS", "0")
+    assert load_server_config([]).incident.invalid == "AZURE_SQL_INCIDENT_RETENTION_DAYS"
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("AZURE_SQL_INCIDENT_LOG", "disabled"),
+        ("AZURE_SQL_INCIDENT_SLOW_SECONDS", "1"),
+        ("AZURE_SQL_INCIDENT_RETENTION_DAYS", "0"),
+    ],
+)
+def test_a_bad_incident_setting_turns_the_log_off_and_the_server_still_starts(
+    monkeypatch, tmp_path, caplog, name, value
+) -> None:
+    monkeypatch.setenv("AZURE_SQL_SERVER", "server.database.windows.net")
+    monkeypatch.setenv("AZURE_SQL_DEFAULT_DATABASE", "appdb")
+    monkeypatch.setenv("AZURE_SQL_ALLOWED_DATABASES", "appdb")
+    monkeypatch.setenv("AZURE_SQL_PERFORMANCE_STATE_DIR", str(tmp_path))
+    for other in INCIDENT_ENV:
+        monkeypatch.delenv(other, raising=False)
+    monkeypatch.setenv(name, value)
+
+    config = load_server_config([])
+    with caplog.at_level(logging.WARNING, logger="azure_sql_mcp.incident_log"):
+        log = IncidentLog.from_config(config)
+
+    assert (log.status()["enabled"], log.status()["reason"]) == (False, "invalid_config")
+    assert [record.variable for record in caplog.records] == [name]
+    assert not (tmp_path / "incidents").exists()
+
+
+def test_incident_settings_do_not_rotate_the_config_fingerprint(
+    server_config_factory,
+) -> None:
+    # Toggling the log must not orphan learning scopes keyed on this fingerprint.
+    config = server_config_factory()
+    changed = replace(
+        config,
+        incident=IncidentSettings(
+            enabled=False, directory="elsewhere", retention_days=7, slow_seconds=20
+        ),
+    )
+
+    assert changed.sanitized_config_fingerprint() == config.sanitized_config_fingerprint()
+
+
+@pytest.mark.parametrize("profile", [None, *McpProfile])
+def test_incident_tools_are_local_stdio_only_in_every_profile(
+    server_config_factory,
+    profile: McpProfile | None,
+) -> None:
+    local = server_config_factory(
+        profile=profile,
+        tool_groups=frozenset({ToolGroup.PERFORMANCE}),
+    )
+    remote = replace(
+        local,
+        transport=TransportConfig(
+            mode=TransportMode.STREAMABLE_HTTP, host="127.0.0.1", port=8000
+        ),
+    )
+
+    assert INCIDENT_TOOL_NAMES == {"report_stuck", "export_incident_backlog"}
+    assert all(local.is_tool_enabled(name) for name in INCIDENT_TOOL_NAMES)
+    assert not any(remote.is_tool_enabled(name) for name in INCIDENT_TOOL_NAMES)
 
 
 def test_view_sql_state_persistence_requires_explicit_opt_in(monkeypatch) -> None:

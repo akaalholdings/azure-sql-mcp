@@ -22,6 +22,7 @@ from typing import Literal
 from typing import NoReturn
 
 from mcp.server.auth.settings import AuthSettings
+from mcp.server.fastmcp import Context
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.tools import ToolManager
@@ -41,6 +42,7 @@ from .candidate_lineage import combined_parent_id
 from .candidate_lineage import validate_combined_parent
 from .config import AccessMode
 from .config import McpProfile
+from .config import TOOL_GROUPS
 from .config import ServerConfig
 from .config import TransportMode
 from .config import load_server_config
@@ -51,6 +53,10 @@ from .database_policy import load_database_policy_or_deny
 from .diagnostics import DiagnosticQueryService
 from .equivalence_preflight import EquivalencePreflightService
 from .health import HealthService
+from .incident_log import IncidentLog
+from .incident_log import note_exception
+from .incident_log import record_startup_failure
+from .incident_log import summarize_backlog
 from .index_optimizer import IndexCandidate
 from .index_optimizer import IndexOptimizer
 from .index_optimizer import build_index_candidate_statement
@@ -120,6 +126,7 @@ from .resources import register_resources
 from .result_status import ResultStatus
 from .result_status import apply_result_status
 from .result_status import status_payload
+from .retry import _is_transient
 from .safe_sql import SafeSqlValidator
 from .schema_compat import portable_input_schema
 from .server_instructions import SERVER_INSTRUCTIONS
@@ -254,8 +261,27 @@ _CATALOG_PAIR_TOOLS = frozenset(
 )
 
 
+def _tool_failure_diagnostic(exc: Exception) -> dict[str, Any]:
+    failure_diagnostic = extract_failure_diagnostic(exc)
+    if _is_transient(exc):
+        # Skills retry these before they report a blocker.
+        failure_diagnostic["transient"] = True
+    return failure_diagnostic
+
+
 class _SanitizingToolManager(ToolManager):
     """Return stable validation failures without echoing untrusted arguments."""
+
+    def __init__(
+        self,
+        warn_on_duplicate_tools: bool = True,
+        *,
+        incidents: IncidentLog | None = None,
+    ) -> None:
+        super().__init__(warn_on_duplicate_tools)
+        self.incidents = incidents or IncidentLog(None, disabled_reason="disabled_by_config")
+        # Package tool names, including ones this profile or access mode hides.
+        self.known_tool_names: frozenset[str] = frozenset()
 
     async def call_tool(
         self,
@@ -263,6 +289,24 @@ class _SanitizingToolManager(ToolManager):
         arguments: dict[str, Any],
         context=None,
         convert_result: bool = False,
+    ) -> Any:
+        # Any other name is agent text and may hold a database or table name.
+        label = name if name in self.known_tool_names else "unregistered"
+        call = self.incidents.begin(label, arguments, context)
+        try:
+            raw = await self._call_tool_checked(name, arguments, context)
+            result = self._convert(name, raw) if convert_result else raw
+        except BaseException as exc:
+            self.incidents.end(call, exc=exc)
+            raise
+        self.incidents.end(call, result=raw)
+        return result
+
+    async def _call_tool_checked(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        context=None,
     ) -> Any:
         try:
             result = await super().call_tool(
@@ -302,9 +346,9 @@ class _SanitizingToolManager(ToolManager):
                     separators=(",", ":"),
                 )
             ) from None
-        result = apply_result_status(name, result)
-        if not convert_result:
-            return result
+        return apply_result_status(name, result)
+
+    def _convert(self, name: str, result: Any) -> Any:
         tool = self.get_tool(name)
         if tool is None:  # pragma: no cover - super().call_tool already resolved it
             raise ToolError(f"Unknown tool: {name}")
@@ -412,9 +456,24 @@ class AzureSqlMcpApplication:
             token_verifier=token_verifier,
             auth=_auth_settings(config) if token_verifier else None,
         )
-        self.mcp._tool_manager = _SanitizingToolManager(
-            warn_on_duplicate_tools=self.mcp.settings.warn_on_duplicate_tools
+        # Budget and argument-name lookups may raise; the log treats that as unknown.
+        self.incidents = IncidentLog.from_config(
+            config,
+            server_version=self._package_version,
+            budget_for=lambda tool, arguments: self._timeout_for_tool(
+                tool,
+                self.config.validate_database_name(arguments.get("database_name")),
+            ),
+            declared_for=lambda tool: self.mcp._tool_manager._tools[tool].parameters[
+                "properties"
+            ],
+            on_tick=lambda: self.pool.note_leaked_connections(),
         )
+        tool_manager = _SanitizingToolManager(
+            warn_on_duplicate_tools=self.mcp.settings.warn_on_duplicate_tools,
+            incidents=self.incidents,
+        )
+        self.mcp._tool_manager = tool_manager
 
         authenticator = AzureSqlAuthenticator(config)
         pool = ConnectionPool(config, authenticator)
@@ -544,6 +603,10 @@ class AzureSqlMcpApplication:
         self._register_tools()
         if self.learning_service is not None:
             self._register_learning_tools()
+        self._register_incident_tools()
+        tool_manager.known_tool_names = frozenset(
+            [tool.name for tool in tool_manager.list_tools()]
+        ) | frozenset(TOOL_GROUPS)
         self._prune_disabled_tools()
         self._enforce_strict_tool_argument_models()
         register_resources(
@@ -4142,6 +4205,176 @@ class AzureSqlMcpApplication:
                 lambda db: self._get_index_review(db, review_id),
             )
 
+    def _register_incident_tools(self) -> None:
+        """Register the local, DB-free incident tools; pruned off stdio."""
+
+        @self.mcp.tool(
+            description=(
+                "Record that this agent session is blocked: skill text contradicts a "
+                "tool, the same call fails the same way again, a call hangs, or a "
+                "capability is missing. Writes one redacted local incident to the "
+                "owner's fix backlog and never touches the database. Do not include "
+                "SQL, literals, object, server, or database names, parameter values, "
+                "or result data."
+            ),
+            annotations=ToolAnnotations(
+                title="Report Stuck",
+                readOnlyHint=False,
+                destructiveHint=False,
+                idempotentHint=False,
+                openWorldHint=False,
+            ),
+        )
+        async def report_stuck(
+            skill: Literal[
+                "sql-health-triage",
+                "sql-optimizer",
+                "sql-plan-enforcer",
+                "sql-index-manager",
+                "none",
+            ] = Field(description='Maintained skill that is blocked, or "none".'),
+            blocker_kind: Literal[
+                "skill_tool_contradiction",
+                "repeated_tool_failure",
+                "tool_hang_or_timeout",
+                "missing_capability",
+                "unclear_next_step",
+                "policy_blocks_required_step",
+                "other",
+            ] = Field(description="What kind of blocker this is."),
+            summary: str = Field(
+                min_length=10,
+                max_length=500,
+                description=(
+                    "One sentence on what is blocked. No SQL, literals, names, "
+                    "parameter values, or result data."
+                ),
+            ),
+            skill_version: str | None = Field(
+                default=None,
+                pattern=r"^[0-9A-Za-z.+-]{1,32}$",
+                description="The skill's metadata.version from its SKILL.md front matter.",
+            ),
+            last_tool: str | None = Field(
+                default=None,
+                pattern=r"^[a-z][a-z0-9_]{0,63}$",
+                description="The last tool called before the blocker.",
+            ),
+            attempts: int = Field(
+                default=1,
+                ge=1,
+                le=100,
+                description="How many times the blocked step was tried.",
+            ),
+            related_ids: list[str] = Field(
+                default_factory=list,
+                max_length=5,
+                description=(
+                    "Case, session, candidate, decision, evidence, handoff, intent, "
+                    "lesson, review, or incident ids this server returned; other "
+                    "values are dropped."
+                ),
+            ),
+            ctx: Context | None = None,
+        ) -> ResponseType:
+            expected_version = _LEARNING_SKILL_VERSIONS.get(skill)
+            if last_tool is not None and self.mcp._tool_manager.get_tool(last_tool) is None:
+                last_tool = "unregistered"  # agent text, possibly a name
+            outcome = self.incidents.report_blocker(
+                skill=skill,
+                blocker_kind=blocker_kind,
+                summary=summary,
+                skill_version=skill_version,
+                skill_version_expected=expected_version,
+                last_tool=last_tool,
+                attempts=attempts,
+                related_ids=related_ids,
+                context=ctx,
+                tool_names=getattr(self.mcp._tool_manager, "known_tool_names", ()),
+            )
+            result: dict[str, Any] = {
+                "recorded": bool(outcome.get("recorded")),
+                "coalesced": bool(outcome.get("coalesced")),
+                "incident_id": outcome.get("incident_id"),
+                "fingerprint": outcome.get("fingerprint"),
+                "summary": outcome.get("summary"),
+                "skill_version_expected": expected_version,
+                "skill_version_mismatch": bool(outcome.get("skill_version_mismatch")),
+                "next_step": (
+                    "Stop retrying that exact call. Tell the user what is blocked and "
+                    "give the incident_id; continue only with independent work."
+                ),
+            }
+            if not (result["recorded"] or result["coalesced"]):
+                result["reason"] = outcome.get("reason")
+                # A rate-limited report is a normal answer, not a degraded one.
+                if result["reason"] != "rate_limited":
+                    reason = (
+                        f"The incident log is off: {self.incidents.status()['reason']}."
+                        if not self.incidents.enabled
+                        else f"The report was not recorded: {outcome.get('reason')}."
+                    )
+                    result.update(status_payload(ResultStatus.UNAVAILABLE, reason))
+            return result
+
+        @self.mcp.tool(
+            description=(
+                "Return the local incident fix backlog grouped by fingerprint: titles, "
+                "counts, priorities, and fingerprints. include_details=true adds "
+                "redacted examples and agent summaries. Never touches the database; "
+                "the owner exports the full backlog with azure-sql-mcp-incidents."
+            ),
+            annotations=ToolAnnotations(
+                title="Export Incident Backlog",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )
+        async def export_incident_backlog(
+            since_days: int = Field(
+                default=14,
+                ge=1,
+                le=90,
+                description="Days of incidents to include.",
+            ),
+            min_priority: Literal["P1", "P2", "P3", "P4"] = Field(
+                default="P3",
+                description=(
+                    "Lowest priority to include. P4 adds caller errors, policy "
+                    "rejections, degraded results, and abandoned work."
+                ),
+            ),
+            max_items: int = Field(
+                default=20,
+                ge=1,
+                le=50,
+                description="Most items to return.",
+            ),
+            include_details: bool = Field(
+                default=False,
+                description="Add redacted examples and agent summaries from all sessions.",
+            ),
+        ) -> ResponseType:
+            if not self.incidents.enabled:
+                return {
+                    **status_payload(
+                        ResultStatus.UNAVAILABLE,
+                        f"The incident log is off: {self.incidents.status()['reason']}.",
+                    ),
+                    "items": [],
+                }
+            backlog = await asyncio.to_thread(
+                self.incidents.backlog,
+                performance_db=self.performance_store.db_path,
+                since_days=since_days,
+                min_priority=min_priority,
+                max_items=max_items,
+                include_summaries=include_details,
+            )
+            return backlog if include_details else summarize_backlog(backlog)
+
     def _register_learning_tools(self) -> None:
         """Register the owner-only, advisory learning plane on local stdio."""
 
@@ -5026,6 +5259,7 @@ class AzureSqlMcpApplication:
                 "session_workflow_cleanup_headroom_seconds": 5 * 60,
                 "client_timeout_managed_by_server": False,
             },
+            "incident_log": self.incidents.status(),
             "runtime_fingerprint": runtime_fingerprint,
             "runtime_compatibility_fingerprint": compatibility_fingerprint,
             "tool_schema_fingerprint": schema_fingerprint,
@@ -5083,7 +5317,7 @@ class AzureSqlMcpApplication:
             **checks,
             "azure_sql_database": platform,
             "mcp_contract": {
-                "contract_version": "2.5.1",
+                "contract_version": "2.6.0",
                 "performance_tuning": 1,
                 "durable_view_change": 1,
                 "prepared_plan_action": 1,
@@ -7009,6 +7243,7 @@ class AzureSqlMcpApplication:
                     extra={"lease_id": lease_id},
                 )
         except Exception as exc:
+            note_exception(exc, "server.index_benchmark")
             benchmark_error = type(exc).__name__
             benchmark_failure_diagnostic = extract_failure_diagnostic(exc)
             try:
@@ -7172,6 +7407,7 @@ class AzureSqlMcpApplication:
                 benchmark_error = type(exc).__name__
                 terminal_error = exc
             except Exception as exc:
+                note_exception(exc, "server.index_benchmark_after")
                 benchmark_error = type(exc).__name__
                 benchmark_failure_diagnostic = extract_failure_diagnostic(exc)
 
@@ -7546,6 +7782,7 @@ class AzureSqlMcpApplication:
                 status = "linked"
                 link_id = link.get("link_id")
             except Exception as exc:
+                note_exception(exc, "server.learning_terminal_link")
                 logger.warning(
                     "Learning terminal linkage failed after successful tool operation.",
                     extra={
@@ -7665,7 +7902,7 @@ class AzureSqlMcpApplication:
         except Exception as exc:
             duration_ms = self._duration_ms(started_at)
             sanitized_error = sanitize_error_message(str(exc))
-            failure_diagnostic = extract_failure_diagnostic(exc)
+            failure_diagnostic = _tool_failure_diagnostic(exc)
             logger.error(
                 "Tool failed",
                 extra={
@@ -7880,7 +8117,11 @@ class AzureSqlMcpApplication:
                     "error": sanitized_error,
                 },
             )
-            self._raise_tool_error("tool_error", sanitized_error)
+            self._raise_tool_error(
+                "tool_error",
+                sanitized_error,
+                details={"failure_diagnostic": _tool_failure_diagnostic(exc)},
+            )
 
     async def _execute_safe_sql(self, database_name: str, sql: str) -> dict[str, Any]:
         validated = self.validator.validate_read_only(sql)
@@ -8664,6 +8905,7 @@ class AzureSqlMcpApplication:
                     )
                 )
             except Exception as exc:
+                note_exception(exc, "server.metadata_inventory")
                 unresolved.append(
                     {
                         "reference": ref,
@@ -8806,6 +9048,7 @@ class AzureSqlMcpApplication:
         try:
             return {"ok": True, "data": await callback()}
         except Exception as exc:
+            note_exception(exc, "server.optional_payload")
             return {"ok": False, "error": sanitize_error_message(str(exc))}
 
     async def _optional_evidence(
@@ -8815,6 +9058,7 @@ class AzureSqlMcpApplication:
         try:
             return await callback()
         except Exception as exc:
+            note_exception(exc, "server.optional_evidence")
             return {
                 "available": False,
                 "error": sanitize_error_message(str(exc)),
@@ -9482,6 +9726,8 @@ class AzureSqlMcpApplication:
         self.mcp.settings.port = self.config.transport.port
 
         try:
+            # Started first so lease-cleanup failures are captured too.
+            self.incidents.start()
             cleanup = await self._cleanup_expired_index_leases()
             if cleanup["examined"]:
                 logger.info("Reconciled expired temporary-index leases.", extra=cleanup)
@@ -9491,7 +9737,13 @@ class AzureSqlMcpApplication:
                 await self.mcp.run_sse_async()
             else:
                 await self.mcp.run_streamable_http_async()
+            self.incidents.mark_shutting_down()
+        except BaseException as exc:
+            self.incidents.record_process_failure(exc, phase="run")
+            raise
         finally:
+            # First, so calls still open are recorded even if a later close hangs.
+            self.incidents.close()
             try:
                 self.performance_store.close()
             except Exception as exc:
@@ -9526,9 +9778,14 @@ class AzureSqlMcpApplication:
 
 
 async def async_main(argv: list[str] | None = None) -> None:
-    config = load_server_config(argv)
-    configure_logging(config.log_level, config.log_format)
-    app = AzureSqlMcpApplication(config)
+    try:
+        config = load_server_config(argv)
+        configure_logging(config.log_level, config.log_format)
+        app = AzureSqlMcpApplication(config)
+    except BaseException as exc:
+        # The server never started: record it from flags and env, then fail as before.
+        record_startup_failure(exc, argv=argv)
+        raise
     await app.run()
 
 

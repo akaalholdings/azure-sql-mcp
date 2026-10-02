@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 from .connection import AzureSqlExecutor
+from .incident_log import note_exception
 from .observability import sanitize_error_message
 from .result_status import ResultStatus
 from .result_status import status_payload
@@ -73,6 +74,7 @@ class VersionStoreService:
         try:
             rows = await self.executor.fetch_all(database_name, PVS_STATS_SQL)
         except Exception as exc:
+            note_exception(exc, "version_store.pvs_stats")
             return {
                 "database_name": database_name,
                 **status_payload(
@@ -149,6 +151,7 @@ class VersionStoreService:
         try:
             return await self.executor.fetch_all(database_name, query)
         except Exception as exc:
+            note_exception(exc, "version_store.optional")
             gaps.append(f"{label} could not be read: {sanitize_error_message(str(exc))}")
             return []
 
