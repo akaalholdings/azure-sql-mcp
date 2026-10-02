@@ -82,19 +82,18 @@ def test_exact_reverse_ddl_round_trips_all_definition_options() -> None:
     assert "OPTIMIZE_FOR_SEQUENTIAL_KEY = ON" in ddl
     assert "SUPPRESS_DUP_KEY_MESSAGES" not in ddl
     assert "ON [ps Order]]Date] ([Order]]Date])" in ddl
-    assert "REBUILD PARTITIONS" not in ddl
-    assert (
-        "REBUILD PARTITION = 1 WITH (DATA_COMPRESSION = PAGE, XML_COMPRESSION = OFF)"
-        in ddl
-    )
-    assert (
-        "REBUILD PARTITION = 2 WITH (DATA_COMPRESSION = ROW, XML_COMPRESSION = ON)"
-        in ddl
-    )
-    assert (
-        "REBUILD PARTITION = 3 WITH (DATA_COMPRESSION = PAGE, XML_COMPRESSION = OFF)"
-        in ddl
-    )
+    # Per-partition compression is part of the one CREATE statement: no
+    # trailing offline ALTER INDEX ... REBUILD PARTITION statements.
+    assert "ALTER INDEX" not in ddl
+    assert "REBUILD PARTITION" not in ddl
+    with_clause = ddl[ddl.index("\nWITH (") : ddl.index("\nON [ps Order]]Date]")]
+    assert "DATA_COMPRESSION = PAGE ON PARTITIONS (1, 3)" in with_clause
+    assert "DATA_COMPRESSION = ROW ON PARTITIONS (2)" in with_clause
+    assert "XML_COMPRESSION = ON ON PARTITIONS (2)" in with_clause
+    assert "XML_COMPRESSION = OFF" not in ddl
+    assert ddl.count(";") == len(
+        [line for line in ddl.splitlines() if line.startswith("SET ")]
+    ) + 1
 
 
 def test_reverse_ddl_refuses_incomplete_or_unsupported_metadata() -> None:
@@ -254,3 +253,22 @@ def test_real_catalog_filegroup_type_is_reversible() -> None:
     assert rendered["executable"] is True, rendered["blockers"]
     assert rendered["drop_ddl"].startswith("DROP INDEX ")
     assert "\nON [PRIMARY]" in rendered["ddl"]
+
+
+def test_non_partitioned_compression_is_inside_the_create_statement() -> None:
+    index = _index(
+        filter_definition=None,
+        has_filter=False,
+        partition_columns=(),
+        data_space_name="PRIMARY",
+        data_space_type="ROWS_FILEGROUP",
+        partition_scheme_name=None,
+        partition_compression=((1, "PAGE"),),
+        xml_compression=((1, "OFF"),),
+    )
+
+    ddl = render_reverse_index_ddl(index)["ddl"]
+
+    assert "OPTIMIZE_FOR_SEQUENTIAL_KEY = ON, DATA_COMPRESSION = PAGE)\nON [PRIMARY];" in ddl
+    assert "ON PARTITIONS" not in ddl
+    assert "ALTER INDEX" not in ddl

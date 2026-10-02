@@ -45,6 +45,7 @@ OBJECTIVES: dict[str, tuple[str, str]] = {
     "executions": ("executions", "executions"),
 }
 
+# Design cap; the engine allows 32 key columns.
 MAX_KEY_COLUMNS = 16
 MAX_NONCLUSTERED_KEY_BYTES = 1700
 LOW_SELECTIVITY_DISTINCT = 10
@@ -52,7 +53,31 @@ LOB_TYPES = {"text", "ntext", "image", "xml", "geography", "geometry"}
 KEY_INELIGIBLE_TYPES = LOB_TYPES | {"sql_variant", "hierarchyid_lob"}
 ROWSTORE_NONCLUSTERED = 2
 UNUSED_MIN_UPTIME_DAYS = 7
-UNUSED_HIGH_CONFIDENCE_DAYS = 30
+# Index removal window (owner decision 2026-10-02): one full month-end plus a
+# buffer for close jobs and one missed capture.
+UNUSED_HIGH_CONFIDENCE_DAYS = 35
+# A plan-reference check shorter than this is no evidence of non-use.
+MIN_REFERENCE_WINDOW_DAYS = 7
+# Proof handoff: the costliest supporting queries up to 80% of the
+# recommendation's attributed cost, at most three.
+PROOF_SET_SHARE = 0.8
+PROOF_SET_MAX = 3
+REGRESSION_SET_MAX = 10
+ROLLBACK_CPU_INCREASE_PCT = 20
+PIN_BLOCKER = "index_named_by_hint_or_forced_plan"
+# An index hint the scan could not tie to exactly one index (case differs from the
+# catalog name, or the name is on several tables): it may name any removal.
+UNRESOLVED_HINT_BLOCKER = "unresolved_index_hint"
+# Removal blockers that cap confidence at medium; any other blocker means low.
+_SOFT_REMOVAL_BLOCKERS = frozenset(
+    {
+        "forced_plan_dependency_check_incomplete",
+        "hint_reference_check_incomplete",
+        "query_store_reference_window_shorter_than_usage_window",
+        "query_store_window_coverage_unknown",
+        "statistics_reference_check_unavailable",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +136,9 @@ class ColumnInfo:
     max_length: int
     is_nullable: bool = True
     is_computed: bool = False
+    # COLUMNPROPERTY IsIndexable / IsDeterministic; None when not read.
+    is_indexable: bool | None = None
+    is_deterministic: bool | None = None
 
     @property
     def is_lob(self) -> bool:
@@ -118,7 +146,15 @@ class ColumnInfo:
 
     @property
     def key_eligible(self) -> bool:
-        return not self.is_lob and self.type_name.lower() not in KEY_INELIGIBLE_TYPES
+        return (
+            not self.is_lob
+            and self.type_name.lower() not in KEY_INELIGIBLE_TYPES
+            and (not self.is_computed or self.is_indexable is True)
+        )
+
+    @property
+    def include_eligible(self) -> bool:
+        return not self.is_computed or self.is_deterministic is True
 
     @property
     def width_bytes(self) -> int:
@@ -176,6 +212,21 @@ class AdvisorInputs:
     query_store: dict[str, Any] = field(default_factory=dict)
     gaps: list[str] = field(default_factory=list)
     observed_at_utc: str | None = None
+    # Plans that read each unused index's statistics (OptimizerStatsUsage); None when unchecked.
+    index_statistics_references: dict[tuple[str, str, str], int | None] = field(default_factory=dict)
+    # Query Store intervals overlapping the window: effective_start_utc,
+    # effective_end_utc, interval_count, oldest_interval_start_utc. None when unread.
+    query_store_coverage: dict[str, Any] | None = None
+    # (query_id, plan_id, schema, table, index_name) for every index a forced
+    # Query Store plan reads, from all forced plans, not only the analysed ones.
+    forced_plan_accesses: list[tuple[int, int, str, str, str]] = field(default_factory=list)
+    # Index hints in query text, Query Store hints, plan guides and modules:
+    # (schema, table, index) -> where each hint is.
+    index_hint_references: dict[tuple[str, str, str], list[str]] = field(default_factory=dict)
+    # "complete" only when every forced plan / every hint source was read.
+    # hint_coverage "unresolved": a hint names no single index, so removals fail closed.
+    forced_plan_coverage: str = "not_checked"
+    hint_coverage: str = "not_checked"
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +259,20 @@ class _Candidate:
     @property
     def key_names(self) -> tuple[str, ...]:
         return tuple(name for name, _ in self.keys)
+
+
+@dataclass
+class _Pin:
+    """Why an index cannot be removed yet, and what must change first."""
+
+    reasons: list[str] = field(default_factory=list)
+    prerequisites: list[str] = field(default_factory=list)
+
+    def add(self, reason: str, prerequisite: str) -> None:
+        if reason not in self.reasons:
+            self.reasons.append(reason)
+        if prerequisite not in self.prerequisites:
+            self.prerequisites.append(prerequisite)
 
 
 def _norm(value: str) -> str:
@@ -253,6 +318,8 @@ def build_index_advice(inputs: AdvisorInputs) -> dict[str, Any]:
         }
 
     uptime_days = _days_since(inputs.engine_start_time_utc, inputs.observed_at_utc)
+    window, _ = _query_store_window(inputs)
+    rate_days = _rate_days(inputs)
     recommendations: list[dict[str, Any]] = []
     tables_out: list[dict[str, Any]] = []
     for key in sorted(table_keys, key=lambda k: -sum(a.attributed for a in by_table.get(k, []))):
@@ -281,7 +348,8 @@ def build_index_advice(inputs: AdvisorInputs) -> dict[str, Any]:
             candidates = _merge_candidates(candidates, columns, settings)
             table_recs.extend(
                 _reconcile_with_existing(
-                    candidates, existing, columns, info, table_writes, inputs, total
+                    candidates, existing, columns, info, table_writes, inputs, total,
+                    accesses=table_accesses, rate_days=rate_days,
                 )
             )
         if settings.include_existing_index_review:
@@ -324,9 +392,7 @@ def build_index_advice(inputs: AdvisorInputs) -> dict[str, Any]:
                     "dml_statements": int(table_writes["dml_statements"]),
                     "dml_executions_in_window": round(float(table_writes["executions"]), 1),
                     "dml_rows_in_window": round(float(table_writes["rows"]), 1),
-                    "dml_rows_per_day": round(
-                        float(table_writes["rows"]) / max(1, settings.lookback_days), 1
-                    ),
+                    "dml_rows_per_day": round(float(table_writes["rows"]) / rate_days, 1),
                 },
                 "existing_indexes": [
                     _existing_index_summary(index, table_accesses, inputs) for index in existing
@@ -356,11 +422,7 @@ def build_index_advice(inputs: AdvisorInputs) -> dict[str, Any]:
         "contract": CONTRACT,
         "recommend_only": True,
         "database_name": inputs.database_name,
-        "window": {
-            "start_utc": inputs.window_start_utc,
-            "end_utc": inputs.window_end_utc,
-            "lookback_days": settings.lookback_days,
-        },
+        "window": window,
         "objective": settings.objective,
         "objective_unit": objective_unit,
         "query_store": dict(inputs.query_store),
@@ -784,7 +846,11 @@ def _lookup_candidate(
         kinds={"cover_lookup"} | ({"extend_seek"} if feed.residual else set()),
     )
     _set_includes(candidate, needed, columns, clustering, settings)
-    if candidate.partial_covering or "lob_columns_not_included" in candidate.notes:
+    if (
+        candidate.partial_covering
+        or "lob_columns_not_included" in candidate.notes
+        or "computed_columns_not_includable" in candidate.notes
+    ):
         return None
     low = [column for column, _ in candidate.keys if 0 < distinct(column) < LOW_SELECTIVITY_DISTINCT]
     if len(low) == len(candidate.keys):
@@ -805,6 +871,7 @@ def _set_includes(
     implicit = {_norm(name) for name in clustering}
     includes: list[str] = []
     skipped_lob: list[str] = []
+    skipped_computed: list[str] = []
     for column in needed:
         lowered = _norm(column)
         if lowered in key_names or lowered in implicit or lowered in {_norm(c) for c in includes}:
@@ -813,9 +880,14 @@ def _set_includes(
         if info is not None and info.is_lob:
             skipped_lob.append(column)
             continue
+        if info is not None and not info.include_eligible:
+            skipped_computed.append(column)
+            continue
         includes.append(column)
     if skipped_lob:
         candidate.notes.append("lob_columns_not_included")
+    if skipped_computed:
+        candidate.notes.append("computed_columns_not_includable")
     if len(includes) > settings.max_include_columns or _too_wide(includes, columns):
         candidate.partial_covering = True
         candidate.notes.append("covering_would_duplicate_most_of_the_table")
@@ -831,6 +903,46 @@ def _too_wide(includes: list[str], columns: dict[str, ColumnInfo]) -> bool:
         columns[_norm(name)].width_bytes for name in includes if _norm(name) in columns
     )
     return row_width > 0 and include_width > 0.6 * row_width and len(includes) > 4
+
+
+def _key_width(keys: list[tuple[str, str]], columns: dict[str, ColumnInfo]) -> int:
+    """Declared key width in bytes; columns without catalog metadata count as 0."""
+
+    return sum(columns[_norm(name)].width_bytes for name, _ in keys if _norm(name) in columns)
+
+
+def _fit_key_width(
+    candidate: _Candidate,
+    columns: dict[str, ColumnInfo],
+    selectivity: dict[tuple[str, str, str], ColumnSelectivity],
+) -> None:
+    """Move trailing key columns (never the first) to INCLUDE until the key fits.
+
+    A wider key creates with only a warning, then fails INSERT or UPDATE with
+    error 1946 once a row's key value exceeds the limit.
+    """
+
+    moved: list[str] = []
+    while len(candidate.keys) > 1 and _key_width(candidate.keys, columns) > MAX_NONCLUSTERED_KEY_BYTES:
+        name, _ = candidate.keys.pop()
+        moved.insert(0, name)
+    if not moved:
+        return
+    lowered = {_norm(name) for name in moved}
+    candidate.includes = moved + [c for c in candidate.includes if _norm(c) not in lowered]
+    candidate.notes.append("key_columns_moved_to_include_for_1700_byte_limit")
+    # Selectivity was judged on the designed key; the moved columns may have
+    # been the only selective ones.
+    stats = [
+        selectivity.get((_norm(candidate.schema), _norm(candidate.table), _norm(name)))
+        for name in candidate.key_names
+    ]
+    if not candidate.low_selectivity and all(
+        value is not None and 0 < float(value.distinct_estimate or 0.0) < LOW_SELECTIVITY_DISTINCT
+        for value in stats
+    ):
+        candidate.low_selectivity = True
+        candidate.notes.append("all_key_columns_low_selectivity")
 
 
 def _key_eligible(columns: dict[str, ColumnInfo], column: str) -> bool:
@@ -925,6 +1037,9 @@ def _reconcile_with_existing(
     writes: dict[str, float],
     inputs: AdvisorInputs,
     total: float,
+    *,
+    accesses: list[_Access],
+    rate_days: float,
 ) -> list[dict[str, Any]]:
     """Turn merged candidates into create / extend / widen / already-covered advice.
 
@@ -944,6 +1059,7 @@ def _reconcile_with_existing(
     by_target: dict[tuple[str, str], tuple[ExistingIndex, _Candidate]] = {}
     creates: list[_Candidate] = []
     for candidate in candidates:
+        _fit_key_width(candidate, columns, inputs.selectivity)
         if candidate.low_selectivity and len(candidate.supports) < 2:
             continue
         covering = next(
@@ -976,6 +1092,9 @@ def _reconcile_with_existing(
                 and _same_keys_prefix(candidate.keys, index)
                 and not index.is_primary_key
                 and not index.is_unique_constraint
+                # Plan accesses keep no constants, so the query cannot be
+                # proven to satisfy a filter.
+                and not index.filter_definition
             ),
             None,
         )
@@ -1005,7 +1124,8 @@ def _reconcile_with_existing(
 
     for (action, _), (target, candidate) in by_target.items():
         rec = _change_existing_recommendation(
-            action, target, candidate, columns, info, writes, settings, total, clustering
+            action, target, candidate, columns, info, writes, settings, total, clustering,
+            accesses=accesses, rate_days=rate_days,
         )
         if rec is not None:
             recommendations.append(rec)
@@ -1015,7 +1135,9 @@ def _reconcile_with_existing(
         name = _generated_name(candidate, taken_names)
         taken_names.add(_norm(name))
         recommendations.append(
-            _create_recommendation(candidate, name, columns, info, writes, settings, total)
+            _create_recommendation(
+                candidate, name, columns, info, writes, settings, total, rate_days=rate_days
+            )
         )
     return recommendations
 
@@ -1109,7 +1231,50 @@ def _existing_index_findings(
         for index in existing
         if index.index_type_code == ROWSTORE_NONCLUSTERED and not index.is_hypothetical
     ]
+    clustering = _clustering_keys(existing)
+    columns = inputs.columns.get(_table_key(schema, table), {})
+    pins = _index_pins(schema, table, accesses, inputs)
+    # consumed: indexes that already have a finding. removed: indexes advised
+    # for removal. survivors: indexes that absorb another one in this report,
+    # so they are never consolidated themselves. rebuilt: survivors that get a
+    # rebuild; a second rebuild from the catalogued definition would undo it.
     consumed: set[str] = set()
+    removed: set[str] = set()
+    survivors: set[str] = set()
+    rebuilt: set[str] = set()
+
+    def consolidate(redundant: ExistingIndex, survivor: ExistingIndex, reason: str) -> None:
+        consumed.add(_norm(redundant.name))
+        needed = _absorbed_columns(redundant, survivor, clustering)
+        if needed and _norm(survivor.name) in rebuilt:
+            findings.append(
+                _consolidation_review(
+                    schema,
+                    table,
+                    redundant,
+                    survivor,
+                    reason,
+                    "survivor_rebuild_already_recommended",
+                    f"Another recommendation already rebuilds {survivor.name}. Apply that "
+                    f"change first, then re-run this review to consolidate {redundant.name}.",
+                    needed,
+                    accesses,
+                    total,
+                )
+            )
+            return
+        rec = _consolidate_recommendation(
+            schema, table, redundant, survivor, reason, accesses, total,
+            needed=needed, columns=columns, settings=inputs.settings,
+        )
+        if rec["action"] == "consolidate_index":
+            _apply_removal_dependencies(rec, pins.get(_norm(redundant.name)), inputs)
+        findings.append(rec)
+        if rec["action"] == "consolidate_index":
+            removed.add(_norm(redundant.name))
+            survivors.add(_norm(survivor.name))
+            if needed:
+                rebuilt.add(_norm(survivor.name))
 
     # Exact duplicates first: same keys (order and direction) and same filter.
     groups: dict[tuple[Any, ...], list[ExistingIndex]] = defaultdict(list)
@@ -1124,51 +1289,65 @@ def _existing_index_findings(
     for indexes in groups.values():
         if len(indexes) < 2:
             continue
-        keeper = max(indexes, key=_keeper_rank)
+        # A twin that a hint or forced plan names survives, so the cleanup keeps
+        # its value without breaking that query.
+        keeper = max(indexes, key=lambda index: _keeper_rank(index, pins))
         for duplicate in indexes:
-            if duplicate is keeper or _protected(duplicate):
+            if duplicate is keeper or not _removable_into(duplicate, keeper):
                 continue
-            consumed.add(_norm(duplicate.name))
-            findings.append(
-                _consolidate_recommendation(
-                    schema, table, duplicate, keeper, "exact_duplicate_keys", accesses, total
+            pin = pins.get(_norm(duplicate.name))
+            if pin is not None and _norm(keeper.name) in pins:
+                consumed.add(_norm(duplicate.name))
+                findings.append(
+                    _review_recommendation(
+                        schema,
+                        table,
+                        duplicate.name,
+                        "duplicate_pinned_by_hint_or_forced_plan",
+                        f"{duplicate.name} has exactly the same keys as {keeper.name}, but queries "
+                        "name both in hints or forced plans, so removing either one breaks a "
+                        "query. First: " + " ".join(pin.prerequisites),
+                    )
                 )
-            )
+                continue
+            consolidate(duplicate, keeper, "exact_duplicate_keys")
 
-    # Left-prefix redundancy: a narrower nonunique index whose keys lead a wider one.
+    # Left-prefix redundancy: a narrower nonunique index whose keys lead a wider
+    # one. The widest extension survives, so a survivor is never itself a
+    # left prefix that gets consolidated later.
     for narrow in nonclustered:
-        if _norm(narrow.name) in consumed or narrow.is_disabled or _protected(narrow):
+        if (
+            _norm(narrow.name) in consumed
+            or _norm(narrow.name) in survivors
+            or narrow.is_disabled
+            or _constraint_protected(narrow)
+        ):
             continue
         if narrow.filter_definition:
             continue
-        wider = next(
-            (
-                other
-                for other in nonclustered
-                if other is not narrow
-                and not other.is_disabled
-                and _norm(other.name) not in consumed
-                and not other.filter_definition
-                and len(other.key_columns) > len(narrow.key_columns)
-                and all(
-                    _norm(a.name) == _norm(b.name) and a.direction == b.direction
-                    for a, b in zip(narrow.key_columns, other.key_columns, strict=False)
-                )
-            ),
-            None,
-        )
-        if wider is None:
-            continue
-        consumed.add(_norm(narrow.name))
-        findings.append(
-            _consolidate_recommendation(
-                schema, table, narrow, wider, "left_prefix_of_wider_index", accesses, total
+        extensions = [
+            other
+            for other in nonclustered
+            if other is not narrow
+            and not other.is_disabled
+            and _norm(other.name) not in removed
+            and not other.filter_definition
+            and _removable_into(narrow, other)
+            and len(other.key_columns) > len(narrow.key_columns)
+            and all(
+                _norm(a.name) == _norm(b.name) and a.direction == b.direction
+                for a, b in zip(narrow.key_columns, other.key_columns, strict=False)
             )
-        )
+        ]
+        if not extensions:
+            continue
+        wider = max(extensions, key=lambda other: len(other.key_columns))
+        consolidate(narrow, wider, "left_prefix_of_wider_index")
 
-    # Unused nonclustered indexes.
+    # Unused nonclustered indexes. A survivor stays: it now serves the seeks of
+    # the index consolidated into it.
     for index in nonclustered:
-        if _norm(index.name) in consumed:
+        if _norm(index.name) in consumed or _norm(index.name) in survivors:
             continue
         if index.is_disabled:
             findings.append(
@@ -1198,34 +1377,169 @@ def _existing_index_findings(
                         )
                     )
             continue
-        drop = _unused_drop_recommendation(schema, table, index, inputs, uptime_days)
+        drop = _unused_drop_recommendation(
+            schema, table, index, inputs, uptime_days, existing, removed,
+            pin=pins.get(_norm(index.name)),
+        )
         if drop is not None:
             findings.append(drop)
+            if drop["action"] == "drop_index":
+                removed.add(_norm(index.name))
     return findings
 
 
-def _keeper_rank(index: ExistingIndex) -> tuple[int, int, int, int]:
+def _keeper_rank(index: ExistingIndex, pins: dict[str, _Pin]) -> tuple[int, int, int, int, int, int]:
     return (
-        1 if _protected(index) else 0,
+        1 if _constraint_protected(index) else 0,
+        1 if _norm(index.name) in pins else 0,
+        len(_fk_support_ids(index)),
         1 if index.is_unique else 0,
         len(index.include_columns),
         _reads(index) or 0,
     )
 
 
-def _protected(index: ExistingIndex) -> bool:
+def _constraint_protected(index: ExistingIndex) -> bool:
+    """Protections that no other index can take over."""
+
     evidence = index.protection_evidence or {}
     return bool(
         index.is_primary_key
         or index.is_unique_constraint
         or index.is_unique
-        or evidence.get("child_foreign_key_support")
         or evidence.get("referenced_foreign_keys")
         or evidence.get("partition_switch_dependency")
         or evidence.get("indexed_view")
         or evidence.get("auto_created")
         or index.is_auto_created
     )
+
+
+def _fk_support_ids(index: ExistingIndex) -> frozenset[int]:
+    """Child foreign keys whose columns lead this index's keys.
+
+    A filtered index supports none: the RI check seeks every child row of the
+    parent key, and a filter cannot be proven to match that.
+    """
+
+    if index.filter_definition:
+        return frozenset()
+    evidence = index.protection_evidence or {}
+    ids: set[int] = set()
+    for support in evidence.get("child_foreign_key_support") or []:
+        if not isinstance(support, dict) or support.get("leading_key_supported") is False:
+            continue
+        try:
+            ids.add(int(support["foreign_key_id"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return frozenset(ids)
+
+
+def _protection_complete(index: ExistingIndex) -> bool:
+    return (index.protection_evidence or {}).get("coverage") == "complete"
+
+
+def _removable_into(redundant: ExistingIndex, survivor: ExistingIndex) -> bool:
+    """A redundant index may go only when the survivor keeps its FK support."""
+
+    return not _constraint_protected(redundant) and _fk_support_ids(redundant) <= _fk_support_ids(
+        survivor
+    )
+
+
+def _withhold_for_incomplete_protection(rec: dict[str, Any], index: ExistingIndex) -> None:
+    """Fail closed: no executable removal DDL without complete protection metadata."""
+
+    if _protection_complete(index):
+        return
+    rec["blockers"] = list(dict.fromkeys([*rec["blockers"], "protection_metadata_incomplete"]))
+    rec["confidence"] = "low"
+    rec["ddl"] = None
+    rec["rollback_ddl"] = None
+
+
+def _index_pins(
+    schema: str, table: str, accesses: list[_Access], inputs: AdvisorInputs
+) -> dict[str, _Pin]:
+    """Indexes that a query names in a hint or reads through a forced Query Store plan.
+
+    Dropping one fails the hinted statement with Msg 308; a forced plan that
+    reads it fails forcing with NO_INDEX and silently falls back.
+    """
+
+    pins: dict[str, _Pin] = defaultdict(_Pin)
+
+    def forced(query_id: int, plan_id: int, name: str) -> None:
+        pins[_norm(name)].add(
+            "forced_query_store_plan",
+            f"Unforce plan {plan_id} for query {query_id} (sys.sp_query_store_unforce_plan), or "
+            f"force a plan that does not read {name}, then re-run this review.",
+        )
+
+    for item in accesses:
+        name = item.access.index_name
+        if not name:
+            continue
+        if item.access.forced_index:
+            pins[_norm(name)].add(
+                "index_hint_in_plan",
+                f"Remove or retarget the table hint that names {name} in query "
+                f"{item.query.query_id} (plan {item.query.plan_id}), then re-run this review.",
+            )
+        if item.query.is_forced_plan:
+            forced(item.query.query_id, item.query.plan_id, name)
+    key = _table_key(schema, table)
+    for query_id, plan_id, access_schema, access_table, name in inputs.forced_plan_accesses:
+        if _table_key(access_schema, access_table) == key:
+            forced(query_id, plan_id, name)
+    for (hint_schema, hint_table, name), places in inputs.index_hint_references.items():
+        if _table_key(hint_schema, hint_table) != key:
+            continue
+        for place in places:
+            pins[_norm(name)].add(
+                "index_named_in_hint_plan_guide_or_module",
+                f"Remove or retarget the index hint in {place}, then re-run this review.",
+            )
+    return dict(pins)
+
+
+def _apply_removal_dependencies(
+    rec: dict[str, Any], pin: _Pin | None, inputs: AdvisorInputs
+) -> None:
+    """Hint and forced-plan dependencies of an index advised for removal.
+
+    A pinned index keeps its action so the intended end state stays visible, but
+    gets no executable DDL until the prerequisites are done (fail closed).
+    """
+
+    rec.setdefault("prerequisites", [])
+    if pin is not None:
+        rec["reason_codes"] = list(dict.fromkeys([*rec["reason_codes"], *pin.reasons]))
+        rec["blockers"] = list(dict.fromkeys([*rec["blockers"], PIN_BLOCKER]))
+        rec["prerequisites"] = list(pin.prerequisites)
+        rec["confidence"] = "low"
+        rec["ddl"] = None
+        rec["rollback_ddl"] = None
+        return
+    if inputs.hint_coverage == "unresolved":
+        rec["blockers"] = list(dict.fromkeys([*rec["blockers"], UNRESOLVED_HINT_BLOCKER]))
+        rec["prerequisites"] = [
+            "Find the index hints listed in gaps that match no single index, confirm that "
+            f"none of them names {rec['index_name']} (or retarget them), then re-run this review."
+        ]
+        rec["confidence"] = "low"
+        rec["ddl"] = None
+        rec["rollback_ddl"] = None
+    incomplete = []
+    if inputs.forced_plan_coverage != "complete":
+        incomplete.append("forced_plan_dependency_check_incomplete")
+    if inputs.hint_coverage not in {"complete", "unresolved"}:
+        incomplete.append("hint_reference_check_incomplete")
+    if incomplete:
+        rec["blockers"] = list(dict.fromkeys([*rec["blockers"], *incomplete]))
+        if rec["confidence"] == "high":
+            rec["confidence"] = "medium"
 
 
 def _protection_reasons(index: ExistingIndex) -> list[str]:
@@ -1261,6 +1575,10 @@ def _unused_drop_recommendation(
     index: ExistingIndex,
     inputs: AdvisorInputs,
     uptime_days: float | None,
+    existing: list[ExistingIndex],
+    removed: set[str],
+    *,
+    pin: _Pin | None,
 ) -> dict[str, Any] | None:
     if index.filter_definition:
         return _review_recommendation(
@@ -1271,10 +1589,33 @@ def _unused_drop_recommendation(
             "No reads since the counters reset, but filtered indexes often serve rare, "
             "valuable queries. Confirm with the application owner before any change.",
         )
-    if _protected(index):
+    if _constraint_protected(index):
         return None
-    references = inputs.index_plan_references.get(
-        (_norm(schema), _norm(table), _norm(index.name))
+    other_support: set[int] = set()
+    for other in existing:
+        if (
+            other is not index
+            and not other.is_disabled
+            and other.index_type_code in {1, 2}
+            and _norm(other.name) not in removed
+        ):
+            other_support |= _fk_support_ids(other)
+    if not _fk_support_ids(index) <= other_support:
+        return _review_recommendation(
+            schema,
+            table,
+            index.name,
+            "sole_foreign_key_support",
+            "No reads since the counters reset, but it is the only index that supports "
+            "a foreign key. Without it, deletes and key updates on the parent table scan "
+            "this table. Keep it.",
+        )
+    key = (_norm(schema), _norm(table), _norm(index.name))
+    references = inputs.index_plan_references.get(key)
+    _, query_store_days = _query_store_window(inputs)
+    # The days of Query Store plans the reference check could see.
+    reference_days = (
+        query_store_days if query_store_days is not None else float(inputs.settings.lookback_days)
     )
     blockers: list[str] = []
     reason_codes = ["no_reads_since_counter_reset"]
@@ -1289,8 +1630,16 @@ def _unused_drop_recommendation(
             f"Usage counters show no reads, but {references} Query Store plan(s) in the "
             "window reference it. Keep it; the counters were probably reset.",
         )
-    else:
+    elif reference_days >= MIN_REFERENCE_WINDOW_DAYS:
         reason_codes.append("no_query_store_plan_reference_in_window")
+    if query_store_days is None:
+        blockers.append("query_store_window_coverage_unknown")
+    statistics = inputs.index_statistics_references.get(key)
+    statistics_used = bool(statistics)
+    if statistics is None:
+        blockers.append("statistics_reference_check_unavailable")
+    elif statistics_used:
+        reason_codes.append("index_statistics_used_by_optimizer")
     capture_mode = str(inputs.query_store.get("query_capture_mode") or "").upper()
     if capture_mode and capture_mode != "ALL":
         blockers.append(f"query_store_capture_mode_{capture_mode.lower()}_may_miss_rare_queries")
@@ -1305,18 +1654,58 @@ def _unused_drop_recommendation(
             f"No reads, but usage counters reset {uptime_days:.1f} day(s) ago. Re-check "
             f"after at least {UNUSED_MIN_UPTIME_DAYS} days, ideally a full business cycle.",
         )
-    if uptime_days is not None and uptime_days >= UNUSED_HIGH_CONFIDENCE_DAYS and not blockers:
-        confidence = "high"
-    elif not blockers or blockers == [b for b in blockers if b.startswith("query_store_capture_mode")]:
-        confidence = "medium"
-    else:
+    # Plan references should cover as much of the removal window as the counters do.
+    usage_days = float(UNUSED_HIGH_CONFIDENCE_DAYS)
+    if uptime_days is not None:
+        usage_days = min(uptime_days, usage_days)
+    if reference_days < usage_days:
+        blockers.append("query_store_reference_window_shorter_than_usage_window")
+    hard = [
+        blocker
+        for blocker in blockers
+        if blocker not in _SOFT_REMOVAL_BLOCKERS and not blocker.startswith("query_store_capture_mode")
+    ]
+    if hard:
         confidence = "low"
+    elif (
+        uptime_days is not None
+        and uptime_days >= UNUSED_HIGH_CONFIDENCE_DAYS
+        and not blockers
+        and not statistics_used
+    ):
+        confidence = "high"
+    else:
+        confidence = "medium"
     updates = int(index.usage.get("user_updates") or 0)
     size_mb = _index_size_mb(index)
     rendered = render_reverse_index_ddl(index)
-    if rendered.get("executable") is not True:
+    executable = rendered.get("executable") is True
+    if not executable:
         blockers.extend(rendered.get("blockers") or [])
         confidence = "low"
+    ddl = rendered.get("drop_ddl") if executable else None
+    rollback_ddl = rendered.get("ddl") if executable else None
+    risks = [
+        "Rare jobs (month-end, quarter-end) may need it; confirm a full business cycle.",
+        "Index hints or plan guides that name it will fail after removal.",
+    ]
+    if statistics_used:
+        # Auto-created statistics would bring back only a sampled single-column
+        # histogram, not this index's multi-column density or full-scan histogram.
+        statistics_name = quote_identifier(_replacement_statistics_name(index.name))
+        table_sql = f"{quote_identifier(index.schema)}.{quote_identifier(index.table)}"
+        columns_sql = ", ".join(quote_identifier(column.name) for column in index.key_columns)
+        if ddl is not None and rollback_ddl is not None:
+            ddl = (
+                f"CREATE STATISTICS {statistics_name} ON {table_sql} ({columns_sql}) "
+                f"WITH FULLSCAN, PERSIST_SAMPLE_PERCENT = ON;\n{ddl}"
+            )
+            rollback_ddl = f"{rollback_ddl}\nDROP STATISTICS {table_sql}.{statistics_name};"
+        risks.append(
+            f"{statistics} Query Store plan(s) read this index's statistics. The replacement "
+            "statistics scan the whole table WITH FULLSCAN; on a very large table use SAMPLE n "
+            "PERCENT instead and keep PERSIST_SAMPLE_PERCENT = ON."
+        )
     rationale = (
         f"No seeks, scans, or lookups in {uptime_days:.0f} day(s) of usage counters"
         if uptime_days is not None
@@ -1326,7 +1715,7 @@ def _unused_drop_recommendation(
     if size_mb is not None:
         rationale += f", and it occupies {size_mb} MB"
     rationale += ". Removing it saves write and storage cost; keep the rollback ready."
-    return {
+    rec = {
         "action": "drop_index",
         "schema": schema,
         "table": table,
@@ -1344,18 +1733,77 @@ def _unused_drop_recommendation(
         "reason_codes": reason_codes,
         "blockers": blockers,
         "rationale": rationale,
-        "risks": [
-            "Rare jobs (month-end, quarter-end) may need it; confirm a full business cycle.",
-            "Index hints or plan guides that name it will fail after removal.",
-        ],
-        "ddl": rendered.get("drop_ddl") if rendered.get("executable") else None,
-        "rollback_ddl": rendered.get("ddl") if rendered.get("executable") else None,
+        "risks": risks,
+        "ddl": ddl,
+        "rollback_ddl": rollback_ddl,
+        "reference_window_days": round(reference_days, 2),
         "validation": {
             "before_change": "Confirm no hint, plan guide, or forced plan names the index.",
             "after_change": "Watch Query Store for regressions on queries that touch this table.",
         },
         "evidence_sources": ["index_usage_dmv", "query_store_plan_reference_check"],
     }
+    _withhold_for_incomplete_protection(rec, index)
+    _apply_removal_dependencies(rec, pin, inputs)
+    return rec
+
+
+def _replacement_statistics_name(index_name: str) -> str:
+    name = "st_" + index_name
+    if len(name) > 128:
+        digest = hashlib.sha256(index_name.encode("utf-8")).hexdigest()[:8]
+        name = name[:119] + "_" + digest
+    return name
+
+
+def _absorbed_columns(
+    redundant: ExistingIndex, survivor: ExistingIndex, clustering: tuple[str, ...]
+) -> list[str]:
+    """Columns of the redundant index that the survivor does not already carry."""
+
+    present = (
+        {_norm(c.name) for c in survivor.key_columns}
+        | {_norm(c) for c in survivor.include_columns}
+        | {_norm(c) for c in clustering}
+    )
+    needed: list[str] = []
+    for column in list(redundant.include_columns) + [c.name for c in redundant.key_columns]:
+        if _norm(column) not in present:
+            present.add(_norm(column))
+            needed.append(column)
+    return needed
+
+
+def _consolidation_review(
+    schema: str,
+    table: str,
+    redundant: ExistingIndex,
+    survivor: ExistingIndex,
+    reason: str,
+    review_reason: str,
+    detail: str,
+    needed: list[str],
+    accesses: list[_Access],
+    total: float,
+) -> dict[str, Any]:
+    description = (
+        "has exactly the same keys as" if reason == "exact_duplicate_keys" else "is a left prefix of"
+    )
+    uses = [item for item in accesses if _norm(item.access.index_name or "") == _norm(redundant.name)]
+    reads = _reads(redundant)
+    return _review_recommendation(
+        schema,
+        table,
+        redundant.name,
+        review_reason,
+        (
+            f"{redundant.name} {description} {survivor.name}, but it also carries "
+            f"{', '.join(needed)}, which {survivor.name} does not. {detail} Reads on "
+            f"{redundant.name} since the counters reset: {reads if reads is not None else 'unknown'}."
+        ),
+        supports=uses,
+        total=total,
+    )
 
 
 def _consolidate_recommendation(
@@ -1366,19 +1814,44 @@ def _consolidate_recommendation(
     reason: str,
     accesses: list[_Access],
     total: float,
+    *,
+    needed: list[str],
+    columns: dict[str, ColumnInfo],
+    settings: AdvisorSettings,
 ) -> dict[str, Any]:
-    keys = {_norm(c.name) for c in survivor.key_columns}
-    survivor_includes = list(survivor.include_columns)
-    for column in list(redundant.include_columns) + [c.name for c in redundant.key_columns]:
-        if _norm(column) not in keys and _norm(column) not in {_norm(c) for c in survivor_includes}:
-            survivor_includes.append(column)
-    added = [c for c in survivor_includes if c not in survivor.include_columns]
+    survivor_includes = list(survivor.include_columns) + list(needed)
     survivor_change: dict[str, Any] | None = None
-    if added and survivor.index_type_code == ROWSTORE_NONCLUSTERED and not (
-        survivor.is_primary_key or survivor.is_unique_constraint
-    ):
+    if needed:
+        if survivor.is_primary_key or survivor.is_unique_constraint:
+            return _consolidation_review(
+                schema, table, redundant, survivor, reason,
+                "covering_twin_of_constraint_index",
+                f"{survivor.name} enforces a constraint and cannot take INCLUDE columns, so "
+                f"{redundant.name} is the covering index for these keys. Keep it.",
+                needed, accesses, total,
+            )
+        if (
+            survivor.index_type_code != ROWSTORE_NONCLUSTERED
+            or len(survivor_includes) > settings.max_include_columns
+            or _too_wide(survivor_includes, columns)
+        ):
+            return _consolidation_review(
+                schema, table, redundant, survivor, reason,
+                "survivor_cannot_absorb_includes",
+                f"Adding them to {survivor.name} would make it too wide. Keep "
+                f"{redundant.name}, or redesign both indexes together.",
+                needed, accesses, total,
+            )
         changed = replace(survivor, include_columns=tuple(survivor_includes))
         survivor_change = _drop_existing_ddl(changed, survivor)
+        if survivor_change.get("blockers"):
+            return _consolidation_review(
+                schema, table, redundant, survivor, reason,
+                "survivor_cannot_absorb_includes",
+                f"The rebuild of {survivor.name} cannot be rendered from catalog metadata "
+                f"({', '.join(survivor_change['blockers'])}). Keep {redundant.name}.",
+                needed, accesses, total,
+            )
     rendered = render_reverse_index_ddl(redundant)
     reads = _reads(redundant)
     uses = [item for item in accesses if _norm(item.access.index_name or "") == _norm(redundant.name)]
@@ -1403,7 +1876,7 @@ def _consolidate_recommendation(
     description = (
         "has exactly the same keys as" if reason == "exact_duplicate_keys" else "is a left prefix of"
     )
-    return {
+    rec = {
         "action": "consolidate_index",
         "schema": schema,
         "table": table,
@@ -1423,7 +1896,7 @@ def _consolidate_recommendation(
         "blockers": blockers,
         "rationale": (
             f"{redundant.name} {description} {survivor.name}; the wider index serves its seeks"
-            + (f" once it also includes {', '.join(added)}" if added else "")
+            + (f" once it also includes {', '.join(needed)}" if needed else "")
             + f". Reads on {redundant.name} since the counters reset: {reads if reads is not None else 'unknown'}."
         ),
         "risks": ["Hints or plan guides that name the redundant index will fail after removal."],
@@ -1431,10 +1904,17 @@ def _consolidate_recommendation(
         "rollback_ddl": "\n".join(rollback_parts) if rollback_parts else None,
         "validation": {
             "before_change": "Confirm no hint, plan guide, or forced plan names the redundant index.",
-            "after_change": "Confirm queries that used it now seek the surviving index.",
+            "after_change": (
+                "Confirm queries that used it now seek the surviving index. Roll back if CPU per "
+                f"execution of any query in regression_set rises more than {ROLLBACK_CPU_INCREASE_PCT}% "
+                "over equal windows."
+            ),
+            "regression_set": _query_shares(uses, total),
         },
         "evidence_sources": ["index_definitions", "index_usage_dmv"],
     }
+    _withhold_for_incomplete_protection(rec, redundant)
+    return rec
 
 
 def _heap_recommendation(
@@ -1526,7 +2006,9 @@ def _foreign_key_findings(
         supported = any(
             sorted(_norm(c.name) for c in index.key_columns[: len(fk_columns)]) == sorted(fk_columns)
             for index in existing
-            if not index.is_disabled and index.index_type_code in {1, 2}
+            if not index.is_disabled
+            and index.index_type_code in {1, 2}
+            and not index.filter_definition
         )
         if supported:
             continue
@@ -1540,7 +2022,7 @@ def _foreign_key_findings(
                 "foreign_key_without_supporting_index",
                 (
                     f"Foreign key {fk.name} ({', '.join(fk.columns)}) to "
-                    f"{fk.referenced_schema}.{fk.referenced_table} has no index leading with its "
+                    f"{fk.referenced_schema}.{fk.referenced_table} has no unfiltered index leading with its "
                     "columns. Deletes or key updates on the parent scan this table"
                     + (" and the workload modifies the parent." if parent_dml else ".")
                 ),
@@ -1562,6 +2044,8 @@ def _create_recommendation(
     writes: dict[str, float],
     settings: AdvisorSettings,
     total: float,
+    *,
+    rate_days: float,
 ) -> dict[str, Any]:
     keys_sql = ", ".join(f"{quote_identifier(n)} {d}" for n, d in candidate.keys)
     include_sql = (
@@ -1575,7 +2059,7 @@ def _create_recommendation(
         f"({keys_sql}){include_sql} WITH (ONLINE = ON);"
     )
     rollback = f"DROP INDEX {quote_identifier(name)} ON {table_sql};"
-    return _candidate_recommendation(
+    rec = _candidate_recommendation(
         "create_index",
         candidate,
         name=name,
@@ -1590,7 +2074,21 @@ def _create_recommendation(
         settings=settings,
         total=total,
         write_weight=0.5,
+        rate_days=rate_days,
     )
+    # _fit_key_width leaves an over-limit key only when the first column alone exceeds it.
+    if _key_width(candidate.keys, columns) > MAX_NONCLUSTERED_KEY_BYTES:
+        rec["blockers"] = list(rec["blockers"]) + ["key_width_exceeds_1700_bytes"]
+        rec["confidence"] = "low"
+        rec["ddl"] = None
+        rec["rollback_ddl"] = None
+        rec["risks"] = list(rec["risks"]) + [
+            f"The declared key is wider than {MAX_NONCLUSTERED_KEY_BYTES} bytes: the index would "
+            "create with a warning, then INSERT or UPDATE fails with error 1946 for any row whose "
+            "key value exceeds the limit. Narrow the column type, or index a persisted computed "
+            "hash of the column instead."
+        ]
+    return rec
 
 
 def _change_existing_recommendation(
@@ -1603,6 +2101,9 @@ def _change_existing_recommendation(
     settings: AdvisorSettings,
     total: float,
     clustering: tuple[str, ...],
+    *,
+    accesses: list[_Access],
+    rate_days: float,
 ) -> dict[str, Any] | None:
     if action == "extend_index":
         new_keys = [(c.name, c.direction) for c in target.key_columns]
@@ -1639,10 +2140,30 @@ def _change_existing_recommendation(
         settings=settings,
         total=total,
         write_weight=0.25 if action == "extend_index" else 0.35,
+        rate_days=rate_days,
     )
     if rendered.get("blockers"):
         rec["blockers"] = list(rec["blockers"]) + list(rendered["blockers"])
         rec["confidence"] = "low"
+    # Other queries that read the target lose or change their index on the rebuild.
+    supporting = {item.query.query_id for item in candidate.supports}
+    regression = _query_shares(
+        [
+            item
+            for item in accesses
+            if _norm(item.access.index_name or "") == _norm(target.name)
+            and item.query.query_id not in supporting
+        ],
+        total,
+    )
+    validation = rec["validation"]
+    validation["regression_set"] = regression
+    if regression:
+        validation["sandbox"] += (
+            " Queries in regression_set read the index this rebuild changes; benchmark them "
+            "against the new definition too."
+        )
+        validation["after_change"] = _after_change_text(with_regression=True)
     return rec
 
 
@@ -1658,26 +2179,19 @@ def _drop_existing_ddl(changed: ExistingIndex, original: ExistingIndex) -> dict[
             ),
         }
     return {
-        "ddl": _with_drop_existing(forward["ddl"], changed, online=True),
-        "rollback_ddl": _with_drop_existing(backward["ddl"], original, online=True),
+        "ddl": _with_drop_existing(forward["ddl"]),
+        "rollback_ddl": _with_drop_existing(backward["ddl"]),
         "blockers": [],
     }
 
 
-def _with_drop_existing(ddl: str, index: ExistingIndex, *, online: bool) -> str:
-    """Rebuild in place with DROP_EXISTING, keeping the index's exact compression.
+def _with_drop_existing(ddl: str) -> str:
+    """Rebuild in place, online, in one statement.
 
-    For a single-partition index the trailing per-partition compression rebuild is
-    folded into the same statement so the index is rebuilt once, not twice.
+    The rendered CREATE already carries the exact per-partition compression.
     """
 
-    options = "DROP_EXISTING = ON, " + ("ONLINE = ON, " if online else "")
-    compression = dict(index.partition_compression)
-    if len(compression) == 1 and "\nALTER INDEX " in ddl:
-        ddl = ddl.split("\nALTER INDEX ", 1)[0]
-        value = next(iter(compression.values())) or "NONE"
-        options += f"DATA_COMPRESSION = {value.upper()}, "
-    return ddl.replace("\nWITH (", "\nWITH (" + options, 1)
+    return ddl.replace("\nWITH (", "\nWITH (DROP_EXISTING = ON, ONLINE = ON, ", 1)
 
 
 def _candidate_recommendation(
@@ -1696,18 +2210,22 @@ def _candidate_recommendation(
     settings: AdvisorSettings,
     total: float,
     write_weight: float,
+    rate_days: float,
 ) -> dict[str, Any]:
     supports = candidate.supports
     query_ids = {item.query.query_id for item in supports}
     share = _pct(sum(item.attributed for item in supports), total)
     benefit = _pct(candidate.savings, total)
-    rows_per_day = float(writes.get("rows", 0.0)) / max(1, settings.lookback_days)
+    rows_per_day = float(writes.get("rows", 0.0)) / rate_days
     table_rows = float(info.row_count) if info and info.row_count else None
     churn = min(1.0, rows_per_day / table_rows) if table_rows else 0.0
     penalty = round(min(0.9, write_weight * churn * 4), 3)
     size_mb = _estimate_size_mb(keys, includes, columns, info)
     score = round((benefit or 0.0) * (1 - penalty), 4)
+    # Only the requested window exempts a query from a second active day; a thin
+    # Query Store history is less evidence, never more.
     recurring = any(item.query.active_days >= 2 for item in supports) or settings.lookback_days < 2
+    proof_set = _proof_set(supports)
     if (len(query_ids) >= 2 or (share or 0) >= 5.0) and recurring and not candidate.low_selectivity:
         confidence = "high"
     elif (share or 0) >= 0.5 or len(query_ids) >= 2:
@@ -1750,13 +2268,13 @@ def _candidate_recommendation(
         "validation": {
             "sandbox": (
                 "Prove it on a non-production copy with sql-optimizer: start a tuning session "
-                f"for query {min(query_ids) if query_ids else 'n/a'} and run "
-                "benchmark_index_candidate with these keys and includes."
+                f"for query {proof_set[0]['query_id'] if proof_set else 'n/a'} and run "
+                "benchmark_index_candidate with these keys and includes. Every query in "
+                f"proof_set ({', '.join(str(item['query_id']) for item in proof_set) or 'n/a'}) "
+                "must pass."
             ),
-            "after_change": (
-                "Compare Query Store CPU, duration, and reads for the supporting query ids "
-                "over equal windows before and after."
-            ),
+            "proof_set": proof_set,
+            "after_change": _after_change_text(with_regression=False),
         },
         "evidence_sources": ["query_store_plan_access", "query_store_runtime_stats"]
         + (["missing_index_hint"] if candidate.hint_agreement else []),
@@ -1811,7 +2329,11 @@ def _candidate_risks(action: str, candidate: _Candidate, penalty: float) -> list
     if action == "create_index":
         risks.append("Every insert and delete, and updates to key or included columns, maintain the new index.")
     if action in {"extend_index", "widen_index"}:
-        risks.append("Rebuilding the existing index with DROP_EXISTING takes time and log space; ONLINE = ON keeps it available.")
+        risks.append(
+            "Rebuilding the existing index is one online DROP_EXISTING statement that keeps "
+            "its current compression; it takes time, log space, and room for a second copy "
+            "of the index while it runs."
+        )
     if penalty >= 0.3:
         risks.append("The table is write-heavy relative to its size; weigh the write cost.")
     if candidate.low_selectivity:
@@ -1888,6 +2410,52 @@ def _supporting_queries(supports: list[_Access], total: float) -> list[dict[str,
     for entry in rows:
         entry["workload_share_pct"] = _pct(entry.pop("attributed"), total)
     return rows
+
+
+def _ranked_queries(items: list[_Access]) -> list[tuple[int, int, float]]:
+    """(query_id, plan_id, attributed cost) per query, costliest first."""
+
+    by_query: dict[int, tuple[int, float]] = {}
+    for item in items:
+        plan_id, attributed = by_query.get(item.query.query_id, (item.query.plan_id, 0.0))
+        by_query[item.query.query_id] = (plan_id, attributed + item.attributed)
+    return sorted(
+        ((query_id, plan_id, cost) for query_id, (plan_id, cost) in by_query.items()),
+        key=lambda entry: (-entry[2], entry[0]),
+    )
+
+
+def _proof_set(supports: list[_Access]) -> list[dict[str, Any]]:
+    """The costliest supporting queries until 80% of the recommendation's cost, at most three."""
+
+    ranked = _ranked_queries(supports)
+    whole = sum(cost for _, _, cost in ranked)
+    chosen: list[dict[str, Any]] = []
+    covered = 0.0
+    for query_id, plan_id, cost in ranked:
+        chosen.append(
+            {"query_id": query_id, "plan_id": plan_id, "share_of_recommendation_pct": _pct(cost, whole)}
+        )
+        covered += cost
+        if len(chosen) >= PROOF_SET_MAX or covered >= PROOF_SET_SHARE * whole:
+            break
+    return chosen
+
+
+def _query_shares(items: list[_Access], total: float) -> list[dict[str, Any]]:
+    return [
+        {"query_id": query_id, "plan_id": plan_id, "workload_share_pct": _pct(cost, total)}
+        for query_id, plan_id, cost in _ranked_queries(items)[:REGRESSION_SET_MAX]
+    ]
+
+
+def _after_change_text(*, with_regression: bool) -> str:
+    sets = "proof_set and regression_set" if with_regression else "proof_set"
+    return (
+        f"Compare Query Store CPU, duration, and reads for the {sets} queries over equal "
+        "windows before and after. Roll back if CPU per execution of any listed query rises "
+        f"more than {ROLLBACK_CPU_INCREASE_PCT}%."
+    )
 
 
 def _existing_index_summary(
@@ -1979,6 +2547,64 @@ def _index_size_mb(index: ExistingIndex) -> float | None:
     return round(sum(pages) * 8 / 1024, 2)
 
 
+def _query_store_window(inputs: AdvisorInputs) -> tuple[dict[str, Any], float | None]:
+    """The requested window and the part of it that Query Store actually holds.
+
+    Returns the report's ``window`` and the held days (None when coverage was not read).
+    """
+
+    lookback = inputs.settings.lookback_days
+    window: dict[str, Any] = {
+        "start_utc": inputs.window_start_utc,
+        "end_utc": inputs.window_end_utc,
+        "lookback_days": lookback,
+        "requested_days": lookback,
+        "query_store_effective_start_utc": None,
+        "query_store_effective_end_utc": None,
+        "query_store_effective_days": None,
+        "query_store_interval_count": None,
+        "query_store_oldest_interval_utc": None,
+    }
+    coverage = inputs.query_store_coverage
+    if coverage is None:
+        return window, None
+    count = int(coverage.get("interval_count") or 0)
+    window["query_store_interval_count"] = count
+    window["query_store_oldest_interval_utc"] = _utc_text(
+        _parse_utc(coverage.get("oldest_interval_start_utc"))
+    )
+    starts = [
+        value
+        for value in (_parse_utc(inputs.window_start_utc), _parse_utc(coverage.get("effective_start_utc")))
+        if value is not None
+    ]
+    ends = [
+        value
+        for value in (_parse_utc(inputs.window_end_utc), _parse_utc(coverage.get("effective_end_utc")))
+        if value is not None
+    ]
+    if count <= 0 or not starts or not ends or min(ends) <= max(starts):
+        window["query_store_effective_days"] = 0.0
+        return window, 0.0
+    start, end = max(starts), min(ends)
+    days = max(1 / 24, (end - start).total_seconds() / 86_400)
+    window["query_store_effective_start_utc"] = _utc_text(start)
+    window["query_store_effective_end_utc"] = _utc_text(end)
+    window["query_store_effective_days"] = round(days, 2)
+    return window, days
+
+
+def _rate_days(inputs: AdvisorInputs) -> float:
+    """Days that per-day rates divide by: the days Query Store holds, else the requested window."""
+
+    _, days = _query_store_window(inputs)
+    return days if days else float(max(1, inputs.settings.lookback_days))
+
+
+def _utc_text(value: datetime | None) -> str | None:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if value else None
+
+
 def _days_since(start_utc: str | None, now_utc: str | None) -> float | None:
     start = _parse_utc(start_utc)
     if start is None:
@@ -2023,11 +2649,81 @@ def _coverage_gaps(
     capture = str(inputs.query_store.get("query_capture_mode") or "").upper()
     if capture == "AUTO":
         gaps.append("Query Store capture mode AUTO skips infrequent queries; rare access paths may be missing")
+    elif capture == "CUSTOM":
+        gaps.append(
+            "Query Store capture mode CUSTOM keeps only queries over its capture thresholds; "
+            "rare access paths may be missing"
+        )
+    elif capture == "NONE":
+        gaps.append("Query Store capture mode NONE captures no new queries; recent workload is missing")
+    gaps.extend(_query_store_retention_gaps(inputs))
     if uptime_days is not None and uptime_days < UNUSED_MIN_UPTIME_DAYS:
         gaps.append(f"index usage counters reset {uptime_days:.1f} day(s) ago; unused-index review is limited")
     if not inputs.selectivity:
         gaps.append("column selectivity from statistics was unavailable; key order uses workload frequency only")
+    unread: list[str] = []
+    for key, table_columns in inputs.columns.items():
+        info = inputs.tables.get(key)
+        prefix = f"{info.schema}.{info.table}" if info else ".".join(key)
+        unread.extend(
+            f"{prefix}.{column.name}"
+            for column in table_columns.values()
+            if column.is_computed and (column.is_indexable is None or column.is_deterministic is None)
+        )
+    if unread:
+        unread.sort()
+        shown = ", ".join(unread[:10]) + (f" and {len(unread) - 10} more" if len(unread) > 10 else "")
+        gaps.append(
+            f"IsIndexable/IsDeterministic were not read for computed column(s) {shown}; they were "
+            "not used as index keys or includes, so advice that needs them may be missing"
+        )
     return gaps
+
+
+def _query_store_retention_gaps(inputs: AdvisorInputs) -> list[str]:
+    gaps: list[str] = []
+    lookback = inputs.settings.lookback_days
+    window, days = _query_store_window(inputs)
+    if days is not None and days < 0.9 * lookback:
+        oldest = window["query_store_oldest_interval_utc"]
+        gaps.append(
+            f"Query Store holds {days:.1f} of the requested {lookback} day(s)"
+            + (f" (oldest retained interval starts {oldest})" if oldest else "")
+            + f"; per-day rates and plan-reference checks use the {days:.1f} day(s) it holds"
+        )
+    options = inputs.query_store
+    stale = _float_or_none(options.get("stale_query_threshold_days"))
+    if stale is not None:
+        shorter_than = []
+        if stale < lookback:
+            shorter_than.append(f"the {lookback}-day review window")
+        if stale < UNUSED_HIGH_CONFIDENCE_DAYS:
+            shorter_than.append(f"the {UNUSED_HIGH_CONFIDENCE_DAYS}-day index removal window")
+        if shorter_than:
+            gaps.append(
+                f"Query Store retention (stale_query_threshold_days) is {stale:g} day(s), shorter "
+                f"than {' and '.join(shorter_than)}; plans of queries that run only at month-end "
+                "may already be purged, so they cannot protect an index from removal"
+            )
+    current = _float_or_none(options.get("current_storage_size_mb"))
+    maximum = _float_or_none(options.get("max_storage_size_mb"))
+    if current is not None and maximum and current >= 0.9 * maximum:
+        mode = options.get("size_based_cleanup_mode")
+        gaps.append(
+            f"Query Store storage is at {100 * current / maximum:.0f}% of max_storage_size_mb "
+            f"({current:g} of {maximum:g} MB"
+            + (f", size_based_cleanup_mode {mode}" if mode else "")
+            + "); at the limit it purges the oldest data or turns READ_ONLY, so older or new "
+            "workload may be missing"
+        )
+    return gaps
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _next_steps(recommendations: list[dict[str, Any]], rewrites: list[dict[str, Any]]) -> list[str]:

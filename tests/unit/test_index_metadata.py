@@ -179,8 +179,8 @@ def test_protection_catalog_fields_are_translated_to_persisted_contract_values()
     assert "i.type_desc AS index_type" in INDEX_PROTECTION_METADATA_SQL
 
 
-def test_only_a_complete_leading_child_foreign_key_is_protected() -> None:
-    base = {
+def _protection_row(**changes: object) -> dict[str, object]:
+    row: dict[str, object] = {
         "object_id": 101,
         "index_id": 2,
         "index_type_code": 2,
@@ -194,36 +194,19 @@ def test_only_a_complete_leading_child_foreign_key_is_protected() -> None:
         "partition_switch_dependency": 0,
         "is_indexed_view": 0,
         "has_index_extended_properties": 0,
-        "child_foreign_key_id": 7001,
-        "child_object_id": 101,
+        "child_foreign_key_ids": None,
+        "referenced_foreign_key_ids": None,
     }
-    unrelated = parse_protection_evidence(
-        [
-            {
-                **base,
-                "child_constraint_column_ordinal": 1,
-                "child_index_key_ordinal": None,
-            },
-            {
-                **base,
-                "child_constraint_column_ordinal": 2,
-                "child_index_key_ordinal": None,
-            },
-        ]
-    )[(101, 2)]
+    row.update(changes)
+    return row
+
+
+def test_only_a_complete_leading_child_foreign_key_is_protected() -> None:
+    # The query returns only foreign keys whose columns fill the leading keys
+    # (in any order), so an unrelated index carries no id list.
+    unrelated = parse_protection_evidence([_protection_row()])[(101, 2)]
     supporting = parse_protection_evidence(
-        [
-            {
-                **base,
-                "child_constraint_column_ordinal": 1,
-                "child_index_key_ordinal": 1,
-            },
-            {
-                **base,
-                "child_constraint_column_ordinal": 2,
-                "child_index_key_ordinal": 2,
-            },
-        ]
+        [_protection_row(child_foreign_key_ids="7001")]
     )[(101, 2)]
 
     assert unrelated["coverage"] == "complete"
@@ -234,10 +217,81 @@ def test_only_a_complete_leading_child_foreign_key_is_protected() -> None:
             "foreign_key_id": 7001,
             "child_object_id": 101,
             "leading_key_supported": True,
-            "constraint_ordinals": [1, 2],
-            "index_key_ordinals": [1, 2],
         }
     ]
+
+
+def test_protection_evidence_reads_one_row_per_index_with_fk_id_lists() -> None:
+    evidence = parse_protection_evidence(
+        [
+            _protection_row(object_id=10, child_foreign_key_ids="9,12"),
+            _protection_row(
+                object_id=20, index_id=1, referenced_foreign_key_ids="9"
+            ),
+        ]
+    )
+
+    child = evidence[(10, 2)]
+    assert child["coverage"] == "complete"
+    assert child["safe_to_remove"] is True
+    assert child["child_foreign_key_support"] == [
+        {"foreign_key_id": 9, "child_object_id": 10, "leading_key_supported": True},
+        {"foreign_key_id": 12, "child_object_id": 10, "leading_key_supported": True},
+    ]
+    assert child["referenced_foreign_keys"] == []
+    referenced = evidence[(20, 1)]
+    assert referenced["child_foreign_key_support"] == []
+    assert referenced["referenced_foreign_key_key_index_ids"] == [9]
+    assert referenced["referenced_foreign_keys"] == [
+        {"foreign_key_id": 9, "key_index_id": 1}
+    ]
+
+
+def test_protection_evidence_with_unparseable_fk_ids_is_incomplete() -> None:
+    child = parse_protection_evidence(
+        [_protection_row(child_foreign_key_ids="9,not-an-id")]
+    )[(101, 2)]
+    referenced = parse_protection_evidence(
+        [_protection_row(referenced_foreign_key_ids="7,")]
+    )[(101, 2)]
+
+    assert child["coverage"] == "incomplete"
+    assert child["safe_to_remove"] is False
+    assert "child_foreign_key_metadata_incomplete" in child["blockers"]
+    assert referenced["coverage"] == "incomplete"
+    assert referenced["safe_to_remove"] is False
+    assert "referenced_foreign_key_metadata_incomplete" in referenced["blockers"]
+
+
+def test_protection_query_returns_one_row_per_index() -> None:
+    sql = INDEX_PROTECTION_METADATA_SQL
+    # No index x foreign key x column cross product that can hit the cap.
+    assert "LEFT JOIN sys.foreign_keys" not in sql
+    assert "LEFT JOIN sys.foreign_key_columns" not in sql
+    assert "OR fk.referenced_object_id" not in sql
+    assert "LEFT JOIN sys.extended_properties" not in sql
+    assert "TOP (100000)" in sql
+    assert "AS child_foreign_key_ids" in sql
+    assert "AS referenced_foreign_key_ids" in sql
+    # Order-insensitive leading-key match: every FK column is a key column
+    # whose ordinal is within the first N keys.
+    assert "NOT BETWEEN 1 AND" in sql
+    assert "fk.key_index_id = i.index_id" in sql
+
+
+def test_protection_cap_is_fail_closed_and_sized_for_one_row_per_index() -> None:
+    many = [_protection_row(object_id=n) for n in range(1, 10_001)]
+    assert len(parse_protection_evidence(many)) == 10_000
+
+    capped = parse_protection_evidence(
+        [_protection_row(object_id=n) for n in range(1, 100_001)]
+    )
+    assert capped == {
+        (0, 0): {
+            "coverage": "incomplete",
+            "blockers": ["protection_metadata_cap_reached"],
+        }
+    }
 
 
 def _complete_rows() -> list[dict[str, object]]:
@@ -503,9 +557,8 @@ def test_protection_evidence_preserves_fk_roles_and_composite_order() -> None:
             "child_foreign_key_support": [
                 {
                     "foreign_key_id": 7002,
+                    "child_object_id": 101,
                     "leading_key_supported": True,
-                    "constraint_ordinals": [1, 2],
-                    "index_key_ordinals": [1, 2],
                 }
             ],
             "automatic_tuning": False,

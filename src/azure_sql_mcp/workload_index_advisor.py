@@ -9,10 +9,14 @@ checks) degrades to a reported gap instead of failing the review.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable
 from datetime import datetime
 from datetime import timezone
 from typing import Any
+from typing import TypeVar
 
+from .azure_tier import dmv_permission_hint
 from .connection import AzureSqlExecutor
 from .index_advisor import OBJECTIVES
 from .index_advisor import AdvisorInputs
@@ -27,6 +31,7 @@ from .index_metadata import ExistingIndex
 from .index_metadata import collect_existing_indexes
 from .incident_log import note_exception
 from .observability import sanitize_error_message
+from .query_store import QueryStoreService
 from .result_status import ResultStatus
 from .result_status import status_payload
 from .showplan_access import parse_plan_access
@@ -39,6 +44,27 @@ MAX_PLANS_PER_QUERY = 3
 MAX_DETAIL_TABLES = 200
 MAX_REFERENCE_CHECKS = 40
 QUERY_TEXT_PREVIEW_CHARS = 300
+# Forced-plan dependency read: plan count, bytes per plan XML, bytes in total.
+MAX_FORCED_PLANS = 500
+MAX_FORCED_PLAN_XML_BYTES = 4_000_000
+MAX_FORCED_PLAN_TOTAL_BYTES = 64_000_000
+# Rows read per hint source (query text, Query Store hints, plan guides, modules).
+MAX_HINT_SOURCE_ROWS = 2_000
+# Each optional dependency read runs concurrently and gives up after the
+# executor's configured query timeout, or this when it has none.
+OPTIONAL_READ_TIMEOUT_SECONDS = 30.0
+# Hint-scan blockers for a hint that matches no single index; it may name any
+# index advised for removal, so removals get no DDL.
+_UNRESOLVED_HINT_BLOCKERS = frozenset(
+    {"unresolved_or_ambiguous_index_hint", "unresolved_or_ambiguous_numeric_index_hint"}
+)
+_HINT_SOURCE_NAMES = {
+    "query_store_text": "Query Store query text",
+    "query_store_query_hints": "Query Store hints",
+    "plan_guides": "plan guides",
+    "module_definitions": "module definitions",
+}
+_REMOVALS_CAPPED = "unused and redundant index removals are capped at medium confidence"
 
 QUERY_STORE_OPTIONS_SQL = """
 SELECT
@@ -49,9 +75,45 @@ SELECT
     interval_length_minutes,
     stale_query_threshold_days,
     max_storage_size_mb,
-    current_storage_size_mb
+    current_storage_size_mb,
+    size_based_cleanup_mode_desc
 FROM sys.database_query_store_options
 """
+
+# The part of the window that Query Store still holds, plus its oldest interval.
+QUERY_STORE_COVERAGE_SQL = """
+SELECT
+    CONVERT(datetime2(0), SWITCHOFFSET(MIN(rsi.start_time), '+00:00')) AS effective_start_utc,
+    CONVERT(datetime2(0), SWITCHOFFSET(MAX(rsi.end_time), '+00:00')) AS effective_end_utc,
+    COUNT_BIG(*) AS interval_count,
+    (
+        SELECT CONVERT(datetime2(0), SWITCHOFFSET(MIN(oldest.start_time), '+00:00'))
+        FROM sys.query_store_runtime_stats_interval AS oldest
+    ) AS oldest_interval_start_utc
+FROM sys.query_store_runtime_stats_interval AS rsi
+WHERE rsi.start_time < TODATETIMEOFFSET(CAST(? AS datetime2), 0)
+  AND rsi.end_time > TODATETIMEOFFSET(CAST(? AS datetime2), 0)
+"""
+
+# Every forced plan, not only the analysed top queries. Plan XML over the
+# per-plan or running-total byte cap is withheld and reported as unread.
+FORCED_PLANS_SQL = """
+SELECT TOP (?)
+    p.plan_id,
+    p.query_id,
+    DATALENGTH(p.query_plan) AS plan_bytes,
+    CASE
+        WHEN DATALENGTH(p.query_plan) <= ?
+         AND SUM(CASE WHEN DATALENGTH(p.query_plan) <= ? THEN DATALENGTH(p.query_plan) ELSE 0 END)
+             OVER (ORDER BY p.plan_id ROWS UNBOUNDED PRECEDING) <= ?
+        THEN CAST(p.query_plan AS nvarchar(max))
+    END AS query_plan
+FROM sys.query_store_plan AS p
+WHERE p.is_forced_plan = 1
+ORDER BY p.plan_id
+"""
+
+_T = TypeVar("_T")
 
 _WORKLOAD_SQL_TEMPLATE = """
 WITH plan_stats AS (
@@ -246,14 +308,21 @@ INNER JOIN sys.columns AS c
 ORDER BY fk.object_id, fkc.constraint_column_id
 """
 
+# plan_references: plans that access the index (Index="[name]").
+# statistics_references: plans whose OptimizerStatsUsage read its statistics.
 _INDEX_REFERENCE_SQL_TEMPLATE = """
 SELECT
     v.ref_id,
-    COUNT(p.plan_id) AS plan_references
-FROM (VALUES {values}) AS v(ref_id, pattern)
-LEFT JOIN sys.query_store_plan AS p
-    ON p.last_execution_time > TODATETIMEOFFSET(CAST(? AS datetime2), 0)
-   AND CHARINDEX(v.pattern, CAST(p.query_plan AS nvarchar(max))) > 0
+    COUNT(CASE WHEN CHARINDEX(v.index_pattern, x.plan_xml) > 0 THEN 1 END) AS plan_references,
+    COUNT(CASE WHEN CHARINDEX(v.stats_pattern, x.plan_xml) > 0 THEN 1 END) AS statistics_references
+FROM (VALUES {values}) AS v(ref_id, index_pattern, stats_pattern)
+LEFT JOIN (
+    SELECT CAST(p.query_plan AS nvarchar(max)) AS plan_xml
+    FROM sys.query_store_plan AS p
+    WHERE p.last_execution_time > TODATETIMEOFFSET(CAST(? AS datetime2), 0)
+) AS x
+    ON CHARINDEX(v.index_pattern, x.plan_xml) > 0
+    OR CHARINDEX(v.stats_pattern, x.plan_xml) > 0
 GROUP BY v.ref_id
 """
 
@@ -276,8 +345,19 @@ def _norm(value: str) -> str:
 
 
 class WorkloadIndexAdvisor:
-    def __init__(self, executor: AzureSqlExecutor):
+    def __init__(
+        self,
+        executor: AzureSqlExecutor,
+        *,
+        optional_read_timeout_seconds: float | None = None,
+    ):
         self.executor = executor
+        if optional_read_timeout_seconds is None:
+            config = getattr(executor, "config", None)
+            optional_read_timeout_seconds = float(
+                getattr(config, "query_timeout_seconds", None) or OPTIONAL_READ_TIMEOUT_SECONDS
+            )
+        self.optional_read_timeout_seconds = optional_read_timeout_seconds
 
     async def review(
         self,
@@ -334,7 +414,8 @@ class WorkloadIndexAdvisor:
                     ResultStatus.UNAVAILABLE,
                     "Existing index metadata could not be read, so no index advice is safe: "
                     + sanitize_error_message(str(exc))
-                    + ". VIEW DEFINITION and VIEW DATABASE STATE are required.",
+                    + ". The index catalog views need VIEW DEFINITION. "
+                    + dmv_permission_hint("sys.dm_db_index_usage_stats"),
                 ),
             }
         tables = await self._tables(database_name, gaps)
@@ -373,11 +454,62 @@ class WorkloadIndexAdvisor:
         await self._forwarded_fetches(database_name, heap_ids, tables, by_id, gaps)
         selectivity = await self._selectivity(database_name, detail_ids, by_id, gaps)
         foreign_keys = await self._foreign_keys(database_name, gaps)
-        references = (
-            await self._index_references(database_name, existing, start, gaps)
-            if include_existing_index_review and query_store_readable
-            else {}
+
+        # Optional dependency reads run concurrently, each bounded; a timeout or
+        # failure becomes a gap. Gaps are kept per read for a stable order.
+        reference_gaps: list[str] = []
+        forced_gaps: list[str] = []
+        hint_gaps: list[str] = []
+        coverage_gaps: list[str] = []
+        pin_reads = include_existing_index_review and query_store_readable
+        (
+            (references, statistics_references),
+            (forced_accesses, forced_coverage),
+            (hint_references, hint_coverage),
+            coverage,
+        ) = await asyncio.gather(
+            self._bounded(
+                self._index_references(database_name, existing, start, reference_gaps)
+                if pin_reads
+                else _value(({}, {})),
+                fallback=({}, {}),
+                gaps=reference_gaps,
+                what="Query Store plan reference",
+                consequence="unused-index findings stay low confidence",
+                site="workload_index_advisor.index_references",
+            ),
+            self._bounded(
+                self._forced_plans(database_name, forced_gaps)
+                if pin_reads
+                else _value(([], "not_checked")),
+                fallback=([], "incomplete"),
+                gaps=forced_gaps,
+                what="forced Query Store plan",
+                consequence=_REMOVALS_CAPPED,
+                site="workload_index_advisor.forced_plans",
+            ),
+            self._bounded(
+                self._index_hints(database_name, existing, hint_gaps)
+                if include_existing_index_review
+                else _value(({}, "not_checked")),
+                fallback=({}, "incomplete"),
+                gaps=hint_gaps,
+                what="index hint",
+                consequence=_REMOVALS_CAPPED,
+                site="workload_index_advisor.index_hints",
+            ),
+            self._bounded(
+                self._query_store_coverage(database_name, start, end, coverage_gaps)
+                if query_store_readable
+                else _value(None),
+                fallback=None,
+                gaps=coverage_gaps,
+                what="Query Store window coverage",
+                consequence="per-day rates use the requested window and removals are capped at medium confidence",
+                site="workload_index_advisor.query_store_coverage",
+            ),
         )
+        gaps.extend(reference_gaps + forced_gaps + hint_gaps + coverage_gaps)
         if include_existing_index_review and not query_store_readable:
             gaps.append(
                 "Query Store plan references could not be checked; unused-index findings stay low confidence"
@@ -408,6 +540,12 @@ class WorkloadIndexAdvisor:
             query_store=query_store,
             gaps=gaps,
             observed_at_utc=(now or datetime.now(timezone.utc)).isoformat(),
+            index_statistics_references=statistics_references,
+            query_store_coverage=coverage,
+            forced_plan_accesses=forced_accesses,
+            index_hint_references=hint_references,
+            forced_plan_coverage=forced_coverage,
+            hint_coverage=hint_coverage,
         )
         report = build_index_advice(inputs)
         report.update(self._overall_status(report, query_store, query_store_readable, queries))
@@ -437,6 +575,7 @@ class WorkloadIndexAdvisor:
             "stale_query_threshold_days": row.get("stale_query_threshold_days"),
             "max_storage_size_mb": row.get("max_storage_size_mb"),
             "current_storage_size_mb": row.get("current_storage_size_mb"),
+            "size_based_cleanup_mode": row.get("size_based_cleanup_mode_desc"),
         }
         readable = state in {"READ_WRITE", "READ_ONLY"}
         if state == "READ_ONLY":
@@ -678,13 +817,34 @@ class WorkloadIndexAdvisor:
             if entry["schema"] and entry["table"] and entry["columns"]
         ]
 
+    async def _bounded(
+        self,
+        read: Awaitable[_T],
+        *,
+        fallback: _T,
+        gaps: list[str],
+        what: str,
+        consequence: str,
+        site: str,
+    ) -> _T:
+        try:
+            return await asyncio.wait_for(read, timeout=self.optional_read_timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            note_exception(exc, site)
+            gaps.append(
+                f"The {what} read timed out after {self.optional_read_timeout_seconds:g} s; {consequence}"
+            )
+            return fallback
+
     async def _index_references(
         self,
         database_name: str,
         existing: list[ExistingIndex],
         start: datetime,
         gaps: list[str],
-    ) -> dict[tuple[str, str, str], int | None]:
+    ) -> tuple[dict[tuple[str, str, str], int | None], dict[tuple[str, str, str], int | None]]:
+        """Query Store plans in the window that access, or read the statistics of, each unused index."""
+
         unused = [
             index
             for index in existing
@@ -694,17 +854,19 @@ class WorkloadIndexAdvisor:
             and sum(int(index.usage.get(m) or 0) for m in ("user_seeks", "user_scans", "user_lookups")) == 0
         ]
         if not unused:
-            return {}
+            return {}, {}
         checked = unused[:MAX_REFERENCE_CHECKS]
         if len(unused) > len(checked):
             gaps.append(
                 f"Query Store references were checked for {len(checked)} of {len(unused)} unused indexes"
             )
-        values = ", ".join("(?, ?)" for _ in checked)
+        values = ", ".join("(?, ?, ?)" for _ in checked)
         params: list[Any] = []
         for position, index in enumerate(checked):
-            params.extend([position, 'Index="[' + index.name.replace("]", "]]") + ']"'])
+            quoted = "[" + index.name.replace("]", "]]") + ']"'
+            params.extend([position, 'Index="' + quoted, 'Statistics="' + quoted])
         params.append(_iso(start))
+        keys = [(_norm(i.schema), _norm(i.table), _norm(i.name)) for i in checked]
         try:
             rows = await self.executor.fetch_all(
                 database_name, _INDEX_REFERENCE_SQL_TEMPLATE.format(values=values), params=params
@@ -714,11 +876,161 @@ class WorkloadIndexAdvisor:
             gaps.append(
                 "Query Store index references could not be checked: " + sanitize_error_message(str(exc))
             )
-            return {(_norm(i.schema), _norm(i.table), _norm(i.name)): None for i in checked}
-        counts = {int(_float(row.get("ref_id"))): int(_float(row.get("plan_references"))) for row in rows}
+            return dict.fromkeys(keys), dict.fromkeys(keys)
+        plans: dict[int, int] = {}
+        statistics: dict[int, int] = {}
+        for row in rows:
+            position = int(_float(row.get("ref_id")))
+            plans[position] = int(_float(row.get("plan_references")))
+            statistics[position] = int(_float(row.get("statistics_references")))
+        return (
+            {key: plans.get(position) for position, key in enumerate(keys)},
+            {key: statistics.get(position) for position, key in enumerate(keys)},
+        )
+
+    async def _forced_plans(
+        self, database_name: str, gaps: list[str]
+    ) -> tuple[list[tuple[int, int, str, str, str]], str]:
+        """Every index each forced Query Store plan reads, and whether all plans were read."""
+
+        try:
+            rows = await self.executor.fetch_all(
+                database_name,
+                FORCED_PLANS_SQL,
+                params=[
+                    MAX_FORCED_PLANS + 1,
+                    MAX_FORCED_PLAN_XML_BYTES,
+                    MAX_FORCED_PLAN_XML_BYTES,
+                    MAX_FORCED_PLAN_TOTAL_BYTES,
+                ],
+            )
+        except Exception as exc:
+            note_exception(exc, "workload_index_advisor.forced_plans")
+            gaps.append(
+                "Forced Query Store plans could not be read: "
+                + sanitize_error_message(str(exc))
+                + f"; {_REMOVALS_CAPPED}"
+            )
+            return [], "incomplete"
+        coverage = "complete"
+        if len(rows) > MAX_FORCED_PLANS:
+            rows = rows[:MAX_FORCED_PLANS]
+            coverage = "incomplete"
+            gaps.append(
+                f"More than {MAX_FORCED_PLANS} forced Query Store plans exist and only "
+                f"{MAX_FORCED_PLANS} were checked for index dependencies; {_REMOVALS_CAPPED}"
+            )
+        accesses: list[tuple[int, int, str, str, str]] = []
+        unread = 0
+        for row in rows:
+            plan_xml = row.get("query_plan")
+            plan = parse_plan_access(str(plan_xml)) if plan_xml else None
+            if plan is None or plan.parse_error:
+                unread += 1
+                continue
+            query_id = int(_float(row.get("query_id")))
+            plan_id = int(_float(row.get("plan_id")))
+            accesses.extend(
+                (query_id, plan_id, access.schema, access.table, access.index_name)
+                for access in plan.accesses
+                if access.index_name
+            )
+        if unread:
+            coverage = "incomplete"
+            gaps.append(
+                f"{unread} forced Query Store plan(s) were too large to read or could not be "
+                f"parsed; {_REMOVALS_CAPPED}"
+            )
+        return accesses, coverage
+
+    async def _index_hints(
+        self, database_name: str, existing: list[ExistingIndex], gaps: list[str]
+    ) -> tuple[dict[tuple[str, str, str], list[str]], str]:
+        """INDEX and FORCESEEK hints in query text, Query Store hints, plan guides and modules."""
+
+        identities = [
+            {
+                "object_id": index.object_id,
+                "index_id": index.index_id,
+                "schema": index.schema,
+                "table": index.table,
+                "index_name": index.name,
+            }
+            for index in existing
+            # A heap (index_id 0) cannot be named in an index hint.
+            if index.index_id > 0 and not index.is_hypothetical
+        ]
+        try:
+            result = await QueryStoreService(self.executor).get_index_hint_coverage(
+                database_name, index_identities=identities, limit=MAX_HINT_SOURCE_ROWS
+            )
+        except Exception as exc:
+            note_exception(exc, "workload_index_advisor.index_hints")
+            gaps.append(
+                "Index hints could not be checked: " + sanitize_error_message(str(exc)) + f"; {_REMOVALS_CAPPED}"
+            )
+            return {}, "incomplete"
+        references: dict[tuple[str, str, str], list[str]] = {}
+        for evidence in result.get("evidence") or []:
+            place = _hint_place(str(evidence.get("source") or ""), evidence.get("source_id") or {})
+            for resolved in evidence.get("resolved_indexes") or []:
+                key = (
+                    _norm(str(resolved.get("schema") or "")),
+                    _norm(str(resolved.get("table") or "")),
+                    _norm(str(resolved.get("index_name") or "")),
+                )
+                places = references.setdefault(key, [])
+                if place not in places:
+                    places.append(place)
+        coverage = result.get("coverage") or {}
+        unresolved = [
+            _HINT_SOURCE_NAMES.get(str(source), str(source))
+            for source, source_coverage in (coverage.get("sources") or {}).items()
+            if _UNRESOLVED_HINT_BLOCKERS & set(source_coverage.get("blockers") or [])
+        ]
+        if unresolved:
+            gaps.append(
+                f"Index hints in {', '.join(unresolved)} match no single index here: the name "
+                "differs in case from the index name, is on more than one table without a "
+                "TABLE HINT target, or names no index in this database. Any of them may name an "
+                "index advised for removal, so unused and redundant index removals have no DDL"
+            )
+        if coverage.get("status") == "complete":
+            return references, "complete"
+        blockers = [
+            str(blocker)
+            for blocker in coverage.get("blockers") or []
+            if blocker not in _UNRESOLVED_HINT_BLOCKERS
+        ]
+        if blockers or not unresolved:
+            gaps.append(
+                "Index hints in query text, Query Store hints, plan guides and modules were not fully checked"
+                + (f" ({', '.join(blockers[:5])})" if blockers else "")
+                + f"; {_REMOVALS_CAPPED}"
+            )
+        return references, "unresolved" if unresolved else "incomplete"
+
+    async def _query_store_coverage(
+        self, database_name: str, start: datetime, end: datetime, gaps: list[str]
+    ) -> dict[str, Any] | None:
+        try:
+            rows = await self.executor.fetch_all(
+                database_name, QUERY_STORE_COVERAGE_SQL, params=[_iso(end), _iso(start)]
+            )
+        except Exception as exc:
+            note_exception(exc, "workload_index_advisor.query_store_coverage")
+            gaps.append(
+                "Query Store window coverage could not be read: "
+                + sanitize_error_message(str(exc))
+                + "; per-day rates use the requested window and removals are capped at medium confidence"
+            )
+            return None
+        row = rows[0] if rows else {}
         return {
-            (_norm(index.schema), _norm(index.table), _norm(index.name)): counts.get(position)
-            for position, index in enumerate(checked)
+            "effective_start_utc": row.get("effective_start_utc"),
+            "effective_end_utc": row.get("effective_end_utc"),
+            "interval_count": int(_float(row.get("interval_count"))),
+            "oldest_interval_start_utc": row.get("oldest_interval_start_utc"),
         }
 
     @staticmethod
@@ -753,6 +1065,22 @@ class WorkloadIndexAdvisor:
             ResultStatus.OK,
             f"Analysed {len(queries)} Query Store plan(s); {len(recommendations)} recommendation(s).",
         )
+
+
+async def _value(value: _T) -> _T:
+    return value
+
+
+def _hint_place(source: str, source_id: dict[str, Any]) -> str:
+    if source == "query_store_text":
+        return f"the text of query {source_id.get('query_id')}"
+    if source == "query_store_query_hints":
+        return f"the Query Store hint on query {source_id.get('query_id')}"
+    if source == "plan_guides":
+        return f"plan guide {source_id.get('plan_guide_id')}"
+    if source == "module_definitions":
+        return f"module object_id {source_id.get('object_id')}"
+    return source or "an unknown hint source"
 
 
 def _id_list(object_ids: list[int]) -> str:

@@ -128,6 +128,7 @@ def render_reverse_index_ddl(index: ExistingIndex) -> dict[str, Any]:
             f"ALLOW_ROW_LOCKS = {_on_off(index.allow_row_locks)}",
             f"ALLOW_PAGE_LOCKS = {_on_off(index.allow_page_locks)}",
             f"OPTIMIZE_FOR_SEQUENTIAL_KEY = {_on_off(index.optimize_for_sequential_key)}",
+            *_compression_options(index),
         )
     )
     placement = _placement_sql(index)
@@ -152,8 +153,7 @@ def render_reverse_index_ddl(index: ExistingIndex) -> dict[str, Any]:
         + placement
         + ";"
     )
-    compression_sql = _compression_sql(index)
-    base["ddl"] = create_sql + ("\n" + compression_sql if compression_sql else "")
+    base["ddl"] = create_sql
     base["reverse_ddl"] = base["ddl"]
     base["drop_ddl"] = (
         "DROP INDEX "
@@ -326,35 +326,38 @@ def _placement_sql(index: ExistingIndex) -> str:
     return "\nON " + quote_identifier(index.data_space_name or "")
 
 
-def _compression_sql(index: ExistingIndex) -> str:
+def _compression_options(index: ExistingIndex) -> list[str]:
+    """CREATE INDEX WITH options that keep the exact per-partition compression.
+
+    One statement rebuilds every partition with its own compression, so a
+    rebuild or rollback never needs offline ALTER INDEX ... REBUILD PARTITION.
+    """
+
     data_by_partition = dict(index.partition_compression)
     xml_by_partition = dict(index.xml_compression)
     partition_numbers = sorted(set(data_by_partition) | set(xml_by_partition))
     if not partition_numbers:
-        return ""
-    groups: dict[tuple[str, str | None], list[int]] = defaultdict(list)
+        return []
+    data_groups: dict[str, list[int]] = defaultdict(list)
+    xml_on: list[int] = []
     for number in partition_numbers:
-        data_compression = data_by_partition.get(number, "NONE").upper()
-        xml_compression = xml_by_partition.get(number)
-        groups[
-            (data_compression, xml_compression.upper() if xml_compression else None)
-        ].append(number)
-    statements: list[str] = []
-    for (data_compression, xml_compression), numbers in sorted(groups.items()):
-        options = [f"DATA_COMPRESSION = {data_compression}"]
-        if xml_compression is not None:
-            options.append(f"XML_COMPRESSION = {xml_compression}")
-        for number in numbers:
-            statements.append(
-                "ALTER INDEX "
-                + quote_identifier(index.name)
-                + " ON "
-                + quote_identifier(index.schema)
-                + "."
-                + quote_identifier(index.table)
-                + f" REBUILD PARTITION = {number} WITH ({', '.join(options)});"
-            )
-    return "\n".join(statements)
+        data_groups[data_by_partition.get(number, "NONE").upper()].append(number)
+        if str(xml_by_partition.get(number) or "").upper() == "ON":
+            xml_on.append(number)
+    partitioned = (index.data_space_type or "").upper() in {"PARTITION_SCHEME", "PARTITION SCHEME"}
+
+    def scope(numbers: list[int]) -> str:
+        if not partitioned:
+            return ""
+        return " ON PARTITIONS (" + ", ".join(str(number) for number in numbers) + ")"
+
+    options = [
+        f"DATA_COMPRESSION = {compression}{scope(numbers)}"
+        for compression, numbers in sorted(data_groups.items())
+    ]
+    if xml_on:
+        options.append(f"XML_COMPRESSION = ON{scope(xml_on)}")
+    return options
 
 
 def _on_off(value: bool | None) -> str:

@@ -126,9 +126,17 @@ FROM sys.databases
 WHERE name = DB_NAME()
 """
 
+# One row per index; TOP matches parse_protection_evidence(max_rows).
+# child_foreign_key_ids lists the foreign keys on the index's table whose
+# columns are exactly the index's leading key columns, in any order: N distinct
+# FK columns that each have a key ordinal from 1 to N. Filtered indexes are
+# listed too (a keep-protection); they cannot serve the RI check, so callers
+# that count alternative FK support must skip them.
+# referenced_foreign_key_ids lists the foreign keys that use this index as
+# their referenced key.
 INDEX_PROTECTION_METADATA_SQL = """
 SELECT
-    TOP (10000)
+    TOP (100000)
     i.object_id,
     i.index_id,
     i.type AS index_type_code,
@@ -142,37 +150,58 @@ SELECT
     CASE WHEN ds.type = 'PS' THEN 1 ELSE 0 END AS partition_switch_dependency,
     o.type AS parent_object_type_code,
     CASE WHEN o.type = 'V' THEN 1 ELSE 0 END AS is_indexed_view,
-    fk.object_id AS child_foreign_key_id,
-    fk.parent_object_id AS child_object_id,
-    fk.referenced_object_id AS referenced_object_id,
-    fk.key_index_id AS referenced_key_index_id,
-    fkc.constraint_column_id AS child_constraint_column_ordinal,
-    fkc.parent_column_id AS child_column_id,
-    fkc.referenced_column_id AS referenced_column_id,
-    ic.key_ordinal AS child_index_key_ordinal,
-    CASE WHEN ep.major_id IS NULL THEN 0 ELSE 1 END AS has_index_extended_properties
+    child.child_foreign_key_ids,
+    referenced.referenced_foreign_key_ids,
+    CASE
+        WHEN EXISTS (
+            SELECT 1
+            FROM sys.extended_properties AS ep
+            WHERE ep.class = 7
+              AND ep.major_id = i.object_id
+              AND ep.minor_id = i.index_id
+        ) THEN 1
+        ELSE 0
+    END AS has_index_extended_properties
 FROM sys.indexes AS i
 INNER JOIN sys.objects AS o
     ON o.object_id = i.object_id
 LEFT JOIN sys.data_spaces AS ds
     ON ds.data_space_id = i.data_space_id
-LEFT JOIN sys.foreign_keys AS fk
-    ON fk.parent_object_id = i.object_id
-    OR fk.referenced_object_id = i.object_id
-LEFT JOIN sys.foreign_key_columns AS fkc
-    ON fkc.constraint_object_id = fk.object_id
-LEFT JOIN sys.index_columns AS ic
-    ON ic.object_id = fkc.parent_object_id
-    AND ic.index_id = i.index_id
-    AND ic.column_id = fkc.parent_column_id
-LEFT JOIN sys.extended_properties AS ep
-    ON ep.class = 7
-    AND ep.major_id = i.object_id
-    AND ep.minor_id = i.index_id
+OUTER APPLY (
+    SELECT
+        STRING_AGG(CONVERT(varchar(max), fk.object_id), ',')
+            WITHIN GROUP (ORDER BY fk.object_id) AS child_foreign_key_ids
+    FROM sys.foreign_keys AS fk
+    WHERE fk.parent_object_id = i.object_id
+      AND NOT EXISTS (
+          SELECT 1
+          FROM sys.foreign_key_columns AS fkc
+          LEFT JOIN sys.index_columns AS ic
+              ON ic.object_id = fkc.parent_object_id
+              AND ic.index_id = i.index_id
+              AND ic.column_id = fkc.parent_column_id
+          WHERE fkc.constraint_object_id = fk.object_id
+            AND (
+                ic.key_ordinal IS NULL
+                OR ic.key_ordinal NOT BETWEEN 1 AND (
+                    SELECT COUNT(*)
+                    FROM sys.foreign_key_columns AS fkc_count
+                    WHERE fkc_count.constraint_object_id = fk.object_id
+                )
+            )
+      )
+) AS child
+OUTER APPLY (
+    SELECT
+        STRING_AGG(CONVERT(varchar(max), fk.object_id), ',')
+            WITHIN GROUP (ORDER BY fk.object_id) AS referenced_foreign_key_ids
+    FROM sys.foreign_keys AS fk
+    WHERE fk.referenced_object_id = i.object_id
+      AND fk.key_index_id = i.index_id
+) AS referenced
 WHERE i.index_id > 0
   AND o.type IN ('U', 'V')
-ORDER BY i.object_id, i.index_id, fk.object_id,
-    fkc.constraint_column_id
+ORDER BY i.object_id, i.index_id
 """
 
 _DIRECTION_PATTERN = re.compile(
@@ -1223,7 +1252,7 @@ async def _collect_protection_evidence(
 def parse_protection_evidence(
     rows: Iterable[dict[str, Any]],
     *,
-    max_rows: int = 10_000,
+    max_rows: int = 100_000,
 ) -> dict[tuple[int, int], dict[str, Any]]:
     """Parse the fixed protection query without weakening failed coverage."""
 
@@ -1310,63 +1339,33 @@ def parse_protection_evidence(
         ] or _as_bool(row.get("has_index_extended_properties"))
         item["extended_properties"] = item["has_index_extended_properties"]
 
-        foreign_key_id = _as_optional_int(row.get("child_foreign_key_id"))
-        if foreign_key_id is None:
-            continue
-        child_object_id = _as_optional_int(row.get("child_object_id"))
-        referenced_object_id = _as_optional_int(row.get("referenced_object_id"))
-        referenced_key_index_id = _as_optional_int(row.get("referenced_key_index_id"))
-        if (
-            referenced_object_id == object_id
-            and referenced_key_index_id == index_id
-        ):
-            item["referenced_foreign_key_key_index_ids"].add(foreign_key_id)
-        if child_object_id != object_id:
-            continue
-        child = item["child_foreign_key_support"].setdefault(
-            foreign_key_id,
-            {
-                "foreign_key_id": foreign_key_id,
-                "child_object_id": child_object_id,
-                "constraint_ordinals": [],
-                "index_key_ordinals": [],
-            },
-        )
-        constraint_ordinal = _as_optional_int(
-            row.get("child_constraint_column_ordinal")
-        )
-        index_ordinal = _as_optional_int(row.get("child_index_key_ordinal"))
-        if constraint_ordinal is None:
-            child["metadata_incomplete"] = True
+        child_ids = _foreign_key_ids(row.get("child_foreign_key_ids"))
+        if child_ids is None:
             item["coverage"] = "incomplete"
             item.setdefault("blockers", []).append(
                 "child_foreign_key_metadata_incomplete"
             )
         else:
-            child["constraint_ordinals"].append(constraint_ordinal)
-        if index_ordinal is not None:
-            child["index_key_ordinals"].append(index_ordinal)
+            for foreign_key_id in child_ids:
+                item["child_foreign_key_support"][foreign_key_id] = {
+                    "foreign_key_id": foreign_key_id,
+                    "child_object_id": object_id,
+                    "leading_key_supported": True,
+                }
+        referenced_ids = _foreign_key_ids(row.get("referenced_foreign_key_ids"))
+        if referenced_ids is None:
+            item["coverage"] = "incomplete"
+            item.setdefault("blockers", []).append(
+                "referenced_foreign_key_metadata_incomplete"
+            )
+        else:
+            item["referenced_foreign_key_key_index_ids"].update(referenced_ids)
 
     for item in evidence.values():
-        child_support: list[dict[str, Any]] = []
-        for support in item["child_foreign_key_support"].values():
-            constraint_ordinals = support.pop("constraint_ordinals")
-            index_ordinals = support.pop("index_key_ordinals")
-            support["leading_key_supported"] = bool(
-                not support.pop("metadata_incomplete", False)
-                and constraint_ordinals
-                and sorted(constraint_ordinals) == list(
-                    range(1, len(constraint_ordinals) + 1)
-                )
-                and index_ordinals == constraint_ordinals
-            )
-            support["constraint_ordinals"] = constraint_ordinals
-            support["index_key_ordinals"] = index_ordinals
-            if support["leading_key_supported"]:
-                child_support.append(support)
-        item["child_foreign_key_support"] = sorted(
-            child_support, key=lambda value: value["foreign_key_id"]
-        )
+        item["child_foreign_key_support"] = [
+            item["child_foreign_key_support"][foreign_key_id]
+            for foreign_key_id in sorted(item["child_foreign_key_support"])
+        ]
         item["referenced_foreign_key_key_index_ids"] = sorted(
             item["referenced_foreign_key_key_index_ids"]
         )
@@ -1383,6 +1382,20 @@ def parse_protection_evidence(
         item.setdefault("specialist_type", None)
         item["safe_to_remove"] = item.get("coverage") == "complete"
     return evidence
+
+
+def _foreign_key_ids(value: Any) -> list[int] | None:
+    """Parse a comma-separated foreign key id list; None when malformed."""
+
+    if value is None:
+        return []
+    ids: list[int] = []
+    for part in str(value).split(","):
+        text = part.strip()
+        if not (text.isascii() and text.isdigit()):
+            return None
+        ids.append(int(text))
+    return ids
 
 
 def _resolve_usage_context(
