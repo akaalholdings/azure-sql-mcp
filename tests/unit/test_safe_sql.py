@@ -299,6 +299,11 @@ def test_comment_and_literal_tricks_do_not_hide_code(validator, sql):
         "SELECT * FROM dbo.t WITH (SERIALIZABLE)",
         "SELECT * FROM dbo.t WITH (REPEATABLEREAD)",
         "SELECT * FROM dbo.t WITH (READCOMMITTEDLOCK)",
+        # Quoted hint names: fail closed rather than rely on how SQL Server reads them.
+        "SELECT * FROM dbo.t WITH ([UPDLOCK])",
+        'SELECT * FROM dbo.t WITH ("TABLOCK")',
+        "SELECT * FROM dbo.t ([XLOCK])",
+        "SELECT * FROM dbo.t WITH (NOLOCK, [HOLDLOCK])",
     ],
 )
 def test_rejects_locking_hints_in_any_position(validator, sql):

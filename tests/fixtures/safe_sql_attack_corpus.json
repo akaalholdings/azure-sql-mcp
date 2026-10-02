@@ -1,0 +1,6259 @@
+{
+ "source": "validator-attack-corpus.json: defensive sweep 2026-10-02 against d8c331d (1,422 unique inputs)",
+ "generated_against": "2.6.0",
+ "note": "cases: the sweep inputs as typed. 148 rows are not literal SQL: they hold an escape as text (\\x85 as four characters), a note in parentheses or brackets, or a placeholder such as <30000 'x' chars>. materialized: the real input that such a row describes, where cases does not already hold it; 'from' is that row. An entry with prefix/repeat/count/suffix is prefix + repeat * count + suffix. All decisions come from safe_sql.py 2.6.0 and were checked by hand.",
+ "cases": [
+  {
+   "sql": "SELECT NEXT VALUE FOR dbo.OrderNumbers",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT/**/VALUE/**/FOR dbo.OrderNumbers",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT -- c\nVALUE -- c\nFOR dbo.OrderNumbers",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT\n  VALUE\n  FOR dbo.OrderNumbers",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT\tVALUE\tFOR dbo.OrderNumbers",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT     VALUE     FOR   dbo.OrderNumbers",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR [dbo].[OrderNumbers]",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR [dbo].[Order Numbers]",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR dbo.OrderNumbers AS n",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR dbo.OrderNumbers n",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT (NEXT VALUE FOR dbo.OrderNumbers)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT CASE WHEN 1=1 THEN NEXT VALUE FOR dbo.OrderNumbers END",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT COALESCE(NEXT VALUE FOR dbo.OrderNumbers, 0)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT ISNULL(NEXT VALUE FOR dbo.OrderNumbers, 0)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR dbo.OrderNumbers OVER (ORDER BY (SELECT 1))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR dbo.OrderNumbers OVER (ORDER BY name), name FROM sys.objects",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR dbo.A, NEXT VALUE FOR dbo.B",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM (SELECT NEXT VALUE FOR dbo.OrderNumbers AS n) q",
+   "admitted": false
+  },
+  {
+   "sql": "WITH c AS (SELECT NEXT VALUE FOR dbo.OrderNumbers AS n) SELECT * FROM c",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT (NEXT VALUE FOR dbo.OrderNumbers) + 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT CAST(NEXT VALUE FOR dbo.OrderNumbers AS bigint)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR dbo.A AS n UNION ALL SELECT NEXT VALUE FOR dbo.B",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT next value for dbo.OrderNumbers",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NeXt VaLuE fOr dbo.OrderNumbers",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT ＮＥＸＴ VALUE FOR dbo.OrderNumbers",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR dbo.[OrderNumbers]",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT name FROM sys.objects ORDER BY NEXT VALUE FOR dbo.OrderNumbers",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.t WITH (TAB/**/LOCK)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.t WITH (UPD/**/LOCK)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.t (TABLOCK)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.t (HOLDLOCK)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.t OPTION (TABLE HINT(t, TABLOCK))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.t OPTION (TABLE HINT(t, HOLDLOCK))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.t WITH (ＸＬＯＣＫ)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.t WITH (PAGLOCK)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM dbo.t WITH (ROWLOCK)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM dbo.t WITH (READPAST)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM dbo.t WITH (SNAPSHOT)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM dbo.t WITH ([TABLOCK])",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.t WITH (TABLOCKX)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.GetRows(1) WITH (UPDLOCK)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.t WITH (NOLOCK, HOLDLOCK)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM OPENXML(@h, '/root', 2)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM OPENROWSET('SQLNCLI','...','SELECT 1')",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM OPENDATASOURCE('SQLNCLI','...').db.dbo.t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM OPENQUERY(LS, 'SELECT 1')",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM [OPENROWSET]('x')",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM OPENJSON('[1,2]')",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM dbo.ExternalSalesArchive",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT p.* FROM PREDICT(MODEL = @m, DATA = dbo.t) AS p",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 DECLARE c CURSOR FOR SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT IDENT_CURRENT('dbo.t')",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT SCOPE_IDENTITY()",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT SESSION_CONTEXT(N'k')",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT CONTEXT_INFO()",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM dbo.t OPTION (RECOMPILE)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM dbo.t OPTION (USE HINT('DISABLE_OPTIMIZER_ROWGOAL'))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.t OPTION (QUERYTRACEON 9481)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM dbo.t OPTION (MAXDOP 1)",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @x int; SET @x = (SELECT NEXT VALUE FOR dbo.OrderNumbers); SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int = NEXT VALUE FOR dbo.OrderNumbers; SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT TOP (CAST(NEXT VALUE FOR dbo.OrderNumbers AS int)) name FROM sys.objects",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.t WHERE id = (SELECT NEXT VALUE FOR dbo.OrderNumbers)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT COUNT(*) FROM dbo.t HAVING COUNT(*) > (SELECT NEXT VALUE FOR dbo.OrderNumbers)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR `dbo`.`OrderNumbers`",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.t WITH ([UPDLOCK])",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.t WITH ([HOLDLOCK])",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.t WITH ([XLOCK])",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.t WITH (\"TABLOCK\")",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.t WITH (INDEX(1), TABLOCK)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM ExternalArchive",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM dbo.RemoteViaElasticQuery",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM dbo.vSalesArchive",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM OPENROWSET(BULK 'c:\\x.txt', SINGLE_CLOB) AS a",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM CHANGETABLE(CHANGES dbo.t, 0) AS c",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM SEMANTICKEYPHRASETABLE(dbo.t, col)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT NEWSEQUENTIALID()",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 EXEC sys.sp_sequence_get_range N'dbo.OrderNumbers', 10, NULL",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 1; SELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "SET @x = 1, @y = 2; SELECT @x, @y",
+   "admitted": true
+  },
+  {
+   "sql": "SET @x = 1 SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 1 NOCOUNT ON; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET @@ROWCOUNT = 1; SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SET @x = 1 DELETE FROM dbo.t",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = (SELECT COUNT(*) FROM dbo.t); SELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "SET @x = NEXT VALUE FOR dbo.seq; SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SET NOCOUNT ON; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET ROWCOUNT 100; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 1; SET NOCOUNT ON; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = CAST((SELECT TOP 1 id FROM [db].[dbo].[t]) AS int); SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 1; SELECT 1; SELECT 2",
+   "admitted": false
+  },
+  {
+   "sql": "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 1 WAITFOR DELAY '00:00:05'",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 0x1; SELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "SET @x = 1, NOCOUNT ON; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 1 PRINT 'hi'",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x += 1; SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SET DEADLOCK_PRIORITY LOW; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = @@SPID; SELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 SET @x = 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET IDENTITY_INSERT dbo.t ON; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET STATISTICS IO ON; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET CONTEXT_INFO 0x01; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 1 UPDATE dbo.t SET v = 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 1; GRANT SELECT ON dbo.t TO public",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = (SELECT * FROM dbo.t FOR XML AUTO); SELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @x int; SET @x=1; SELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @x int = 1; SELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @t TABLE (id int); SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @t TABLE (id uniqueidentifier DEFAULT NEWID()); SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @t TABLE (id int DEFAULT (NEXT VALUE FOR dbo.seq)); SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE (a int, b AS (a+1)); SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @c CURSOR; SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @c CURSOR FOR SELECT 1; SELECT 2",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int = (SELECT TOP 1 id FROM [db].[dbo].[t]); SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x XML = (SELECT * FROM dbo.t FOR XML AUTO); SELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @x int DELETE FROM dbo.t",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int; DELETE FROM dbo.Users",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int = 1 SELECT @x DELETE FROM dbo.t",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int; DBCC CHECKDB",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x TABLE (id int); INSERT INTO @x VALUES (1); SELECT * FROM @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int = 1; EXEC sp_who",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x sysname = 'x'; SELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @a int, @b int; SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @x int = 1;\nSELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @delete int = 1; SET @delete = 2; SELECT @delete AS [Update]",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @c CURSOR; OPEN @c; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @c datetime2 = SYSDATETIME(); SELECT * FROM dbo.o WHERE t >= @c",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @t TABLE (id int); INSERT @t EXEC sp_who; SELECT * FROM @t",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int; MERGE dbo.t USING dbo.s ON 1=1 WHEN MATCHED THEN DELETE;",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int; SELECT * INTO dbo.copy FROM dbo.t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.a INNER MERGE JOIN dbo.b ON a.id=b.id",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT id FROM dbo.a UNION SELECT id FROM dbo.b OPTION (MERGE UNION)",
+   "admitted": true
+  },
+  {
+   "sql": "MERGE JOIN dbo.t AS t USING dbo.s AS s ON t.id=s.id WHEN MATCHED THEN UPDATE SET t.v=s.v;",
+   "admitted": false
+  },
+  {
+   "sql": "MERGE UNION dbo.t USING dbo.s ON 1=1 WHEN MATCHED THEN DELETE;",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 MERGE JOIN dbo.t AS t USING dbo.s AS s ON t.id=s.id WHEN MATCHED THEN DELETE;",
+   "admitted": false
+  },
+  {
+   "sql": "MERGE INTO dbo.t USING dbo.s ON t.id=s.id WHEN MATCHED THEN DELETE;",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; MERGE dbo.t USING dbo.s ON 1=1 WHEN MATCHED THEN DELETE;",
+   "admitted": false
+  },
+  {
+   "sql": "MERGE [JOIN] USING dbo.s ON 1=1 WHEN MATCHED THEN DELETE;",
+   "admitted": false
+  },
+  {
+   "sql": "MERGE JOIN.dbo.t AS t USING dbo.s AS s ON t.id=s.id WHEN MATCHED THEN DELETE;",
+   "admitted": false
+  },
+  {
+   "sql": "MERGE TOP (1) JOIN USING dbo.s ON 1=1 WHEN MATCHED THEN DELETE;",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 MERGE UNION dbo.t USING dbo.s ON 1=1 WHEN MATCHED THEN DELETE;",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 USE HINT",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 USE PLAN",
+   "admitted": false
+  },
+  {
+   "sql": "USE HINT; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "USE PLAN; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.t OPTION (USE HINT('FORCE_LEGACY_CARDINALITY_ESTIMATION'))",
+   "admitted": false
+  },
+  {
+   "sql": "USE master; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 USE master",
+   "admitted": false
+  },
+  {
+   "sql": "USE [HINT]; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 USE PLAN N'<ShowPlanXML/>'",
+   "admitted": false
+  },
+  {
+   "sql": "USE HINT SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 AS n) SELECT * FROM c; SET @x=1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int; THROW 50000, 'x', 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 THROW 50000, 'x', 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 RECEIVE TOP(1) * FROM dbo.q",
+   "admitted": false
+  },
+  {
+   "sql": "RECEIVE TOP(1) * FROM dbo.q",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 'WAITFOR'; SELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @delete int = 1; SELECT @delete AS DELETE",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 1 BEGIN TRANSACTION",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 1 CHECKPOINT",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int; KILL 55",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 SEND ON CONVERSATION @h MESSAGE TYPE t (N'x')",
+   "admitted": false
+  },
+  {
+   "sql": "SEND ON CONVERSATION @h MESSAGE TYPE t (N'x')",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @h uniqueidentifier; SEND ON CONVERSATION @h MESSAGE TYPE t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 FETCH NEXT FROM c",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @c CURSOR; FETCH NEXT FROM @c",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 MOVE CONVERSATION @h TO @g",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 GET CONVERSATION GROUP @g FROM q",
+   "admitted": false
+  },
+  {
+   "sql": "BEGIN DIALOG @h FROM SERVICE a TO SERVICE 'b'",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @h uniqueidentifier; BEGIN DIALOG CONVERSATION @h FROM SERVICE a TO SERVICE 'b'",
+   "admitted": false
+  },
+  {
+   "sql": "SET @ROWCOUNT = 1; SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SET @LOCK_TIMEOUT = 1; SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SET @@LOCK_TIMEOUT = 1; SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SET @x = 1 FETCH NEXT FROM c",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 WRITETEXT dbo.t.c @p 'x'",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 UPDATETEXT dbo.t.c @p 0 0 'x'",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 READTEXT dbo.t.c @p 0 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE c CURSOR FOR SELECT 1; SELECT 2",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = NEWID(); SELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "SET @x = DB_NAME(); SELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @x int; SET ANSI_WARNINGS OFF; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 1 REVERT",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 ALTER INDEX i ON dbo.t REBUILD",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 1; SET @y = (SELECT 1); SELECT @x, @y",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @t TABLE (id int); INSERT @t VALUES (1); SELECT * FROM @t",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @c CURSOR; SET @c = CURSOR FOR SELECT 1; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * INTO @t FROM dbo.x",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 1 CREATE TABLE dbo.z (id int)",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int; GOTO lbl; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 1 UNION SELECT 2",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 1 JOIN dbo.t ON 1=1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; THROW 50000, 'oops', 1;",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; THROW;",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 THROW 50000, 'oops', 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 AS THROW",
+   "admitted": true
+  },
+  {
+   "sql": "THROW 50000, 'x', 1;",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM (SELECT 1 x) t; THROW 60000, 'y', 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; RECEIVE TOP(1) * FROM dbo.my_queue;",
+   "admitted": false
+  },
+  {
+   "sql": "RECEIVE TOP(1) * FROM dbo.my_queue;",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 RECEIVE TOP(1) * FROM dbo.my_queue",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; SEND ON CONVERSATION '00000000-0000-0000-0000-000000000000' MESSAGE TYPE [t] (N'x');",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; END CONVERSATION '00000000-0000-0000-0000-000000000000';",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; END CONVERSATION '00000000-0000-0000-0000-000000000000' WITH CLEANUP;",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; MOVE CONVERSATION '00000000-0000-0000-0000-000000000000' TO '00000000-0000-0000-0000-000000000001';",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; GET CONVERSATION GROUP @g FROM dbo.my_queue;",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; BEGIN DIALOG CONVERSATION @h FROM SERVICE [a] TO SERVICE 'b';",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; DISABLE TRIGGER dbo.trg ON dbo.tbl;",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; ENABLE TRIGGER dbo.trg ON dbo.tbl;",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; DISABLE TRIGGER ALL ON DATABASE;",
+   "admitted": false
+  },
+  {
+   "sql": "sp_who",
+   "admitted": false
+  },
+  {
+   "sql": "sp_configure 'show advanced options', 1",
+   "admitted": false
+  },
+  {
+   "sql": "master.dbo.sp_who",
+   "admitted": false
+  },
+  {
+   "sql": "sp_configure",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; sp_who",
+   "admitted": false
+  },
+  {
+   "sql": "sp_refreshsqlmodule 'dbo.v'",
+   "admitted": false
+  },
+  {
+   "sql": "{ call dbo.my_proc }",
+   "admitted": false
+  },
+  {
+   "sql": "{ call dbo.my_proc(1, 2) }",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM { call dbo.my_proc }",
+   "admitted": false
+  },
+  {
+   "sql": "{call sp_configure('show advanced options',1)}",
+   "admitted": false
+  },
+  {
+   "sql": "lbl: SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "lbl: UPDATE dbo.t SET x = 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; lbl: SELECT 2",
+   "admitted": false
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 x) SELECT * FROM c",
+   "admitted": true
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 x) DELETE FROM dbo.t",
+   "admitted": false
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 x) INSERT INTO dbo.t SELECT * FROM c",
+   "admitted": false
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 x) UPDATE dbo.t SET x=1",
+   "admitted": false
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 x) MERGE dbo.t USING c ON 1=1 WHEN MATCHED THEN DELETE",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.t FOR BROWSE",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.t FOR XML AUTO",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM dbo.t FOR XML PATH('r'), TYPE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM dbo.t FOR JSON AUTO",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT x FROM dbo.t FOR JSON PATH, ROOT('d')",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 UNION SELECT 2",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 EXCEPT SELECT 2",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 INTERSECT SELECT 2",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 UNION SELECT 2; DELETE FROM dbo.t",
+   "admitted": false
+  },
+  {
+   "sql": "VALUES (1),(2)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM (VALUES (1),(2)) v(x)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1; VALUES (1)",
+   "admitted": false
+  },
+  {
+   "sql": "DELETE FROM dbo.t OUTPUT deleted.* ",
+   "admitted": false
+  },
+  {
+   "sql": "INSERT INTO dbo.t OUTPUT inserted.* VALUES (1)",
+   "admitted": false
+  },
+  {
+   "sql": "UPDATE dbo.t SET x=1 OUTPUT inserted.*",
+   "admitted": false
+  },
+  {
+   "sql": "(SELECT 1); DELETE FROM dbo.t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM (UPDATE dbo.t SET x=1 OUTPUT inserted.x) q",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 WHERE EXISTS (DELETE FROM dbo.t)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; (sp_who)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; PRINT 'x'",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; CHECKPOINT",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; WAITFOR DELAY '00:00:05'",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; KILL 55",
+   "admitted": false
+  },
+  {
+   "sql": "SET ROWCOUNT 10; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; ADD SIGNATURE TO dbo.p BY CERTIFICATE c",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; GRANT SELECT ON dbo.t TO public",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; REVERT",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; USE other_db",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; ALTER INDEX ix ON dbo.t REORGANIZE",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; UPDATE STATISTICS dbo.t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; DBCC FREEPROCCACHE",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM OPENQUERY(srv, 'SELECT 1')",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; TRUNCATE TABLE dbo.t",
+   "admitted": false
+  },
+  {
+   "sql": "FETCH NEXT FROM my_cursor",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; FETCH NEXT FROM my_cursor",
+   "admitted": false
+  },
+  {
+   "sql": "FETCH NEXT FROM my_cursor INTO @a",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 FETCH NEXT FROM my_cursor",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT x FROM dbo.t ORDER BY x OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1; ELSE SELECT 2",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1; END",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 END",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 SELECT 2",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; SELECT 2",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 /* c */ SELECT 2",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 UNION ALL SELECT 2 INTO dbo.t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 UNION ALL SELECT x FROM dbo.t WHERE 1 IN (SELECT 1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM (VALUES(1)) v(x); DELETE FROM dbo.t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM (SELECT 1) t WHERE 1=1 FOR XML AUTO",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT @x = col FROM dbo.t",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @x INT; SELECT @x = col FROM dbo.t; SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT @x += col FROM dbo.t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.t FOR XML AUTO DELETE FROM dbo.x",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.t FOR XML RAW, ELEMENTS, XMLSCHEMA",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM dbo.t FOR XML AUTO, BINARY BASE64",
+   "admitted": true
+  },
+  {
+   "sql": "WITH XMLNAMESPACES ('u' AS n) SELECT 1 x FOR XML PATH",
+   "admitted": false
+  },
+  {
+   "sql": "WITH a AS (SELECT 1 x), b AS (SELECT 2 y) SELECT * FROM a, b",
+   "admitted": true
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 x) SELECT * FROM c; DELETE FROM dbo.t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 OPTION (USE HINT('FORCE_LEGACY_CARDINALITY_ESTIMATION'))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 OPTION (USE PLAN N'<plan/>')",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 OPTION (RECOMPILE)",
+   "admitted": true
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 x) SELECT * FROM c OPTION (MAXRECURSION 10)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1;;",
+   "admitted": false
+  },
+  {
+   "sql": ";SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 -- ; DELETE FROM dbo.t\n",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 /* DELETE FROM dbo.t */",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR dbo.seq",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR dbo.seq OVER (ORDER BY (SELECT 1))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM (SELECT NEXT VALUE FOR dbo.seq AS n) q",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM dbo.t TABLESAMPLE (10 PERCENT)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM dbo.t WITH (NOLOCK)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM dbo.t WITH (INDEX(1))",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM CHANGETABLE(VERSION dbo.t, (id), (1)) AS c",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM OPENJSON('[]')",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT dbo.myfunc(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT sp_who()",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM dbo.mytvf(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 AS [UPDATE]",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT [DELETE] FROM dbo.t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 AS \"INSERT\"",
+   "admitted": true
+  },
+  {
+   "sql": "RAISERROR('x',16,1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; RAISERROR('x',16,1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT x FROM dbo.t ORDER BY x; UPDATE dbo.t SET x=1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 INTO @t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; ELSE DELETE FROM dbo.t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; ELSE UPDATE dbo.t SET x=1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; ELSE EXEC sp_who",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 ELSE",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 END UPDATE dbo.t SET x=1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 EXCEPT SELECT 4",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM dbo.t PIVOT (SUM(v) FOR k IN ([a])) p",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM dbo.t UNPIVOT (v FOR k IN (a,b)) u",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT CASE WHEN 1=1 THEN 1 ELSE 2 END",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1; CASE WHEN 1=1 THEN 1 END",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * INTO dbo.newt FROM dbo.t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\u000bINSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\fINSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --cINSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c INSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c INSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\u001cINSERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u001dINSERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u001eINSERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u001fINSERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\rINSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\nINSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\u0000INSERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\fUPDATE t SET c=1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\fDELETE FROM t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\fDROP TABLE t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\fEXEC xp_cmdshell 'dir'",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\fCREATE TABLE t(a int)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\fSELECT NEXT VALUE FOR s",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u000bUPDATE t SET c=1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --cDROP TABLE t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c EXEC xp_cmdshell 'dir'",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\r\nINSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 /* /* */ INSERT INTO t VALUES(1) */",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 /*/ INSERT INTO t VALUES(1) */",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 /* '*/ INSERT INTO t VALUES(1) --' */",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 /* INSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 /* x */ INSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT '/*' , 1 ",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 /* /* */ INSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "ＳＥＬＥＣＴ 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1;ＩＮＳＥＲＴ INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "𝐰𝐾𝐥𝐶𝐰𝐭 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1;ІNSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM ＯＰＥＮＲＯＷＳＥＴ('x','y','z')",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1;INS​ERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 －－INSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1;ＥＸＥＣ xp_cmdshell 'x'",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT N'it''s a test'",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 WHERE 'a'='a' --'",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1;SELECTN'x'",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT [N'x]",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 'a''b'' --'' c'",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 'x' /*INSERT INTO t VALUES(1)*/",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT {fn USER()}",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT {ts '2020-01-01 00:00:00'}",
+   "admitted": true
+  },
+  {
+   "sql": "{call sp_who}",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 WHERE 1 = {call foo}",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT {fn CONVERT(1, SQL_INTEGER)}",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT {d '2020-01-01'}",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1\u0000INSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 'a\u0000b'",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT $100",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT a$b FROM t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT @@VERSION",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 0x4950",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT -$100.5",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT a#b FROM t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 —INSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 ‒‒INSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 ⁃⁃INSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 ﹣﹣INSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 /* AAAA...(20000 'A' chars, block comment left unterminated)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1+1+1+...+1 (5000 '1' tokens joined by '+')",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --xxxx...(20000 'x' chars)\fINSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --a\rSELECT 2",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --a\fSELECT 2",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --a\u000bSET @x=1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1--\fINSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --\f\tDROP TABLE t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT next value for s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NeXt VaLuE fOr s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR dbo.s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR [dbo].[s]",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR [My Seq]",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT/**/VALUE/**/FOR s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT --x\n VALUE FOR s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT\n\tVALUE\n\tFOR\n\ts",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT (NEXT VALUE FOR s)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT (((NEXT VALUE FOR s)))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR s OVER (ORDER BY (SELECT NULL))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT CASE WHEN 1=1 THEN NEXT VALUE FOR s ELSE 0 END",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT COALESCE(NEXT VALUE FOR s, 0)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM (SELECT NEXT VALUE FOR s AS n) q",
+   "admitted": false
+  },
+  {
+   "sql": "WITH q AS (SELECT NEXT VALUE FOR s AS n) SELECT * FROM q",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR s AS n, NEXT VALUE FOR s AS m",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT x FROM t WHERE x < (SELECT NEXT VALUE FOR s)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT IIF(1=1, NEXT VALUE FOR s, 0)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT CONVERT(INT, NEXT VALUE FOR s)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT TOP (NEXT VALUE FOR s) * FROM t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR dbo.s AS n FOR JSON PATH",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 AS a, NEXT VALUE FOR s AS b",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT CAST(NEXT VALUE FOR s AS VARCHAR(20))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t WITH (TABLOCK)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t WITH (HOLDLOCK)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t WITH (tablock)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t WITH (TAB/**/LOCK)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t WITH (HOLD/**/LOCK)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t (TABLOCK)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t (HOLDLOCK)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t WITH (UPDLOCK)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t WITH (XLOCK)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t WITH (SERIALIZABLE)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t WITH (REPEATABLEREAD)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t WITH (READCOMMITTEDLOCK)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t WITH (TABLOCKX)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t OPTION (TABLE HINT(t, TABLOCK))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t OPTION (TABLE HINT(t, HOLDLOCK))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t WITH (PAGLOCK)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t WITH (ROWLOCK)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t WITH (NOLOCK)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t WITH (READPAST)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t WITH (TABLOCK, INDEX(0))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t WITH (UPDLOCK, HOLDLOCK)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t a JOIN u b ON a.id=b.id OPTION (TABLE HINT(a, XLOCK))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM OPENROWSET('SQLNCLI','Server=x;','select 1')",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM OPENROWSET(BULK N'f.txt', SINGLE_CLOB) AS x",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM OPENQUERY(srv, 'select 1')",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM OPENDATASOURCE('SQLNCLI','Server=x').db.dbo.t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM OPEN/**/ROWSET('a','b','c')",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM OPENROWS/**/ET('a','b','c')",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM OPENJSON(@j)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT value FROM OPENJSON('[1,2]')",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM OPENXML(@h, '/x', 2)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t CROSS APPLY OPENJSON(t.j)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM dbo.ExternalArchiveTable",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM PREDICT(MODEL = @m, DATA = d AS p)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT @@IDENTITY",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT IDENT_CURRENT('t')",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT a INTO t2 FROM src",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT CURRENT_TRANSACTION_ID()",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT @@FETCH_STATUS",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT @@CURSOR_ROWS",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT NEWID()",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t OPTION (RECOMPILE)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t OPTION (QUERYTRACEON 4199)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t OPTION (MAXDOP 1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t OPTION (USE HINT('ENABLE_PARALLEL_PLAN_PREFERENCE'))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t OPTION (KEEPFIXED PLAN)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT [NEXT] VALUE FOR s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT \"NEXT\" VALUE FOR s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR s;",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 WHERE EXISTS (SELECT NEXT VALUE FOR s)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t WHERE 1 = NEXT VALUE FOR s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR s WITHIN GROUP (ORDER BY 1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR s()",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t WITH (SNAPSHOT)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t WITH (FORCESEEK)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t WITH (INDEX(1))",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t WITH (NOEXPAND)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t WITH (UPD/**/LOCK)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM OPENROWSET /**/ ('a','b','c')",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM OPENDATA/**/SOURCE('x','y').a.b.c",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM OPEN/**/QUERY(srv, 'select 1')",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t OPTION (QUERYTRACEON 8649, RECOMPILE)",
+   "admitted": true
+  },
+  {
+   "sql": "SET CONTEXT_INFO 0x01",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c UPDATE t SET c=1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c DELETE FROM t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c DROP TABLE t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c CREATE TABLE t(a int)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c SELECT NEXT VALUE FOR s",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c EXEC xp_cmdshell 'dir'",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c WAITFOR DELAY '00:00:10'",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c GRANT CONTROL TO sa",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c ALTER TABLE t ADD c int",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\fINSERT INTO t VALUES(1)  [known: FF, round-1]",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\u000bINSERT INTO t VALUES(1)  [known: VT, round-1]",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c INSERT INTO t VALUES(1)  [known: LS, round-1]",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --cINSERT INTO t VALUES(1)  [known: NEL, round-1]",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\nDROP TABLE t  [neg-ctl: LF ends comment]",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\rDROP TABLE t  [neg-ctl: CR ends comment]",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\r\nINSERT INTO t VALUES(1)  [neg-ctl]",
+   "admitted": false
+  },
+  {
+   "sql": "{call dbo.SomeProc}",
+   "admitted": false
+  },
+  {
+   "sql": "{ call dbo.SomeProc }",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; {call dbo.SomeProc}",
+   "admitted": false
+  },
+  {
+   "sql": "{?=call dbo.f}",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT {fn xp_cmdshell('dir')}",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t WHERE d = {ts '2020-01-01 00:00:00'}",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT {d '2020-01-01'} AS x",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM {oj dbo.t LEFT OUTER JOIN dbo.u ON t.id=u.id}",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 WHERE 'a' LIKE 'a' {escape '\\'}",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t WHERE x = {fn NOW()}",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 WHERE 1=1; {call dbo.p}",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 —— DROP TABLE t  (em-dash x2)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 －－ DROP TABLE t  (fullwidth hyphen)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 ﹣﹣ DROP TABLE t  (small hyphen-minus)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 −− DROP TABLE t  (minus sign U+2212)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1；ＩＮＳＥＲＴ INTO t VALUES(1)  (fullwidth ; + INSERT)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1;𝐈𝐍𝐒𝐄𝐑𝐓 INTO t VALUES(1)  (math-bold INSERT)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; ДРОП TABLE t  (Cyrillic DROP)",
+   "admitted": false
+  },
+  {
+   "sql": "ＤＲＯＰ TABLE t  (fullwidth DROP)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; DROP TABLE t  (NBSP)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 /* a /* b */ c */ , 2  (nested block comment)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 /* x */ ; DROP TABLE t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --/*\nDROP TABLE t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 /* */ , 2  (PS inside block comment)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 /* /* */ INSERT INTO t VALUES(1) */  (nested-comment hiding attempt)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 /* never ends",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT N'it''s'",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT n'abc'  (lowercase n prefix)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 WHERE 'a--b' = 'a--b'",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 'x'';DROP TABLE t--'  (payload inside one string literal)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT [DROP] FROM t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT \"DROP\" FROM t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT [a]]b] FROM t  (]] escape)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 'a''  (doubled quote -> unterminated)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 WHERE col IN'x'  (N-like prefix preceded by alnum)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 'a' 'b'  (adjacent strings)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\u0000\nDROP TABLE t  (NUL in comment, LF ends it)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1\u0000INSERT INTO t VALUES(1)  (NUL separates)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 /*\u0000*/ , 2  (NUL in block comment)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\u0000 INSERT INTO t VALUES(1)  (NUL then PS in comment)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT $100 AS m  (money literal)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT $-100 AS m",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 0x4142 AS b  (binary literal)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 AS a$b  ($ in identifier)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 FROM dbo.t AS t$x",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --<30000 'x' chars> INSERT INTO t VALUES(1)  (long comment + PS)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1<50000 spaces>  (huge whitespace)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --<20000 'y' chars>\fDROP TABLE t  (long comment + FF, known class)",
+   "admitted": false
+  },
+  {
+   "sql": "EXEC {call p}",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --a SELECT 2 --b INSERT INTO t VALUES(1)  (PS terminator twice)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c    (PS then only whitespace)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c SELECT 2  (PS then second SELECT)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c SELECT NEXT VALUE FOR s  (LS known class)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\fEXEC sp_executesql N'SELECT 1'  (FF known class)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c TRUNCATE TABLE t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c MERGE t USING s ON 1=1 WHEN MATCHED THEN DELETE",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\u001dUPDATE t SET c=1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u001eDELETE FROM t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u001fDROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c DROP TABLE t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c EXEC sp_who",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --cEXEC sp_executesql N'DROP TABLE t'",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --cRECEIVE TOP(1) * FROM q",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c SEND ON CONVERSATION @h MESSAGE TYPE mt (N'x')",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c END CONVERSATION @h",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --cMOVE CONVERSATION @h TO @g",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --cGET CONVERSATION GROUP @g FROM q",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --cTHROW 50000, N'x', 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --cSELECT NEXT VALUE FOR s",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c GRANT CONTROL TO someuser",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --cSELECT * FROM OPENQUERY(srv,'SELECT 1')",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --cBEGIN TRAN",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --cALTER TABLE t ADD c int",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --cWAITFOR DELAY '00:00:05'",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\fINSERT INTO t VALUES(1)  [round-1 anchor]",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT/**/VALUE/**/FOR/**/s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE/**/FOR s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT/**/NEXT VALUE FOR s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT  VALUE  FOR  s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR [s]",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR s AS n",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT\nVALUE\nFOR s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT\tVALUE\tFOR\ts",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 THROW",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 RECEIVE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 FETCH",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 MERGE",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 SEND",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1; THROW 50000, N'x', 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; RECEIVE TOP(1) * FROM q",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; SEND ON CONVERSATION @h MESSAGE TYPE mt (N'x')",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; END CONVERSATION @h",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; MOVE CONVERSATION @h TO @g",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; GET CONVERSATION GROUP @g FROM q",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; ENABLE TRIGGER trg ON t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; DISABLE TRIGGER trg ON t",
+   "admitted": false
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 AS x) SELECT * FROM c",
+   "admitted": true
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 AS x) DELETE FROM t",
+   "admitted": false
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 AS x) INSERT INTO t SELECT x FROM c",
+   "admitted": false
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 AS x) UPDATE t SET a=1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; {call sp_who}",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT {fn NOW()} AS n",
+   "admitted": true
+  },
+  {
+   "sql": "sys.sp_who",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; label1: SELECT 2",
+   "admitted": false
+  },
+  {
+   "sql": "label1: SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT name FROM sys.objects FOR XML AUTO",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT name FROM sys.objects FOR JSON PATH",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT name FROM sys.objects FOR BROWSE",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 AS a FOR XML RAW, XMLSCHEMA, ELEMENTS",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 AS x UNION SELECT 2",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 AS x EXCEPT SELECT 2",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 AS x INTERSECT SELECT 2",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT x FROM (VALUES(1),(2)) v(x)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 OUTPUT inserted.*",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1\nSELECT 2",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1\nINSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE(a int) SELECT * FROM @t",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE c CURSOR FOR SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int = (SELECT NEXT VALUE FOR s)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 AS \"DROP TABLE t\"",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 AS [DROP TABLE t]",
+   "admitted": true
+  },
+  {
+   "sql": "SET @x = NEXT VALUE FOR seq SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x BIGINT = NEXT VALUE FOR seq SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x BIGINT SET @x = NEXT VALUE FOR seq SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x AS INT = (NEXT VALUE FOR dbo.seq) SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = (SELECT NEXT VALUE FOR seq) SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x INT = NEXT VALUE FOR [dbo].[seq] SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR seq",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int = (SELECT NEXT VALUE FOR seq) SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "set @x = next value for seq select @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE (id int DEFAULT NEXT VALUE FOR seq) SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET @a = NEXT VALUE FOR s1 SET @b = NEXT VALUE FOR s2 SELECT @a,@b",
+   "admitted": false
+  },
+  {
+   "sql": "SET NOCOUNT ON SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET ANSI_NULLS OFF SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET LOCK_TIMEOUT 0 SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET ROWCOUNT 5 SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET DEADLOCK_PRIORITY LOW SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET FMTONLY ON SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET STATISTICS IO ON SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET CONTEXT_INFO 0x1 SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET DATEFORMAT dmy SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET @@SPID = 1 SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "set nocount on select 1",
+   "admitted": false
+  },
+  {
+   "sql": "ＳＥＴ NOCOUNT ON SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET/**/NOCOUNT ON SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET XACT_ABORT ON SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET ARITHABORT ON SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET IDENTITY_INSERT t ON SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 1, @y = 2 SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 1 DELETE FROM t",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 1 DROP TABLE t",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 1 EXEC sp_who",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = CASE WHEN 1=1 THEN 2 ELSE 3 END SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SET @ = 1 SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x=1;SELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "SET @x = (UPDATE t SET c=1 OUTPUT inserted.c) SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE (id int DEFAULT (dbo.f())) SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE (id AS (dbo.f())) SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE (id int DEFAULT (xp_cmdshell('x'))) SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE (id int) SELECT * FROM @t",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE (id int PRIMARY KEY) SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE (id int CHECK (dbo.f(id) > 0)) SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @c CURSOR SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @c CURSOR; SET @c = CURSOR FOR SELECT 1; OPEN @c",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @c CURSOR FOR SELECT 1 FROM t",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int = (SELECT COUNT(*) FROM t) SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int = (SELECT TOP 1 id FROM t ORDER BY id) SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int DECLARE @y int SET @x=1 SET @y=2 SELECT @x+@y",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x XML = '<a/>' SELECT @x.value('(/a)[1]','int')",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int = 0x1 SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM a INNER MERGE JOIN b ON a.id=b.id",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 OPTION (MERGE JOIN)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 UNION SELECT 2 OPTION (MERGE UNION)",
+   "admitted": true
+  },
+  {
+   "sql": "MERGE INTO t USING s ON t.id=s.id WHEN MATCHED THEN DELETE;",
+   "admitted": false
+  },
+  {
+   "sql": "MERGE JOIN USING s ON 1=1 WHEN MATCHED THEN DELETE;",
+   "admitted": false
+  },
+  {
+   "sql": "MERGE UNION USING s ON 1=1 WHEN MATCHED THEN DELETE;",
+   "admitted": false
+  },
+  {
+   "sql": "MERGE [JOIN] USING s ON 1=1 WHEN MATCHED THEN DELETE;",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 AS MERGE UNION SELECT 2",
+   "admitted": true
+  },
+  {
+   "sql": "MERGE dbo.[JOIN] USING s ON 1=1 WHEN MATCHED THEN DELETE;",
+   "admitted": false
+  },
+  {
+   "sql": "USE PLAN SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "USE master SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 AS [DROP] FROM t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT [INSERT] FROM t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 WHERE 'JOIN' = 'JOIN'",
+   "admitted": true
+  },
+  {
+   "sql": "/*c*/ SET @x = 1 SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = NEXT VALUE FOR seq;SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = NEXT VALUE FOR dbo.seq ; SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x BIGINT = NEXT VALUE FOR seq;SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x BIGINT;SET @x = NEXT VALUE FOR seq;SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x INT = (NEXT VALUE FOR seq);SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = NEXT VALUE FOR [dbo].[seq];SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET @a = NEXT VALUE FOR s1;SET @b = NEXT VALUE FOR s2;SELECT @a,@b",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = NEXT VALUE FOR seq OVER (ORDER BY (SELECT NULL));SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT @x = NEXT VALUE FOR seq",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x BIGINT;SELECT @x = NEXT VALUE FOR seq",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT @x = 1",
+   "admitted": true
+  },
+  {
+   "sql": "SET @x = (SELECT COUNT(*) FROM t);SELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "SET @x = (SELECT NEXT VALUE FOR seq);SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = (SELECT TOP 1 1 FROM t);SELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @x int;SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @x int;SET @x=1;SELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "SET @x=1;INSERT INTO t VALUES(1);SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SET NOCOUNT ON;SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET LOCK_TIMEOUT 0;SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE (id int DEFAULT NEXT VALUE FOR seq);SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = NEWID();SELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "SET @x = SCOPE_IDENTITY();SELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @x BIGINT=0;SET @x += NEXT VALUE FOR seq;SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = NEXT VALUE FOR seq",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x BIGINT = NEXT VALUE FOR seq",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\fSET NOCOUNT ON",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\fSET ARITHABORT OFF",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\fSET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\fSET LOCK_TIMEOUT 0",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\fSET ROWCOUNT 5",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\fSET DATEFORMAT dmy",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\fSET ANSI_NULLS OFF",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\fSET FMTONLY ON",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\fSET CONTEXT_INFO 0x55",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\fSET DEADLOCK_PRIORITY HIGH",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\u000bSET NOCOUNT ON",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\u000bSET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\fSET @x = NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --cSET NOCOUNT ON",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c SET NOCOUNT ON",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c SET NOCOUNT ON",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\u001cSET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u001dSET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u001eSET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u001fSET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\nSET NOCOUNT ON",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\rSET NOCOUNT ON",
+   "admitted": false
+  },
+  {
+   "sql": "SET TRANSACTION ISOLATION LEVEL SNAPSHOT;SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 /*c\f*/ SET NOCOUNT ON",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 1\nSELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int = 1\r\nSELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SET\t@x = 1;SELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 FROM t AS SET",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 FROM t AS USE",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 FROM t AS MERGE",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x=1;;SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x=1;SELECT @x;",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @x int;SELECT @x;SELECT 2",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x=(WITH c AS (SELECT 1 n) SELECT n FROM c);SELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "SET @x=(SELECT 1 FOR XML PATH(''));SELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "select next value for s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT /**/ VALUE FOR s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT/*/*x*/*/VALUE FOR s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT--c\nVALUE--c\nFOR s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT\tVALUE\tFOR s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT\r\nVALUE\r\nFOR s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT   VALUE   FOR s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT /*x*/NEXT VALUE FOR s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT/**/VALUE FOR s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT CASE WHEN 1=1 THEN NEXT/**/VALUE/**/FOR s ELSE 0 END",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR s OVER (ORDER BY (SELECT 1))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT/**/VALUE/**/FOR s OVER (ORDER BY (SELECT 1))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT (SELECT NEXT VALUE FOR s)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT (SELECT NEXT/**/VALUE/**/FOR s)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 WHERE NEXT VALUE FOR s > 0",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR s, NEXT VALUE FOR s2",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT n FROM (SELECT NEXT VALUE FOR s AS n) q",
+   "admitted": false
+  },
+  {
+   "sql": "WITH c AS (SELECT NEXT VALUE FOR s AS n) SELECT n FROM c",
+   "admitted": false
+  },
+  {
+   "sql": "WITH c AS (SELECT NEXT/**/VALUE/**/FOR s AS n) SELECT n FROM c",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT ＮＥＸＴ VALUE FOR s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT [VALUE] FOR s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT x FROM OPENJSON('{}') WITH (x int)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM OPENROWSET('SQLNCLI','','SELECT 1')",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM OPENROWSET(BULK 'c:\\f.txt', SINGLE_CLOB) x",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM OPEN/**/ROWSET('SQLNCLI','','SELECT 1')",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM [OPENROWSET]('SQLNCLI','','SELECT 1')",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM OPENQUERY(srv,'SELECT 1')",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM OPEN/**/QUERY(srv,'SELECT 1')",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM OPENDATASOURCE('SQLNCLI','...').d.s.t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM oPeNrOwSeT('SQLNCLI','','SELECT 1')",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t WITH ([TABLOCK])",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t WITH (READUNCOMMITTED)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t OPTION (TABLE HINT(t, TAB/**/LOCK))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t OPTION (TABLE HINT(t, INDEX(1)))",
+   "admitted": false
+  },
+  {
+   "sql": "select * from t with (updlock)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t WITH (X/**/LOCK)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM PREDICT(MODEL=@m, DATA=t)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM dbo.SomeExternalTable",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t OPTION (QUERYTRACEON 9481)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t OPTION (USE PLAN N'<x/>')",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t WHERE a=@a OPTION (OPTIMIZE FOR UNKNOWN)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t OPTION (FAST 1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t OPTION (TABLE HINT(t, PAGLOCK))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t OPTION (TABLE HINT(t, ROWLOCK))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t OPTION (TABLE HINT ( t , PAGLOCK ))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t WITH (ROWLOCK, PAGLOCK)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t WITH (NOLOCK, PAGLOCK)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t WITH (INDEX(1), PAGLOCK)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t WITH (PAGLOCK, HOLDLOCK)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t WITH (FORCESCAN)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t WITH (SPATIAL_WINDOW_MAX_CELLS=100)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t WITH (PAGLOCK) WHERE id=1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t (PAGLOCK)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t (ROWLOCK)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t WITH (PAG/**/LOCK)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\\u0085INSERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\u0085UPDATE t SET c=1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\u0085DELETE FROM t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\u0085DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\u0085CREATE TABLE t(a int)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\u0085SELECT NEXT VALUE FOR s",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\u0085SELECT 2 INTO t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\u0085EXEC sp_who",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\u0085DBCC CHECKDB",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\u0085ALTER TABLE t ADD c int",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c UPDATE t SET c=1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c DELETE FROM t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c CREATE TABLE t(a int)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c SELECT NEXT VALUE FOR s",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c SELECT 2 INTO t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c EXEC sp_who",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c DBCC CHECKDB",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c ALTER TABLE t ADD c int",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c SELECT 2 INTO t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c DBCC CHECKDB",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\\fSELECT a INTO t FROM x",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\u000bSELECT a INTO #t FROM x",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 THROW 50000, N'x', 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 RECEIVE TOP(1) * FROM q",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 SEND ON CONVERSATION @h MESSAGE TYPE mt (N'x')",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 END CONVERSATION @h",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 ENABLE TRIGGER trg ON tbl",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 DISABLE TRIGGER trg ON tbl",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 CHECKPOINT",
+   "admitted": false
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 x) INSERT INTO t SELECT x FROM c",
+   "admitted": false
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 x) UPDATE t SET c=1",
+   "admitted": false
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 x) DELETE FROM t",
+   "admitted": false
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 x) MERGE t USING c ON 1=1 WHEN MATCHED THEN DELETE",
+   "admitted": false
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 x) DELETE c",
+   "admitted": false
+  },
+  {
+   "sql": ";WITH c AS (SELECT 1 x) SELECT * FROM c",
+   "admitted": false
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 x)\\n--z\\fDELETE FROM t",
+   "admitted": false
+  },
+  {
+   "sql": "{call myproc}",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; {call myproc}",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM {fn NOW()}",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1; label1:",
+   "admitted": false
+  },
+  {
+   "sql": "myproc",
+   "admitted": false
+  },
+  {
+   "sql": "dbo.myproc",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 AS a FOR XML PATH('')",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 AS a FOR XML RAW, ELEMENTS, TYPE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 AS a FOR XML PATH('r'), ROOT('x')",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 AS a FOR JSON PATH",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 AS a FOR JSON AUTO, INCLUDE_NULL_VALUES",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT a FROM t FOR BROWSE",
+   "admitted": false
+  },
+  {
+   "sql": "(SELECT 1) UNION (SELECT 2)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 UNION SELECT 2 EXCEPT SELECT 3",
+   "admitted": true
+  },
+  {
+   "sql": "(SELECT 1)",
+   "admitted": false
+  },
+  {
+   "sql": "((SELECT 1))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 UNION ALL SELECT 2 --c\\fINSERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 UNION SELECT NEXT VALUE FOR s",
+   "admitted": false
+  },
+  {
+   "sql": "INSERT INTO t OUTPUT inserted.* VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "DELETE t OUTPUT deleted.*",
+   "admitted": false
+  },
+  {
+   "sql": "UPDATE t SET c=1 OUTPUT inserted.*",
+   "admitted": false
+  },
+  {
+   "sql": "INSERT INTO t OUTPUT inserted.* INTO u VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT a FROM t ORDER BY NEXT VALUE FOR s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR s OVER (ORDER BY a) FROM t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 OPTION (MAXDOP 1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 OPTION (HASH JOIN)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 OPTION (USE HINT('ENABLE_PARALLEL_PLAN_PREFERENCE'))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 OPTION (USE PLAN N'<ShowPlanXML/>')",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1; SELECT 2; SELECT 3",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 /*\\f*/ DROP TABLE t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\\x01DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x02DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x03DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x04DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x05DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x06DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x07DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x08DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x0eDROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x0fDROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x10DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x11DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x12DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x13DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x14DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x15DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x16DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x17DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x18DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x19DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x1aDROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x1bDROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\tDROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x7fDROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x80DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x81DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x82DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x83DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x84DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x86DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x87DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x88DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x8dDROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x9bDROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x9fDROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\xa0DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c　DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c​DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c﻿DROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1\\nDR\\x00OP TABLE t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1\\nINS\\x00ERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 /* a /* b */ INSERT INTO t VALUES(1) */",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 /*/ INSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 /* x */ y */ SELECT 2",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 /* c */ DROP TABLE t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 /* -- */ DROP TABLE t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 /* DROP TABLE t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 /* '*/' DROP TABLE t */",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 WHERE 1=0 {call dbo.DoWrite}",
+   "admitted": false
+  },
+  {
+   "sql": "{call dbo.DoWrite}",
+   "admitted": false
+  },
+  {
+   "sql": "{call dbo.DoWrite(1,'x')}",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT {fn UCASE('abc')}",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT {fn NOW()}",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM {oj dbo.a LEFT OUTER JOIN dbo.b ON a.id=b.id}",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c {call dbo.DoWrite}",
+   "admitted": true
+  },
+  {
+   "sql": "ＳＥＬＥＣＴ 1\\nDROP TABLE t (fullwidth SELECT)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c ＤＲＯＰ TABLE t (fullwidth DROP after PS)",
+   "admitted": false
+  },
+  {
+   "sql": "ЅЕЛЕСТ 1 (Cyrillic SELECT lookalike)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1\\n\\U0001d403\\U0001d415\\U0001d40e\\U0001d40f TABLE t (math-bold DROP)",
+   "admitted": false
+  },
+  {
+   "sql": "ＥＸＥＣ dbo.DoWrite (fullwidth EXEC)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1\\nＷＡＩＴＦＯＲ DELAY '00:00:05' (fullwidth WAITFOR)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT １\\nDROP TABLE t (fullwidth digit 1, ascii DROP)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 －－c\\nDROP TABLE t (fullwidth hyphen x2 as comment)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 —— DROP TABLE t (em-dash x2)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 –– DROP TABLE t (en-dash x2)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 −− DROP TABLE t (minus-sign x2)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 ‐‐ DROP TABLE t (hyphen U+2010 x2)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT N'a' --c DROP TABLE t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 'a''b' WHERE 1=0 --c DROP TABLE t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT $100 WHERE 1=0",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 0x4452 WHERE 1=0",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1\\nDROP@x TABLE t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1\\nDROP$ TABLE t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1\\nDRO#P TABLE t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 'abc",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM [t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM [a]]b]",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --<100000 'x' chars> DROP TABLE t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --<60000 'y' chars> INSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT [<5000 'z' chars>] WHERE 1=0",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c SET STATISTICS IO ON",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c SET SHOWPLAN_TEXT ON",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c SET TEXTSIZE 2048",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c ALTER INDEX ALL ON t REBUILD",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c CREATE INDEX ix ON t(c)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c UPDATE STATISTICS t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c DBCC FREEPROCCACHE",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c BEGIN TRANSACTION",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c WAITFOR DELAY '00:00:05'",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\\rDROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\nDROP TABLE t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 DROP TABLE t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @x BIGINT = NEXT VALUE FOR seq\nSELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x BIGINT = NEXT VALUE FOR dbo.seq\nSELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x BIGINT\nSET @x = NEXT VALUE FOR seq\nSELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x BIGINT\nSET @x = (SELECT NEXT VALUE FOR seq)\nSELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x BIGINT = NEXT VALUE FOR seq OVER (ORDER BY (SELECT 1))\nSELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR seq AS c",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR seq OVER (ORDER BY (SELECT 1)) AS c",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x BIGINT = CONVERT(BIGINT, NEXT VALUE FOR seq)\nSELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x BIGINT\nSET @x = CONVERT(BIGINT, NEXT VALUE FOR seq)\nSELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE (c BIGINT DEFAULT NEXT VALUE FOR seq)\nSELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT (SELECT NEXT VALUE FOR seq) AS c",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 WHERE NEXT VALUE FOR seq > 0",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE (c INT DEFAULT (dbo.f()))\nSELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE (c AS dbo.f())\nSELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE (c NVARCHAR(100) DEFAULT (xp_cmdshell('dir')))\nSELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE (c NVARCHAR(100) DEFAULT (fn_get_sql(0x)))\nSELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE (c INT CHECK (c > dbo.f()))\nSELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE (c INT DEFAULT (sp_oacreate()))\nSELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE (c DATETIME DEFAULT (GETDATE()))\nSELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE (a INT, b AS a*2)\nSELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @c CURSOR\nSELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @c CURSOR\nSET @c = CURSOR FOR SELECT 1 FROM t\nSELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE c CURSOR FOR SELECT 1 FROM t\nSELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE [c] CURSOR FOR SELECT 1 FROM t\nSELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE c CURSOR FOR SELECT 1\nOPEN c\nSELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @c CURSOR\nSET @c = CURSOR LOCAL SCROLL FOR SELECT 1 FROM t\nSELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "MERGE INTO t USING s ON 1=1 WHEN MATCHED THEN DELETE",
+   "admitted": false
+  },
+  {
+   "sql": "MERGE UNION USING s ON 1=1 WHEN MATCHED THEN DELETE",
+   "admitted": false
+  },
+  {
+   "sql": "MERGE [JOIN] USING s ON 1=1 WHEN MATCHED THEN DELETE",
+   "admitted": false
+  },
+  {
+   "sql": "MERGE JOIN.dbo.t USING s ON 1=1 WHEN MATCHED THEN DELETE",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 FROM a MERGE JOIN b ON 1=1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM [JOIN]",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM \"UNION\"",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT [HINT] FROM t",
+   "admitted": true
+  },
+  {
+   "sql": "MERGE\n[JOIN]\nUSING s ON 1=1 WHEN MATCHED THEN DELETE",
+   "admitted": false
+  },
+  {
+   "sql": "USE \"PLAN\"",
+   "admitted": false
+  },
+  {
+   "sql": "USE [HINT]",
+   "admitted": false
+  },
+  {
+   "sql": "USE HINT",
+   "admitted": false
+  },
+  {
+   "sql": "USE PLAN",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t OPTION (USE HINT('DISABLE_OPTIMIZER_ROWGOAL'))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM t OPTION (USE PLAN N'<ShowPlanXML/>')",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1; USE PLAN",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x INT\nSET @x = @@SPID\nSELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SET ROWCOUNT @x\nSELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET TEXTSIZE 2048\nSELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET IDENTITY_INSERT t ON\nSELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x INT\nSET @x = 1, NOCOUNT ON\nSELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 1 SELECT STATISTICS",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x INT = 1\nSELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x INT\nSET @x = 1 UPDATE t SET c=1\nSELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x INT = (SELECT TOP 1 c FROM t)\nSELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x INT SET @x = 1 INSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x INT = 1\nMERGE t USING s ON 1=1 WHEN MATCHED THEN DELETE",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x INT\nSET @x = (SELECT 1); DELETE FROM t\nSELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @a INT = 1, @b INT = 2\nSELECT @a + @b",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x INT\nSET @x = 1\nSELECT * FROM a MERGE JOIN b ON 1=1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE (c INT)\nINSERT INTO @t VALUES (1)\nSELECT * FROM @t",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE (c INT)\nSELECT * INTO @t FROM s",
+   "admitted": false
+  },
+  {
+   "sql": "SET @NOCOUNT ON\nSELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x VARBINARY(128) = 0x55\nSET CONTEXT_INFO @x\nSELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET LOCK_TIMEOUT 0\nSELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET DEADLOCK_PRIORITY HIGH\nSELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 AS x) SELECT x FROM c",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @x INT = 1\nWITH c AS (SELECT @x AS x) SELECT x FROM c",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x INT\nSET @x = 1 WAITFOR DELAY '00:00:05'\nSELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x INT = 1\nRECEIVE TOP(1) * FROM q",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = NEXT VALUE FOR seq; SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x BIGINT; SET @x = NEXT VALUE FOR seq; SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = (SELECT NEXT VALUE FOR seq); SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = CONVERT(BIGINT, NEXT VALUE FOR seq); SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = NEXT VALUE FOR seq OVER (ORDER BY (SELECT 1)); SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = COALESCE(NEXT VALUE FOR seq, 0); SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = CASE WHEN 1=1 THEN NEXT VALUE FOR seq ELSE 0 END; SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = NEXT VALUE FOR seq + 1; SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = NEXT VALUE FOR [dbo].[seq]; SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x BIGINT = NEXT VALUE FOR seq; SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR [dbo].[seq]",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR \"seq\"",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR seq OVER (ORDER BY c) FROM t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 + NEXT VALUE FOR seq",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT CASE WHEN 1=1 THEN NEXT VALUE FOR seq END",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT c FROM t ORDER BY NEXT VALUE FOR seq",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT TOP (NEXT VALUE FOR seq) c FROM t",
+   "admitted": false
+  },
+  {
+   "sql": "SET ROWCOUNT 5; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET LOCK_TIMEOUT 0; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @b VARBINARY(128); SET CONTEXT_INFO 0x55; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET ANSI_NULLS OFF; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET FMTONLY ON; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET DEADLOCK_PRIORITY HIGH; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET IDENTITY_INSERT t ON; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET OFFSETS SELECT,FROM ON; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET XACT_ABORT ON; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 1, NOCOUNT ON; SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 1, @y = 2; SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SET @x = 1, @y = NEXT VALUE FOR seq; SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE (c INT); SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @t TABLE (c INT DEFAULT (dbo.f())); SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @t TABLE (c BIGINT DEFAULT (NEXT VALUE FOR seq)); SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE (c NVARCHAR(50) DEFAULT (xp_cmdshell('x'))); SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE c CURSOR FOR SELECT 1; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = 1; SELECT 1; DELETE FROM t",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x INT; SET @x = 1; SELECT 1; UPDATE t SET c=1",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = NEXT VALUE FOR seq; INSERT INTO t VALUES(1); SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM a MERGE JOIN b ON 1=1; SELECT 2",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 OPTION (USE PLAN N'<x/>')",
+   "admitted": true
+  },
+  {
+   "sql": "SET @x = @@TRANCOUNT; SELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "SET @x = @@IDENTITY; SELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0001SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0001SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0001SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0001DECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0001SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0002SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0002SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0002SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0002DECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0002SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0003SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0003SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0003SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0003DECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0003SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0004SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0004SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0004SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0004DECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0004SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0005SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0005SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0005SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0005DECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0005SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0006SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0006SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0006SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0006DECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0006SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0007SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0007SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0007SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0007DECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0007SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\bSET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\bSET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\bSET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\bDECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\bSELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u000eSET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u000eSET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u000eSET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u000eDECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u000eSELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u000fSET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u000fSET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u000fSET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u000fDECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u000fSELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0010SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0010SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0010SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0010DECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0010SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0011SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0011SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0011SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0011DECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0011SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0012SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0012SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0012SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0012DECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0012SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0013SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0013SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0013SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0013DECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0013SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0014SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0014SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0014SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0014DECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0014SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0015SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0015SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0015SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0015DECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0015SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0016SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0016SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0016SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0016DECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0016SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0017SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0017SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0017SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0017DECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0017SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0018SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0018SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0018SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0018DECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0018SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0019SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0019SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0019SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0019DECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0019SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u001aSET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u001aSET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u001aSET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u001aDECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u001aSELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u001bSET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u001bSET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u001bSET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u001bDECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u001bSELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --cSET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --cSET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --cSET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --cDECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --cSELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --cSET CONTEXT_INFO 0x55",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --cSET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --cDECLARE c CURSOR FOR SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --cSELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c DECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c SET CONTEXT_INFO 0x55",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c DECLARE c CURSOR FOR SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c SET CONTEXT_INFO 0x55",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c DECLARE c CURSOR FOR SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c᠎SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c᠎SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c᠎SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c᠎DECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c᠎SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c​SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c​SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c​SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c​DECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c​SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c⁠SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c⁠SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c⁠SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c⁠DECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c⁠SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c﻿SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c﻿SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c﻿SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c﻿DECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c﻿SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c DECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c　SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c　SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c　SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c　DECLARE c CURSOR FOR SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c　SELECT NEXT VALUE FOR seq",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\nSET CONTEXT_INFO 0x55",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT RAND(42)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT RAND(42), RAND()",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT c FROM t WHERE RAND(7) > 0.5",
+   "admitted": false
+  },
+  {
+   "sql": "WITH x AS (SELECT RAND(9) AS r) SELECT r FROM x",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT c FROM dbo.t WHERE 1=1 AND RAND(123) < 0.1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT /**/ VALUE /**/ FOR /**/ s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT\\nVALUE\\nFOR s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR s OVER (ORDER BY (SELECT 1)) FROM t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT c FROM t WHERE c = NEXT VALUE FOR s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT CASE WHEN 1=1 THEN NEXT VALUE FOR s END",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT x FROM (VALUES (NEXT VALUE FOR s)) v(x)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT --c\\nNEXT VALUE FOR s",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT NEXT VALUE FOR otherdb.dbo.s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT NEXT\\tVALUE\\tFOR s",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\\u0085EXEC xp_cmdshell 'dir'",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\u0085SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c WAITFOR DELAY '00:00:10'",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c SELECT * FROM OPENQUERY(srv,'SELECT 1')",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\\u0085BEGIN TRAN",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c GRANT CONTROL TO sa",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\\rINSERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\tINSERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\u001aINSERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t WITH (TabLock)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM fn_x(1,'XLOCK')",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t WHERE c = 'HOLDLOCK'",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t OPTION (TABLE HINT(t, SERIALIZABLE))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM OPENROWSET(BULK 'x', SINGLE_CLOB) AS a",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM OPENXML(@h,'/x')",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM PREDICT(MODEL=@m, DATA=t AS d)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM OPEN/**/ROWSET(BULK 'x', SINGLE_CLOB) a",
+   "admitted": false
+  },
+  {
+   "sql": "OPEN c; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET CONTEXT_INFO 0x55; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = NEXT VALUE FOR s; SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "WITH r AS (SELECT 1 AS n) SELECT n FROM r OPTION (MAXRECURSION 0)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c WAITFOR DELAY '00:00:05'",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c TRUNCATE TABLE t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c BEGIN TRAN",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c INSERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c INSERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\bINSERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --cINSERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 AS n) SELECT * FROM c",
+   "admitted": true
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 AS n) INSERT INTO t SELECT n FROM c",
+   "admitted": false
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 AS n) DELETE FROM t",
+   "admitted": false
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 AS n) UPDATE t SET x=1",
+   "admitted": false
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 AS n) MERGE t USING c ON 1=1 WHEN MATCHED THEN DELETE",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; DECLARE @x int",
+   "admitted": false
+  },
+  {
+   "sql": "THROW 50000, N'x', 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; THROW",
+   "admitted": false
+  },
+  {
+   "sql": "RECEIVE TOP(1) * FROM q",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM (RECEIVE TOP(1) * FROM q) AS r",
+   "admitted": false
+  },
+  {
+   "sql": "SEND ON CONVERSATION @h MESSAGE TYPE mt (N'x')",
+   "admitted": false
+  },
+  {
+   "sql": "GET CONVERSATION GROUP @g FROM q",
+   "admitted": false
+  },
+  {
+   "sql": "MOVE CONVERSATION @h TO @g",
+   "admitted": false
+  },
+  {
+   "sql": "END CONVERSATION @h",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 BEGIN DIALOG CONVERSATION @h FROM SERVICE a TO SERVICE 'b'",
+   "admitted": false
+  },
+  {
+   "sql": "{ call sp_who }",
+   "admitted": false
+  },
+  {
+   "sql": "{ CALL dbo.myproc }",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM {oj dbo.a a LEFT OUTER JOIN dbo.b b ON a.id=b.id}",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; lbl:",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM (VALUES (1),(2)) AS t(x)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t FOR BROWSE",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 AS n FOR XML RAW, XMLDATA",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 AS [tag], NULL AS [parent!1] FOR XML EXPLICIT",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 AS n FOR JSON PATH, ROOT('r')",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 AS n FOR XML PATH('') ; INSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM (SELECT 1 WHERE EXISTS (SELECT 1)) x",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 AS n INTO dbo.newtbl",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT (SELECT NEXT VALUE FOR s) AS n",
+   "admitted": false
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 AS n) SELECT * FROM c OPTION (MAXRECURSION 2)",
+   "admitted": true
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 AS n) SELECT * FROM c OPTION (MAXRECURSION 0)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 OPTION (USE HINT('DISABLE_OPTIMIZER_ROWGOAL'))",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT * FROM ＯＰＥＮＱＵＥＲＹ(srv,'SELECT 1')",
+   "admitted": true
+  },
+  {
+   "sql": "ＥＸＥＣ xp_cmdshell 'dir'",
+   "admitted": false
+  },
+  {
+   "sql": "ＷＡＩＴＦＯＲ DELAY '00:00:05'",
+   "admitted": false
+  },
+  {
+   "sql": "ＥＸＥＣ sp_executesql N'DROP TABLE t'",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 /*x*/ SELECT 2",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 /* /* */ INSERT INTO t VALUES(1) */ ",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 INSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 INSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1INSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1\fINSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c SET @x = NEXT VALUE FOR s",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c DENY SELECT ON t TO someuser",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c REVOKE SELECT ON t FROM someuser",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c MERGE t USING s ON 1=1 WHEN MATCHED THEN DELETE",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c CREATE INDEX ix ON t(c)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c ALTER INDEX ALL ON t REBUILD",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c UPDATE STATISTICS t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c EXEC sp_executesql N'DROP TABLE t'",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c SELECT * FROM OPENQUERY(srv,'SELECT 1')",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --cUPDATE t SET c=1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --cDELETE FROM t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --cGRANT CONTROL TO sa",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int = 1 SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @c CURSOR FOR SELECT 1; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE (id int DEFAULT NEXT VALUE FOR s); SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @t TABLE (id int DEFAULT dbo.f()); SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @t TABLE (id AS NEXT VALUE FOR s); SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int = NEXT VALUE FOR s; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int = (SELECT NEXT VALUE FOR s); SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = NEXT VALUE FOR s",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x = (SELECT NEXT VALUE FOR s); SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int = xp_cmdshell(1); SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int=1,@y int=NEXT VALUE FOR s; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int = 1 SET @y int = 2 SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x=1; SET @y=2; SELECT 1",
+   "admitted": true
+  },
+  {
+   "sql": "SET @x=1 SET @y=2 SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int; SELECT NEXT VALUE FOR s",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int; SELECT NEXT VALUE FOR s;",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int = ASCII('a'); SELECT @x",
+   "admitted": true
+  },
+  {
+   "sql": "SET @x = (SELECT c INTO #t FROM t); SELECT @x",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @g CURSOR GLOBAL FOR SELECT 1; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SET @x=1; SET NOCOUNT ON; SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "MERGE JOIN USING s ON 1=1 WHEN MATCHED THEN DELETE",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 AS c UNION SELECT 2 OPTION (MERGE UNION)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM t OPTION (USE HINT('FORCE_LEGACY_CARDINALITY_ESTIMATION'))",
+   "admitted": false
+  },
+  {
+   "sql": "MERGE \"JOIN\" USING s ON 1=1 WHEN MATCHED THEN DELETE",
+   "admitted": false
+  },
+  {
+   "sql": "DECLARE @x int=1; MERGE JOIN USING s ON 1=1 WHEN MATCHED THEN DELETE",
+   "admitted": false
+  },
+  {
+   "sql": "MERGE JOIN;SELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "MERGE dbo.JOIN USING s ON 1=1 WHEN MATCHED THEN DELETE",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\\x85SET NOCOUNT ON   (\\x85 = NEL, one code point U+0085)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c SET NOCOUNT ON   (  = LINE SEPARATOR)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c SET NOCOUNT ON   (  = PARAGRAPH SEPARATOR)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c\\x85SELECT NEXT VALUE FOR s",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x85ALTER SEQUENCE s RESTART WITH 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x85SET IDENTITY_INSERT t ON",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x0eINSERT INTO t VALUES(1)   (\\x0e = SO)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x0fINSERT INTO t VALUES(1)   (\\x0f = SI)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x1bSET NOCOUNT ON   (\\x1b = ESC)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x07SET NOCOUNT ON   (\\x07 = BEL)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x08SET NOCOUNT ON   (\\x08 = BS)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x01SET NOCOUNT ON   (\\x01 = SOH)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x7fSET NOCOUNT ON   (\\x7f = DEL)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x85SET CONTEXT_INFO 0x55",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x85SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x85WAITFOR DELAY '00:00:05'",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\x85EXEC sp_who",
+   "admitted": true
+  },
+  {
+   "sql": "DECLARE @x int=1;SELECT @x --c\\x85SET NOCOUNT ON",
+   "admitted": true
+  },
+  {
+   "sql": "SET @x=1;SELECT @x --c\\x85SELECT NEXT VALUE FOR s",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1/*\\x85*/",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\\xa0SET NOCOUNT ON   (\\xa0 = NBSP; believed harmless - not a line break)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c​SET NOCOUNT ON   (​ = ZWSP; believed harmless - not a line break)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --cCREATE TABLE t(a int)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --cEXEC sp_who",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --cSELECT * FROM t WITH (UPDLOCK)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c SELECT * FROM t WITH (UPDLOCK)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c SELECT * FROM t WITH (UPDLOCK)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c INSERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c INSERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c INSERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c INSERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c INSERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c　INSERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c​INSERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c﻿INSERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --DROP TABLE t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1-- INSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c \tUPDATE t SET c=1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --a--bDELETE FROM t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 WHERE 1={call foo}",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; {call someproc}",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT {fn UCASE('a')}",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT {t '00:00:00'}",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT * FROM {oj a LEFT JOIN b ON a.x=b.x}",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1; {call INSERT}",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 FROM t WHERE 1 = {fn x(NEXT VALUE FOR s)}",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --cＩＮＳＥＲＴ INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "𝐰𝐞𝐥𝐞𝐡𝐭 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --c𝐈𝐍𝐒𝐄𝐑𝐓 INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "ЅELECT 1",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --cINS​ERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --cINS­ERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --cＥＸＥＣ sp_who",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 ——INSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 −−INSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 -—INSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT N'go drop table t'",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT n'drop table t'",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 'it''s; drop table t'",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 AS [INSERT INTO t VALUES(1)]",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 AS [a]]b]",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 AS \"INSERT INTO t VALUES(1)\"",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 0x4452",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT my$col FROM t",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 WHERE x=@p",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --cINS\u0000ERT INTO t VALUES(1)",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 --c\u0000INSERT INTO t VALUES(1)",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 'ab'",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT '--\nINSERT INTO t VALUES(1)'",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 /* a /* b */ c */ + 1",
+   "admitted": true
+  },
+  {
+   "sql": "SELECT 1 /*x*/ --cDROP TABLE t",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --cMERGE t USING s ON 1=1 WHEN MATCHED THEN DELETE",
+   "admitted": false
+  },
+  {
+   "sql": "SELECT 1 --cTRUNCATE TABLE t",
+   "admitted": false
+  }
+ ],
+ "materialized": [
+  {
+   "prefix": "SELECT 1 /* ",
+   "repeat": "A",
+   "count": 20000,
+   "suffix": "",
+   "admitted": false,
+   "from": "SELECT 1 /* AAAA...(20000 'A' chars, block comment left unterminated)"
+  },
+  {
+   "prefix": "SELECT 1",
+   "repeat": "+1",
+   "count": 4999,
+   "suffix": "",
+   "admitted": true,
+   "from": "SELECT 1+1+1+...+1 (5000 '1' tokens joined by '+')"
+  },
+  {
+   "prefix": "SELECT 1 --",
+   "repeat": "x",
+   "count": 20000,
+   "suffix": "\fINSERT INTO t VALUES(1)",
+   "admitted": false,
+   "from": "SELECT 1 --xxxx...(20000 'x' chars)\fINSERT INTO t VALUES(1)"
+  },
+  {
+   "sql": "SELECT 1 --c\nDROP TABLE t",
+   "admitted": false,
+   "from": "SELECT 1 --c\nDROP TABLE t  [neg-ctl: LF ends comment]"
+  },
+  {
+   "sql": "SELECT 1 --c\rDROP TABLE t",
+   "admitted": false,
+   "from": "SELECT 1 --c\rDROP TABLE t  [neg-ctl: CR ends comment]"
+  },
+  {
+   "sql": "SELECT 1 —— DROP TABLE t",
+   "admitted": false,
+   "from": "SELECT 1 —— DROP TABLE t  (em-dash x2)"
+  },
+  {
+   "sql": "SELECT 1 －－ DROP TABLE t",
+   "admitted": false,
+   "from": "SELECT 1 －－ DROP TABLE t  (fullwidth hyphen)"
+  },
+  {
+   "sql": "SELECT 1 ﹣﹣ DROP TABLE t",
+   "admitted": false,
+   "from": "SELECT 1 ﹣﹣ DROP TABLE t  (small hyphen-minus)"
+  },
+  {
+   "sql": "SELECT 1 −− DROP TABLE t",
+   "admitted": false,
+   "from": "SELECT 1 −− DROP TABLE t  (minus sign U+2212)"
+  },
+  {
+   "sql": "SELECT 1；ＩＮＳＥＲＴ INTO t VALUES(1)",
+   "admitted": false,
+   "from": "SELECT 1；ＩＮＳＥＲＴ INTO t VALUES(1)  (fullwidth ; + INSERT)"
+  },
+  {
+   "sql": "SELECT 1;𝐈𝐍𝐒𝐄𝐑𝐓 INTO t VALUES(1)",
+   "admitted": false,
+   "from": "SELECT 1;𝐈𝐍𝐒𝐄𝐑𝐓 INTO t VALUES(1)  (math-bold INSERT)"
+  },
+  {
+   "sql": "SELECT 1; ДРОП TABLE t",
+   "admitted": false,
+   "from": "SELECT 1; ДРОП TABLE t  (Cyrillic DROP)"
+  },
+  {
+   "sql": "ＤＲＯＰ TABLE t",
+   "admitted": false,
+   "from": "ＤＲＯＰ TABLE t  (fullwidth DROP)"
+  },
+  {
+   "sql": "SELECT 1; DROP TABLE t",
+   "admitted": false,
+   "from": "SELECT 1; DROP TABLE t  (NBSP)"
+  },
+  {
+   "sql": "SELECT 1 /* a /* b */ c */ , 2",
+   "admitted": true,
+   "from": "SELECT 1 /* a /* b */ c */ , 2  (nested block comment)"
+  },
+  {
+   "sql": "SELECT 1 /* */ , 2",
+   "admitted": true,
+   "from": "SELECT 1 /* */ , 2  (PS inside block comment)"
+  },
+  {
+   "sql": "SELECT n'abc'",
+   "admitted": true,
+   "from": "SELECT n'abc'  (lowercase n prefix)"
+  },
+  {
+   "sql": "SELECT 'x'';DROP TABLE t--'",
+   "admitted": true,
+   "from": "SELECT 'x'';DROP TABLE t--'  (payload inside one string literal)"
+  },
+  {
+   "sql": "SELECT [a]]b] FROM t",
+   "admitted": true,
+   "from": "SELECT [a]]b] FROM t  (]] escape)"
+  },
+  {
+   "sql": "SELECT 'a''",
+   "admitted": false,
+   "from": "SELECT 'a''  (doubled quote -> unterminated)"
+  },
+  {
+   "sql": "SELECT 1 WHERE col IN'x'",
+   "admitted": true,
+   "from": "SELECT 1 WHERE col IN'x'  (N-like prefix preceded by alnum)"
+  },
+  {
+   "sql": "SELECT 'a' 'b'",
+   "admitted": true,
+   "from": "SELECT 'a' 'b'  (adjacent strings)"
+  },
+  {
+   "sql": "SELECT 1 --c\u0000\nDROP TABLE t",
+   "admitted": false,
+   "from": "SELECT 1 --c\u0000\nDROP TABLE t  (NUL in comment, LF ends it)"
+  },
+  {
+   "sql": "SELECT 1 /*\u0000*/ , 2",
+   "admitted": true,
+   "from": "SELECT 1 /*\u0000*/ , 2  (NUL in block comment)"
+  },
+  {
+   "sql": "SELECT 1 --c\u0000 INSERT INTO t VALUES(1)",
+   "admitted": false,
+   "from": "SELECT 1 --c\u0000 INSERT INTO t VALUES(1)  (NUL then PS in comment)"
+  },
+  {
+   "sql": "SELECT $100 AS m",
+   "admitted": true,
+   "from": "SELECT $100 AS m  (money literal)"
+  },
+  {
+   "sql": "SELECT 0x4142 AS b",
+   "admitted": true,
+   "from": "SELECT 0x4142 AS b  (binary literal)"
+  },
+  {
+   "sql": "SELECT 1 AS a$b",
+   "admitted": true,
+   "from": "SELECT 1 AS a$b  ($ in identifier)"
+  },
+  {
+   "prefix": "SELECT 1 --",
+   "repeat": "x",
+   "count": 30000,
+   "suffix": " INSERT INTO t VALUES(1)",
+   "admitted": false,
+   "from": "SELECT 1 --<30000 'x' chars> INSERT INTO t VALUES(1)  (long comment + PS)"
+  },
+  {
+   "prefix": "SELECT 1",
+   "repeat": " ",
+   "count": 50000,
+   "suffix": "",
+   "admitted": true,
+   "from": "SELECT 1<50000 spaces>  (huge whitespace)"
+  },
+  {
+   "prefix": "SELECT 1 --",
+   "repeat": "y",
+   "count": 20000,
+   "suffix": "\fDROP TABLE t",
+   "admitted": false,
+   "from": "SELECT 1 --<20000 'y' chars>\fDROP TABLE t  (long comment + FF, known class)"
+  },
+  {
+   "sql": "SELECT 1 --a SELECT 2 --b INSERT INTO t VALUES(1)",
+   "admitted": false,
+   "from": "SELECT 1 --a SELECT 2 --b INSERT INTO t VALUES(1)  (PS terminator twice)"
+  },
+  {
+   "sql": "SELECT 1 --c  ",
+   "admitted": true,
+   "from": "SELECT 1 --c    (PS then only whitespace)"
+  },
+  {
+   "sql": "SELECT 1 --c SELECT 2",
+   "admitted": true,
+   "from": "SELECT 1 --c SELECT 2  (PS then second SELECT)"
+  },
+  {
+   "sql": "SELECT 1 --c\fEXEC sp_executesql N'SELECT 1'",
+   "admitted": false,
+   "from": "SELECT 1 --c\fEXEC sp_executesql N'SELECT 1'  (FF known class)"
+  },
+  {
+   "sql": "SELECT 1 --cSELECT 2 INTO t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\u0085SELECT 2 INTO t"
+  },
+  {
+   "sql": "SELECT 1 --cDBCC CHECKDB",
+   "admitted": false,
+   "from": "SELECT 1 --c\\u0085DBCC CHECKDB"
+  },
+  {
+   "sql": "SELECT 1 --c\fSELECT a INTO t FROM x",
+   "admitted": true,
+   "from": "SELECT 1 --c\\fSELECT a INTO t FROM x"
+  },
+  {
+   "sql": "SELECT 1 --c\u000bSELECT a INTO #t FROM x",
+   "admitted": false,
+   "from": "SELECT 1 --c\\u000bSELECT a INTO #t FROM x"
+  },
+  {
+   "sql": "WITH c AS (SELECT 1 x)\n--z\fDELETE FROM t",
+   "admitted": false,
+   "from": "WITH c AS (SELECT 1 x)\\n--z\\fDELETE FROM t"
+  },
+  {
+   "sql": "SELECT 1 UNION ALL SELECT 2 --c\fINSERT INTO t VALUES(1)",
+   "admitted": false,
+   "from": "SELECT 1 UNION ALL SELECT 2 --c\\fINSERT INTO t VALUES(1)"
+  },
+  {
+   "sql": "SELECT 1 /*\f*/ DROP TABLE t",
+   "admitted": false,
+   "from": "SELECT 1 /*\\f*/ DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --c\u0001DROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x01DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --c\u0002DROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x02DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --c\u0003DROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x03DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --c\u0004DROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x04DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --c\u0005DROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x05DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --c\u0006DROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x06DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --c\u0007DROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x07DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --c\bDROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x08DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --c\u000eDROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x0eDROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --c\u000fDROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x0fDROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --c\u0010DROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x10DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --c\u0011DROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x11DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --c\u0012DROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x12DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --c\u0013DROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x13DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --c\u0014DROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x14DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --c\u0015DROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x15DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --c\u0016DROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x16DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --c\u0017DROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x17DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --c\u0018DROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x18DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --c\u0019DROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x19DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --c\u001aDROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x1aDROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --c\u001bDROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x1bDROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --c\tDROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\tDROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --cDROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x7fDROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --cDROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x80DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --cDROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x81DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --cDROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x82DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --cDROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x83DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --cDROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x84DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --cDROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x86DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --cDROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x87DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --cDROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x88DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --cDROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x8dDROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --cDROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x9bDROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --cDROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x9fDROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1 --c DROP TABLE t",
+   "admitted": true,
+   "from": "SELECT 1 --c\\xa0DROP TABLE t"
+  },
+  {
+   "sql": "SELECT 1\nDR\u0000OP TABLE t",
+   "admitted": false,
+   "from": "SELECT 1\\nDR\\x00OP TABLE t"
+  },
+  {
+   "sql": "SELECT 1\nINS\u0000ERT INTO t VALUES(1)",
+   "admitted": false,
+   "from": "SELECT 1\\nINS\\x00ERT INTO t VALUES(1)"
+  },
+  {
+   "sql": "ＳＥＬＥＣＴ 1\nDROP TABLE t",
+   "admitted": false,
+   "from": "ＳＥＬＥＣＴ 1\\nDROP TABLE t (fullwidth SELECT)"
+  },
+  {
+   "sql": "SELECT 1 --c ＤＲＯＰ TABLE t",
+   "admitted": false,
+   "from": "SELECT 1 --c ＤＲＯＰ TABLE t (fullwidth DROP after PS)"
+  },
+  {
+   "sql": "ЅЕЛЕСТ 1",
+   "admitted": false,
+   "from": "ЅЕЛЕСТ 1 (Cyrillic SELECT lookalike)"
+  },
+  {
+   "sql": "SELECT 1\n𝐃𝐕𝐎𝐏 TABLE t",
+   "admitted": false,
+   "from": "SELECT 1\\n\\U0001d403\\U0001d415\\U0001d40e\\U0001d40f TABLE t (math-bold DROP)"
+  },
+  {
+   "sql": "ＥＸＥＣ dbo.DoWrite",
+   "admitted": false,
+   "from": "ＥＸＥＣ dbo.DoWrite (fullwidth EXEC)"
+  },
+  {
+   "sql": "SELECT 1\nＷＡＩＴＦＯＲ DELAY '00:00:05'",
+   "admitted": false,
+   "from": "SELECT 1\\nＷＡＩＴＦＯＲ DELAY '00:00:05' (fullwidth WAITFOR)"
+  },
+  {
+   "sql": "SELECT １\nDROP TABLE t",
+   "admitted": false,
+   "from": "SELECT １\\nDROP TABLE t (fullwidth digit 1, ascii DROP)"
+  },
+  {
+   "sql": "SELECT 1 －－c\nDROP TABLE t",
+   "admitted": false,
+   "from": "SELECT 1 －－c\\nDROP TABLE t (fullwidth hyphen x2 as comment)"
+  },
+  {
+   "sql": "SELECT 1 –– DROP TABLE t",
+   "admitted": false,
+   "from": "SELECT 1 –– DROP TABLE t (en-dash x2)"
+  },
+  {
+   "sql": "SELECT 1 ‐‐ DROP TABLE t",
+   "admitted": false,
+   "from": "SELECT 1 ‐‐ DROP TABLE t (hyphen U+2010 x2)"
+  },
+  {
+   "sql": "SELECT 1\nDROP@x TABLE t",
+   "admitted": false,
+   "from": "SELECT 1\\nDROP@x TABLE t"
+  },
+  {
+   "sql": "SELECT 1\nDROP$ TABLE t",
+   "admitted": false,
+   "from": "SELECT 1\\nDROP$ TABLE t"
+  },
+  {
+   "sql": "SELECT 1\nDRO#P TABLE t",
+   "admitted": false,
+   "from": "SELECT 1\\nDRO#P TABLE t"
+  },
+  {
+   "prefix": "SELECT 1 --",
+   "repeat": "x",
+   "count": 100000,
+   "suffix": " DROP TABLE t",
+   "admitted": false,
+   "from": "SELECT 1 --<100000 'x' chars> DROP TABLE t"
+  },
+  {
+   "prefix": "SELECT 1 --",
+   "repeat": "y",
+   "count": 60000,
+   "suffix": " INSERT INTO t VALUES(1)",
+   "admitted": false,
+   "from": "SELECT 1 --<60000 'y' chars> INSERT INTO t VALUES(1)"
+  },
+  {
+   "prefix": "SELECT [",
+   "repeat": "z",
+   "count": 5000,
+   "suffix": "] WHERE 1=0",
+   "admitted": true,
+   "from": "SELECT [<5000 'z' chars>] WHERE 1=0"
+  },
+  {
+   "sql": "SELECT --c\nNEXT VALUE FOR s",
+   "admitted": false,
+   "from": "SELECT --c\\nNEXT VALUE FOR s"
+  },
+  {
+   "sql": "SELECT 1 --cEXEC xp_cmdshell 'dir'",
+   "admitted": false,
+   "from": "SELECT 1 --c\\u0085EXEC xp_cmdshell 'dir'"
+  },
+  {
+   "sql": "SELECT 1 --c\tINSERT INTO t VALUES(1)",
+   "admitted": true,
+   "from": "SELECT 1 --c\\tINSERT INTO t VALUES(1)"
+  },
+  {
+   "sql": "SELECT 1 --c\u001aINSERT INTO t VALUES(1)",
+   "admitted": true,
+   "from": "SELECT 1 --c\\u001aINSERT INTO t VALUES(1)"
+  },
+  {
+   "sql": "SELECT 1 --cALTER SEQUENCE s RESTART WITH 1",
+   "admitted": false,
+   "from": "SELECT 1 --c\\x85ALTER SEQUENCE s RESTART WITH 1"
+  },
+  {
+   "sql": "SELECT 1 --cSET IDENTITY_INSERT t ON",
+   "admitted": false,
+   "from": "SELECT 1 --c\\x85SET IDENTITY_INSERT t ON"
+  },
+  {
+   "sql": "SELECT 1 --c\u000eINSERT INTO t VALUES(1)",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x0eINSERT INTO t VALUES(1)   (\\x0e = SO)"
+  },
+  {
+   "sql": "SELECT 1 --c\u000fINSERT INTO t VALUES(1)",
+   "admitted": true,
+   "from": "SELECT 1 --c\\x0fINSERT INTO t VALUES(1)   (\\x0f = SI)"
+  },
+  {
+   "sql": "DECLARE @x int=1;SELECT @x --cSET NOCOUNT ON",
+   "admitted": false,
+   "from": "DECLARE @x int=1;SELECT @x --c\\x85SET NOCOUNT ON"
+  },
+  {
+   "sql": "SET @x=1;SELECT @x --cSELECT NEXT VALUE FOR s",
+   "admitted": true,
+   "from": "SET @x=1;SELECT @x --c\\x85SELECT NEXT VALUE FOR s"
+  },
+  {
+   "sql": "SELECT 1/**/",
+   "admitted": true,
+   "from": "SELECT 1/*\\x85*/"
+  }
+ ]
+}

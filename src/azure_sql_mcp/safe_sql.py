@@ -182,13 +182,15 @@ def strip_literals_and_comments(sql: str) -> str:
     return _lex(sql).code
 
 
-def _code_words(sql: str) -> list[str]:
-    """Upper-cased words outside literals, comments and quoted identifiers.
+def _code_words(sql: str, *, include_quoted: bool = False) -> list[str]:
+    """Upper-cased words outside literals and comments.
 
+    Words inside quoted identifiers are skipped unless include_quoted is set.
     NFKC folds compatibility forms (for example full-width letters) so they
     cannot disguise a keyword.
     """
-    words = unicodedata.normalize("NFKC", _lex(sql).words)
+    lexed = _lex(sql)
+    words = unicodedata.normalize("NFKC", lexed.code if include_quoted else lexed.words)
     return [word.upper() for word in _CODE_WORD_PATTERN.findall(words)]
 
 
@@ -403,7 +405,8 @@ class SafeSqlValidator:
             raise ValueError("WAITFOR is not allowed in restricted mode (DoS risk).")
         if SP_EXECUTESQL_PATTERN.search(candidate):
             raise ValueError("sp_executesql is not allowed in restricted mode (dynamic SQL risk).")
-        hints = sorted(LOCKING_HINTS.intersection(_code_words(sql)))
+        # Quoted hint names ([UPDLOCK], "TABLOCK") count too: fail closed.
+        hints = sorted(LOCKING_HINTS.intersection(_code_words(sql, include_quoted=True)))
         if hints:
             raise ValueError(
                 f"Locking hints ({', '.join(hints)}) are not allowed in restricted mode."
