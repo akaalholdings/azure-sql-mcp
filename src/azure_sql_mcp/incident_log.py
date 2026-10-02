@@ -1665,8 +1665,7 @@ class IncidentLog:
         temporary = path.with_name(f".{path.name}.{threading.get_ident()}.tmp")
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            if hasattr(os, "fchmod"):
-                os.fchmod(fd, 0o600)
+            _fchmod_private(fd)
             os.write(fd, _encode(payload))
         finally:
             os.close(fd)
@@ -1865,8 +1864,7 @@ class IncidentLog:
             os.O_APPEND | os.O_CREAT | os.O_WRONLY,
             0o600,
         )
-        if hasattr(os, "fchmod"):
-            os.fchmod(fd, 0o600)
+        _fchmod_private(fd)
         self._fd, self._fd_day = fd, day
         return fd
 
@@ -2111,6 +2109,13 @@ def _number(value: object) -> float:
 def _timestamp_label(value: object) -> str | None:
     text = str(value or "")
     return text if re.fullmatch(r"[0-9T:.\-]{10,30}Z?", text) else None
+
+
+def _fchmod_private(fd: int) -> None:
+    # os.fchmod is missing on Windows before Python 3.13; there the mode is advisory.
+    fchmod = getattr(os, "fchmod", None)
+    if fchmod is not None:
+        fchmod(fd, 0o600)
 
 
 def _encode(record: Mapping[str, Any]) -> bytes:
