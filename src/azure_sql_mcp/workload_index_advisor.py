@@ -1,7 +1,9 @@
 """Collect Query Store workload and catalog evidence, then run the index advisor.
 
 All reads are read-only and need only ``VIEW DATABASE STATE`` and
-``VIEW DEFINITION`` (plus ``SELECT`` on tables for statistics histograms). No
+``VIEW DEFINITION`` (plus ``SELECT`` on tables for statistics histograms; on
+Basic, S0, S1 and elastic-pool databases the index usage counters need
+``##MS_ServerStateReader##`` or an admin, see ``azure_tier``). No
 history tables, policy file, or installation step is required. Optional
 evidence (operational stats, histograms, foreign keys, Query Store reference
 checks) degrades to a reported gap instead of failing the review.
@@ -244,7 +246,9 @@ SELECT
     CASE WHEN ty.is_assembly_type = 1 THEN ty.name ELSE TYPE_NAME(c.system_type_id) END AS type_name,
     c.max_length,
     c.is_nullable,
-    c.is_computed
+    c.is_computed,
+    COLUMNPROPERTY(c.object_id, c.name, 'IsIndexable') AS is_indexable,
+    COLUMNPROPERTY(c.object_id, c.name, 'IsDeterministic') AS is_deterministic
 FROM sys.columns AS c
 INNER JOIN sys.types AS ty
     ON ty.user_type_id = c.user_type_id
@@ -287,8 +291,10 @@ OUTER APPLY (
 WHERE st.object_id IN ({ids})
 """
 
+# One row per foreign key column; one more than the cap is read to detect it.
+MAX_FOREIGN_KEY_ROWS = 5_000
 FOREIGN_KEYS_SQL = """
-SELECT TOP (5000)
+SELECT TOP (?)
     fk.object_id AS foreign_key_id,
     fk.name AS foreign_key_name,
     OBJECT_SCHEMA_NAME(fk.parent_object_id) AS schema_name,
@@ -451,6 +457,7 @@ class WorkloadIndexAdvisor:
         ][:MAX_DETAIL_TABLES]
 
         columns = await self._columns(database_name, detail_ids, by_id, gaps)
+        gaps.extend(_unusable_computed_column_gaps(columns, tables))
         await self._forwarded_fetches(database_name, heap_ids, tables, by_id, gaps)
         selectivity = await self._selectivity(database_name, detail_ids, by_id, gaps)
         foreign_keys = await self._foreign_keys(database_name, gaps)
@@ -711,6 +718,8 @@ class WorkloadIndexAdvisor:
                 max_length=int(_float(row.get("max_length"))),
                 is_nullable=bool(row.get("is_nullable")),
                 is_computed=bool(row.get("is_computed")),
+                is_indexable=_bool_or_none(row.get("is_indexable")),
+                is_deterministic=_bool_or_none(row.get("is_deterministic")),
             )
         return columns
 
@@ -779,11 +788,21 @@ class WorkloadIndexAdvisor:
 
     async def _foreign_keys(self, database_name: str, gaps: list[str]) -> list[ForeignKeyInfo]:
         try:
-            rows = await self.executor.fetch_all(database_name, FOREIGN_KEYS_SQL)
+            rows = await self.executor.fetch_all(
+                database_name, FOREIGN_KEYS_SQL, params=[MAX_FOREIGN_KEY_ROWS + 1]
+            )
         except Exception as exc:
             note_exception(exc, "workload_index_advisor.foreign_keys")
             gaps.append("Foreign keys could not be read: " + sanitize_error_message(str(exc)))
             return []
+        if len(rows) > MAX_FOREIGN_KEY_ROWS:
+            # The key that continues past the cap was read only in part.
+            cut = rows[MAX_FOREIGN_KEY_ROWS].get("foreign_key_id")
+            rows = [row for row in rows[:MAX_FOREIGN_KEY_ROWS] if row.get("foreign_key_id") != cut]
+            gaps.append(
+                f"More than {MAX_FOREIGN_KEY_ROWS} foreign key column rows exist; foreign keys past "
+                "that cap were not checked for a supporting index"
+            )
         grouped: dict[Any, dict[str, Any]] = {}
         for row in rows:
             fk_id = row.get("foreign_key_id")
@@ -1083,6 +1102,33 @@ def _hint_place(source: str, source_id: dict[str, Any]) -> str:
     return source or "an unknown hint source"
 
 
+def _unusable_computed_column_gaps(
+    columns: dict[tuple[str, str], dict[str, ColumnInfo]],
+    tables: dict[tuple[str, str], TableInfo],
+) -> list[str]:
+    """Computed columns that COLUMNPROPERTY rules out; unread flags are the advisor's own gap."""
+
+    unusable: list[str] = []
+    for key, table_columns in columns.items():
+        info = tables.get(key)
+        prefix = f"{info.schema}.{info.table}" if info else ".".join(key)
+        for column in table_columns.values():
+            if not column.is_computed or column.is_indexable is None or column.is_deterministic is None:
+                continue
+            if not column.is_deterministic:
+                unusable.append(f"{prefix}.{column.name} (not deterministic)")
+            elif not column.is_indexable:
+                unusable.append(f"{prefix}.{column.name} (not indexable)")
+    if not unusable:
+        return []
+    unusable.sort()
+    shown = ", ".join(unusable[:10]) + (f" and {len(unusable) - 10} more" if len(unusable) > 10 else "")
+    return [
+        f"Computed column(s) {shown} cannot be index keys, and non-deterministic ones cannot be "
+        "included columns; index advice that needs them, such as covering a key lookup, is withheld"
+    ]
+
+
 def _id_list(object_ids: list[int]) -> str:
     return ", ".join(str(int(value)) for value in dict.fromkeys(object_ids))
 
@@ -1111,3 +1157,7 @@ def _int_or_none(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _bool_or_none(value: Any) -> bool | None:
+    return None if value is None else bool(value)

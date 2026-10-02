@@ -63,6 +63,8 @@ SERVER_STATE_GATED_DMVS = frozenset(
         "sys.dm_exec_cached_plans",
         "sys.dm_exec_query_stats",
         "sys.dm_os_waiting_tasks",
+        "sys.dm_db_index_usage_stats",
+        "sys.dm_os_sys_info",
     }
 )
 # A server-level permission on every service objective.

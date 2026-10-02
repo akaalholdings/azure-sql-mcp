@@ -172,6 +172,27 @@ def test_ungated_and_special_hints() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("dmv", "gated"),
+    [
+        ("sys.dm_db_index_usage_stats", True),
+        ("sys.dm_os_sys_info", True),
+        ("sys.dm_db_partition_stats", False),
+    ],
+)
+def test_existing_index_metadata_dmvs_follow_their_documented_permissions(dmv, gated) -> None:
+    # collect_existing_indexes reads all three. Microsoft Learn: usage stats and
+    # sys_info need the server role on Basic, S0, S1 and pools; partition stats
+    # needs VIEW DATABASE STATE (and VIEW DEFINITION) on every tier.
+    s0 = classify_service_tier("Standard", "S0", None)
+    provisioned = classify_service_tier("GeneralPurpose", "GP_Gen5_2", None)
+
+    hint = dmv_permission_hint(dmv, s0)
+
+    assert ("##MS_ServerStateReader##" in hint and "not enough" in hint) is gated
+    assert dmv_permission_hint(dmv, provisioned) == "VIEW DATABASE STATE is required."
+
+
 def test_permission_sets_match_the_documented_permissions() -> None:
     entries = documented_entries()
     gated = {name for name, entry in entries.items() if entry["permission"].get("basic_s0_s1_pool")}

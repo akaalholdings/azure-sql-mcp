@@ -1013,6 +1013,128 @@
         "basic_s0_s1_pool": null,
         "note": "Other callers see no row; DATABASEPROPERTYEX gives Edition and ServiceObjective to any user."
       }
+    },
+    "sys.dm_db_index_usage_stats": {
+      "doc_page": "sql/relational-databases/system-dynamic-management-objects/sys-dm-db-index-usage-stats-transact-sql",
+      "retrieved_utc": "2026-10-02",
+      "kind": "view",
+      "columns": [
+        "database_id",
+        "object_id",
+        "index_id",
+        "user_seeks",
+        "user_scans",
+        "user_lookups",
+        "user_updates",
+        "last_user_seek",
+        "last_user_scan",
+        "last_user_lookup",
+        "last_user_update",
+        "system_seeks",
+        "system_scans",
+        "system_lookups",
+        "system_updates",
+        "last_system_seek",
+        "last_system_scan",
+        "last_system_lookup",
+        "last_system_update"
+      ],
+      "excluded": {
+        "pdw_node_id": "Azure Synapse Analytics only"
+      },
+      "permission": {
+        "default": "VIEW DATABASE STATE",
+        "basic_s0_s1_pool": "##MS_ServerStateReader##"
+      }
+    },
+    "sys.dm_os_sys_info": {
+      "doc_page": "sql/relational-databases/system-dynamic-management-objects/sys-dm-os-sys-info-transact-sql",
+      "retrieved_utc": "2026-10-02",
+      "kind": "view",
+      "columns": [
+        "cpu_ticks",
+        "ms_ticks",
+        "cpu_count",
+        "hyperthread_ratio",
+        "physical_memory_kb",
+        "virtual_memory_kb",
+        "committed_kb",
+        "committed_target_kb",
+        "visible_target_kb",
+        "stack_size_in_bytes",
+        "os_quantum",
+        "os_error_mode",
+        "os_priority_class",
+        "max_workers_count",
+        "scheduler_count",
+        "scheduler_total_count",
+        "deadlock_monitor_serial_number",
+        "sqlserver_start_time_ms_ticks",
+        "sqlserver_start_time",
+        "affinity_type",
+        "affinity_type_desc",
+        "process_kernel_time_ms",
+        "process_user_time_ms",
+        "time_source",
+        "time_source_desc",
+        "virtual_machine_type",
+        "virtual_machine_type_desc",
+        "softnuma_configuration",
+        "softnuma_configuration_desc",
+        "process_physical_affinity",
+        "sql_memory_model",
+        "sql_memory_model_desc",
+        "socket_count",
+        "cores_per_socket",
+        "numa_node_count",
+        "container_type",
+        "container_type_desc"
+      ],
+      "internal": [
+        "process_physical_affinity"
+      ],
+      "excluded": {
+        "physical_memory_in_bytes": "SQL Server 2008 and 2008 R2 only",
+        "virtual_memory_in_bytes": "SQL Server 2008 and 2008 R2 only",
+        "bpool_committed": "SQL Server 2008 and 2008 R2 only",
+        "bpool_commit_target": "SQL Server 2008 and 2008 R2 only",
+        "bpool_visible": "SQL Server 2008 and 2008 R2 only",
+        "pdw_node_id": "Azure Synapse Analytics only"
+      },
+      "permission": {
+        "default": "VIEW DATABASE STATE",
+        "basic_s0_s1_pool": "##MS_ServerStateReader##"
+      }
+    },
+    "sys.dm_db_partition_stats": {
+      "doc_page": "sql/relational-databases/system-dynamic-management-objects/sys-dm-db-partition-stats-transact-sql",
+      "retrieved_utc": "2026-10-02",
+      "kind": "view",
+      "columns": [
+        "partition_id",
+        "object_id",
+        "index_id",
+        "partition_number",
+        "in_row_data_page_count",
+        "in_row_used_page_count",
+        "in_row_reserved_page_count",
+        "lob_used_page_count",
+        "lob_reserved_page_count",
+        "row_overflow_used_page_count",
+        "row_overflow_reserved_page_count",
+        "used_page_count",
+        "reserved_page_count",
+        "row_count"
+      ],
+      "excluded": {
+        "pdw_node_id": "Azure Synapse Analytics only",
+        "distribution_id": "Azure Synapse Analytics only"
+      },
+      "permission": {
+        "default": "VIEW DATABASE STATE",
+        "basic_s0_s1_pool": null,
+        "note": "Also needs VIEW DEFINITION; the page gives the same requirement on every service objective."
+      }
     }
   }
 }

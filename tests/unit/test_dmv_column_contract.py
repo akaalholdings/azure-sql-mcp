@@ -14,11 +14,13 @@ import pytest
 
 from azure_sql_mcp.diagnostics import DiagnosticQueryService
 from azure_sql_mcp.health import HealthService
+from azure_sql_mcp.index_metadata import collect_existing_indexes
 from azure_sql_mcp.plan_cache import PlanCacheService
 from azure_sql_mcp.resource_governance import ResourceGovernanceService
 from azure_sql_mcp.tempdb_memory import TempdbMemoryService
 from azure_sql_mcp.version_store import VersionStoreService
 from azure_sql_mcp.wait_stats import WaitStatsService
+from azure_sql_mcp.workload_index_advisor import TABLES_SQL
 from tests.azure_dmv_contract import LIVE_DIR
 from tests.azure_dmv_contract import DmvColumnError
 from tests.azure_dmv_contract import StrictDmvExecutor
@@ -239,6 +241,21 @@ async def test_other_diagnostic_reads_use_documented_columns(call) -> None:
     await call(executor)
 
     assert executor.violations == []
+
+
+@pytest.mark.asyncio
+async def test_index_metadata_reads_use_documented_columns() -> None:
+    # Usage counters, engine start time and partition sizes feed every index review.
+    executor = StrictDmvExecutor()
+
+    await collect_existing_indexes(executor, "appdb")  # type: ignore[arg-type]
+    await executor.fetch_all("appdb", TABLES_SQL)
+
+    assert executor.violations == []
+    read = " ".join(query for _, query, _ in executor.calls)
+    contract = documented_entries()
+    for dmv in ("sys.dm_db_index_usage_stats", "sys.dm_os_sys_info", "sys.dm_db_partition_stats"):
+        assert dmv in read and dmv in contract
 
 
 @pytest.mark.parametrize("capture", sorted(LIVE_DIR.glob("*.json")), ids=lambda path: path.stem)

@@ -10,11 +10,11 @@ from typing import Any
 import pytest
 
 from azure_sql_mcp import workload_index_advisor as module
-from azure_sql_mcp.azure_tier import SERVER_STATE_GATED_DMVS
 from azure_sql_mcp.workload_index_advisor import WorkloadIndexAdvisor
 from azure_sql_mcp.workload_index_advisor import resolve_window
 from azure_sql_mcp.workload_index_advisor import workload_sql
 from tests.unit.test_index_advisor import _index
+from tests.unit.test_index_advisor import _orders_clustered
 from tests.unit.test_index_advisor import _orders_indexes
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "showplans"
@@ -375,7 +375,9 @@ async def test_index_hint_in_a_module_pins_the_index(existing) -> None:
     ],
 )
 @pytest.mark.asyncio
-async def test_hint_that_matches_no_single_index_withholds_drop_ddl(existing, hint, same_name_elsewhere) -> None:
+async def test_hint_differing_in_case_or_naming_two_indexes_pins_the_index(existing, hint, same_name_elsewhere) -> None:
+    # Dropping an index such a hint names fails the query with Msg 308, so the
+    # hint pins every index it can name: no executable DROP.
     if same_name_elsewhere:
         existing.append(_index("Sales", "OrderLines", "IX_Odd]Name", ("Quantity",), index_id=4, reads=500))
     executor = RoutingExecutor(
@@ -391,10 +393,10 @@ async def test_hint_that_matches_no_single_index_withholds_drop_ddl(existing, hi
     report = await WorkloadIndexAdvisor(executor).review("appdb", **LONG)
 
     rec = _unused_drop(report)
-    assert "unresolved_index_hint" in rec["blockers"]
+    assert "index_named_by_hint_or_forced_plan" in rec["blockers"]
     assert rec["confidence"] == "low"
     assert rec["ddl"] is None and rec["rollback_ddl"] is None
-    assert any("module definitions match no single index" in gap for gap in report["gaps"])
+    assert any("module object_id 1234" in step for step in rec["prerequisites"])
 
 
 @pytest.mark.asyncio
@@ -512,11 +514,6 @@ async def test_optional_evidence_failure_becomes_a_gap_not_a_failure(existing) -
     assert any(gap.startswith("Statistics histograms could not be read") for gap in report["gaps"])
 
 
-@pytest.mark.xfail(
-    "sys.dm_db_index_usage_stats" not in SERVER_STATE_GATED_DMVS,
-    reason="azure_tier.SERVER_STATE_GATED_DMVS does not list sys.dm_db_index_usage_stats yet",
-    strict=True,
-)
 @pytest.mark.asyncio
 async def test_existing_index_metadata_failure_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
     async def failing_collect(executor, database_name, **kwargs):
@@ -534,6 +531,124 @@ async def test_existing_index_metadata_failure_is_unavailable(monkeypatch: pytes
     assert "VIEW DEFINITION" in reason
     assert "##MS_ServerStateReader##" in reason
     assert "Basic, S0, S1 and elastic-pool" in reason
+
+
+@pytest.fixture
+def clustered_only(monkeypatch: pytest.MonkeyPatch):
+    # Only the clustered keys exist, so a covered lookup is a create_index.
+    indexes = [
+        _orders_clustered(),
+        _index("Sales", "OrderLines", "PK_Sales_OrderLines", ("OrderLineID",), index_id=1, type_code=1, primary_key=True),
+    ]
+    for index in indexes:
+        index.usage_context["engine_start_time_utc"] = "2026-08-01T00:00:00Z"
+
+    async def fake_collect(executor, database_name, **kwargs):
+        return indexes
+
+    monkeypatch.setattr(module, "collect_existing_indexes", fake_collect)
+    return indexes
+
+
+def _computed(column: str, is_indexable: int, is_deterministic: int) -> RoutingExecutor:
+    """One lookup query on Sales.Orders, where ``column`` is a computed column."""
+
+    rows = [
+        dict(row, is_computed=1, is_indexable=is_indexable, is_deterministic=is_deterministic)
+        if row["column_name"] == column
+        else row
+        for row in RoutingExecutor().responses["columns"]
+    ]
+    return RoutingExecutor(columns=rows, workload=[_workload_row(1, "seek_residual_lookup_sort.xml", 900_000)])
+
+
+def _orders_create(report: dict[str, Any]) -> list[dict[str, Any]]:
+    return [r for r in report["recommendations"] if r["action"] == "create_index" and r["table"] == "Orders"]
+
+
+@pytest.mark.asyncio
+async def test_columns_read_computed_column_indexability_from_columnproperty(clustered_only) -> None:
+    executor = _computed("Comments", 1, 1)
+
+    await WorkloadIndexAdvisor(executor).review("appdb", now=NOW)
+
+    column_sql = next(call[1] for call in executor.calls if call[0] == "columns")
+    assert "COLUMNPROPERTY(c.object_id, c.name, 'IsIndexable') AS is_indexable" in column_sql
+    assert "COLUMNPROPERTY(c.object_id, c.name, 'IsDeterministic') AS is_deterministic" in column_sql
+
+
+def _used_columns(rec: dict[str, Any]) -> list[str]:
+    return [key["name"] for key in rec["key_columns"]] + list(rec["include_columns"])
+
+
+# Comments is a column the lookup must INCLUDE; CustomerID is its leading key.
+COMPUTED_ROLES = pytest.mark.parametrize("column", ["Comments", "CustomerID"])
+
+
+@COMPUTED_ROLES
+@pytest.mark.asyncio
+async def test_deterministic_indexable_computed_column_is_used_in_advice(clustered_only, column) -> None:
+    # Computed columns fail closed without COLUMNPROPERTY; once it says the column
+    # can be indexed, the covering index for the lookup comes back.
+    report = await WorkloadIndexAdvisor(_computed(column, 1, 1)).review("appdb", now=NOW)
+
+    [rec] = _orders_create(report)
+    assert column in _used_columns(rec)
+    assert not any(column in gap for gap in report["gaps"])
+
+
+@COMPUTED_ROLES
+@pytest.mark.asyncio
+async def test_nondeterministic_computed_column_is_never_used_and_is_reported(clustered_only, column) -> None:
+    # SQL rejects a non-deterministic computed column as a key or INCLUDE column.
+    report = await WorkloadIndexAdvisor(_computed(column, 0, 0)).review("appdb", now=NOW)
+
+    assert not any(column in _used_columns(rec) for rec in _orders_create(report))
+    [gap] = [gap for gap in report["gaps"] if f"Sales.Orders.{column}" in gap]
+    assert f"{column} (not deterministic)" in gap
+    assert "withheld" in gap
+
+
+def _foreign_key_rows(count: int, columns_per_key: int) -> list[dict[str, Any]]:
+    columns = ("StockItemID", "PackageTypeID", "Quantity")[:columns_per_key]
+    return [
+        {
+            "foreign_key_id": 100 + n // columns_per_key,
+            "foreign_key_name": f"FK_{n // columns_per_key}",
+            "schema_name": "Sales",
+            "table_name": "OrderLines",
+            "referenced_schema": "Sales",
+            "referenced_table": "Orders",
+            "constraint_column_id": n % columns_per_key + 1,
+            "column_name": columns[n % columns_per_key],
+            "delete_referential_action_desc": "NO_ACTION",
+            "is_disabled": False,
+        }
+        for n in range(count)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_foreign_key_list_at_cap_is_reported_as_gap() -> None:
+    cap = module.MAX_FOREIGN_KEY_ROWS
+    # Three columns per key: the row past the cap is the last column of a key
+    # whose first two columns were read.
+    executor = RoutingExecutor(foreign_keys=_foreign_key_rows(cap + 1, 3))
+    gaps: list[str] = []
+
+    foreign_keys = await WorkloadIndexAdvisor(executor)._foreign_keys("appdb", gaps)
+
+    fk_call = next(call for call in executor.calls if call[0] == "foreign_keys")
+    assert fk_call[2] == [cap + 1]
+    assert any(f"{cap} foreign key column rows" in gap and "not checked" in gap for gap in gaps)
+    # A key judged on part of its columns gives a wrong supporting-index finding.
+    assert all(len(fk.columns) == 3 for fk in foreign_keys)
+    assert len(foreign_keys) == cap // 3
+
+    complete = RoutingExecutor(foreign_keys=_foreign_key_rows(cap, 2))
+    complete_gaps: list[str] = []
+    assert len(await WorkloadIndexAdvisor(complete)._foreign_keys("appdb", complete_gaps)) == cap // 2
+    assert complete_gaps == []
 
 
 @pytest.mark.asyncio
