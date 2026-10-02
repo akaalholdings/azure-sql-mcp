@@ -67,7 +67,14 @@ INDEX_REVIEW_CLASSIFIER_POLICY_VERSION = "index-review-classifier-v1"
 INDEX_REVIEW_COLLECTOR_VERSION = "index-review-collector-v1"
 INDEX_REVIEW_SKILL = "sql-index-manager"
 INDEX_REVIEW_SKILL_VERSION = "2.0.0"
-MIN_OBSERVATION_DAYS = 90
+# Owner decision 2026-10-02: 35 days always holds one full month-end plus a
+# buffer for close jobs and one missed capture. Quarter-end and year-end
+# databases raise it with business_cycle_extension_days.
+MIN_OBSERVATION_DAYS = 35
+# Removal gate v2 tolerances over the trailing window.
+MIN_USAGE_COVERAGE_PCT = 95.0
+MAX_UNOBSERVED_HOURS = 48.0
+QUERY_STORE_CHAIN_MARGIN_DAYS = 2
 MAX_CAPTURE_ROWS = 10_000
 MAX_PLAN_XML_CHARS = 4_000_000
 SNAPSHOT_REUSE_HOURS = 48
@@ -200,10 +207,18 @@ _OBSERVATION_KEYS = frozenset(
      "gaps", "database_incarnation_fingerprint", "engine_identity", "engine_start_time_utc",
      "observed_snapshot_count", "expected_snapshot_count", "observation_days", "elapsed_hours",
      "required_elapsed_hours", "first_run", "no_gap_over_48_hours", "daily_continuity",
-     "max_gap_hours", "stable_engine", "stable_database_incarnation", "stable_counter_epoch",
+     "max_gap_hours", "max_usable_gap_hours", "stable_engine", "stable_database_incarnation", "stable_counter_epoch",
      "stable_definition", "enough_observation_days", "complete_subject_history",
      "complete_usable_counter_coverage", "reset_detected", "physical_database_change",
-     "engine_epoch_change", "usage_window_covers_history"}
+     "engine_epoch_change", "usage_window_covers_history", "window_start_utc",
+     "anchor_observed_at_utc", "subject_younger_than_window", "segments", "coverage_pct",
+     "unobserved_hours_total", "max_unobserved_hours", "window_read_count",
+     "query_store_chain_complete", "query_store_advisory", "query_store_retention_days"}
+)
+_USAGE_SEGMENT_KEYS = frozenset(
+    {"boundary", "first_observed_at_utc", "last_observed_at_utc", "observation_count",
+     "reset_at_utc", "began_in_window", "unobserved_hours_before", "reads_first",
+     "reads_last", "read_count", "write_count", "proven_read_count"}
 )
 
 _GATE_KEYS = frozenset(
@@ -354,6 +369,7 @@ _SCHEMA_ALLOWED_KEYS: dict[str, frozenset[str]] = {
     ) | _GATE_KEYS,
     "gate_map": _GATE_KEYS,
     "observation_gate": _OBSERVATION_KEYS,
+    "usage_segment": _USAGE_SEGMENT_KEYS,
     "coverage_sources": _COVERAGE_SOURCE_KEYS,
     "gap": _GAP_KEYS,
     "runtime_interval": _RUNTIME_INTERVAL_KEYS,
@@ -426,6 +442,9 @@ _SCHEMA_CONTAINER_TYPES: dict[tuple[str, str], str] = {
     ("child_fk", "constraint_ordinals"): "list",
     ("child_fk", "index_key_ordinals"): "list",
     ("observation", "state_counts"): "mapping",
+    ("observation", "gaps"): "list",
+    ("observation_gate", "gaps"): "list",
+    ("observation_gate", "segments"): "list",
     ("gate", "gates"): "mapping",
     ("gate", "observation"): "mapping",
 }
@@ -500,6 +519,10 @@ def _child_payload_schema(schema: str | None, key: str) -> str | None:
         return "scalar"
     if schema == "observation" and key == "state_counts":
         return "state_counts"
+    if schema in {"observation", "observation_gate"} and key == "gaps":
+        return "gap"
+    if schema == "observation_gate" and key == "segments":
+        return "usage_segment"
     if schema == "gate" and key == "gates":
         return "gate_map"
     if schema == "gate" and key == "observation":
@@ -1372,7 +1395,9 @@ class IndexReviewV1:
             raise ValueError("review_id must be a bounded deterministic selector.")
         _identifier(self.database_name, "database_name")
         _identifier(self.as_of_run_id, "as_of_run_id")
-        if self.prior_review_id is not None:
+        if self.prior_review_id is not None and not (
+            len(self.prior_review_id) < 200 and _REVIEW_ID.fullmatch(self.prior_review_id)
+        ):
             _identifier(self.prior_review_id, "prior_review_id")
         if self.overall_state not in INDEX_REVIEW_OVERALL_STATES:
             raise ValueError("Unsupported index review overall state.")
@@ -2602,6 +2627,11 @@ class SqlIndexHistoryRepository:
                 if stored_request != context.request_fingerprint:
                     raise IndexReviewIdempotencyConflictError("Index history idempotency key was replayed with different request material.")
                 return False
+            # The transaction opens SERIALIZABLE for the idempotency lock above;
+            # HOLDLOCK keeps that range lock to commit. Collect production
+            # catalog, Query Store and module rows under READ COMMITTED (row
+            # versions on Azure SQL) so no range locks are held on them.
+            session.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
             captured = collector(session, context)
             if captured.run.run_id != context.run_id or captured.run.request_fingerprint != context.request_fingerprint:
                 raise IndexReviewIntegrityError("Capture collector returned an unexpected run identity.")
@@ -3771,7 +3801,10 @@ class IndexReviewService:
         history: Sequence[tuple[IndexReviewRunV1, IndexReviewSnapshotV1]],
         compact: str,
     ) -> tuple[IndexReviewRunV1, IndexReviewSnapshotV1] | None:
-        return next((pair for pair in history if _compact(pair[0].run_id) == compact), None)
+        matches = [pair for pair in history if _compact(pair[0].run_id).startswith(compact)]
+        if len(matches) > 1:
+            raise IndexReviewIntegrityError("Review selector matches more than one run.")
+        return matches[0] if matches else None
 
 
 def moment_minus_days(value: str, days: int) -> str:
@@ -3870,123 +3903,370 @@ def _coverage_incomplete(value: Any) -> bool:
     return False
 
 
+_USAGE_COUNTER_KEYS = ("user_seeks", "user_scans", "user_lookups", "user_updates")
+_READ_COUNTER_KEYS = ("user_seeks", "user_scans", "user_lookups")
+# Usage counters are the primary removal evidence. These capture-time Query
+# Store blockers hide no reads while daily captures chain the coverage.
+_ADVISORY_QUERY_STORE_BLOCKERS = frozenset(
+    {"query_store_capture_mode_not_all", "query_store_stale_threshold_insufficient"}
+)
+_ADVISORY_CAPTURE_MODES = frozenset({"ALL", "AUTO", "CUSTOM"})
+
+
+def _hours(left: datetime, right: datetime) -> float:
+    return (right - left).total_seconds() / 3600.0
+
+
+def _usable_counters(
+    item: Mapping[str, Any] | None,
+    snapshot: IndexReviewSnapshotV1,
+) -> dict[str, int] | None:
+    """Return one observation's usage counters, or None when they prove nothing."""
+
+    if item is None or snapshot.engine_start_time_utc is None:
+        return None
+    if not (item.get("counter_epoch_fingerprint") or snapshot.counter_epoch_fingerprint):
+        return None
+    if _mapping_value(item.get("coverage")).get("usage") not in {"covered", "partial"}:
+        return None
+    counters = _mapping_value(item.get("counters"))
+    values = [counters.get(key) for key in _USAGE_COUNTER_KEYS]
+    if all(_is_nonnegative_int(value) for value in values):
+        return {key: _as_int(value) for key, value in zip(_USAGE_COUNTER_KEYS, values)}
+    # sys.dm_db_index_usage_stats has no row for an index unused since the
+    # known engine start.
+    if all(value is None for value in values):
+        return dict.fromkeys(_USAGE_COUNTER_KEYS, 0)
+    return None
+
+
+def _usage_segments(
+    usable: Sequence[tuple[IndexReviewSnapshotV1, Mapping[str, Any], dict[str, int]]],
+    window_start: datetime | None,
+    first_boundary: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+    """Split usable observations into counter epochs.
+
+    Counters are cumulative inside an epoch, so a missed capture loses no
+    reads unless a reset hides them; the caller bounds the gaps. A new epoch
+    starts at zero, so its absolute counters are the reads since the restart;
+    the time from the previous observation to the restart is unobserved. A segment's read_count is None when a counter decreased inside
+    it: a reset of unknown cause and time. Its proven_read_count still counts
+    the read growth seen between captures. Returns the segments, the in-window
+    unobserved intervals, and whether an epoch changed without an engine start.
+    """
+
+    working: list[dict[str, Any]] = []
+    gaps: list[dict[str, Any]] = []
+    unexplained_epoch_change = False
+    previous: tuple[IndexReviewSnapshotV1, datetime, tuple[Any, ...]] | None = None
+    for snapshot, item, counters in usable:
+        observed = _parse_time(snapshot.observed_at_utc)
+        epoch = (
+            snapshot.engine_fingerprint,
+            snapshot.engine_start_time_utc,
+            item.get("counter_epoch_fingerprint") or snapshot.counter_epoch_fingerprint,
+        )
+        if previous is not None and previous[2] == epoch:
+            segment = working[-1]
+            if any(counters[key] < segment["_last"][key] for key in _USAGE_COUNTER_KEYS):
+                segment["_decreased"] = True
+            segment["_proven"] += sum(
+                max(0, counters[key] - segment["_last"][key]) for key in _READ_COUNTER_KEYS
+            )
+            segment["_last"] = counters
+            segment["last_observed_at_utc"] = snapshot.observed_at_utc
+            segment["observation_count"] += 1
+        else:
+            reset_at: datetime | None = None
+            unobserved = 0.0
+            boundary = first_boundary
+            if previous is not None:
+                previous_snapshot, previous_time, _epoch = previous
+                engine_start = _parse_utc_timestamp(snapshot.engine_start_time_utc)
+                if snapshot.engine_start_time_utc == previous_snapshot.engine_start_time_utc:
+                    boundary, reset_at = "counter_epoch_change", observed
+                    unexplained_epoch_change = True
+                elif engine_start is not None and previous_time < engine_start <= observed:
+                    boundary, reset_at = "engine_start", engine_start
+                else:
+                    boundary, reset_at = "engine_start_time_unknown", observed
+                unobserved_from = max(previous_time, window_start or previous_time)
+                unobserved = max(0.0, _hours(unobserved_from, reset_at))
+                if unobserved > 0:
+                    gaps.append(
+                        {
+                            "from_utc": _timestamp(unobserved_from, "from_utc"),
+                            "to_utc": _timestamp(reset_at, "to_utc"),
+                            "hours": round(unobserved, 3),
+                            "left_run_id": previous_snapshot.run_id,
+                            "right_run_id": snapshot.run_id,
+                            "reason": boundary,
+                        }
+                    )
+            working.append(
+                {
+                    "boundary": boundary,
+                    "first_observed_at_utc": snapshot.observed_at_utc,
+                    "last_observed_at_utc": snapshot.observed_at_utc,
+                    "observation_count": 1,
+                    "reset_at_utc": (
+                        _timestamp(reset_at, "reset_at_utc") if reset_at is not None else None
+                    ),
+                    "began_in_window": previous is not None,
+                    "unobserved_hours_before": round(unobserved, 3),
+                    "_first": counters,
+                    "_last": counters,
+                    "_decreased": False,
+                    # An epoch that began after the anchor run started at zero.
+                    "_proven": (
+                        sum(counters[key] for key in _READ_COUNTER_KEYS)
+                        if previous is not None
+                        else 0
+                    ),
+                }
+            )
+        previous = (snapshot, observed, epoch)
+    segments = []
+    for working_segment in working:
+        segment = {key: value for key, value in working_segment.items() if not key.startswith("_")}
+        first, last = working_segment["_first"], working_segment["_last"]
+        # An epoch that began after the anchor run started at zero.
+        base = dict.fromkeys(_USAGE_COUNTER_KEYS, 0) if segment["began_in_window"] else first
+        decreased = working_segment["_decreased"]
+        segment["reads_first"] = sum(first[key] for key in _READ_COUNTER_KEYS)
+        segment["reads_last"] = sum(last[key] for key in _READ_COUNTER_KEYS)
+        segment["read_count"] = (
+            None if decreased else sum(last[key] - base[key] for key in _READ_COUNTER_KEYS)
+        )
+        segment["write_count"] = (
+            None if decreased else last["user_updates"] - base["user_updates"]
+        )
+        segment["proven_read_count"] = working_segment["_proven"]
+        segments.append(segment)
+    return segments, gaps, unexplained_epoch_change
+
+
+def _query_store_retention_days(snapshot: IndexReviewSnapshotV1) -> int | None:
+    coverage = _mapping_value(snapshot.coverage.get("query_store"))
+    for value in (
+        coverage.get("stale_query_threshold_days"),
+        coverage.get("retention_days"),
+        snapshot.query_store.get("stale_query_threshold_days"),
+        snapshot.query_store.get("retention_days"),
+    ):
+        retention = _as_optional_int(value)
+        if retention is not None:
+            return retention
+    return None
+
+
+def _query_store_lookback_days(snapshot: IndexReviewSnapshotV1) -> float | None:
+    """Days of Query Store history one capture read: retention, capped by its window."""
+
+    retention = _query_store_retention_days(snapshot)
+    if retention is None:
+        return None
+    coverage = _mapping_value(snapshot.coverage.get("query_store"))
+    window_minutes = _as_float(coverage.get("requested_window_minutes")) or _as_float(
+        snapshot.query_store.get("window_minutes")
+    )
+    return min(float(retention), window_minutes / 1440.0) if window_minutes else float(retention)
+
+
+def _query_store_state(
+    snapshot: IndexReviewSnapshotV1,
+    item: Mapping[str, Any] | None,
+) -> str:
+    """Return complete, advisory (only waivable blockers) or incomplete."""
+
+    raw = snapshot.coverage.get("query_store")
+    coverage = {"status": raw} if isinstance(raw, str) else _mapping_value(raw)
+    status = (
+        _mapping_value(item.get("coverage")).get("query_store")
+        if item is not None
+        else coverage.get("status")
+    )
+    if status == "complete":
+        return "complete"
+    blockers = coverage.get("blockers")
+    blocker_set = set(blockers) if isinstance(blockers, (list, tuple)) else set()
+    capture_mode = str(snapshot.query_store.get("capture_mode") or "").upper()
+    if (
+        blocker_set
+        and blocker_set <= _ADVISORY_QUERY_STORE_BLOCKERS
+        and _as_int(coverage.get("malformed")) == 0
+        and not _as_bool(coverage.get("capped"))
+        and capture_mode in _ADVISORY_CAPTURE_MODES
+    ):
+        return "advisory"
+    return "incomplete"
+
+
+def _reference_in_window(reference: Mapping[str, Any], window_start: datetime | None) -> bool:
+    # last_seen is the end of the newest runtime interval with executions; a
+    # reference without one is kept in scope.
+    last_seen = _parse_utc_timestamp(reference.get("last_seen"))
+    return last_seen is None or window_start is None or last_seen >= window_start
+
+
 def _observation_gate(
     subject: Mapping[str, Any],
     snapshots: Sequence[IndexReviewSnapshotV1],
     *,
     minimum_days: int,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], list[Mapping[str, Any]], int | None]:
+    """Evaluate the trailing minimum_days window of one subject's history.
+
+    The window is anchored on the last usable observation at or before its
+    start. Returns the observation facts, the subject's observations from the
+    anchor on, and the selected observation's absolute read counters.
+    """
+
     subject_id = subject.get("subject_id")
     ordered = sorted(snapshots, key=lambda item: (item.observed_at_utc, item.run_id))
-    history_by_snapshot = [
-        next((item for item in snapshot.subjects if item.get("subject_id") == subject_id), None)
+    pairs = [
+        (snapshot, next((item for item in snapshot.subjects if item.get("subject_id") == subject_id), None))
         for snapshot in ordered
     ]
-    observations = [item for item in history_by_snapshot if item is not None]
-    times = [_parse_time(snapshot.observed_at_utc) for snapshot in ordered]
-    gaps = [
-        (right - left).total_seconds() / 3600.0
-        for left, right in zip(times, times[1:])
-    ]
-    engine_epochs = {
-        (snapshot.engine_identity, snapshot.engine_start_time_utc, snapshot.engine_fingerprint)
-        for snapshot in ordered
-    }
-    database_epochs = {
-        (snapshot.database_incarnation_identity, snapshot.database_incarnation_fingerprint)
-        for snapshot in ordered
-    }
-    counter_epochs = {
-        item.get("counter_epoch_fingerprint") or snapshot.counter_epoch_fingerprint
-        for snapshot, item in zip(ordered, history_by_snapshot)
-        if item is not None
-    }
-    definitions = {_subject_definition_identity(item) for item in observations}
-    stable_engine = (
-        len(engine_epochs) == 1
-        and all(value is not None for value in next(iter(engine_epochs), (None, None, None)))
-    )
-    stable_database_incarnation = (
-        len(database_epochs) == 1
-        and all(
-            value is not None
-            for value in next(iter(database_epochs), (None, None))
-        )
-    )
-    engine_start = (
-        _parse_utc_timestamp(next(iter(engine_epochs))[1])
-        if stable_engine
+    usable: list[tuple[IndexReviewSnapshotV1, Mapping[str, Any], dict[str, int]]] = []
+    for snapshot, item in pairs:
+        counters = _usable_counters(item, snapshot)
+        if item is not None and counters is not None:
+            usable.append((snapshot, item, counters))
+    window_start = (
+        _parse_time(ordered[-1].observed_at_utc) - timedelta(days=minimum_days)
+        if ordered
         else None
     )
-    engine_covers_history = bool(times) and engine_start is not None and engine_start <= times[0]
-    required_counter_keys = ("user_seeks", "user_scans", "user_lookups", "user_updates")
-    usable_flags = []
-    for item in history_by_snapshot:
-        counters = _mapping_value(item.get("counters")) if item is not None else {}
-        item_coverage = _mapping_value(item.get("coverage")) if item is not None else {}
-        usable_flags.append(
-            item is not None
-            and all(
-                _is_nonnegative_int(counters.get(key))
-                for key in required_counter_keys
-            )
-            and (
-                item_coverage.get("usage") == "covered"
-                or item_coverage.get("usage") == "partial" and engine_covers_history
-            )
-        )
+    anchor = next(
+        (
+            entry
+            for entry in reversed(usable)
+            if window_start is not None and _parse_time(entry[0].observed_at_utc) <= window_start
+        ),
+        None,
+    )
+    anchor_time = _parse_time(anchor[0].observed_at_utc) if anchor is not None else None
+
+    def in_window(snapshot: IndexReviewSnapshotV1) -> bool:
+        observed = _parse_time(snapshot.observed_at_utc)
+        if anchor_time is not None:
+            return observed >= anchor_time
+        return window_start is not None and observed > window_start
+
+    window_pairs = [(snapshot, item) for snapshot, item in pairs if in_window(snapshot)]
+    window_snapshots = [snapshot for snapshot, _item in window_pairs]
+    observations = [item for _snapshot, item in window_pairs if item is not None]
+    window_usable = [entry for entry in usable if in_window(entry[0])]
+    segments, gaps, unexplained_epoch_change = _usage_segments(
+        window_usable,
+        window_start,
+        "window_anchor" if anchor is not None else "first_observation",
+    )
+    # Only a counter decrease reveals a reset with no engine start change,
+    # and an engine can start before the database fails over onto it. Usable
+    # observations at most 48 h apart bound both blind spots.
+    usable_times = [_parse_time(entry[0].observed_at_utc) for entry in window_usable]
+    max_usable_gap = max(
+        (_hours(left, right) for left, right in zip(usable_times, usable_times[1:])),
+        default=None,
+    )
+    selected_usable = bool(usable) and usable[-1][0].run_id == ordered[-1].run_id
+    selected_reads = (
+        sum(usable[-1][2][key] for key in _READ_COUNTER_KEYS) if selected_usable else None
+    )
+    unobserved = [float(gap["hours"]) for gap in gaps]
+    unobserved_total = sum(unobserved)
+    max_unobserved = max(unobserved, default=0.0)
+    coverage_pct = (
+        100.0 * (1.0 - unobserved_total / (minimum_days * 24.0)) if anchor is not None else None
+    )
+
+    chain_complete = anchor_time is not None
+    states = []
+    previous_time = anchor_time
+    for snapshot, item in window_pairs:
+        observed = _parse_time(snapshot.observed_at_utc)
+        if previous_time is None or observed <= previous_time:
+            continue
+        states.append(_query_store_state(snapshot, item))
+        lookback = _query_store_lookback_days(snapshot)
+        if (
+            lookback is None
+            or _hours(previous_time, observed) / 24.0 + QUERY_STORE_CHAIN_MARGIN_DAYS > lookback
+        ):
+            chain_complete = False
+        previous_time = observed
+    chain_complete = chain_complete and bool(states) and "incomplete" not in states
+
+    times = [_parse_time(snapshot.observed_at_utc) for snapshot in window_snapshots]
+    capture_gaps = [_hours(left, right) for left, right in zip(times, times[1:])]
+    max_gap = max(capture_gaps, default=None)
+    no_long_gap = (
+        max(max_unobserved, max_gap or 0.0, max_usable_gap or 0.0) <= MAX_UNOBSERVED_HOURS
+    )
     dates = {value.date() for value in times}
     expected_dates = (
-        {
-            times[0].date() + timedelta(days=offset)
-            for offset in range((times[-1].date() - times[0].date()).days + 1)
-        }
+        {times[0].date() + timedelta(days=offset) for offset in range((times[-1].date() - times[0].date()).days + 1)}
         if times
         else set()
     )
-    max_gap = max(gaps, default=None)
-    elapsed_hours = (
-        (times[-1] - times[0]).total_seconds() / 3600.0 if len(times) >= 2 else 0.0
-    )
-    enough_days = (
-        len(times) >= minimum_days + 1
-        and elapsed_hours >= minimum_days * 24
-        and len(dates) >= minimum_days + 1
-    )
-    return {
+    database_epochs = {
+        (snapshot.database_incarnation_identity, snapshot.database_incarnation_fingerprint)
+        for snapshot in window_snapshots
+    }
+    definitions = {_subject_definition_identity(item) for item in observations}
+    read_counts = [segment["read_count"] for segment in segments]
+    observation = {
         "observed_snapshot_count": len(observations),
-        "expected_snapshot_count": len(ordered),
+        "expected_snapshot_count": len(window_snapshots),
         "observation_days": len(dates),
         "minimum_observation_days": minimum_days,
-        "elapsed_hours": elapsed_hours,
+        "elapsed_hours": _hours(times[0], times[-1]) if len(times) >= 2 else 0.0,
         "required_elapsed_hours": minimum_days * 24,
         "first_run": len(observations) <= 1,
-        "no_gap_over_48_hours": bool(times) and (max_gap is None or max_gap <= 48.0),
+        "no_gap_over_48_hours": no_long_gap,
         "daily_continuity": bool(times) and expected_dates.issubset(dates),
         "max_gap_hours": max_gap,
-        "stable_engine": stable_engine and engine_covers_history,
-        "stable_database_incarnation": stable_database_incarnation,
-        "stable_counter_epoch": len(counter_epochs) == 1 and None not in counter_epochs,
+        "max_usable_gap_hours": max_usable_gap,
+        "stable_engine": bool(window_snapshots) and all(
+            snapshot.engine_identity and snapshot.engine_start_time_utc and snapshot.engine_fingerprint
+            for snapshot in window_snapshots
+        ),
+        "stable_database_incarnation": (
+            len(database_epochs) == 1 and None not in next(iter(database_epochs))
+        ),
+        "stable_counter_epoch": bool(segments) and not unexplained_epoch_change,
         "stable_definition": len(definitions) == 1 and None not in definitions,
-        "enough_observation_days": enough_days,
-        "complete_subject_history": len(observations) == len(ordered),
-        "complete_usable_counter_coverage": bool(usable_flags) and all(usable_flags),
-        "reset_detected": len(counter_epochs - {None}) > 1,
+        "enough_observation_days": anchor is not None and no_long_gap,
+        "complete_subject_history": bool(window_snapshots) and len(observations) == len(window_snapshots),
+        "complete_usable_counter_coverage": selected_usable,
+        "reset_detected": len(segments) > 1,
         "physical_database_change": len({value for value in database_epochs if value[0] is not None}) > 1,
-        "engine_epoch_change": len({value for value in engine_epochs if value[0] is not None}) > 1,
-        "usage_window_covers_history": engine_covers_history,
+        "engine_epoch_change": len(
+            {snapshot.engine_start_time_utc for snapshot in window_snapshots if snapshot.engine_start_time_utc}
+        ) > 1,
+        "usage_window_covers_history": coverage_pct is not None and coverage_pct >= MIN_USAGE_COVERAGE_PCT,
+        "window_start_utc": (
+            _timestamp(window_start, "window_start_utc") if window_start is not None else None
+        ),
+        "anchor_observed_at_utc": anchor[0].observed_at_utc if anchor is not None else None,
+        "subject_younger_than_window": anchor is None,
+        "segments": segments,
+        "gaps": gaps,
+        "coverage_pct": round(coverage_pct, 3) if coverage_pct is not None else None,
+        "unobserved_hours_total": round(unobserved_total, 3),
+        "max_unobserved_hours": round(max_unobserved, 3),
+        "window_read_count": (
+            sum(count for count in read_counts if count is not None)
+            if read_counts and None not in read_counts
+            else None
+        ),
+        "query_store_chain_complete": chain_complete,
+        "query_store_advisory": "advisory" in states,
     }
-
-
-def _subject_history(subject: Mapping[str, Any], snapshots: Sequence[IndexReviewSnapshotV1]) -> list[Mapping[str, Any]]:
-    subject_id = subject.get("subject_id")
-    items = [
-        item
-        for snapshot in snapshots
-        for item in snapshot.subjects
-        if item.get("subject_id") == subject_id
-    ]
-    return sorted(items, key=lambda item: str(item.get("observed_at_utc", "")))
+    return observation, observations, selected_reads
 
 
 def _specialist_or_uncertain_protection(
@@ -4013,34 +4293,22 @@ def evaluate_removal_gate(
         reverse_ddl = render_reverse_index_definition(reversible)
     except (TypeError, ValueError):
         reverse_ddl = {"executable": False}
-    history = _subject_history(subject, snapshots)
-    observation = _observation_gate(subject, snapshots, minimum_days=minimum_days)
+    observation, history, selected_reads = _observation_gate(
+        subject, snapshots, minimum_days=minimum_days
+    )
+    window_start = _parse_utc_timestamp(observation["window_start_utc"])
     filter_payload = _mapping_value(reversible.get("filter"))
     data_space = _mapping_value(reversible.get("data_space"))
-    counters = [_mapping_value(item.get("counters")) for item in history]
-    read_keys = ("user_seeks", "user_scans", "user_lookups")
-    valid_counters = bool(counters) and all(
-        all(
-            _is_nonnegative_int(counter.get(key))
-            for key in read_keys + ("user_updates",)
-        )
-        for counter in counters
-    )
-    nondecreasing = valid_counters and all(
-        all(_as_int(right.get(key)) >= _as_int(left.get(key)) for key in read_keys + ("user_updates",))
-        for left, right in zip(counters, counters[1:])
-    )
-    read_deltas_zero = nondecreasing and all(
-        all(_as_int(right.get(key)) - _as_int(left.get(key)) == 0 for key in read_keys)
-        for left, right in zip(counters, counters[1:])
-    )
+    segments = observation["segments"]
+    # read_count is None only for a segment whose counters decreased.
+    nondecreasing = bool(segments) and all(segment["read_count"] is not None for segment in segments)
+    zero_reads = nondecreasing and all(segment["read_count"] == 0 for segment in segments)
     historical_protections = [_mapping_value(item.get("protections")) for item in history]
-    historical_coverages = [_mapping_value(item.get("coverage")) for item in history]
     references = [
         reference
         for item in history
         for reference in item.get("query_store_references", [])
-        if isinstance(reference, Mapping)
+        if isinstance(reference, Mapping) and _reference_in_window(reference, window_start)
     ]
     executed_reference = any(_reference_has_execution(reference) for reference in references)
     stored_plan_without_execution = bool(references) and not executed_reference
@@ -4066,14 +4334,10 @@ def evaluate_removal_gate(
         )
         for protection in historical_protections
     )
-    complete_coverage = bool(historical_coverages) and all(
-        not _coverage_incomplete(coverage)
-        and coverage.get("query_store") == "complete"
-        and coverage.get("hint") == "complete"
-        and coverage.get("dependency") == "complete"
-        and coverage.get("protection") == "complete"
-        for coverage in historical_coverages
-    )
+    # Hints, dependencies and protections are current-state facts: the
+    # selected capture must have read them completely.
+    current_coverage = _mapping_value(subject.get("coverage"))
+    current_complete = not _coverage_incomplete(current_coverage)
     dangerous_type = str(reversible.get("index_type") or "").upper() != "NONCLUSTERED" or _as_int(reversible.get("index_type_code"), 2) != 2
     gate = {
         "enabled_user_created": reversible.get("is_disabled") is False and reversible.get("is_auto_created") is False and reversible.get("is_hypothetical") is False,
@@ -4093,34 +4357,41 @@ def evaluate_removal_gate(
             reverse_ddl.get("executable") is True
             and not definition.get("reversibility_blockers")
         ),
+        # Engine restarts split counter epochs; a physical database change in
+        # the window still closes the gate.
         "stable_engine_and_database": (
             observation["stable_engine"]
             and observation["stable_database_incarnation"]
             and not observation["physical_database_change"]
-            and not observation["engine_epoch_change"]
         ),
         "stable_counter_epoch": observation["stable_counter_epoch"],
         "stable_definition": observation["stable_definition"],
         "continuous_usable_days": (
             observation["enough_observation_days"]
-            and observation["no_gap_over_48_hours"]
-            and observation["daily_continuity"]
             and observation["complete_subject_history"]
+            and observation["usage_window_covers_history"]
+            and observation["no_gap_over_48_hours"]
         ),
-        "complete_usable_counter_coverage": (
-            observation["complete_usable_counter_coverage"] and valid_counters
-        ),
+        "complete_usable_counter_coverage": observation["complete_usable_counter_coverage"],
         "counters_never_decrease": nondecreasing,
-        "zero_seek_scan_lookup_deltas": bool(counters) and read_deltas_zero,
+        "zero_seek_scan_lookup_deltas": zero_reads,
         "measurable_write_or_storage_burden": any(_as_int(item.get("write_burden")) > 0 or _as_int(item.get("size_pages")) > 0 for item in history),
-        "query_store_coverage_complete": complete_coverage and not executed_reference,
+        "query_store_coverage_complete": (
+            observation["query_store_chain_complete"] and not executed_reference
+        ),
         "hint_coverage_complete": (
-            complete_coverage and not historical_hint
+            current_complete
+            and current_coverage.get("hint") == "complete"
+            and not historical_hint
         ),
         "dependency_coverage_complete": (
-            complete_coverage and not historical_dependency
+            current_complete
+            and current_coverage.get("dependency") == "complete"
+            and not historical_dependency
         ),
-        "protection_coverage_complete": complete_coverage,
+        "protection_coverage_complete": (
+            current_complete and current_coverage.get("protection") == "complete"
+        ),
         "not_protected": not historical_protected,
         "no_foreign_key_dependency": not referenced_fk and not child_fk_protected,
         "no_historical_query_store_execution_reference": not executed_reference,
@@ -4133,11 +4404,7 @@ def evaluate_removal_gate(
         "blockers": blockers,
         "observation": observation,
         "historical_reference": executed_reference,
-        "read_count": (
-            sum(_as_int(counters[-1].get(key)) for key in read_keys)
-            if counters and valid_counters
-            else None
-        ),
+        "read_count": selected_reads,
         "write_burden": max((_as_int(item.get("write_burden")) for item in history), default=None),
     }
 
@@ -4253,6 +4520,9 @@ def _review_id(
     material = {
         "algorithm": INDEX_REVIEW_ALGORITHM_VERSION,
         "classifier": INDEX_REVIEW_CLASSIFIER_POLICY_VERSION,
+        # 2.6.1 changed the removal gate under the same algorithm version; the
+        # marker keeps a 2.6.0 id from resolving to advice it never carried.
+        "removal_gate": "trailing-window-v2",
         "minimum_days": minimum_days,
         "database_fingerprint": database_fingerprint_value,
         "as_of_run_id": selected_run_id,
@@ -4268,7 +4538,9 @@ def _review_id(
             "p=" + _compact(policy),
             "db=" + _compact(database_fingerprint_value),
             "as=" + _compact(selected_run_id),
-            "pr=" + (_compact(prior_base_run_id) if prior_base_run_id else "-"),
+            # A 10-character prior prefix keeps a recheck id under the
+            # 200-character selector bound; get_review resolves it uniquely.
+            "pr=" + (_compact(prior_base_run_id)[:10] if prior_base_run_id else "-"),
             "h=" + _compact(history_fingerprint),
             "s=" + signature,
         )
@@ -4325,9 +4597,9 @@ def review_index_portfolio(
             raise IndexReviewPolicyError("Prior review is outside the current policy scope.")
         if _parse_time(prior_review.observation["as_of_observed_at_utc"]) >= _parse_time(selected.observed_at_utc):
             raise IndexReviewPolicyError("Prior review must be strictly earlier than the selected run.")
+    # The prior review drives recheck transitions only; the gate always reads
+    # the history up to the selected run.
     history = [item for item in ordered if item.observed_at_utc <= selected.observed_at_utc]
-    if prior_review is not None:
-        history = [item for item in history if item.observed_at_utc > prior_review.observation["as_of_observed_at_utc"]]
     history_fingerprint = _digest(
         "index-review-history-v1",
         [{"run_id": item.run_id, "snapshot_fingerprint": item.snapshot_fingerprint} for item in history],
@@ -4357,7 +4629,12 @@ def review_index_portfolio(
         else:
             removal = evaluate_removal_gate(subject, history, minimum_days=minimum_days)
             protections = _mapping_value(subject.get("protections"))
-            has_valid_read_delta = removal["gates"].get("zero_seek_scan_lookup_deltas") is False and removal["gates"].get("counters_never_decrease") is True
+            # Any proven read in the window keeps the index, even in a segment
+            # whose counters later decreased.
+            has_valid_read_delta = any(
+                segment["proven_read_count"] > 0
+                for segment in removal["observation"]["segments"]
+            )
             has_reference = removal["historical_reference"] is True
             protected = any(
                 _as_bool(protections.get(key))
@@ -4490,6 +4767,19 @@ def review_index_portfolio(
         overall = "inconclusive"
     database_fp = selected.database_fingerprint
     review_id = _review_id(database_fp, selected.run_id, prior_run_id, minimum_days, history_fingerprint)
+    retention_days = _query_store_retention_days(selected)
+    review_gaps = []
+    if retention_days is not None and retention_days < minimum_days:
+        # The selected capture's Query Store does not reach the window start;
+        # removal gates rely on Query Store coverage chained by earlier captures.
+        review_gaps.append(
+            {
+                "from_utc": moment_minus_days(selected.observed_at_utc, minimum_days),
+                "to_utc": moment_minus_days(selected.observed_at_utc, retention_days),
+                "hours": float((minimum_days - retention_days) * 24),
+                "reason": "query_store_retention_shorter_than_window",
+            }
+        )
     observation = {
         "snapshot_count": len(history),
         "as_of_observed_at_utc": selected.observed_at_utc,
@@ -4498,6 +4788,9 @@ def review_index_portfolio(
         "history_fingerprint": history_fingerprint,
         "state_counts": {state: states.count(state) for state in sorted(INDEX_REVIEW_STATES)},
         "recommend_only": True,
+        "window_start_utc": moment_minus_days(selected.observed_at_utc, minimum_days),
+        "query_store_retention_days": retention_days,
+        "gaps": review_gaps,
     }
     return IndexReviewV1(
         review_id=review_id,

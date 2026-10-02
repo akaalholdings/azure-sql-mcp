@@ -3,9 +3,13 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from unittest.mock import MagicMock
 
 import pytest
 
+from azure_sql_mcp.connection import AzureSqlExecutor
 from azure_sql_mcp.database_policy import DatabasePolicySet
 from azure_sql_mcp.index_review import CAPTURE_READ_SQL
 from azure_sql_mcp.index_review import CONTRACT_CHECKS
@@ -13,15 +17,19 @@ from azure_sql_mcp.index_review import CONTRACT_DEFAULTS
 from azure_sql_mcp.index_review import CONTRACT_PROBE_SQL
 from azure_sql_mcp.index_review import CaptureContext
 from azure_sql_mcp.index_review import CaptureResult
+from azure_sql_mcp.index_review import EXISTING_INDEX_METADATA_SQL
 from azure_sql_mcp.index_review import IDEMPOTENCY_LOCK_SQL
 from azure_sql_mcp.index_review import INSERT_RUN_SQL
 from azure_sql_mcp.index_review import INSERT_SNAPSHOT_SQL
+from azure_sql_mcp.index_review import IndexReviewCollectionError
 from azure_sql_mcp.index_review import IndexReviewIdempotencyConflictError
 from azure_sql_mcp.index_review import IndexReviewRunV1
 from azure_sql_mcp.index_review import IndexReviewSchemaError
 from azure_sql_mcp.index_review import IndexReviewSnapshotV1
 from azure_sql_mcp.index_review import SqlIndexHistoryRepository
 from azure_sql_mcp.index_review import _digest
+from azure_sql_mcp.index_review import _run_params
+from azure_sql_mcp.index_review import _snapshot_params
 from azure_sql_mcp.index_review import _subject_fingerprint
 from azure_sql_mcp.index_review import engine_fingerprint
 
@@ -158,24 +166,32 @@ class _CursorResult:
         self.rows = rows
 
 
+READ_COMMITTED_SQL = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+
+
 class _Session:
     def __init__(self, owner):
         self.owner = owner
         self.capture = None
         self.run_params = None
         self.snapshot_params = []
+        self.statements = []
 
     def fetch_all(self, statement, params=None):
-        if statement != IDEMPOTENCY_LOCK_SQL:
-            raise AssertionError("unexpected transaction statement")
-        return self.owner.lock_rows
+        self.statements.append(statement)
+        if statement == IDEMPOTENCY_LOCK_SQL:
+            return self.owner.lock_rows
+        if statement == EXISTING_INDEX_METADATA_SQL:
+            return []
+        raise AssertionError("unexpected transaction statement")
 
     def execute(self, statement, params=None):
+        self.statements.append(statement)
         if statement == INSERT_RUN_SQL:
             self.run_params = list(params or ())
         elif statement == INSERT_SNAPSHOT_SQL:
             self.snapshot_params.append(list(params or ()))
-        else:
+        elif statement != READ_COMMITTED_SQL:
             raise AssertionError("unexpected transaction statement")
 
 
@@ -185,6 +201,7 @@ class _Executor:
         self.snapshot_rows = []
         self.lock_rows = []
         self.transaction_calls = 0
+        self.sessions = []
         self.probe_rows = probe_rows or _probe_rows()
 
     async def execute_batches(self, database_name, statement, params=None):
@@ -199,6 +216,7 @@ class _Executor:
         assert database_name == "appdb"
         self.transaction_calls += 1
         session = _Session(self)
+        self.sessions.append(session)
         result = callback(session)
         if session.capture is not None:
             capture = session.capture
@@ -433,3 +451,170 @@ async def test_repository_accepts_existing_broader_effective_permissions() -> No
     assert probe.allow_read is True
     assert probe.allow_write is True
     assert probe.dangerous_permissions_absent is False
+
+
+def _context(capture: CaptureResult) -> CaptureContext:
+    return CaptureContext(
+        "appdb",
+        capture.run.database_fingerprint,
+        capture.run.run_id,
+        capture.run.idempotency_key_hash,
+        capture.run.request_fingerprint,
+        capture.run.observed_at_utc,
+        35,
+    )
+
+
+@pytest.mark.asyncio
+async def test_capture_collects_under_read_committed_after_the_idempotency_lock() -> None:
+    # SERIALIZABLE (set by the exactly-once transaction) would hold range
+    # locks on catalog, Query Store and module rows for the whole collection.
+    # Only the idempotency lock needs it, and HOLDLOCK keeps that lock to
+    # commit after the session level drops to READ COMMITTED.
+    executor = _Executor()
+    repository = SqlIndexHistoryRepository(executor, _policy(allow_write=True))
+    capture = _capture()
+
+    def collector(session, _context):
+        session.fetch_all(EXISTING_INDEX_METADATA_SQL)
+        session.capture = capture
+        return capture
+
+    await repository.append_capture(_context(capture), collector)
+
+    statements = executor.sessions[0].statements
+    assert statements[:3] == [
+        IDEMPOTENCY_LOCK_SQL,
+        READ_COMMITTED_SQL,
+        EXISTING_INDEX_METADATA_SQL,
+    ]
+    assert statements[3:] == [INSERT_RUN_SQL, INSERT_SNAPSHOT_SQL]
+
+
+@pytest.mark.asyncio
+async def test_replayed_capture_changes_no_isolation_and_collects_nothing() -> None:
+    executor = _Executor()
+    repository = SqlIndexHistoryRepository(executor, _policy(allow_write=True))
+    capture = _capture()
+
+    def collector(session, _context):
+        session.capture = capture
+        return capture
+
+    await repository.append_capture(_context(capture), collector)
+    await repository.append_capture(_context(capture), collector)
+
+    assert executor.sessions[1].statements == [IDEMPOTENCY_LOCK_SQL]
+
+
+@pytest.mark.asyncio
+async def test_capture_isolation_change_never_reaches_a_pooled_connection(
+    sample_server_config,
+) -> None:
+    # The real exactly-once transaction runs on a fake driver connection. The
+    # connection that carried SERIALIZABLE and READ COMMITTED is discarded,
+    # never released back to the pool other tools read through.
+    connection = MagicMock()
+    cursor = MagicMock()
+    cursor.description = None
+    connection.cursor.return_value = cursor
+    pool = SimpleNamespace(
+        acquire=AsyncMock(return_value=connection),
+        release=AsyncMock(),
+        discard=AsyncMock(),
+    )
+    executor = _Executor()
+    executor.execute_transaction_exactly_once = AzureSqlExecutor(
+        sample_server_config, MagicMock(), pool
+    ).execute_transaction_exactly_once
+    repository = SqlIndexHistoryRepository(executor, _policy(allow_write=True))
+    capture = _capture()
+
+    def collector(session, _context):
+        session.fetch_all(EXISTING_INDEX_METADATA_SQL)
+        stored = _Session(executor)
+        stored.execute(INSERT_RUN_SQL, _run_params(capture.run))
+        for subject in capture.snapshot.subjects:
+            stored.execute(INSERT_SNAPSHOT_SQL, _snapshot_params(capture.run, subject))
+        executor.run_rows, executor.snapshot_rows = _stored_rows(capture, stored)
+        return capture
+
+    result = await repository.append_capture(_context(capture), collector)
+
+    assert result.already_captured is False
+    statements = [call.args[0] for call in cursor.execute.call_args_list]
+    assert statements[:6] == [
+        "SET XACT_ABORT ON",
+        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        "BEGIN TRANSACTION",
+        IDEMPOTENCY_LOCK_SQL,
+        READ_COMMITTED_SQL,
+        EXISTING_INDEX_METADATA_SQL,
+    ]
+    connection.commit.assert_called_once_with()
+    pool.release.assert_not_awaited()
+    pool.discard.assert_awaited_once_with("appdb", connection)
+
+
+@pytest.mark.asyncio
+async def test_failed_capture_after_isolation_change_never_reaches_a_pooled_connection(
+    sample_server_config,
+) -> None:
+    # A collector failure after the READ COMMITTED switch rolls back and
+    # discards the connection too; no session state goes back to the pool.
+    connection = MagicMock()
+    cursor = MagicMock()
+    cursor.description = None
+    connection.cursor.return_value = cursor
+    pool = SimpleNamespace(
+        acquire=AsyncMock(return_value=connection),
+        release=AsyncMock(),
+        discard=AsyncMock(),
+    )
+    executor = _Executor()
+    executor.execute_transaction_exactly_once = AzureSqlExecutor(
+        sample_server_config, MagicMock(), pool
+    ).execute_transaction_exactly_once
+    repository = SqlIndexHistoryRepository(executor, _policy(allow_write=True))
+    capture = _capture()
+
+    def collector(session, _context):
+        raise IndexReviewCollectionError("collection failed")
+
+    with pytest.raises(IndexReviewCollectionError):
+        await repository.append_capture(_context(capture), collector)
+
+    statements = [call.args[0] for call in cursor.execute.call_args_list]
+    assert statements[-2:] == [IDEMPOTENCY_LOCK_SQL, READ_COMMITTED_SQL]
+    connection.rollback.assert_called_once_with()
+    connection.commit.assert_not_called()
+    pool.release.assert_not_awaited()
+    pool.discard.assert_awaited_once_with("appdb", connection)
+
+
+def _stored_rows(capture: CaptureResult, session: _Session):
+    run_names = (
+        "RunId", "ContractVersion", "SchemaVersion", "CollectorVersion",
+        "DatabaseName", "DatabaseFingerprint", "DatabaseIncarnationFingerprint",
+        "DatabaseIncarnationIdentity", "EngineFingerprint", "EngineIdentity",
+        "EngineStartTimeUtc", "IdempotencyKeyHash",
+        "RequestFingerprint", "ObservedAtUtc", "CounterEpochFingerprint",
+        "InventoryFingerprint", "QueryStoreFingerprint", "QueryStoreState",
+        "QueryCaptureMode", "ObservationStartUtc", "ObservationEndUtc",
+        "CoverageJson", "SubjectCount", "SnapshotSetFingerprint", "QueryStoreJson",
+    )
+    run_row = dict(zip(run_names, session.run_params, strict=True))
+    run_row["CreatedAtUtc"] = capture.run.created_at_utc
+    snapshot_names = (
+        "SnapshotId", "RunId", "SubjectId", "SubjectKind", "SubjectFingerprint",
+        "ObjectId", "IndexId", "SchemaName", "ObjectName", "IndexName",
+        "DefinitionJson", "DefinitionFingerprint", "CounterEpochFingerprint",
+        "CountersJson", "ObservedAtUtc", "FirstObservedAtUtc", "LastObservedAtUtc",
+        "SizePages", "SizeBytes", "WriteBurden", "QueryStoreReferencesJson",
+        "ProtectionsJson", "MissingSignatureJson", "AggregatesJson", "CoverageJson",
+    )
+    snapshot_rows = [
+        dict(zip(snapshot_names, values, strict=True))
+        for values in session.snapshot_params
+    ]
+    return [run_row], snapshot_rows

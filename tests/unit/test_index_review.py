@@ -26,6 +26,7 @@ from azure_sql_mcp.index_review import IndexReviewSchemaError
 from azure_sql_mcp.index_review import IndexReviewService
 from azure_sql_mcp.index_review import IndexReviewSnapshotV1
 from azure_sql_mcp.index_review import MAX_CAPTURE_ROWS
+from azure_sql_mcp.index_review import MIN_OBSERVATION_DAYS
 from azure_sql_mcp.index_review import _column_names
 from azure_sql_mcp.index_review import _redacted_index
 from azure_sql_mcp.index_review import daily_idempotency_key
@@ -160,6 +161,13 @@ def _index(
     return subject
 
 
+_BASE_TIME = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def _utc(value: datetime) -> str:
+    return value.isoformat().replace("+00:00", "Z")
+
+
 def _snapshot(
     ordinal: int,
     *,
@@ -167,12 +175,16 @@ def _snapshot(
     subjects: tuple[dict[str, object], ...] | None = None,
     epoch: str = "epoch-1",
     engine: str = "a" * 64,
+    engine_start: str = "2025-12-01T00:00:00Z",
+    database_incarnation: str = "physical-db-1",
     query_store: dict[str, object] | None = None,
+    query_store_coverage: dict[str, object] | None = None,
 ) -> IndexReviewSnapshotV1:
-    observed = datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(days=ordinal)
+    observed = _BASE_TIME + timedelta(days=ordinal)
     selected = subjects if subjects is not None else ((index or _index()),)
     coverage = {
-        "query_store": {"status": "complete"},
+        "query_store": query_store_coverage
+        or {"status": "complete", "stale_query_threshold_days": 90},
         "hints": "complete",
         "dependency": "complete",
         "protection": "complete",
@@ -182,17 +194,99 @@ def _snapshot(
         snapshot_id=f"snapshot-{ordinal}",
         database_name="appdb",
         database_fingerprint="db-1",
-        observed_at_utc=observed.isoformat().replace("+00:00", "Z"),
+        observed_at_utc=_utc(observed),
         counter_epoch_fingerprint=epoch,
         engine_fingerprint=engine,
         engine_identity="azure-sql-database",
-        engine_start_time_utc="2025-12-01T00:00:00Z",
-        database_incarnation_fingerprint="b" * 64,
-        database_incarnation_identity="physical-db-1",
+        engine_start_time_utc=engine_start,
+        database_incarnation_fingerprint=(
+            "b" * 64 if database_incarnation == "physical-db-1" else "c" * 64
+        ),
+        database_incarnation_identity=database_incarnation,
         subjects=selected,
-        query_store=query_store or {"enabled": True, "complete": True},
+        query_store=query_store
+        or {"enabled": True, "complete": True, "stale_query_threshold_days": 90},
         coverage=coverage,
     )
+
+
+# Azure SQL Database defaults: AUTO capture and a 30-day stale threshold. A
+# 2.6.x capture over a 35-day window records both as Query Store blockers.
+_AZURE_DEFAULT_QUERY_STORE = {
+    "enabled": True,
+    "complete": False,
+    "state": "READ_WRITE",
+    "capture_mode": "AUTO",
+    "stale_query_threshold_days": 30,
+    "retention_days": 30,
+    "window_minutes": 35 * 1440,
+}
+_AZURE_DEFAULT_QUERY_STORE_COVERAGE = {
+    "status": "incomplete",
+    "blockers": [
+        "query_store_capture_mode_not_all",
+        "query_store_stale_threshold_insufficient",
+    ],
+    "malformed": 0,
+    "capped": False,
+    "stale_query_threshold_days": 30,
+    "retention_days": 30,
+    "requested_window_minutes": 35 * 1440,
+}
+
+
+def _history(
+    days: int,
+    *,
+    restarts: dict[int, float] | None = None,
+    missing: frozenset[int] = frozenset(),
+    seeks=lambda day: 0,
+    azure_default_query_store: bool = False,
+) -> list[IndexReviewSnapshotV1]:
+    """Daily captures; ``restarts`` maps a capture day to the hours before
+    that capture when the engine restarted (failover, scale, pause/resume).
+    ``seeks`` returns the cumulative user_seeks counter seen by that capture,
+    or None when sys.dm_db_index_usage_stats has no row for the index."""
+
+    epoch = 1
+    engine_start = datetime(2025, 12, 1, tzinfo=timezone.utc)
+    snapshots = []
+    for day in range(days):
+        observed = _BASE_TIME + timedelta(days=day)
+        if restarts and day in restarts:
+            epoch += 1
+            engine_start = observed - timedelta(hours=restarts[day])
+        if day in missing:
+            continue
+        index = _index(reads=0)
+        value = seeks(day)
+        if value is None:
+            index["counters"] = {key: None for key in index["counters"]}
+        else:
+            index["counters"]["user_seeks"] = value
+        index["counter_epoch_fingerprint"] = f"epoch-{epoch}"
+        if azure_default_query_store:
+            index["coverage"]["query_store"] = "incomplete"
+        snapshots.append(
+            _snapshot(
+                day,
+                index=index,
+                epoch=f"epoch-{epoch}",
+                engine=f"{epoch:x}" * 64,
+                engine_start=_utc(engine_start),
+                query_store=(
+                    dict(_AZURE_DEFAULT_QUERY_STORE)
+                    if azure_default_query_store
+                    else None
+                ),
+                query_store_coverage=(
+                    dict(_AZURE_DEFAULT_QUERY_STORE_COVERAGE)
+                    if azure_default_query_store
+                    else None
+                ),
+            )
+        )
+    return snapshots
 
 
 def _captured_index() -> SimpleNamespace:
@@ -500,12 +594,33 @@ def test_daily_key_and_hash_are_deterministic_and_raw_key_is_not_the_hash() -> N
     assert idempotency_key_hash(fingerprint, key) == idempotency_key_hash("a" * 64, key)
 
 
-@pytest.mark.parametrize("count", [90, 91])
-def test_drop_gate_requires_90_distinct_observation_days(count: int) -> None:
+def test_owner_removal_window_is_35_days() -> None:
+    # Owner decision 2026-10-02: 35 days always holds one full month-end
+    # plus a buffer for close jobs and one missed capture.
+    assert MIN_OBSERVATION_DAYS == 35
+
+
+@pytest.mark.parametrize("count", [35, 36])
+def test_drop_gate_needs_a_snapshot_at_or_before_the_window_start(count: int) -> None:
     snapshots = [_snapshot(day) for day in range(count)]
     review = review_index_portfolio("appdb", snapshots)
-    state = review.subjects[0]["state"]
-    assert state == ("drop_candidate" if count == 91 else "observe")
+    subject = review.subjects[0]
+    observation = subject["removal_gate"]["observation"]
+
+    assert review.minimum_observation_days == 35
+    assert observation["window_start_utc"] == _utc(
+        _BASE_TIME + timedelta(days=count - 1 - 35)
+    )
+    if count == 36:
+        assert subject["state"] == "drop_candidate"
+        assert observation["anchor_observed_at_utc"] == _utc(_BASE_TIME)
+        assert observation["subject_younger_than_window"] is False
+    else:
+        # Day 0 is one day after the window start: nothing proves the first
+        # day of the window, so the index is too young to judge.
+        assert subject["state"] == "observe"
+        assert "continuous_usable_days" in subject["reason_codes"]
+        assert observation["subject_younger_than_window"] is True
 
 
 def test_drop_gate_requires_complete_engine_and_database_identity() -> None:
@@ -582,23 +697,446 @@ def test_disabled_and_hypothetical_indexes_require_specialist_observation(
     assert review.subjects[0]["removal_gate"]["gates"]["not_protected"] is False
 
 
-def test_business_cycle_extension_and_gap_are_fail_closed() -> None:
-    snapshots = [_snapshot(day) for day in range(99)]
-    extended = review_index_portfolio(
+@pytest.mark.parametrize(("count", "state"), [(95, "observe"), (96, "drop_candidate")])
+def test_business_cycle_extension_lengthens_the_trailing_window(
+    count: int, state: str
+) -> None:
+    # A quarter-end database extends the 35-day window per database (+60).
+    review = review_index_portfolio(
         "appdb",
-        snapshots,
-        business_cycle_extension_days=10,
+        [_snapshot(day) for day in range(count)],
+        business_cycle_extension_days=60,
     )
-    assert extended.subjects[0]["state"] == "observe"
 
-    with_gap = snapshots[:45] + [_snapshot(48 + day) for day in range(55)]
-    assert review_index_portfolio("appdb", with_gap).subjects[0]["state"] == "observe"
+    assert review.minimum_observation_days == 95
+    assert review.subjects[0]["state"] == state
+
+
+def test_reads_before_the_trailing_window_do_not_block_removal() -> None:
+    # Seeks on day 10 only; the 35-day window of the day-50 run starts on day
+    # 15, so whole-history evidence must not keep this index forever.
+    snapshots = _history(51, seeks=lambda day: 3 if day >= 10 else 0)
+
+    subject = review_index_portfolio("appdb", snapshots).subjects[0]
+
+    assert subject["state"] == "drop_candidate"
+    assert subject["removal_gate"]["observation"]["window_read_count"] == 0
+
+
+def test_counter_epoch_change_without_engine_start_change_observes_only_inside_window() -> None:
+    def history(reset_day: int) -> list[IndexReviewSnapshotV1]:
+        snapshots = []
+        for day in range(90):
+            index = _index()
+            epoch = "epoch-2" if day >= reset_day else "epoch-1"
+            index["counter_epoch_fingerprint"] = epoch
+            snapshots.append(_snapshot(day, index=index, epoch=epoch))
+        return snapshots
+
+    inside = review_index_portfolio("appdb", history(70)).subjects[0]
+    assert inside["state"] == "observe"
+    assert "stable_counter_epoch" in inside["reason_codes"]
+
+    outside = review_index_portfolio("appdb", history(20)).subjects[0]
+    assert outside["state"] == "drop_candidate"
+
+
+def test_physical_database_change_inside_window_observes() -> None:
+    def history(change_day: int) -> list[IndexReviewSnapshotV1]:
+        return [
+            _snapshot(
+                day,
+                database_incarnation=(
+                    "physical-db-2" if day >= change_day else "physical-db-1"
+                ),
+            )
+            for day in range(60)
+        ]
+
+    inside = review_index_portfolio("appdb", history(40)).subjects[0]
+    assert inside["state"] == "observe"
+    assert "stable_engine_and_database" in inside["reason_codes"]
+    assert inside["removal_gate"]["observation"]["physical_database_change"] is True
+
+    assert (
+        review_index_portfolio("appdb", history(10)).subjects[0]["state"]
+        == "drop_candidate"
+    )
+
+
+def test_failover_then_clean_unused_days_yields_drop_candidate() -> None:
+    # Failover one hour before the day-20 capture: one unobserved hour, then
+    # a new counter epoch that starts at zero and stays at zero.
+    snapshots = _history(40, restarts={20: 1})
+
+    subject = review_index_portfolio("appdb", snapshots).subjects[0]
+    observation = subject["removal_gate"]["observation"]
+
+    assert subject["state"] == "drop_candidate"
+    assert [segment["boundary"] for segment in observation["segments"]] == [
+        "window_anchor",
+        "engine_start",
+    ]
+    assert observation["segments"][1]["began_in_window"] is True
+    assert observation["unobserved_hours_total"] == pytest.approx(23.0)
+    assert observation["max_unobserved_hours"] == pytest.approx(23.0)
+    assert observation["coverage_pct"] == pytest.approx(100 * (1 - 23 / 840), abs=0.001)
+    assert observation["gaps"] == [
+        {
+            "from_utc": _utc(_BASE_TIME + timedelta(days=19)),
+            "to_utc": _utc(_BASE_TIME + timedelta(days=20, hours=-1)),
+            "hours": pytest.approx(23.0),
+            "left_run_id": "run-19",
+            "right_run_id": "run-20",
+            "reason": "engine_start",
+        }
+    ]
+
+
+def test_one_missed_capture_inside_an_epoch_is_tolerated() -> None:
+    # Counters are cumulative inside an epoch, so a missed day loses nothing.
+    snapshots = _history(37, missing=frozenset({17}))
+
+    subject = review_index_portfolio("appdb", snapshots).subjects[0]
+    observation = subject["removal_gate"]["observation"]
+
+    assert subject["state"] == "drop_candidate"
+    assert observation["unobserved_hours_total"] == 0
+    assert observation["coverage_pct"] == 100
+
+
+@pytest.mark.parametrize(
+    "seeks",
+    [lambda day: 0, lambda day: 50 if 10 <= day < 20 else 0],
+    ids=["unused", "reads_hidden_by_a_silent_reset"],
+)
+def test_capture_gap_over_48_hours_inside_one_epoch_observes(seeks) -> None:
+    # Only a counter decrease reveals a reset with no engine start change,
+    # and sparse captures miss it: seeks on days 10-19, then a silent reset to
+    # zero before the day-29 capture. Captures at most 48 h apart bound that
+    # blind spot like any other unobserved interval.
+    snapshots = [
+        snapshot
+        for snapshot in _history(37, seeks=seeks, azure_default_query_store=True)
+        if snapshot.run_id in {"run-0", "run-1", "run-29", "run-36"}
+    ]
+
+    subject = review_index_portfolio("appdb", snapshots).subjects[0]
+    observation = subject["removal_gate"]["observation"]
+
+    assert subject["state"] == "observe"
+    assert subject["reason_codes"] == ["continuous_usable_days"]
+    assert observation["max_gap_hours"] == pytest.approx(672.0)
+    assert observation["no_gap_over_48_hours"] is False
+    assert observation["enough_observation_days"] is False
+
+
+@pytest.mark.parametrize(
+    ("unusable_days", "state"),
+    [(frozenset({20}), "drop_candidate"), (frozenset({20, 21, 22}), "observe")],
+)
+def test_captures_without_usable_counters_count_as_missed(
+    unusable_days: frozenset[int], state: str
+) -> None:
+    # A capture whose usage read failed cannot reveal a reset, so the 48 h
+    # bound runs between captures with usable counters, not raw captures.
+    snapshots = []
+    for snapshot in _history(37):
+        if int(snapshot.run_id.removeprefix("run-")) in unusable_days:
+            item = dict(snapshot.subjects[0])
+            item["coverage"] = {**item["coverage"], "usage": "unavailable"}
+            snapshot = replace(snapshot, subjects=(item,))
+        snapshots.append(snapshot)
+
+    subject = review_index_portfolio("appdb", snapshots).subjects[0]
+    observation = subject["removal_gate"]["observation"]
+
+    assert subject["state"] == state
+    assert observation["max_gap_hours"] == pytest.approx(24.0)
+    assert observation["max_usable_gap_hours"] == pytest.approx(
+        24.0 * (len(unusable_days) + 1)
+    )
+    if state == "observe":
+        assert subject["reason_codes"] == ["continuous_usable_days"]
+
+
+def test_reads_hidden_by_a_reset_keep_the_index() -> None:
+    # The old epoch shows 7 old seeks and no growth. After the failover the
+    # new epoch's first counters already show 3 seeks: the absolute counters
+    # of an epoch that began in the window expose reads a delta would hide.
+    snapshots = _history(
+        40,
+        restarts={20: 6},
+        seeks=lambda day: 3 if day >= 20 else 7,
+    )
+
+    subject = review_index_portfolio("appdb", snapshots).subjects[0]
+    gate = subject["removal_gate"]
+
+    assert subject["state"] == "keep"
+    assert subject["reason_codes"] == ["protected_or_used"]
+    assert gate["gates"]["zero_seek_scan_lookup_deltas"] is False
+    assert gate["gates"]["counters_never_decrease"] is True
+    assert [segment["read_count"] for segment in gate["observation"]["segments"]] == [0, 3]
+
+
+def test_counter_decrease_without_engine_start_change_observes() -> None:
+    # A decrease with the same sqlserver_start_time is a reset of unknown
+    # cause and time: reads before it are lost, so the gate stays closed.
+    snapshots = _history(40, seeks=lambda day: 2 if day >= 30 else 5)
+
+    subject = review_index_portfolio("appdb", snapshots).subjects[0]
+
+    assert subject["state"] == "observe"
+    assert "counters_never_decrease" in subject["reason_codes"]
+
+
+def test_reads_in_one_epoch_keep_the_index_when_another_epoch_decreased() -> None:
+    # Any read evidence in the window means keep. Epoch 1 shows 4 seeks; the
+    # unknown reset inside epoch 2 must not turn proven reads into observe.
+    def seeks(day: int) -> int:
+        if day < 20:
+            return 4 if day >= 10 else 0
+        return 3 if day < 30 else 1
+
+    subject = review_index_portfolio(
+        "appdb", _history(40, restarts={20: 1}, seeks=seeks)
+    ).subjects[0]
+
+    assert [
+        segment["read_count"]
+        for segment in subject["removal_gate"]["observation"]["segments"]
+    ] == [4, None]
+    assert subject["state"] == "keep"
+    assert subject["reason_codes"] == ["protected_or_used"]
+
+
+def test_reads_proven_before_an_unexplained_decrease_keep_the_index() -> None:
+    # One epoch: seeks grow from 0 to 50 on day 10, then fall back to 0 on
+    # day 20 with no engine start change. The decrease hides how many reads
+    # the segment saw, but the growth already proved reads in the window.
+    snapshots = _history(37, seeks=lambda day: 50 if 10 <= day < 20 else 0)
+
+    subject = review_index_portfolio("appdb", snapshots).subjects[0]
+    (segment,) = subject["removal_gate"]["observation"]["segments"]
+
+    assert segment["read_count"] is None
+    assert segment["proven_read_count"] == 50
+    assert subject["state"] == "keep"
+    assert subject["reason_codes"] == ["protected_or_used"]
+
+
+def test_unobserved_interval_over_48_hours_across_a_reset_observes() -> None:
+    # Days 21 and 22 were not captured and the engine restarted 4 hours
+    # before the day-23 capture: reads from day 20 to the restart are lost.
+    blocked = _history(40, restarts={23: 4}, missing=frozenset({21, 22}))
+    subject = review_index_portfolio("appdb", blocked).subjects[0]
+
+    assert subject["state"] == "observe"
+    assert "continuous_usable_days" in subject["reason_codes"]
+    assert subject["removal_gate"]["observation"]["max_unobserved_hours"] == pytest.approx(68.0)
+
+    # An early restart does not make the same 72 h capture gap safe: on Azure
+    # an engine can start well before the database fails over onto it, so
+    # reads on the old primary after the restart are lost too.
+    early = _history(40, restarts={23: 64}, missing=frozenset({21, 22}))
+    early_subject = review_index_portfolio("appdb", early).subjects[0]
+    early_observation = early_subject["removal_gate"]["observation"]
+
+    assert early_subject["state"] == "observe"
+    assert early_subject["reason_codes"] == ["continuous_usable_days"]
+    assert early_observation["max_unobserved_hours"] == pytest.approx(8.0)
+    assert early_observation["max_usable_gap_hours"] == pytest.approx(72.0)
+
+
+def test_usage_coverage_below_95_percent_observes() -> None:
+    # Three restarts, each 20 hours after the previous capture: no single
+    # interval is over 48 h, but 60 of 840 window hours are unobserved.
+    snapshots = _history(36, restarts={10: 4, 20: 4, 30: 4})
+
+    subject = review_index_portfolio("appdb", snapshots).subjects[0]
+    observation = subject["removal_gate"]["observation"]
+
+    assert subject["state"] == "observe"
+    assert "continuous_usable_days" in subject["reason_codes"]
+    assert observation["max_unobserved_hours"] == pytest.approx(20.0)
+    assert observation["coverage_pct"] == pytest.approx(100 * (1 - 60 / 840), abs=0.001)
+
+
+@pytest.mark.parametrize(("missed_day", "state"), [(25, "drop_candidate"), (11, "observe")])
+def test_failover_next_to_a_missed_capture_exceeds_35_day_coverage(
+    missed_day: int, state: str
+) -> None:
+    # Business Critical failover: the new primary's sqlserver_start_time is
+    # weeks old, so the whole capture gap before it is unobserved. On a
+    # 35-day window 95% coverage allows 42 h in total, tighter than the 48 h
+    # single-interval limit. A missed capture right before the failover makes
+    # a 48 h blind spot, so the index stays in observe while it is in the window.
+    snapshots = _history(
+        40,
+        restarts={12: 24 * 40},
+        missing=frozenset({missed_day}),
+        azure_default_query_store=True,
+    )
+
+    subject = review_index_portfolio("appdb", snapshots).subjects[0]
+    observation = subject["removal_gate"]["observation"]
+
+    assert subject["state"] == state
+    assert [gap["reason"] for gap in observation["gaps"]] == ["engine_start_time_unknown"]
+    if state == "observe":
+        assert subject["reason_codes"] == ["continuous_usable_days"]
+        assert observation["max_unobserved_hours"] == pytest.approx(48.0)
+        assert observation["coverage_pct"] == pytest.approx(100 * (1 - 48 / 840), abs=0.001)
+
+
+def test_index_with_no_usage_row_counts_as_zero_reads() -> None:
+    # sys.dm_db_index_usage_stats has no row until the first use after an
+    # engine start; with a known start time that means zero reads.
+    unused = review_index_portfolio("appdb", _history(36, seeks=lambda day: None))
+    assert unused.subjects[0]["state"] == "drop_candidate"
+    assert unused.subjects[0]["removal_gate"]["read_count"] == 0
+
+    first_seek = review_index_portfolio(
+        "appdb", _history(36, seeks=lambda day: 1 if day >= 30 else None)
+    )
+    assert first_seek.subjects[0]["state"] == "keep"
+
+
+def test_missing_usage_row_without_engine_start_is_not_zero() -> None:
+    snapshots = [
+        replace(snapshot, engine_start_time_utc=None)
+        for snapshot in _history(36, seeks=lambda day: None)
+    ]
+
+    subject = review_index_portfolio("appdb", snapshots).subjects[0]
+
+    assert subject["state"] == "observe"
+    assert "complete_usable_counter_coverage" in subject["reason_codes"]
+
+
+def test_index_read_only_at_month_end_is_kept() -> None:
+    # Seeks only on Jan 31, Feb 28 and Mar 31. Every 35-day window holds a
+    # month-end, so every review from the first full window on keeps it.
+    month_ends = {30, 58, 89}
+    snapshots = _history(
+        100,
+        seeks=lambda day: sum(5 for month_end in month_ends if day >= month_end),
+    )
+
+    states = {
+        review_index_portfolio("appdb", snapshots, as_of_run_id=f"run-{day}")
+        .subjects[0]["state"]
+        for day in range(35, 100)
+    }
+
+    assert states == {"keep"}
+
+
+def test_default_azure_query_store_settings_after_failover_and_missed_day_drop() -> None:
+    # Live check 14: AUTO capture, 30-day stale threshold, one failover and
+    # one missed daily capture. Daily captures chain Query Store coverage
+    # across the 35-day window, so the unused index reaches drop_candidate.
+    snapshots = _history(
+        40,
+        restarts={12: 2},
+        missing=frozenset({25}),
+        azure_default_query_store=True,
+    )
+
+    review = review_index_portfolio("appdb", snapshots)
+    subject = review.subjects[0]
+
+    assert subject["state"] == "drop_candidate"
+    assert subject["removal_gate"]["observation"]["query_store_chain_complete"] is True
+    assert subject["removal_gate"]["observation"]["query_store_advisory"] is True
+
+    used = _history(
+        40,
+        restarts={12: 2},
+        missing=frozenset({25}),
+        seeks=lambda day: 2 if day >= 30 else 0,
+        azure_default_query_store=True,
+    )
+    assert review_index_portfolio("appdb", used).subjects[0]["state"] == "keep"
+
+
+def test_query_store_advisory_blockers_need_chained_retention() -> None:
+    # One epoch, no reads, but no capture between day 3 and day 36: a 30-day
+    # stale threshold cannot cover a 33-day capture gap.
+    snapshots = [
+        snapshot
+        for snapshot in _history(40, azure_default_query_store=True)
+        if snapshot.run_id in {f"run-{day}" for day in (0, 1, 2, 3, 36, 37, 38, 39)}
+    ]
+
+    subject = review_index_portfolio("appdb", snapshots).subjects[0]
+
+    assert subject["state"] == "observe"
+    assert "query_store_coverage_complete" in subject["reason_codes"]
+    assert subject["removal_gate"]["observation"]["query_store_chain_complete"] is False
+
+
+def test_hard_query_store_blockers_are_never_advisory() -> None:
+    capped = dict(_AZURE_DEFAULT_QUERY_STORE_COVERAGE)
+    capped["blockers"] = [*capped["blockers"], "query_store_plan_cap_reached"]
+    capped["capped"] = True
+    snapshots = [
+        replace(snapshot, coverage={**snapshot.coverage, "query_store": capped})
+        if snapshot.run_id == "run-30"
+        else snapshot
+        for snapshot in _history(40, azure_default_query_store=True)
+    ]
+
+    subject = review_index_portfolio("appdb", snapshots).subjects[0]
+
+    assert subject["state"] == "observe"
+    assert "query_store_coverage_complete" in subject["reason_codes"]
+
+
+def test_query_store_retention_shorter_than_window_is_reported_as_gap() -> None:
+    short = review_index_portfolio("appdb", _history(40, azure_default_query_store=True))
+    assert short.observation["window_start_utc"] == _utc(_BASE_TIME + timedelta(days=4))
+    assert short.observation["query_store_retention_days"] == 30
+    assert short.observation["gaps"] == [
+        {
+            "from_utc": _utc(_BASE_TIME + timedelta(days=4)),
+            "to_utc": _utc(_BASE_TIME + timedelta(days=9)),
+            "hours": 120.0,
+            "reason": "query_store_retention_shorter_than_window",
+        }
+    ]
+
+    covered = review_index_portfolio("appdb", _history(40))
+    assert covered.observation["query_store_retention_days"] == 90
+    assert covered.observation["gaps"] == []
+
+
+def test_executed_query_store_reference_counts_only_inside_the_window() -> None:
+    def history(last_seen_day: int) -> list[IndexReviewSnapshotV1]:
+        snapshots = []
+        for day in range(60):
+            index = _index()
+            if day >= last_seen_day:
+                index["query_store_references"] = [
+                    {
+                        "query_id": 7,
+                        "plan_id": 70,
+                        "execution_count": 4,
+                        "last_seen": _utc(_BASE_TIME + timedelta(days=last_seen_day)),
+                    }
+                ]
+            snapshots.append(_snapshot(day, index=index))
+        return snapshots
+
+    inside = review_index_portfolio("appdb", history(40)).subjects[0]
+    assert inside["state"] == "keep"
+
+    before_window = review_index_portfolio("appdb", history(10)).subjects[0]
+    assert before_window["state"] == "drop_candidate"
 
 
 def test_epoch_counter_definition_protection_and_special_type_gates() -> None:
-    reset = [_snapshot(day, epoch="epoch-2" if day == 45 else "epoch-1") for day in range(90)]
-    assert review_index_portfolio("appdb", reset).subjects[0]["state"] == "observe"
-
     protected = [_snapshot(day, index=_index(protected=True)) for day in range(90)]
     assert review_index_portfolio("appdb", protected).subjects[0]["state"] == "keep"
 
@@ -1075,7 +1613,7 @@ def test_forced_query_store_reference_keeps_index_and_incomplete_coverage_observ
 def test_review_selector_is_parseable_and_artifacts_are_exactly_seven_inert_files() -> None:
     review = review_index_portfolio("appdb", [_snapshot(1)])
     selector = parse_review_id(review.review_id)
-    assert selector["minimum_days"] == 90
+    assert selector["minimum_days"] == 35
     assert selector["as_of"]
     artifacts = render_index_review_artifacts(review)
     assert set(artifacts) == {
@@ -1131,30 +1669,31 @@ def test_delimited_candidate_identifiers_are_preserved_and_exactly_quoted() -> N
     assert all(line.startswith("--") for line in ddl.splitlines())
 
 
-@pytest.mark.asyncio
-async def test_get_review_reconstructs_deterministically_after_restart() -> None:
-    snapshots = [_snapshot(day) for day in range(90)]
-    run_pairs = []
-    for snapshot in snapshots:
-        run_pairs.append(
-            (
-                IndexReviewRunV1(
-                    snapshot.run_id,
-                    "appdb",
-                    "db-1",
-                    f"key-{snapshot.run_id}",
-                    f"request-{snapshot.run_id}",
-                    snapshot.observed_at_utc,
-                    snapshot.counter_epoch_fingerprint,
-                    snapshot.inventory_fingerprint,
-                    "qs-1",
-                    engine_fingerprint=snapshot.engine_fingerprint,
-                    subject_count=len(snapshot.subjects),
-                    snapshot_set_fingerprint=snapshot.snapshot_fingerprint,
-                ),
-                snapshot,
-            )
+def _service_over(
+    snapshots: list[IndexReviewSnapshotV1],
+    *,
+    clock=None,
+) -> IndexReviewService:
+    run_pairs = [
+        (
+            IndexReviewRunV1(
+                snapshot.run_id,
+                "appdb",
+                "db-1",
+                f"key-{snapshot.run_id}",
+                f"request-{snapshot.run_id}",
+                snapshot.observed_at_utc,
+                snapshot.counter_epoch_fingerprint,
+                snapshot.inventory_fingerprint,
+                "qs-1",
+                engine_fingerprint=snapshot.engine_fingerprint,
+                subject_count=len(snapshot.subjects),
+                snapshot_set_fingerprint=snapshot.snapshot_fingerprint,
+            ),
+            snapshot,
         )
+        for snapshot in snapshots
+    ]
 
     class Repository:
         async def list_history(self, database_name):
@@ -1162,11 +1701,73 @@ async def test_get_review_reconstructs_deterministically_after_restart() -> None
             return run_pairs
 
     executor = SimpleNamespace(config=SimpleNamespace(server="server.database.windows.net"))
-    service = IndexReviewService(executor, Repository(), database_policy=_policy())
+    return IndexReviewService(
+        executor, Repository(), database_policy=_policy(), clock=clock
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_review_reconstructs_deterministically_after_restart() -> None:
+    snapshots = [_snapshot(day) for day in range(90)]
+    service = _service_over(snapshots)
     first = review_index_portfolio("appdb", snapshots)
     restored = await service.get_review("appdb", first.review_id)
     assert restored.review_id == first.review_id
     assert restored.as_dict() == first.as_dict()
+
+
+@pytest.mark.asyncio
+async def test_recheck_review_id_is_bounded_and_round_trips() -> None:
+    snapshots = [_snapshot(day) for day in range(40)]
+    service = _service_over(
+        snapshots, clock=lambda: _BASE_TIME + timedelta(days=39, hours=1)
+    )
+    base = await service.review_portfolio("appdb", as_of_run_id="run-36")
+
+    recheck = await service.review_portfolio("appdb", prior_review_id=base.review_id)
+
+    assert len(recheck.review_id) < 200
+    assert parse_review_id(recheck.review_id)["prior"] is not None
+    assert recheck.prior_review_id == base.review_id
+    assert recheck.prior_base_run_id == "run-36"
+    assert recheck.subjects[0]["state"] == "drop_candidate"
+    assert recheck.subjects[0]["recheck"] == {
+        "is_recheck": True,
+        "prior_state": "drop_candidate",
+        "transition": "unchanged",
+    }
+    # The prior review only drives the transition; the gate still reads the
+    # full history instead of the three runs after the prior review.
+    assert recheck.observation["snapshot_count"] == 40
+    restored = await service.get_review("appdb", recheck.review_id)
+    assert restored.as_dict() == recheck.as_dict()
+
+
+@pytest.mark.asyncio
+async def test_review_id_issued_by_2_6_0_does_not_resolve_to_new_advice() -> None:
+    # 2.6.0 issued this id for the history below (90-day window) with state
+    # observe. The 2.6.1 gate would rebuild the same selector as
+    # drop_candidate, so an id from the earlier gate must fail closed.
+    issued_by_2_6_0 = (
+        "ir1.a=n2imnneve3wf6plg6mnxrsx4xp.d=90.p=4lleekiekkwu5f2d345jch2j76"
+        ".db=nakqz7cfxvrkpilgxntqwctrvy.as=mkhykjzlfw26kfiqgm76yqwddh.pr=-"
+        ".h=3cpzwqchkevd7shft7y7pi7dnm.s=t7tjjofgmoghejrxh2vauzhwjz"
+    )
+    service = _service_over(_history(100, restarts={80: 2}))
+
+    with pytest.raises(IndexReviewIntegrityError):
+        await service.get_review("appdb", issued_by_2_6_0)
+
+
+def test_compact_run_selector_prefix_must_be_unambiguous(monkeypatch) -> None:
+    history = [(SimpleNamespace(run_id=f"run-{day}"), None) for day in (1, 2)]
+    monkeypatch.setattr(
+        "azure_sql_mcp.index_review._compact", lambda value: "abcdefghij" + value[-1]
+    )
+
+    assert IndexReviewService._find_compact_run(history, "abcdefghij2") == history[1]
+    with pytest.raises(IndexReviewIntegrityError):
+        IndexReviewService._find_compact_run(history, "abcdefghij")
 
 
 def test_index_review_profile_contains_base_tools_and_recall_only_learning(server_config_factory) -> None:
