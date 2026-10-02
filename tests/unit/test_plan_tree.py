@@ -305,6 +305,34 @@ def test_children_keep_document_order_so_the_first_is_the_outer_input(showplan) 
     assert [child.node_id for child in nodes[0].children] == [1, 2]
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("1", True), ("true", True), ("True", True), (" TRUE ", True), ("0", False), ("false", False), ("", False), (None, False)],
+)
+def test_is_true_reads_every_xsd_boolean_form(value: str | None, expected: bool) -> None:
+    assert plan_tree.is_true(value) is expected
+
+
+def test_operator_flags_accept_capitalized_booleans(showplan) -> None:
+    plan = showplan.plan(
+        showplan.relop(
+            0,
+            "Nested Loops",
+            "Inner Join",
+            showplan.scan(1, "A"),
+            showplan.scan(2, "B"),
+            attrs='Parallel="True"',
+            warnings='<Warnings NoJoinPredicate="True" />',
+        )
+    ).replace('<IndexScan>', '<IndexScan Ordered="True" ScanDirection="FORWARD">', 1)
+
+    nodes = _nodes(plan)
+
+    assert nodes[0].parallel is True
+    assert plan_tree.warning_texts(nodes[0].element)[0].startswith("No join predicate")
+    assert plan_tree.scan_order(nodes[1]) == "ordered forward"
+
+
 def test_estimated_plans_have_no_self_times(showplan) -> None:
     nodes = _nodes(showplan.plan(showplan.relop(0, "Sort", None, showplan.scan(1, cost=0.4), cost=1.0)))
 

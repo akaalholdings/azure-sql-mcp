@@ -135,6 +135,19 @@ def test_statement_time_udf_share_and_waits(showplan) -> None:
     assert any("eager index spool" in note for note in statement["waits"]["notes"])
 
 
+def test_memory_grant_wait_is_converted_from_seconds(showplan) -> None:
+    # The showplan XSD (MemoryGrantType) documents GrantWaitTime in seconds.
+    plan = showplan.plan(
+        showplan.scan(0, runtime=showplan.runtime((0, 10, 1, 13000, 900))),
+        plan_children='<MemoryGrantInfo GrantedMemory="4096" MaxUsedMemory="4000" GrantWaitTime="12" />',
+    )
+
+    grant = _statement(build_plan_digest(plan))["memory_grant"]
+
+    assert grant["grant_wait_ms"] == 12000
+    assert any("RESOURCE_SEMAPHORE" in note for note in grant["notes"])
+
+
 def test_parameter_tells_and_local_variables(showplan) -> None:
     predicate = (
         '<Predicate><ScalarOperator ScalarString="[T].[Region]=[@local]"><Compare CompareOp="EQ">'

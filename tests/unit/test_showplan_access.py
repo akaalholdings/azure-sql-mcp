@@ -91,6 +91,86 @@ def test_functions_and_implicit_conversions_on_columns_are_non_sargable() -> Non
     assert scan.implicit_conversion_columns == ("AccountNumber",)
 
 
+BOOLEAN_FORMS = [("1", "0"), ("true", "false"), ("True", "False")]
+
+
+@pytest.mark.parametrize(("true", "false"), BOOLEAN_FORMS)
+def test_boolean_attributes_accept_true_false_and_one_zero(true: str, false: str) -> None:
+    # xsd:boolean allows 1/0 and true/false; SSMS re-saves plans with true/false.
+    plan = (
+        _plan("heap_scan_nonsargable.xml")
+        .replace('Implicit="1"', f'Implicit="{true}"')
+        .replace('Implicit="0"', f'Implicit="{false}"')
+        .replace('Ordered="0" ForcedIndex="0"', f'Ordered="{true}" ForcedIndex="{true}"')
+    )
+    scan = _access(parse_plan_access(plan), table="EventLog", operation="heap_scan")
+
+    # A false Implicit is an explicit CONVERT the query wrote; a true one is the type mismatch.
+    assert scan.nonsargable == {"CreatedAt": "convert", "AccountNumber": "convert_implicit"}
+    assert scan.implicit_conversion_columns == ("AccountNumber",)
+    assert scan.ordered is True
+    assert scan.forced_index is True
+
+
+@pytest.mark.parametrize(("true", "false"), BOOLEAN_FORMS)
+def test_lookup_flag_and_sort_direction_accept_both_boolean_forms(true: str, false: str) -> None:
+    plan = (
+        _plan("seek_residual_lookup_sort.xml")
+        .replace(
+            'PhysicalOp="Key Lookup" LogicalOp="Key Lookup"',
+            'PhysicalOp="Clustered Index Seek" LogicalOp="Clustered Index Seek"',
+        )
+        .replace('Lookup="1"', f'Lookup="{true}"')
+        .replace('Ascending="1"', f'Ascending="{false}"')
+    )
+    summary = parse_plan_access(plan)
+
+    lookup = _access(summary, table="Orders", operation="lookup")
+    seek = _access(summary, table="Orders", operation="seek")
+    assert lookup.paired_index == "FK_Sales_Orders_CustomerID"
+    assert seek.order_columns == (("OrderDate", "DESC"),)
+
+
+def test_scalar_udf_on_a_column_is_non_sargable(showplan) -> None:
+    # The showplan XSD names a scalar UDF call UserDefinedFunction inside a ScalarOperator.
+    predicate = (
+        '<Predicate><ScalarOperator><Compare CompareOp="EQ">'
+        '<ScalarOperator><UserDefinedFunction FunctionName="[db].[dbo].[fn_Active]"><ScalarOperator><Identifier>'
+        f'{showplan.column("Customers", "CustomerID")}'
+        "</Identifier></ScalarOperator></UserDefinedFunction></ScalarOperator>"
+        '<ScalarOperator><Const ConstValue="(1)" /></ScalarOperator>'
+        "</Compare></ScalarOperator></Predicate>"
+    )
+    summary = parse_plan_access(showplan.plan(showplan.scan(0, "Customers", body=predicate)))
+    scan = _access(summary, table="Customers", operation="scan")
+
+    assert scan.nonsargable == {"CustomerID": "udf"}
+    assert scan.residual == {}
+
+
+@pytest.mark.parametrize("udf_first", [True, False])
+def test_a_udf_wrap_never_hides_another_wrapper_on_the_column(showplan, udf_first: bool) -> None:
+    # dbo.fn_Norm(AccountNumber) = 1 AND CONVERT_IMPLICIT(nvarchar, AccountNumber) = @acct.
+    column = f"<ScalarOperator><Identifier>{showplan.column('Accounts', 'AccountNumber')}</Identifier></ScalarOperator>"
+    udf = (
+        '<ScalarOperator><Compare CompareOp="EQ"><ScalarOperator><UserDefinedFunction FunctionName="[db].[dbo].[fn_Norm]">'
+        f'{column}</UserDefinedFunction></ScalarOperator><ScalarOperator><Const ConstValue="(1)" /></ScalarOperator>'
+        "</Compare></ScalarOperator>"
+    )
+    implicit = (
+        '<ScalarOperator><Compare CompareOp="EQ"><ScalarOperator><Convert DataType="nvarchar" Style="0" Implicit="1">'
+        f'{column}</Convert></ScalarOperator><ScalarOperator><Identifier><ColumnReference Column="@acct" /></Identifier>'
+        "</ScalarOperator></Compare></ScalarOperator>"
+    )
+    conjuncts = udf + implicit if udf_first else implicit + udf
+    predicate = f'<Predicate><ScalarOperator><Logical Operation="AND">{conjuncts}</Logical></ScalarOperator></Predicate>'
+
+    scan = _access(parse_plan_access(showplan.plan(showplan.scan(0, "Accounts", body=predicate))), table="Accounts", operation="scan")
+
+    assert scan.nonsargable == {"AccountNumber": "convert_implicit"}
+    assert scan.implicit_conversion_columns == ("AccountNumber",)
+
+
 def test_rid_lookup_on_a_heap_is_paired_and_internal_columns_are_dropped() -> None:
     summary = parse_plan_access(_plan("heap_seek_rid_lookup.xml"))
     seek = _access(summary, table="EventLog", operation="seek")

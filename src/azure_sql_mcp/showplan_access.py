@@ -21,6 +21,7 @@ from typing import Any
 from typing import Iterator
 
 from .plan_tree import PlanParseError
+from .plan_tree import is_true
 from .plan_tree import parse_showplan
 from .plan_tree import unquote
 
@@ -35,7 +36,9 @@ _WRAPPER_ELEMENTS = {
     "Convert": "convert",
     "Intrinsic": "intrinsic",
     "Arithmetic": "arithmetic",
-    "UDF": "udf",
+    # ScalarType children; "UDF" is a statement-level element, never inside a predicate.
+    "UserDefinedFunction": "udf",
+    "UserDefinedAggregate": "udf",
     "IF": "case",
     "Aggregate": "aggregate",
 }
@@ -87,6 +90,8 @@ class TableAccess:
     operation: str
     seek_eq_columns: tuple[str, ...] = ()
     seek_range_columns: tuple[str, ...] = ()
+    # Range columns whose bounds are computed at run time (dynamic seek).
+    dynamic_seek_columns: tuple[str, ...] = ()
     residual: dict[str, str] = field(default_factory=dict)
     nonsargable: dict[str, str] = field(default_factory=dict)
     implicit_conversion_columns: tuple[str, ...] = ()
@@ -261,7 +266,7 @@ def _parse_access(
     index_kind = obj.get("IndexKind") or ("Heap" if element.tag == f"{_Q}TableScan" else None)
     storage = obj.get("Storage") or element.get("Storage")
     physical_op = relop.get("PhysicalOp") or ""
-    is_lookup = element.get("Lookup") == "1" or physical_op in {"Key Lookup", "RID Lookup"}
+    is_lookup = is_true(element.get("Lookup")) or physical_op in {"Key Lookup", "RID Lookup"}
     seek_eq, seek_range = _seek_columns(element)
     operation = _operation(physical_op, element, index_kind, is_lookup, bool(seek_eq or seek_range))
 
@@ -306,6 +311,7 @@ def _parse_access(
         operation=operation,
         seek_eq_columns=tuple(seek_eq),
         seek_range_columns=tuple(seek_range),
+        dynamic_seek_columns=tuple(_dynamic_seek_columns(element)),
         residual=residual,
         nonsargable=nonsargable,
         implicit_conversion_columns=tuple(dict.fromkeys(implicit)),
@@ -314,8 +320,8 @@ def _parse_access(
         estimated_executions=executions,
         own_cost=own_cost,
         cost_share=(own_cost / statement_cost) if statement_cost > 0 else 0.0,
-        ordered=element.get("Ordered") == "1",
-        forced_index=element.get("ForcedIndex") == "1",
+        ordered=is_true(element.get("Ordered")),
+        forced_index=is_true(element.get("ForcedIndex")),
     )
 
 
@@ -341,6 +347,33 @@ def _seek_columns(element: ET.Element) -> tuple[list[str], list[str]]:
     if seek_predicates is None:
         return [], []
     return _key_columns(seek_predicates)
+
+
+def _dynamic_seek_columns(element: ET.Element) -> list[str]:
+    """Range columns bounded by an internal expression column.
+
+    GetRangeThroughConvert, GetRangeWithMismatchedTypes and LikeRange* compute the
+    bounds in a Compute Scalar (Expr1003, ...) that the seek range reads; a range
+    bounded by a parameter or constant is a plain seek.
+    """
+
+    seek_predicates = element.find(f"{_Q}SeekPredicates")
+    if seek_predicates is None:
+        return []
+    dynamic: list[str] = []
+    for part in seek_predicates.iter():
+        if part.tag not in {f"{_Q}StartRange", f"{_Q}EndRange"}:
+            continue
+        columns = _column_refs(part.find(f"{_Q}RangeColumns"))
+        expressions = part.find(f"{_Q}RangeExpressions")
+        bounds = expressions.findall(f"{_Q}ScalarOperator") if expressions is not None else []
+        for ref, bound in zip(columns, bounds):
+            computed = any(
+                not inner.table and inner.column.lower().startswith("expr") for inner in _column_refs(bound)
+            )
+            if computed and not _is_internal_column(ref.column) and ref.column not in dynamic:
+                dynamic.append(ref.column)
+    return dynamic
 
 
 def _key_columns(seek_predicates: ET.Element) -> tuple[list[str], list[str]]:
@@ -393,6 +426,13 @@ def _record(residual: dict[str, str], column: str, kind: str) -> None:
         residual[column] = kind
 
 
+def _record_wrapper(nonsargable: dict[str, str], column: str, wrapper: str) -> None:
+    # The first wrapper wins, but a scalar UDF wrap never hides another wrapper on the
+    # same column: scalar_udf reports the function, the other wrapper keeps its finding.
+    if nonsargable.get(column) in {None, "udf"}:
+        nonsargable[column] = wrapper
+
+
 def _classify_scalar(
     scalar: ET.Element,
     belongs,
@@ -424,11 +464,11 @@ def _classify_scalar(
                 if wrapped is None:
                     _record(residual, operand_column, "other")
                 else:
-                    nonsargable.setdefault(operand_column, wrapped)
+                    _record_wrapper(nonsargable, operand_column, wrapped)
         else:
             for ref, wrapper in _wrapped_columns(child, belongs, wrapper=None):
                 if wrapper is not None:
-                    nonsargable.setdefault(ref, wrapper)
+                    _record_wrapper(nonsargable, ref, wrapper)
                     if wrapper == "convert_implicit":
                         implicit.append(ref)
                 else:
@@ -461,7 +501,7 @@ def _classify_compare(
             if wrapper is None:
                 _record(residual, column, "other")
             else:
-                nonsargable.setdefault(column, wrapper)
+                _record_wrapper(nonsargable, column, wrapper)
                 if wrapper == "convert_implicit":
                     implicit.append(column)
 
@@ -520,7 +560,7 @@ def _wrapped_columns(element: ET.Element, belongs, *, wrapper: str | None) -> li
     tag = _local(element.tag)
     current = wrapper
     if tag in _WRAPPER_ELEMENTS and current is None:
-        if tag == "Convert" and element.get("Implicit") == "1":
+        if tag == "Convert" and is_true(element.get("Implicit")):
             current = "convert_implicit"
         elif tag == "Intrinsic":
             current = f"function:{(element.get('FunctionName') or 'unknown').lower()}"
@@ -566,7 +606,7 @@ def _attach_order_and_join_columns(root_op: ET.Element, accesses: list[TableAcce
             for column in sort.findall(f"{_Q}OrderBy/{_Q}OrderByColumn"):
                 reference = column.find(f"{_Q}ColumnReference")
                 if reference is not None:
-                    direction = "ASC" if column.get("Ascending", "1") in {"1", "true"} else "DESC"
+                    direction = "ASC" if is_true(column.get("Ascending", "1")) else "DESC"
                     order_refs.append((_ref(reference), direction))
         stream = relop.find(f"{_Q}StreamAggregate")
         if stream is not None:

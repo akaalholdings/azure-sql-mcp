@@ -17,6 +17,7 @@ from .param_binding import ParameterExecutionContract
 from .plan_diagnostics import parse_statistics_io_messages
 from .plan_diagnostics import summarize_statistics_io_samples
 from .plan_tree import child_relops
+from .plan_tree import is_true
 from .safe_sql import SafeSqlValidator
 
 SHOWPLAN_NAMESPACE = {"sp": "http://schemas.microsoft.com/sqlserver/2004/07/showplan"}
@@ -765,7 +766,7 @@ class PlansService:
             node.attrib.get("EstimateRowsWithoutRowGoal")
         )
         row_goal = (
-            node.attrib.get("IsRowGoal", "").lower() == "true"
+            is_true(node.attrib.get("IsRowGoal"))
             or estimated_without_row_goal is not None
             and estimated_rows is not None
             and estimated_without_row_goal > estimated_rows
@@ -786,7 +787,7 @@ class PlansService:
         index_scan_nodes = self._owned_descendants(node, parent_map, "IndexScan")
         lookup = (
             node.attrib.get("PhysicalOp", "").lower() in {"key lookup", "rid lookup"}
-            or any(scan.attrib.get("Lookup", "").lower() == "true" for scan in index_scan_nodes)
+            or any(is_true(scan.attrib.get("Lookup")) for scan in index_scan_nodes)
         )
         seek_predicates, residual_predicates = self._operator_predicates(node, parent_map)
         spills = self._owned_diagnostic_elements(node, parent_map, {"SpillToTempDb", "HashSpillDetails", "SortSpillDetails"})
@@ -946,7 +947,7 @@ class PlansService:
         counters: list[dict[str, Any]],
     ) -> dict[str, Any] | None:
         physical_op = (node.attrib.get("PhysicalOp") or "").lower()
-        parallel = physical_op == "parallelism" or node.attrib.get("Parallel", "").lower() == "true"
+        parallel = physical_op == "parallelism" or is_true(node.attrib.get("Parallel"))
         if not parallel:
             return None
         rows = [counter["actual_rows"] for counter in counters if counter["actual_rows"] is not None]
@@ -1136,7 +1137,8 @@ class PlansService:
                     "required_memory_kb": self._to_int(node.attrib.get("RequiredMemory")),
                     "desired_memory_kb": self._to_int(node.attrib.get("DesiredMemory")),
                     "requested_memory_kb": self._to_int(node.attrib.get("RequestedMemory")),
-                    "grant_wait_time_ms": self._to_int(node.attrib.get("GrantWaitTime")),
+                    # GrantWaitTime is in seconds (showplan XSD, MemoryGrantType).
+                    "grant_wait_time_ms": self._to_int(node.attrib.get("GrantWaitTime")) * 1000,
                     "granted_memory_kb": self._to_int(node.attrib.get("GrantedMemory")),
                     "max_used_memory_kb": self._to_int(node.attrib.get("MaxUsedMemory")),
                     "max_query_memory_kb": self._to_int(node.attrib.get("MaxQueryMemory")),

@@ -23,6 +23,7 @@ from .plan_tree import clean_text
 from .plan_tree import cross_join_check
 from .plan_tree import estimate_check
 from .plan_tree import is_eager_index_spool
+from .plan_tree import is_true
 from .plan_tree import node_objects
 from .plan_tree import outer_references
 from .plan_tree import output_columns
@@ -278,9 +279,11 @@ def _memory_grant(query_plan: ET.Element) -> dict[str, Any] | None:
         "granted_kb": "GrantedMemory",
         "max_used_kb": "MaxUsedMemory",
         "max_query_memory_kb": "MaxQueryMemory",
-        "grant_wait_ms": "GrantWaitTime",
     }
     section: dict[str, Any] = {key: _number(grant.get(name)) for key, name in fields.items() if grant.get(name) is not None}
+    if grant.get("GrantWaitTime") is not None:
+        # GrantWaitTime is in seconds (showplan XSD, MemoryGrantType).
+        section["grant_wait_ms"] = _number(grant.get("GrantWaitTime")) * 1000
     feedback = grant.get("IsMemoryGrantFeedbackAdjusted")
     if feedback:
         section["grant_feedback"] = clean_text(feedback, 60)
@@ -622,7 +625,7 @@ def _cited_details(nodes: list[PlanNode], cited: list[PlanNode]) -> list[dict[st
     wanted: dict[int, PlanNode] = {id(node): node for node in cited}
     for node in nodes:
         warnings = node.element.find(f"{_Q}Warnings")
-        if warnings is not None and warnings.get("NoJoinPredicate") in {"1", "true"}:
+        if warnings is not None and is_true(warnings.get("NoJoinPredicate")):
             # A warned join is judged from its inputs: show both.
             wanted[id(node)] = node
             for child in node.children[:2]:
@@ -642,7 +645,7 @@ def _cited_details(nodes: list[PlanNode], cited: list[PlanNode]) -> list[dict[st
         if node.row_goal:
             item["row_goal"] = "Active (TOP, FAST, EXISTS): a scan may stop early."
         warnings = node.element.find(f"{_Q}Warnings")
-        if warnings is not None and warnings.get("NoJoinPredicate") in {"1", "true"}:
+        if warnings is not None and is_true(warnings.get("NoJoinPredicate")):
             check = cross_join_check(node)
             item["no_join_predicate"] = _compact(
                 {
@@ -756,7 +759,7 @@ def _node_detail(index: int, node: PlanNode) -> dict[str, Any]:
             "include_columns": [clean_text(c, 128) for c in spool.include_columns],
         }
     warnings = node.element.find(f"{_Q}Warnings")
-    if warnings is not None and warnings.get("NoJoinPredicate") in {"1", "true"}:
+    if warnings is not None and is_true(warnings.get("NoJoinPredicate")):
         cross = cross_join_check(node)
         detail["no_join_predicate"] = _compact(
             {

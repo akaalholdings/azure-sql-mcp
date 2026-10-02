@@ -423,6 +423,28 @@ def test_summarize_showplan_xml_extracts_actionable_operator_diagnostics() -> No
     assert summary["actual_metrics"]["actual_logical_reads"] is None
 
 
+def test_memory_grant_wait_time_is_converted_from_seconds_to_ms() -> None:
+    # The showplan XSD (MemoryGrantType) documents GrantWaitTime in seconds.
+    service = PlansService(executor=None, validator=SafeSqlValidator())  # type: ignore[arg-type]
+    plan = ACTUAL_SHOWPLAN.replace('MaxUsedMemory="512" />', 'MaxUsedMemory="512" GrantWaitTime="12" />')
+
+    grant = service.summarize_showplan_xml(plan)["memory_grants"][0]
+
+    assert grant["grant_wait_time_ms"] == 12000
+
+
+def test_operator_flags_read_the_one_zero_boolean_form() -> None:
+    # Plans read from DMVs and Query Store write xsd:boolean as 1/0, not true/false.
+    service = PlansService(executor=None, validator=SafeSqlValidator())  # type: ignore[arg-type]
+    plan = DETAILED_SHOWPLAN.replace('Lookup="true"', 'Lookup="1"').replace('Parallel="true"', 'Parallel="1"')
+
+    seek = service.summarize_showplan_xml(plan)["operators"][0]
+
+    assert seek["lookup"] is True
+    assert seek["parallel_exchange"] is not None
+    assert seek["parallel_exchange"]["is_exchange"] is False
+
+
 def test_redacted_showplan_parser_deduplicates_multi_object_references() -> None:
     multi_object_plan = DETAILED_SHOWPLAN.replace(
         "</QueryPlan>",

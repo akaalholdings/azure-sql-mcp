@@ -13,6 +13,7 @@ measure, not measured gains.
 
 from __future__ import annotations
 
+import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from dataclasses import field
@@ -25,11 +26,13 @@ from .plan_tree import ce_guess_fraction
 from .plan_tree import clean_text
 from .plan_tree import cross_join_check
 from .plan_tree import estimate_check
+from .plan_tree import is_true
 from .plan_tree import parse_showplan
 from .plan_tree import query_time_stats
 from .plan_tree import statement_elapsed_ms
 from .plan_tree import statements
 from .plan_tree import unquote
+from .showplan_access import TableAccess
 from .showplan_access import eager_spool_index
 from .showplan_access import parse_plan_access
 
@@ -45,6 +48,15 @@ SCAN_TABLE_ROW_FLOOR = 10_000
 EXCESSIVE_GRANT_KB = 1024 * 1024
 UDF_TIME_SHARE_FLOOR = 0.1
 MAX_FINDINGS = 50
+_UDF = f"{_Q}UserDefinedFunction"
+_COLUMN_REFERENCE = f"{_Q}ColumnReference"
+_PREDICATE_TAGS = {f"{_Q}{name}" for name in ("Predicate", "SeekPredicates", "ProbeResidual", "BuildResidual", "Residual")}
+_NAME_PART = re.compile(r"\[((?:[^\]]|\]\])*)\]")
+_COMPUTED_COLUMN_INDEX = (
+    "index a deterministic computed column on the expression (every writer then needs the required "
+    "SET options, for example QUOTED_IDENTIFIER and ANSI_NULLS ON when a module was created, or its "
+    "INSERT, UPDATE or DELETE fails with Msg 1934; adds write cost)"
+)
 
 
 @dataclass
@@ -213,51 +225,107 @@ def _statement_findings(
             )
         )
 
-    _access_rules(accesses, add, impact)
+    _access_rules(accesses, add, impact, by_id)
     _statement_warning_rules(statement, query_plan, add, actual)
+    access_by_node = {access.node_id: access for access in accesses}
     for node in nodes:
-        _operator_rules(node, add, actual)
+        _operator_rules(node, add, actual, access_by_node.get(node.node_id))
     if actual:
         for node in nodes:
             _runtime_rules(node, add)
     return findings
 
 
-def _access_rules(accesses: list[Any], add, impact) -> None:
+def _access_rules(accesses: list[Any], add, impact, by_id: dict[int, PlanNode]) -> None:
     for access in accesses:
         table = clean_text(f"{access.schema}.{access.table}", 200)
         share = impact(access.node_id, access.cost_share)
+        seek_columns = set(access.seek_eq_columns) | set(access.seek_range_columns)
         for column, kind in access.nonsargable.items():
+            if kind == "udf":
+                continue  # scalar_udf reports the function and the column it wraps
             column_name = clean_text(column, 128)
-            add(
-                "implicit_conversion_on_column" if kind == "convert_implicit" else "non_sargable_predicate",
-                _share_severity(share, high=0.3, medium=0.05),
-                "predicates",
-                (
-                    f"{table}.{column_name} is wrapped in an implicit conversion, so no index can seek on it."
-                    if kind == "convert_implicit"
-                    else f"{table}.{column_name} is wrapped in "
-                    f"{clean_text(kind.replace('function:', '').upper(), 60)} "
-                    "inside the predicate, so no index can seek on it."
-                ),
-                (
+            implicit = kind == "convert_implicit"
+            wrapper = "an implicit conversion" if implicit else clean_text(kind.replace("function:", "").upper(), 60)
+            # A dynamic seek (CAST to date via GetRangeThroughConvert, an implicit
+            # conversion via GetRangeWithMismatchedTypes) still seeks a range on
+            # the column and re-checks the wrapped predicate as a residual.
+            dynamic = column in access.dynamic_seek_columns
+            seeked = dynamic or column in seek_columns
+            if dynamic:
+                message = (
+                    f"{table}.{column_name} is wrapped in {wrapper}, but the index still seeks a range on it "
+                    "(dynamic seek) and re-checks the wrapped predicate."
+                )
+                fix = (
+                    "Bind the parameter or variable as the column's exact type: the seek becomes exact "
+                    "and the estimate improves."
+                    if implicit
+                    else "A bare-column half-open range, or a parameter typed as the column, gives an exact "
+                    "seek and a better estimate."
+                )
+            elif seeked:
+                message = (
+                    f"{table}.{column_name} is wrapped in {wrapper} in a residual predicate; the index still "
+                    "seeks on the bare column, and the wrapped predicate filters the rows that seek returns."
+                )
+                fix = (
                     "Bind the parameter or variable as the column's exact type."
-                    if kind == "convert_implicit"
-                    else "Rewrite the predicate so the column is bare (move the work to the "
-                    "parameter side, or use a half-open range for date buckets)."
-                ),
+                    if implicit
+                    else "Usually acceptable. If the residual discards most of the rows the seek reads, rewrite "
+                    f"it with the column bare, or {_COMPUTED_COLUMN_INDEX}."
+                )
+            else:
+                message = (
+                    f"{table}.{column_name} is wrapped in {wrapper} inside the predicate, so an index on "
+                    "the column cannot seek it as written."
+                )
+                fix = (
+                    "Bind the parameter or variable as the column's exact type."
+                    if implicit
+                    else "Rewrite the predicate so the column is bare (move the work to the parameter side, "
+                    f"or use a half-open range for date buckets), or {_COMPUTED_COLUMN_INDEX}."
+                )
+            add(
+                "implicit_conversion_on_column" if implicit else "non_sargable_predicate",
+                "low" if seeked else _share_severity(share, high=0.3, medium=0.05),
+                "predicates",
+                message,
+                fix,
                 node_id=access.node_id,
                 cost_share=access.cost_share,
-                evidence={"table": table, "column": column_name, "wrapper": kind, "operation": access.operation},
+                evidence={
+                    "table": table,
+                    "column": column_name,
+                    "wrapper": kind,
+                    "operation": access.operation,
+                    "dynamic_seek": dynamic,
+                },
             )
-        if access.operation in {"lookup", "rid_lookup"} and access.estimated_executions >= LOOKUP_EXECUTION_FLOOR:
+        # An actual plan counts the lookups that ran: an underestimated outer
+        # input can run a lookup the optimizer expected once 200,000 times, and
+        # an overestimated one can run it far less often (or never).
+        node = by_id.get(access.node_id)
+        actual_executions = node.actual_executions if node is not None and node.has_runtime else None
+        measured = actual_executions is not None
+        timed = node is not None and node.has_timing
+        executions = actual_executions if actual_executions is not None else access.estimated_executions
+        if access.operation in {"lookup", "rid_lookup"} and executions >= LOOKUP_EXECUTION_FLOOR:
             fetched = [clean_text(column, 128) or "" for column in access.output_columns]
+            runs = (
+                f"{actual_executions:,.0f} times (estimated {access.estimated_executions:,.0f})"
+                if actual_executions is not None
+                else f"about {access.estimated_executions:,.0f} times"
+            )
             add(
                 "rid_lookup" if access.operation == "rid_lookup" else "key_lookup",
-                _share_severity(share, high=0.3, medium=0.1),
+                (
+                    _measured_lookup_severity(executions, access.estimated_executions, access.cost_share)
+                    if measured and not timed
+                    else _share_severity(share, high=0.3, medium=0.1)
+                ),
                 "indexes",
-                f"{access.operation.replace('_', ' ').title()} on {table} runs about "
-                f"{access.estimated_executions:,.0f} times to fetch "
+                f"{access.operation.replace('_', ' ').title()} on {table} runs {runs} to fetch "
                 f"{', '.join(fetched) or 'row data'}.",
                 (
                     f"Add {', '.join(fetched)} as INCLUDE columns to "
@@ -271,6 +339,8 @@ def _access_rules(accesses: list[Any], add, impact) -> None:
                 evidence={
                     "table": table,
                     "estimated_executions": access.estimated_executions,
+                    "actual_executions": actual_executions,
+                    "measured": measured,
                     "fetched_columns": fetched,
                     "feeding_index": access.paired_index,
                 },
@@ -432,15 +502,16 @@ def _statement_warning_rules(statement: ET.Element, query_plan: ET.Element, add,
     if grant is not None and actual:
         granted = _float(grant.get("GrantedMemory"))
         used = _float(grant.get("MaxUsedMemory"))
-        wait = _float(grant.get("GrantWaitTime"))
-        if wait > 0:
+        # GrantWaitTime is in seconds (showplan XSD, MemoryGrantType).
+        wait_s = _float(grant.get("GrantWaitTime"))
+        if wait_s > 0:
             add(
                 "memory_grant_wait",
                 "high",
                 "memory",
-                f"The query waited {wait:,.0f} ms for its memory grant.",
+                f"The query waited {wait_s:,.0f} s for its memory grant (RESOURCE_SEMAPHORE).",
                 "Reduce the grant (fix row estimates, avoid wide sorts) or reduce concurrency.",
-                evidence={"grant_wait_ms": wait, "granted_kb": granted},
+                evidence={"grant_wait_ms": wait_s * 1000, "grant_wait_s": wait_s, "granted_kb": granted},
             )
         if granted >= EXCESSIVE_GRANT_KB and used < granted * 0.1:
             add(
@@ -462,7 +533,7 @@ def _statement_warning_rules(statement: ET.Element, query_plan: ET.Element, add,
         )
 
 
-def _operator_rules(node: PlanNode, add, actual: bool) -> None:
+def _operator_rules(node: PlanNode, add, actual: bool, table_access: TableAccess | None) -> None:
     relop = node.element
     physical = node.physical_op
     logical = node.logical_op
@@ -523,10 +594,10 @@ def _operator_rules(node: PlanNode, add, actual: bool) -> None:
             "Rewrite as NOT EXISTS (check NULL semantics first) or make the column NOT NULL.",
             node_id=node.node_id,
         )
-    if warnings is not None and warnings.get("NoJoinPredicate") in {"1", "true"}:
+    if warnings is not None and is_true(warnings.get("NoJoinPredicate")):
         _no_join_predicate(node, add)
     merge = relop.find(f"{_Q}Merge")
-    if merge is not None and merge.get("ManyToMany") in {"1", "true"}:
+    if merge is not None and is_true(merge.get("ManyToMany")):
         add(
             "many_to_many_merge_join",
             "medium",
@@ -560,25 +631,9 @@ def _operator_rules(node: PlanNode, add, actual: bool) -> None:
                     "actual": measured,
                 },
             )
-    if physical == "Compute Scalar" and any(
-        element.tag == f"{_Q}UserDefinedFunction" for element in node.own_elements
-    ):
-        names = sorted(
-            {
-                clean_text(unquote(element.get("FunctionName")), 200) or ""
-                for element in node.own_elements
-                if element.tag == f"{_Q}UserDefinedFunction"
-            }
-        )
-        add(
-            "scalar_udf",
-            "medium",
-            "udf",
-            f"Scalar UDF {', '.join(names)} runs row by row and is not inlined.",
-            "Inline the logic, or make the function inlinable (compatibility level 150+) and confirm the plan changes.",
-            node_id=node.node_id,
-            evidence={"functions": names},
-        )
+    udfs = [element for element in node.own_elements if element.tag == _UDF]
+    if udfs:
+        _scalar_udf(node, udfs, add, table_access)
     if physical == "Table-valued function":
         add(
             "multi_statement_tvf",
@@ -589,6 +644,83 @@ def _operator_rules(node: PlanNode, add, actual: bool) -> None:
             node_id=node.node_id,
             evidence={"estimated_rows": node.estimate_rows},
         )
+
+
+def _scalar_udf(node: PlanNode, udfs: list[ET.Element], add, access: TableAccess | None) -> None:
+    """A UserDefinedFunction element is a call that was not inlined, on any operator.
+
+    ``wrapped_columns`` lists table columns (schema.table.column) that a UDF wraps in a
+    predicate on this operator's own input, which an index on the column cannot seek.
+    """
+
+    own = {id(element) for element in node.own_elements}
+    # A table access reads its own columns from the access record (outer references
+    # excluded). A Filter or join reads only what its inputs output; anything else in
+    # its predicate is an outer reference. An Assert checks a constraint on rows being
+    # written, which nothing searches.
+    inputs = {
+        _column_key(ref)
+        for child in node.children
+        for ref in child.element.iterfind(f"{_Q}OutputList/{_COLUMN_REFERENCE}")
+    }
+    read_predicates = access is None and node.physical_op != "Assert"
+    in_predicate = False
+    wrapped: set[str] = set()
+    for container in node.own_elements:
+        if container.tag not in _PREDICATE_TAGS:
+            continue
+        for udf in container.iter(_UDF):
+            if id(udf) not in own:
+                continue  # inside a subquery's own operator
+            in_predicate = True
+            if container.tag == f"{_Q}SeekPredicates" or not read_predicates:
+                continue  # a seek key holds the function on the value side, not on the column
+            wrapped.update(
+                _qualified_column(ref)
+                for ref in udf.iter(_COLUMN_REFERENCE)
+                if id(ref) in own and ref.get("Table") and _column_key(ref) in inputs
+            )
+    if access is not None:
+        wrapped.update(
+            clean_text(f"{access.schema}.{access.table}.{column}", 300) or ""
+            for column, kind in access.nonsargable.items()
+            if kind == "udf"
+        )
+    wrapped.discard("")
+    names = sorted({clean_text(_object_name(udf.get("FunctionName")), 200) or "" for udf in udfs})
+    message = f"Scalar UDF {', '.join(names)} runs row by row and is not inlined."
+    if wrapped:
+        message += (
+            f" It wraps {', '.join(sorted(wrapped))} inside a predicate, so an index on the column "
+            "cannot seek it as written (non-SARGable)."
+        )
+    if in_predicate and any(not is_true(udf.get("IsClrFunction")) for udf in udfs):
+        message += " A T-SQL scalar UDF also keeps the whole plan serial."
+    add(
+        "scalar_udf",
+        "medium",
+        "udf",
+        message,
+        "Inline the logic, or make the function inlinable (compatibility level 150+) and confirm the plan changes.",
+        node_id=node.node_id,
+        evidence={"functions": names, "in_predicate": in_predicate, "wrapped_columns": sorted(wrapped)},
+    )
+
+
+def _column_key(ref: ET.Element) -> tuple[str | None, ...]:
+    return tuple(unquote(ref.get(name)) for name in ("Schema", "Table", "Alias", "Column"))
+
+
+def _qualified_column(ref: ET.Element) -> str:
+    parts = (unquote(ref.get(name)) for name in ("Schema", "Table", "Column"))
+    return clean_text(".".join(part for part in parts if part), 300) or ""
+
+
+def _object_name(value: str | None) -> str:
+    """``[db].[dbo].[fn]`` as ``db.dbo.fn``."""
+
+    parts = [part.replace("]]", "]") for part in _NAME_PART.findall(value or "")]
+    return ".".join(parts) if parts else unquote(value) or ""
 
 
 def _no_join_predicate(node: PlanNode, add) -> None:
@@ -754,6 +886,20 @@ def _runtime_rules(node: PlanNode, add) -> None:
                     "threads": threads,
                 },
             )
+
+
+def _measured_lookup_severity(actual: float, estimated: float, cost_share: float) -> str:
+    """Grade a lookup by its measured count when the plan did not time its operators.
+
+    The estimated cost share was sized for the estimated count, so it holds only
+    while the lookup ran within ESTIMATE_GAP_FACTOR of that count.
+    """
+
+    if actual >= estimated * ESTIMATE_GAP_FACTOR:
+        return "high" if actual >= LOOKUP_EXECUTION_FLOOR * ESTIMATE_GAP_FACTOR else "medium"
+    if actual * ESTIMATE_GAP_FACTOR <= estimated:
+        return "low"
+    return _share_severity(cost_share, high=0.3, medium=0.1)
 
 
 def _share_severity(share: float, *, high: float, medium: float) -> str:

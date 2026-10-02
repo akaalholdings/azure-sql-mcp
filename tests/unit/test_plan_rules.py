@@ -53,6 +53,13 @@ def test_non_sargable_and_implicit_conversions_are_high_when_they_dominate() -> 
     assert result["plan_kind"] == "estimated"
     assert rules["non_sargable_predicate"]["severity"] == "high"
     assert rules["non_sargable_predicate"]["evidence"]["column"] == "CreatedAt"
+    assert rules["non_sargable_predicate"]["evidence"]["dynamic_seek"] is False
+    # A computed-column index on the expression is the index-side alternative.
+    assert "cannot seek it as written" in rules["non_sargable_predicate"]["message"]
+    assert "computed column" in rules["non_sargable_predicate"]["fix"]
+    # Once that index exists, a writer with the wrong SET options fails (Msg 1934).
+    assert "SET options" in rules["non_sargable_predicate"]["fix"]
+    assert "Msg 1934" in rules["non_sargable_predicate"]["fix"]
     assert rules["implicit_conversion_on_column"]["evidence"]["column"] == "AccountNumber"
     assert rules["plan_affecting_convert"]["severity"] == "high"
     assert result["families"]["predicates"] >= 3
@@ -67,8 +74,102 @@ def test_key_lookup_names_the_columns_and_the_feeding_index() -> None:
     assert lookup["evidence"]["feeding_index"] == "FK_Sales_Orders_CustomerID"
     assert "FK_Sales_Orders_CustomerID" in lookup["fix"]
     assert lookup["estimated_cost_share"] == pytest.approx(0.8324 / 0.85, rel=1e-3)
+    assert lookup["evidence"]["measured"] is False
+    assert lookup["evidence"]["actual_executions"] is None
     assert rules["missing_index_hint"]["severity"] == "medium"
     assert rules["missing_index_hint"]["evidence"]["equality"] == ["CustomerID", "Status"]
+
+
+def test_underestimated_lookup_in_actual_plan_is_reported(showplan) -> None:
+    # The optimizer expected one lookup; parameter sensitivity made it 200,000.
+    rt = showplan.runtime
+    seek = showplan.relop(
+        1, "Index Seek", wrapper="IndexScan", est_rows=1, cost=0.0033,
+        attrs='EstimateRebinds="0" EstimateRewinds="0"',
+        body='<Object Database="[db]" Schema="[dbo]" Table="[Orders]" Index="[IX_Orders_CustomerID]" IndexKind="NonClustered" />'
+        + showplan.seek_keys("Orders", "CustomerID", "@cust"),
+        outputs=showplan.column("Orders", "OrderID"),
+        runtime=rt((0, 200_000, 1, 200, 190)),
+    )
+    lookup = showplan.relop(
+        2, "Key Lookup", wrapper="IndexScan", est_rows=1, cost=0.0033,
+        attrs='EstimateRebinds="0" EstimateRewinds="0"',
+        body='<Object Database="[db]" Schema="[dbo]" Table="[Orders]" Index="[PK_Orders]" IndexKind="Clustered" />',
+        outputs=showplan.column("Orders", "Comments"),
+        runtime=rt((0, 200_000, 200_000, 9500, 9000)),
+    )
+    plan = showplan.plan(
+        showplan.relop(0, "Nested Loops", "Inner Join", seek, lookup, wrapper="NestedLoops", cost=0.0066,
+                       runtime=rt((0, 200_000, 1, 10_000, 9400))),
+        cost=0.0066,
+        plan_children='<QueryTimeStats ElapsedTime="10000" CpuTime="9400" />',
+    )
+
+    finding = _rules(analyze_plan(plan))["key_lookup"]
+
+    assert finding["node_id"] == 2
+    assert finding["severity"] == "high"
+    assert finding["elapsed_share"] == pytest.approx(0.95)
+    assert finding["evidence"]["actual_executions"] == 200_000
+    assert finding["evidence"]["estimated_executions"] == 1
+    assert finding["evidence"]["measured"] is True
+    assert "200,000 times (estimated 1)" in finding["message"]
+    assert "Comments" in finding["fix"] and "IX_Orders_CustomerID" in finding["fix"]
+
+
+def _untimed_lookup_plan(showplan, *, estimated: int, ran: int, lookup_cost: float) -> str:
+    """An actual plan with row and execution counts but no operator times, under a Sort costed at 1.0."""
+
+    rt = showplan.runtime
+    seek = showplan.relop(
+        2, "Index Seek", wrapper="IndexScan", est_rows=estimated, cost=0.003,
+        body='<Object Database="[db]" Schema="[dbo]" Table="[Orders]" Index="[IX_Orders_CustomerID]" IndexKind="NonClustered" />'
+        + "<SeekPredicates>" + showplan.seek_keys("Orders", "CustomerID", "@cust") + "</SeekPredicates>",
+        outputs=showplan.column("Orders", "OrderID"),
+        runtime=rt((0, ran, 1, None, None)),
+    )
+    lookup = showplan.relop(
+        3, "Key Lookup", wrapper="IndexScan", est_rows=1, cost=lookup_cost,
+        attrs=f'EstimateRebinds="{estimated - 1}" EstimateRewinds="0"',
+        body='<Object Database="[db]" Schema="[dbo]" Table="[Orders]" Index="[PK_Orders]" IndexKind="Clustered" />',
+        outputs=showplan.column("Orders", "Comments"),
+        runtime=rt((0, ran, ran, None, None)),
+    )
+    join = showplan.relop(
+        1, "Nested Loops", "Inner Join", seek, lookup, wrapper="NestedLoops", cost=0.003 + lookup_cost,
+        runtime=rt((0, ran, 1, None, None)),
+    )
+    return showplan.plan(showplan.relop(0, "Sort", None, join, cost=1.0, runtime=rt((0, ran, 1, None, None))))
+
+
+def test_measured_lookup_that_did_not_run_is_not_reported(showplan) -> None:
+    # Estimated 5,000 lookups at 80% of the cost; the seek found no rows, so none ran.
+    plan = _untimed_lookup_plan(showplan, estimated=5000, ran=0, lookup_cost=0.8)
+
+    assert "key_lookup" not in _rules(analyze_plan(plan))
+
+
+@pytest.mark.parametrize(
+    ("estimated", "ran", "lookup_cost", "severity"),
+    [
+        (1, 200_000, 0.0033, "high"),  # costed for one lookup: the cost share understates it
+        (1, 500, 0.0033, "medium"),
+        (5000, 200, 0.8, "low"),  # costed for 5,000: the cost share overstates it
+        (5000, 2000, 0.8, "high"),  # ran close to the estimate: the cost share holds
+    ],
+)
+def test_untimed_actual_plan_grades_a_lookup_by_its_measured_count(
+    showplan, estimated: int, ran: int, lookup_cost: float, severity: str
+) -> None:
+    result = analyze_plan(_untimed_lookup_plan(showplan, estimated=estimated, ran=ran, lookup_cost=lookup_cost))
+
+    finding = _rules(result)["key_lookup"]
+
+    assert result["ranking_basis"] == "estimated_cost_share"
+    assert finding["severity"] == severity
+    assert finding["evidence"]["measured"] is True
+    assert finding["evidence"]["actual_executions"] == ran
+    assert f"{ran:,} times (estimated {estimated:,})" in finding["message"]
 
 
 def test_rid_lookup_and_scan_with_seekable_filters_are_index_leads() -> None:
@@ -157,7 +258,7 @@ def test_actual_plan_runtime_rules() -> None:
     plan = _plan(
         sort.replace("</RelOp>", _scan(2, rows=1000, runtime=runtime) + "</RelOp>"),
         plan_children=(
-            '<MemoryGrantInfo GrantedMemory="2097152" MaxUsedMemory="10240" GrantWaitTime="1200" />'
+            '<MemoryGrantInfo GrantedMemory="2097152" MaxUsedMemory="10240" GrantWaitTime="3" />'
             '<ParameterList><ColumnReference Column="@region" ParameterCompiledValue="(1)" ParameterRuntimeValue="(6)" /></ParameterList>'
         ),
     )
@@ -170,9 +271,24 @@ def test_actual_plan_runtime_rules() -> None:
     assert rules["row_estimate_gap"]["severity"] == "high"
     assert rules["parallel_thread_skew"]["evidence"]["max_thread_rows"] == 190000
     assert rules["parallel_thread_skew"]["evidence"]["threads"] == 3
-    assert rules["memory_grant_wait"]["evidence"]["grant_wait_ms"] == 1200
+    assert rules["memory_grant_wait"]["evidence"]["grant_wait_ms"] == 3000
     assert rules["excessive_memory_grant"]["severity"] == "medium"
     assert rules["sniffed_parameter_differs"]["evidence"]["runtime"] == "(6)"
+
+
+def test_grant_wait_time_is_seconds_in_the_showplan(showplan) -> None:
+    # The showplan XSD (MemoryGrantType) documents GrantWaitTime in seconds.
+    plan = showplan.plan(
+        showplan.scan(0, runtime=showplan.runtime((0, 10, 1, 13000, 900))),
+        plan_children='<MemoryGrantInfo GrantedMemory="4096" MaxUsedMemory="4000" GrantWaitTime="12" />',
+    )
+
+    finding = _rules(analyze_plan(plan))["memory_grant_wait"]
+
+    assert finding["evidence"]["grant_wait_ms"] == 12000
+    assert finding["evidence"]["grant_wait_s"] == 12
+    assert "12 s" in finding["message"]
+    assert "RESOURCE_SEMAPHORE" in finding["message"]
 
 
 def test_an_even_parallel_split_is_not_skew() -> None:
@@ -213,17 +329,75 @@ def test_unusable_input_reports_a_parse_error(bad: str) -> None:
     assert result["parse_error"]
 
 
-def _converted(table: str, column: str) -> str:
+def _converted(table: str, column: str, *, implicit: str = "0") -> str:
     """A residual predicate that wraps ``table.column`` in CONVERT, so no index can seek on it."""
 
     return (
         '<Predicate><ScalarOperator ScalarString="residual"><Compare CompareOp="EQ">'
-        f'<ScalarOperator><Convert DataType="date" Style="0" Implicit="0"><ScalarOperator><Identifier>'
+        f'<ScalarOperator><Convert DataType="date" Style="0" Implicit="{implicit}"><ScalarOperator><Identifier>'
         f'<ColumnReference Database="[db]" Schema="[dbo]" Table="[{table}]" Column="{column}" />'
         "</Identifier></ScalarOperator></Convert></ScalarOperator>"
         '<ScalarOperator><Identifier><ColumnReference Column="@Day" /></Identifier></ScalarOperator>'
         "</Compare></ScalarOperator></Predicate>"
     )
+
+
+def _order_date_seek(showplan, start: tuple[str, str], end: tuple[str, str], residual: str) -> str:
+    """An Index Seek on Orders.OrderDate between two bounds, each (ScanType, value), plus a residual."""
+
+    def bound(edge: str, scan_type: str, value: str) -> str:
+        return (
+            f'<{edge} ScanType="{scan_type}"><RangeColumns>{showplan.column("Orders", "OrderDate")}</RangeColumns>'
+            f'<RangeExpressions><ScalarOperator ScalarString="[{value}]"><Identifier><ColumnReference Column="{value}" />'
+            f"</Identifier></ScalarOperator></RangeExpressions></{edge}>"
+        )
+
+    seek = (
+        "<SeekPredicates><SeekPredicateNew><SeekKeys>"
+        + bound("StartRange", *start)
+        + bound("EndRange", *end)
+        + "</SeekKeys></SeekPredicateNew></SeekPredicates>"
+        + residual
+    )
+    return showplan.plan(showplan.scan(0, "Orders", physical="Index Seek", index="IX_Orders_OrderDate", body=seek))
+
+
+@pytest.mark.parametrize(("implicit", "rule"), [("0", "non_sargable_predicate"), ("1", "implicit_conversion_on_column")])
+def test_dynamic_seek_is_not_reported_as_cannot_seek(showplan, implicit: str, rule: str) -> None:
+    # CAST(OrderDate AS date) = @d: GetRangeThroughConvert (or GetRangeWithMismatchedTypes for an
+    # implicit conversion) computes Expr1003/Expr1004, which feed a seek range on OrderDate; the
+    # wrapped predicate is re-checked.
+    plan = _order_date_seek(
+        showplan, ("GT", "Expr1003"), ("LT", "Expr1004"), _converted("Orders", "OrderDate", implicit=implicit)
+    )
+
+    finding = _rules(analyze_plan(plan))[rule]
+
+    assert finding["severity"] == "low"
+    assert finding["evidence"]["dynamic_seek"] is True
+    assert "dynamic seek" in finding["message"]
+    assert "no index can seek" not in finding["message"]
+    assert "cannot seek" not in finding["message"]
+
+
+def test_wrapped_residual_on_a_column_seeked_by_parameters_is_not_a_dynamic_seek(showplan) -> None:
+    # OrderDate >= @from AND OrderDate < @to AND DATEPART(hour, OrderDate) >= 9: a plain range
+    # seek on the bare column, plus a residual inside that range. No run-time range function.
+    datepart = (
+        '<Predicate><ScalarOperator><Compare CompareOp="GE"><ScalarOperator>'
+        '<Intrinsic FunctionName="datepart"><ScalarOperator><Const ConstValue="(7)" /></ScalarOperator>'
+        f'<ScalarOperator><Identifier>{showplan.column("Orders", "OrderDate")}</Identifier></ScalarOperator></Intrinsic>'
+        '</ScalarOperator><ScalarOperator><Const ConstValue="(9)" /></ScalarOperator></Compare></ScalarOperator></Predicate>'
+    )
+    plan = _order_date_seek(showplan, ("GE", "@from"), ("LT", "@to"), datepart)
+
+    finding = _rules(analyze_plan(plan))["non_sargable_predicate"]
+
+    assert finding["severity"] == "low"
+    assert finding["evidence"]["dynamic_seek"] is False
+    assert "dynamic seek" not in finding["message"]
+    assert "cannot seek" not in finding["message"]
+    assert "parameter typed as the column" not in finding["fix"]
 
 
 def test_inner_seek_with_a_correct_per_execution_estimate_is_not_blamed(showplan) -> None:
@@ -382,9 +556,163 @@ def test_scalar_udf_rule_only_reads_the_operator_itself(showplan) -> None:
     inner = showplan.relop(1, "Compute Scalar", None, showplan.scan(2), body=udf)
     outer = showplan.relop(0, "Compute Scalar", None, inner)
 
-    udf_nodes = [f["node_id"] for f in analyze_plan(showplan.plan(outer))["findings"] if f["rule"] == "scalar_udf"]
+    udf = [f for f in analyze_plan(showplan.plan(outer))["findings"] if f["rule"] == "scalar_udf"]
 
-    assert udf_nodes == [1]
+    assert [f["node_id"] for f in udf] == [1]
+    assert udf[0]["evidence"]["in_predicate"] is False
+
+
+def _udf_predicate(table: str, column: str) -> str:
+    """``[dbo].[fn_Active](column) = 1``: the showplan names the call UserDefinedFunction."""
+
+    return (
+        '<Predicate><ScalarOperator ScalarString="[db].[dbo].[fn_Active](col)=(1)"><Compare CompareOp="EQ">'
+        '<ScalarOperator><UserDefinedFunction FunctionName="[db].[dbo].[fn_Active]"><ScalarOperator><Identifier>'
+        f'<ColumnReference Database="[db]" Schema="[dbo]" Table="[{table}]" Column="{column}" />'
+        "</Identifier></ScalarOperator></UserDefinedFunction></ScalarOperator>"
+        '<ScalarOperator><Const ConstValue="(1)" /></ScalarOperator>'
+        "</Compare></ScalarOperator></Predicate>"
+    )
+
+
+@pytest.mark.parametrize("operator", ["scan", "filter"])
+def test_udf_in_scan_predicate_and_filter_is_flagged(showplan, operator: str) -> None:
+    # No NonParallelPlanReason and no UdfElapsedTime: an estimated Query Store plan.
+    predicate = _udf_predicate("Customers", "CustomerID")
+    customer_id = showplan.column("Customers", "CustomerID")
+    relop = (
+        showplan.scan(0, "Customers", body=predicate)
+        if operator == "scan"
+        else showplan.relop(
+            0, "Filter", None, showplan.scan(1, "Customers", cost=0.5, outputs=customer_id), body=predicate
+        )
+    )
+
+    result = analyze_plan(showplan.plan(relop))
+    rules = _rules(result)
+
+    finding = rules["scalar_udf"]
+    assert finding["node_id"] == 0
+    assert finding["evidence"]["functions"] == ["db.dbo.fn_Active"]
+    assert finding["evidence"]["in_predicate"] is True
+    # Table-qualified: a Filter or join can read columns from more than one table.
+    assert finding["evidence"]["wrapped_columns"] == ["dbo.Customers.CustomerID"]
+    assert "non-SARGable" in finding["message"] and "serial" in finding["message"]
+    # scalar_udf owns the wrapped column: no second finding for the same predicate.
+    assert "non_sargable_predicate" not in rules
+
+
+def test_udf_on_the_value_side_of_a_seek_is_not_called_non_sargable(showplan) -> None:
+    # c.CustomerID = dbo.fn_Lookup(o.CustomerRef) on the inner side of a join: the
+    # seek column is bare, so the index still seeks; the function wraps the outer value.
+    seek_keys = (
+        '<SeekPredicates><SeekPredicateNew><SeekKeys><Prefix ScanType="EQ"><RangeColumns>'
+        f'{showplan.column("Customers", "CustomerID")}</RangeColumns><RangeExpressions><ScalarOperator>'
+        '<UserDefinedFunction FunctionName="[db].[dbo].[fn_Lookup]"><ScalarOperator><Identifier>'
+        f'{showplan.column("Orders", "CustomerRef")}</Identifier></ScalarOperator></UserDefinedFunction>'
+        "</ScalarOperator></RangeExpressions></Prefix></SeekKeys></SeekPredicateNew></SeekPredicates>"
+    )
+    plan = showplan.plan(showplan.scan(0, "Customers", physical="Index Seek", body=seek_keys))
+
+    finding = _rules(analyze_plan(plan))["scalar_udf"]
+
+    assert finding["evidence"]["functions"] == ["db.dbo.fn_Lookup"]
+    assert finding["evidence"]["in_predicate"] is True
+    assert finding["evidence"]["wrapped_columns"] == []
+    assert "non-SARGable" not in finding["message"]
+
+
+def test_udf_in_a_check_constraint_assert_wraps_no_searched_column(showplan) -> None:
+    # INSERT into a table whose CHECK constraint calls dbo.fn_ValidSku(Sku): the Assert
+    # validates each new row. Nothing searches Sku, so there is nothing to rewrite.
+    check = (
+        '<Predicate><ScalarOperator><IF><Condition><ScalarOperator><Compare CompareOp="EQ"><ScalarOperator>'
+        '<UserDefinedFunction FunctionName="[db].[dbo].[fn_ValidSku]"><ScalarOperator><Identifier>'
+        f'{showplan.column("Orders", "Sku")}</Identifier></ScalarOperator></UserDefinedFunction></ScalarOperator>'
+        '<ScalarOperator><Const ConstValue="(0)" /></ScalarOperator></Compare></ScalarOperator></Condition>'
+        '<Then><ScalarOperator><Const ConstValue="(0)" /></ScalarOperator></Then>'
+        '<Else><ScalarOperator><Const ConstValue="NULL" /></ScalarOperator></Else></IF></ScalarOperator></Predicate>'
+    )
+    insert = showplan.relop(
+        1, "Clustered Index Insert", "Insert", showplan.relop(2, "Constant Scan", None, cost=0.0001),
+        wrapper="Update", cost=0.01, outputs=showplan.column("Orders", "Sku"),
+        body='<Object Database="[db]" Schema="[dbo]" Table="[Orders]" Index="[PK_Orders]" IndexKind="Clustered" />',
+    )
+    plan = showplan.plan(showplan.relop(0, "Assert", None, insert, cost=0.0101, body=check), cost=0.0101)
+
+    finding = _rules(analyze_plan(plan))["scalar_udf"]
+
+    assert finding["node_id"] == 0
+    assert finding["evidence"]["functions"] == ["db.dbo.fn_ValidSku"]
+    assert finding["evidence"]["wrapped_columns"] == []
+    assert "non-SARGable" not in finding["message"]
+
+
+@pytest.mark.parametrize("operator", ["scan", "filter"])
+def test_udf_over_an_outer_reference_is_not_listed_as_wrapped(showplan, operator: str) -> None:
+    # Inner side of a nested loops join: CreditLimit > dbo.fn_Threshold(o.Amount). Amount is
+    # an Orders column passed in from the outer input; this operator reads Customers.
+    predicate = (
+        '<Predicate><ScalarOperator><Compare CompareOp="GT">'
+        f'<ScalarOperator><Identifier>{showplan.column("Customers", "CreditLimit")}</Identifier></ScalarOperator>'
+        '<ScalarOperator><UserDefinedFunction FunctionName="[db].[dbo].[fn_Threshold]"><ScalarOperator><Identifier>'
+        f'{showplan.column("Orders", "Amount")}</Identifier></ScalarOperator></UserDefinedFunction></ScalarOperator>'
+        "</Compare></ScalarOperator></Predicate>"
+    )
+    credit = showplan.column("Customers", "CreditLimit")
+    amount = showplan.column("Orders", "Amount")
+    inner = (
+        showplan.scan(2, "Customers", cost=0.4, body=predicate, outputs=credit)
+        if operator == "scan"
+        else showplan.relop(
+            2, "Filter", None, showplan.scan(3, "Customers", cost=0.3, outputs=credit),
+            cost=0.4, body=predicate, outputs=credit,
+        )
+    )
+    join = showplan.relop(
+        0, "Nested Loops", "Inner Join", showplan.scan(1, "Orders", cost=0.1, outputs=amount), inner,
+        wrapper="NestedLoops", cost=0.5, body=f"<OuterReferences>{amount}</OuterReferences>",
+    )
+
+    finding = _rules(analyze_plan(showplan.plan(join, cost=0.5)))["scalar_udf"]
+
+    assert finding["node_id"] == 2
+    assert finding["evidence"]["in_predicate"] is True
+    assert finding["evidence"]["wrapped_columns"] == []
+    assert "non-SARGable" not in finding["message"]
+
+
+def _accounts_conjunct(kind: str) -> str:
+    """One conjunct on Accounts.AccountNumber: wrapped in a scalar UDF, an implicit conversion, or UPPER."""
+
+    column = '<ScalarOperator><Identifier><ColumnReference Database="[db]" Schema="[dbo]" Table="[Accounts]" Column="AccountNumber" /></Identifier></ScalarOperator>'
+    wrapped = {
+        "udf": f'<UserDefinedFunction FunctionName="[db].[dbo].[fn_Norm]">{column}</UserDefinedFunction>',
+        "implicit": f'<Convert DataType="nvarchar" Length="40" Style="0" Implicit="1">{column}</Convert>',
+        "upper": f'<Intrinsic FunctionName="upper">{column}</Intrinsic>',
+    }[kind]
+    return (
+        f'<ScalarOperator><Compare CompareOp="EQ"><ScalarOperator>{wrapped}</ScalarOperator>'
+        '<ScalarOperator><Identifier><ColumnReference Column="@acct" /></Identifier></ScalarOperator></Compare></ScalarOperator>'
+    )
+
+
+@pytest.mark.parametrize("udf_first", [True, False])
+@pytest.mark.parametrize(("other", "rule"), [("implicit", "implicit_conversion_on_column"), ("upper", "non_sargable_predicate")])
+def test_a_udf_wrap_does_not_hide_another_wrapper_on_the_same_column(
+    showplan, udf_first: bool, other: str, rule: str
+) -> None:
+    # dbo.fn_Norm(AccountNumber) = @acct AND <other wrapper>(AccountNumber) = @acct, in either order.
+    conjuncts = [_accounts_conjunct("udf"), _accounts_conjunct(other)]
+    if not udf_first:
+        conjuncts.reverse()
+    predicate = '<Predicate><ScalarOperator><Logical Operation="AND">' + "".join(conjuncts) + "</Logical></ScalarOperator></Predicate>"
+
+    rules = _rules(analyze_plan(showplan.plan(showplan.scan(0, "Accounts", body=predicate))))
+
+    assert rules[rule]["severity"] == "high"
+    assert rules[rule]["evidence"]["column"] == "AccountNumber"
+    assert rules["scalar_udf"]["evidence"]["functions"] == ["db.dbo.fn_Norm"]
 
 
 def test_stale_statistics_and_exchange_spills_are_reported(showplan) -> None:

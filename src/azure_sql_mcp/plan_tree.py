@@ -60,6 +60,12 @@ def unquote(identifier: str | None) -> str | None:
     return value
 
 
+def is_true(value: str | None) -> bool:
+    """Read a showplan xsd:boolean: SQL Server writes 1/0, saved plans often true/false."""
+
+    return (value or "").strip().lower() in {"1", "true"}
+
+
 def clean_text(value: object, limit: int | None = 300) -> str | None:
     """Flatten a plan-derived string to one bounded line.
 
@@ -490,7 +496,7 @@ def scan_order(node: PlanNode) -> str | None:
         if ordered is None:
             continue
         direction = element.get("ScanDirection") or ""
-        text = "ordered" if ordered in {"1", "true"} else "unordered"
+        text = "ordered" if is_true(ordered) else "unordered"
         return f"{text} {direction.lower()}".strip()
     return None
 
@@ -502,14 +508,14 @@ def warning_texts(element: ET.Element | None) -> list[str]:
     if warnings is None:
         return []
     found: list[str] = []
-    if warnings.get("NoJoinPredicate") in {"1", "true"}:
+    if is_true(warnings.get("NoJoinPredicate")):
         found.append("No join predicate (often benign: check outer references and both inputs)")
     for attribute, text in (
         ("SpatialGuess", "Spatial index selectivity guessed"),
         ("UnmatchedIndexes", "Filtered index not matched because of parameterization"),
         ("FullUpdateForOnlineIndexBuild", "Full update for online index build"),
     ):
-        if warnings.get(attribute) in {"1", "true"}:
+        if is_true(warnings.get(attribute)):
             found.append(text)
     for convert in warnings.findall(f"{_Q}PlanAffectingConvert"):
         found.append(f"Implicit conversion [{convert.get('ConvertIssue') or '?'}]: {convert.get('Expression') or ''}")
@@ -584,7 +590,7 @@ def _node(element: ET.Element, parent: PlanNode | None, depth: int) -> PlanNode:
         table_cardinality=_number(element.get("TableCardinality")) or 0.0,
         estimate_rows_without_row_goal=_number(element.get("EstimateRowsWithoutRowGoal")),
         avg_row_size=_number(element.get("AvgRowSize")) or 0.0,
-        parallel=element.get("Parallel") in {"1", "true"},
+        parallel=is_true(element.get("Parallel")),
         estimated_mode=element.get("EstimatedExecutionMode") or "",
         threads=tuple(threads),
     )
