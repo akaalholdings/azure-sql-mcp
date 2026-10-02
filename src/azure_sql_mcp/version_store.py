@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .azure_tier import dmv_permission_hint
 from .connection import AzureSqlExecutor
 from .incident_log import note_exception
 from .observability import sanitize_error_message
@@ -81,7 +82,8 @@ class VersionStoreService:
                     ResultStatus.UNAVAILABLE,
                     "sys.dm_tran_persistent_version_store_stats could not be read: "
                     + sanitize_error_message(str(exc))
-                    + ". VIEW DATABASE STATE is required.",
+                    + ". "
+                    + dmv_permission_hint("sys.dm_tran_persistent_version_store_stats"),
                 ),
             }
         if not rows:

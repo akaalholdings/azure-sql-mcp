@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
+from .azure_tier import TIER_SQL
+from .azure_tier import classify_service_tier
+from .azure_tier import dmv_permission_hint
 from .connection import AzureSqlExecutor
+from .incident_log import note_exception
 from .observability import sanitize_error_message
 from .result_status import ResultStatus
 from .result_status import status_payload
@@ -18,9 +23,13 @@ SELECT
     CAST(avg_data_io_percent AS DECIMAL(5, 2)) AS avg_data_io_percent,
     CAST(avg_log_write_percent AS DECIMAL(5, 2)) AS avg_log_write_percent,
     CAST(avg_memory_usage_percent AS DECIMAL(5, 2)) AS avg_memory_usage_percent,
+    CAST(avg_instance_memory_percent AS DECIMAL(5, 2)) AS avg_instance_memory_percent,
     CAST(max_worker_percent AS DECIMAL(5, 2)) AS max_worker_percent,
     CAST(max_session_percent AS DECIMAL(5, 2)) AS max_session_percent,
-    CAST(avg_instance_cpu_percent AS DECIMAL(5, 2)) AS avg_instance_cpu_percent
+    CAST(xtp_storage_percent AS DECIMAL(5, 2)) AS xtp_storage_percent,
+    CAST(avg_instance_cpu_percent AS DECIMAL(5, 2)) AS avg_instance_cpu_percent,
+    dtu_limit,
+    cpu_limit
 FROM sys.dm_db_resource_stats
 WHERE end_time >= DATEADD(MINUTE, -{window_minutes}, GETUTCDATE())
 ORDER BY end_time DESC
@@ -46,6 +55,79 @@ WHERE database_name = ?
 GROUP BY DATEADD(HOUR, DATEDIFF(HOUR, 0, end_time), 0)
 ORDER BY hour_start_utc DESC
 """
+
+GOVERNANCE_DMV = "sys.dm_user_db_resource_governance"
+GOVERNANCE_SQL = """
+SELECT TOP (1) *
+FROM sys.dm_user_db_resource_governance
+WHERE database_id = DB_ID()
+"""
+
+RECENT_SAMPLE_SECONDS = 15
+SUMMARY_METRICS = (
+    "avg_cpu_percent",
+    "avg_data_io_percent",
+    "avg_log_write_percent",
+    "avg_memory_usage_percent",
+    "avg_instance_memory_percent",
+    "max_worker_percent",
+    "max_session_percent",
+    "xtp_storage_percent",
+)
+MEMORY_METRICS = ("avg_memory_usage_percent", "avg_instance_memory_percent")
+MEMORY_NOTE = (
+    "Memory near 100% after ramp-up is expected on Azure SQL Database: the engine caches data "
+    "by design, and Microsoft documents that reaching the memory limit does not slow queries or "
+    "cause errors. Memory pressure shows as RESOURCE_SEMAPHORE waits, pending memory grants or "
+    "out-of-memory events."
+)
+_BYTES_PER_MB = 1024 * 1024
+
+
+def log_rate_caps(governance: dict[str, Any]) -> dict[str, float | None]:
+    """Log-rate caps in MB/s from a sys.dm_user_db_resource_governance row (bytes per second).
+
+    ``effective_log_rate_cap_mb_per_sec`` is the smallest known cap: the database
+    (workload group), the elastic pool or user resource pool, and the instance.
+    """
+
+    caps: dict[str, float | None] = {}
+    for column, key in (
+        ("primary_max_log_rate", "max_log_rate_mb_per_sec"),
+        ("pool_max_log_rate", "pool_max_log_rate_mb_per_sec"),
+        ("instance_max_log_rate", "instance_max_log_rate_mb_per_sec"),
+    ):
+        value = governance.get(column)
+        caps[key] = round(float(value) / _BYTES_PER_MB, 2) if value else None
+    known = [value for value in caps.values() if value]
+    caps["effective_log_rate_cap_mb_per_sec"] = min(known) if known else None
+    return caps
+
+
+def summarize_resource_metric(values: list[float], *, sample_seconds: int | None) -> dict[str, Any]:
+    """Average, extremes, nearest-rank p95 and time above 80% and 95% of the limit.
+
+    ``sample_seconds`` is the sample length (15 for sys.dm_db_resource_stats); the
+    minutes are None for aggregated buckets, where samples are not time slices.
+    """
+
+    ordered = sorted(values)
+    above_80 = sum(1 for value in values if value > 80)
+    above_95 = sum(1 for value in values if value > 95)
+
+    def minutes(count: int) -> float | None:
+        return round(count * sample_seconds / 60, 2) if sample_seconds else None
+
+    return {
+        "avg": round(sum(values) / len(values), 2),
+        "max": round(ordered[-1], 2),
+        "min": round(ordered[0], 2),
+        "p95": round(ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)], 2),
+        "samples_above_80_pct": above_80,
+        "total_samples": len(values),
+        "minutes_above_80": minutes(above_80),
+        "minutes_above_95": minutes(above_95),
+    }
 
 
 class ResourceGovernanceService:
@@ -128,34 +210,26 @@ class ResourceGovernanceService:
         # whatever the current tier exposes, and we expose it as-is.
         # In an elastic pool the view returns a row per pool database, so the
         # current database must be selected explicitly.
-        governance_query = """
-        SELECT TOP 1 *
-        FROM sys.dm_user_db_resource_governance
-        WHERE database_id = DB_ID()
-        """
-        slo_query = """
-        SELECT
-            edition,
-            service_objective,
-            elastic_pool_name
-        FROM sys.database_service_objectives
-        WHERE database_id = DB_ID()
-        """
-
-        governance_rows = await self.executor.fetch_all(database_name, governance_query)
         warnings: list[dict[str, Any]] = []
+        governance_error: str | None = None
         try:
-            slo_rows = await self.executor.fetch_all(database_name, slo_query)
+            governance_rows = await self.executor.fetch_all(database_name, GOVERNANCE_SQL)
+        except Exception as exc:
+            note_exception(exc, "resource_governance.limits")
+            governance_rows = []
+            governance_error = sanitize_error_message(str(exc))
+        try:
+            slo_rows = await self.executor.fetch_all(database_name, TIER_SQL)
         except Exception as exc:
             slo_rows = []
             warnings.append(
                 {
                     "type": "service_objective_unavailable",
-                    "message": "sys.database_service_objectives could not be read: "
+                    "message": "The edition and service objective could not be read: "
                     + sanitize_error_message(str(exc)),
                 }
             )
-        if not governance_rows:
+        if governance_error is None and not governance_rows:
             warnings.append(
                 {
                     "type": "governance_row_missing",
@@ -163,25 +237,34 @@ class ResourceGovernanceService:
                 }
             )
 
-        governance = governance_rows[0] if governance_rows else {}
+        governance = dict(governance_rows[0]) if governance_rows else {}
         slo = slo_rows[0] if slo_rows else {}
+        if governance:
+            governance.update(log_rate_caps(governance))
 
-        # Convert log rate to MB/s for readability when the column is present
-        # (column name varies by tier).
-        log_rate_bytes = governance.get(
-            "primary_max_log_rate_per_db_in_bytes_per_second"
-        ) or governance.get("max_log_rate") or 0
-        if log_rate_bytes:
-            governance["max_log_rate_mb_per_sec"] = round(
-                log_rate_bytes / (1024 * 1024), 2
-            )
-
-        return {
+        payload: dict[str, Any] = {
             "database_name": database_name,
             "service_objective": slo,
             "governance_limits": governance,
             "warnings": warnings,
         }
+        if governance_error is not None:
+            tier = (
+                classify_service_tier(slo.get("edition"), slo.get("service_objective"), slo.get("elastic_pool_name"))
+                if slo
+                else None
+            )
+            # available=False is what evidence collectors read as a gap; without it a
+            # case that lost its limits could still be recorded as healthy.
+            payload["available"] = False
+            payload.update(
+                status_payload(
+                    ResultStatus.UNAVAILABLE,
+                    f"{GOVERNANCE_DMV} could not be read: {governance_error}. "
+                    + dmv_permission_hint(GOVERNANCE_DMV, tier),
+                )
+            )
+        return payload
 
     async def get_resource_stats_history(
         self,
@@ -228,40 +311,40 @@ class ResourceGovernanceService:
             granularity = "15_second_samples"
 
         # Compute summary stats
+        sample_seconds = RECENT_SAMPLE_SECONDS if resolved == "recent" else None
         summary: dict[str, Any] = {}
         if rows:
-            for metric in (
-                "avg_cpu_percent",
-                "avg_data_io_percent",
-                "avg_log_write_percent",
-                "avg_memory_usage_percent",
-                "max_worker_percent",
-            ):
+            for metric in SUMMARY_METRICS:
                 if not any(metric in r for r in rows):
                     continue
                 values = [float(r.get(metric, 0) or 0) for r in rows]
-                above_80 = sum(1 for v in values if v > 80)
-                summary[metric] = {
-                    "avg": round(sum(values) / len(values), 2),
-                    "max": round(max(values), 2),
-                    "min": round(min(values), 2),
-                    "samples_above_80_pct": above_80,
-                    "total_samples": len(values),
-                }
+                summary[metric] = summarize_resource_metric(values, sample_seconds=sample_seconds)
 
-        # Generate warnings for sustained pressure
+        # Generate warnings for sustained pressure; memory is information only.
         warnings: list[dict[str, Any]] = []
+        informational: list[dict[str, Any]] = []
         for metric_name, info in summary.items():
             if info.get("samples_above_80_pct", 0) > len(rows) * 0.3:
                 friendly = metric_name.replace("avg_", "").replace("_", " ").title()
+                message = (
+                    f"{friendly} was above 80% for "
+                    f"{info['samples_above_80_pct']} of {info['total_samples']} samples "
+                    f"(>{30}% of window)"
+                )
+                if metric_name in MEMORY_METRICS:
+                    informational.append(
+                        {
+                            "type": f"memory_{metric_name}",
+                            "message": f"{message}. {MEMORY_NOTE}",
+                            "max": info["max"],
+                            "avg": info["avg"],
+                        }
+                    )
+                    continue
                 warnings.append(
                     {
                         "type": f"sustained_{metric_name}",
-                        "message": (
-                            f"{friendly} was above 80% for "
-                            f"{info['samples_above_80_pct']} of {info['total_samples']} samples "
-                            f"(>{30}% of window)"
-                        ),
+                        "message": message,
                         "max": info["max"],
                         "avg": info["avg"],
                     }
@@ -275,6 +358,7 @@ class ResourceGovernanceService:
             "sample_count": len(rows),
             "summary": summary,
             "warnings": warnings,
+            "informational": informational,
             "history": rows,
             **status,
         }

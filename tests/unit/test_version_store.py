@@ -72,6 +72,9 @@ async def test_unreadable_store_is_unavailable_not_healthy() -> None:
 
     assert result["result_status"] == "unavailable"
     assert "VIEW DATABASE STATE" in result["result_status_reason"]
+    # Basic/S0/S1 and pooled databases need more than VIEW DATABASE STATE for this DMV.
+    assert "##MS_ServerStateReader##" in result["result_status_reason"]
+    assert "elastic-pool" in result["result_status_reason"]
 
 
 @pytest.mark.asyncio

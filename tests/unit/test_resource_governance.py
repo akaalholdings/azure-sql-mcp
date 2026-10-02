@@ -3,6 +3,9 @@ from __future__ import annotations
 import pytest
 
 from azure_sql_mcp.resource_governance import ResourceGovernanceService
+from azure_sql_mcp.resource_governance import log_rate_caps
+from azure_sql_mcp.resource_governance import summarize_resource_metric
+from tests.azure_dmv_contract import documented_row
 
 
 class FakeExecutor:
@@ -43,20 +46,159 @@ async def test_get_io_stats_no_warnings():
     assert result["warnings"] == []
 
 
+GOVERNANCE_DMV = "sys.dm_user_db_resource_governance"
+
+
+def governance_row(**overrides) -> dict:
+    values = {
+        "database_id": 5,
+        "slo_name": "SQLDB_OP_GP_GEN5_2",
+        "cpu_limit": 2,
+        "primary_group_max_cpu": 100.0,
+        "primary_max_log_rate": 50331648,
+        "pool_max_log_rate": 104857600,
+        "instance_max_log_rate": 125829120,
+        "primary_group_max_io": 640,
+        "max_sessions": 30000,
+    }
+    values.update(overrides)
+    return documented_row(GOVERNANCE_DMV, **values)
+
+
 @pytest.mark.asyncio
-async def test_get_resource_limits():
-    gov_rows = [
-        {"primary_group_id": 1, "primary_max_cpu_percent": 100, "primary_max_log_rate_per_db_in_bytes_per_second": 50331648, "primary_group_max_io": 5000, "pool_max_io": 12800, "max_db_memory": 1048576, "max_workers_per_query": 8, "checkpoint_rate_mbps": 100, "volume_local_iops": 4800, "volume_pfs_iops": 4800},
-    ]
+async def test_get_resource_limits_documented_caps():
     slo_rows = [
         {"edition": "GeneralPurpose", "service_objective": "GP_Gen5_2", "elastic_pool_name": None},
     ]
-    service = ResourceGovernanceService(FakeExecutor([gov_rows, slo_rows]))
+    service = ResourceGovernanceService(FakeExecutor([[governance_row()], slo_rows]))
     result = await service.get_resource_limits("testdb")
 
     assert result["service_objective"]["service_objective"] == "GP_Gen5_2"
-    assert result["governance_limits"]["primary_max_cpu_percent"] == 100
-    assert result["governance_limits"]["max_log_rate_mb_per_sec"] == 48.0  # 50331648 / 1048576
+    limits = result["governance_limits"]
+    assert limits["primary_group_max_cpu"] == 100.0  # SELECT * stays raw
+    assert limits["max_log_rate_mb_per_sec"] == 48.0  # 50331648 / 1048576
+    assert limits["pool_max_log_rate_mb_per_sec"] == 100.0
+    assert limits["instance_max_log_rate_mb_per_sec"] == 120.0
+    assert limits["effective_log_rate_cap_mb_per_sec"] == 48.0
+    assert "result_status" not in result
+
+
+def test_log_rate_caps_take_the_smallest_known_cap():
+    assert log_rate_caps({"primary_max_log_rate": 0, "pool_max_log_rate": 31457280, "instance_max_log_rate": None}) == {
+        "max_log_rate_mb_per_sec": None,
+        "pool_max_log_rate_mb_per_sec": 30.0,
+        "instance_max_log_rate_mb_per_sec": None,
+        "effective_log_rate_cap_mb_per_sec": 30.0,
+    }
+    assert log_rate_caps({})["effective_log_rate_cap_mb_per_sec"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_resource_limits_permission_denied_is_unavailable_with_hint():
+    executor = RecordingExecutor(
+        {
+            "dm_user_db_resource_governance": PermissionError("VIEW SERVER STATE permission denied"),
+            "DATABASEPROPERTYEX": [
+                {"edition": "GeneralPurpose", "service_objective": "ElasticPool", "elastic_pool_name": "pool-a"}
+            ],
+        }
+    )
+
+    result = await ResourceGovernanceService(executor).get_resource_limits("appdb")
+
+    assert result["result_status"] == "unavailable"
+    assert "##MS_ServerStateReader##" in result["result_status_reason"]
+    assert "elastic pool" in result["result_status_reason"]
+    assert result["service_objective"]["service_objective"] == "ElasticPool"
+    assert result["governance_limits"] == {}
+    assert result["available"] is False
+
+
+@pytest.mark.asyncio
+async def test_unreadable_governance_keeps_a_performance_case_from_turning_healthy():
+    # get_resource_limits used to raise here, which the case recorded as a gap. The
+    # unavailable payload must stay a gap: missing limits are not an all-clear.
+    from tests.unit.test_performance_workflows import _service
+
+    limits = ResourceGovernanceService(
+        RecordingExecutor(
+            {
+                "dm_user_db_resource_governance": PermissionError("permission denied"),
+                "DATABASEPROPERTYEX": [
+                    {"edition": "GeneralPurpose", "service_objective": "ElasticPool", "elastic_pool_name": "pool-a"}
+                ],
+            }
+        )
+    )
+    service, _, _, _ = _service()
+    case = service.start_case("appdb", "SELECT id FROM dbo.Items")
+
+    result = await service.collect_case_evidence(
+        case.case_id,
+        "appdb",
+        "SELECT id FROM dbo.Items",
+        {"resource_limits": lambda: limits.get_resource_limits("appdb")},
+        window_minutes=15,
+    )
+
+    section = result["sections"]["resource_limits"]
+    assert section["available"] is False
+    assert section["complete"] is False
+    assert result["outcome"] != "healthy"
+
+
+@pytest.mark.asyncio
+async def test_service_objective_is_read_without_owner_rights():
+    # sys.database_service_objectives shows no row to a non-owner; DATABASEPROPERTYEX does.
+    executor = RecordingExecutor({"dm_user_db_resource_governance": [governance_row()]})
+
+    await ResourceGovernanceService(executor).get_resource_limits("appdb")
+
+    assert any("DATABASEPROPERTYEX" in query for _, query, _ in executor.calls)
+
+
+@pytest.mark.asyncio
+async def test_memory_is_informational_not_a_warning():
+    rows = [
+        {"end_time": f"2026-04-01T10:{i:02d}:00", "avg_cpu_percent": 12.0, "avg_memory_usage_percent": 99.0,
+         "avg_instance_memory_percent": 97.0, "max_worker_percent": 2.0}
+        for i in range(40)
+    ]
+    service = ResourceGovernanceService(FakeExecutor([rows]))
+
+    result = await service.get_resource_stats_history("testdb", window_minutes=60)
+
+    assert result["warnings"] == []
+    assert result["summary"]["avg_memory_usage_percent"]["max"] == 99.0  # the data stays
+    informational = {item["type"]: item for item in result["informational"]}
+    assert set(informational) == {"memory_avg_memory_usage_percent", "memory_avg_instance_memory_percent"}
+    assert "expected" in informational["memory_avg_memory_usage_percent"]["message"]
+
+
+def test_summarize_resource_metric_reports_p95_and_time_above():
+    values = [10.0] * 200 + [85.0] * 20 + [99.0] * 20
+
+    summary = summarize_resource_metric(values, sample_seconds=15)
+
+    assert summary["p95"] == 99.0
+    assert summary["max"] == 99.0
+    assert summary["samples_above_80_pct"] == 40
+    assert summary["minutes_above_80"] == 10.0
+    assert summary["minutes_above_95"] == 5.0
+    assert summarize_resource_metric([50.0], sample_seconds=None)["minutes_above_80"] is None
+
+
+@pytest.mark.asyncio
+async def test_recent_history_reads_every_documented_pressure_column():
+    executor = RecordingExecutor({"dm_db_resource_stats": [{"avg_cpu_percent": 5.0, "max_session_percent": 90.0}]})
+
+    result = await ResourceGovernanceService(executor).get_resource_stats_history("appdb", 60)
+
+    query = executor.calls[0][1]
+    for column in ("xtp_storage_percent", "avg_instance_memory_percent", "max_session_percent"):
+        assert column in query
+    assert result["summary"]["max_session_percent"]["p95"] == 90.0
+    assert result["summary"]["avg_cpu_percent"]["minutes_above_80"] == 0.0
 
 
 @pytest.mark.asyncio

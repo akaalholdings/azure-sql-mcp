@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any
 from typing import Awaitable
 from typing import Callable
 
+from .azure_tier import dmv_permission_hint
 from .connection import AzureSqlExecutor
 from .incident_log import note_exception
 from .observability import sanitize_error_message
 from .query_store import QueryStoreService
+from .resource_governance import GOVERNANCE_DMV
+from .resource_governance import GOVERNANCE_SQL
+from .resource_governance import MEMORY_METRICS
+from .resource_governance import MEMORY_NOTE
+from .resource_governance import RECENT_SAMPLE_SECONDS
+from .resource_governance import ResourceGovernanceService
+from .resource_governance import log_rate_caps
 
 HealthCheck = Callable[[str], Awaitable[dict[str, Any]]]
 
@@ -34,15 +43,79 @@ STATUS_SEVERITY = {
     "critical": 2,
 }
 
+# Resource pressure is judged on the full hour of 15-second samples: a single
+# sample never escalates on its own.
+RESOURCE_WINDOW_MINUTES = 60
+PRESSURE_WARNING_P95 = 80.0
+PRESSURE_CRITICAL_P95 = 95.0
+PRESSURE_CRITICAL_MINUTES_ABOVE_95 = 5.0
+# Below 20 samples (5 minutes) the nearest-rank p95 is the single maximum, so p95
+# is not judged: the view holds only minutes after a failover, scale operation or
+# serverless resume.
+PRESSURE_MIN_P95_SAMPLES = 20
+PRESSURE_METRICS = (
+    ("avg_cpu_percent", "CPU"),
+    ("avg_data_io_percent", "Data IO"),
+    ("avg_log_write_percent", "Log write"),
+    ("max_worker_percent", "Workers"),
+    ("max_session_percent", "Sessions"),
+    ("xtp_storage_percent", "In-Memory OLTP storage"),
+)
+PEAK_METRICS = (
+    "avg_cpu_percent",
+    "avg_data_io_percent",
+    "avg_log_write_percent",
+    "avg_memory_usage_percent",
+    "xtp_storage_percent",
+    "max_worker_percent",
+    "max_session_percent",
+)
+
+SESSION_LIMITS_SQL = """
+SELECT
+    max_sessions,
+    primary_group_max_workers
+FROM sys.dm_user_db_resource_governance
+WHERE database_id = DB_ID()
+"""
+
+GEO_LINK_SQL = """
+SELECT
+    link_guid,
+    partner_server,
+    partner_database,
+    role_desc,
+    replication_state_desc,
+    replication_lag_sec,
+    last_replication,
+    last_commit,
+    secondary_allow_connections_desc
+FROM sys.dm_geo_replication_link_status
+"""
+
+REPLICA_STATES_SQL = """
+SELECT
+    synchronization_state_desc,
+    synchronization_health_desc,
+    is_suspended,
+    secondary_lag_seconds,
+    redo_queue_size
+FROM sys.dm_database_replica_states
+WHERE database_id = DB_ID()
+  AND is_local = 0
+"""
+
 
 class HealthService:
     def __init__(
         self,
         executor: AzureSqlExecutor,
         query_store_service: QueryStoreService,
+        resource_governance: ResourceGovernanceService | None = None,
     ):
         self.executor = executor
         self.query_store_service = query_store_service
+        self.resource_governance = resource_governance or ResourceGovernanceService(executor)
 
     async def analyze(self, database_name: str, health_type: str) -> dict[str, Any]:
         requested = self._parse_requested_checks(health_type)
@@ -367,18 +440,7 @@ class HealthService:
             SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS active_requests,
             SUM(CASE WHEN status = 'sleeping' AND open_transaction_count > 0 THEN 1 ELSE 0 END)
                 AS idle_with_open_transaction,
-            SUM(CASE WHEN status = 'sleeping' THEN 1 ELSE 0 END) AS idle_sessions,
-            COALESCE(
-                TRY_CAST(
-                    (SELECT TOP (1) drs.user_sessions_limit
-                     FROM sys.dm_user_db_resource_governance AS drs) AS INT
-                ),
-                TRY_CAST(
-                    (SELECT TOP (1) c.value_in_use
-                     FROM sys.configurations AS c
-                     WHERE c.name = 'user connections') AS INT
-                )
-            ) AS session_limit
+            SUM(CASE WHEN status = 'sleeping' THEN 1 ELSE 0 END) AS idle_sessions
         FROM sys.dm_exec_sessions
         WHERE is_user_process = 1
         """
@@ -391,9 +453,39 @@ class HealthService:
             row.get("idle_with_open_transaction")
         ) or 0
         idle_sessions = self._to_int(row.get("idle_sessions")) or 0
-        session_limit = self._to_int(row.get("session_limit"))
-        if session_limit is not None and session_limit <= 0:
-            session_limit = None
+
+        # The documented limits, read on their own so a tier-gated permission
+        # failure loses only the limit, not the check.
+        limit_rows, limit_error = await self._fetch_optional_rows(database_name, SESSION_LIMITS_SQL)
+        limits = limit_rows[0] if limit_rows else {}
+        session_limit = self._positive_int(limits.get("max_sessions"))
+        worker_limit = self._positive_int(limits.get("primary_group_max_workers"))
+        limit_reason = None
+        if limit_error:
+            limit_reason = (
+                f"{GOVERNANCE_DMV} could not be read: {limit_error}. {dmv_permission_hint(GOVERNANCE_DMV)}"
+            )
+
+        # max_session_percent and max_worker_percent are the documented pressure
+        # signal, as a percentage of this database's limits.
+        pressure: dict[str, Any] = {}
+        pressure_error = None
+        try:
+            history = await self.resource_governance.get_resource_stats_history(
+                database_name, RESOURCE_WINDOW_MINUTES
+            )
+            summary = history.get("summary") or {}
+            pressure = {
+                metric: summary[metric]
+                for metric in ("max_session_percent", "max_worker_percent")
+                if metric in summary
+            }
+        except Exception as exc:
+            note_exception(exc, "health.optional_rows")
+            pressure_error = (
+                "sys.dm_db_resource_stats could not be read: "
+                f"{sanitize_error_message(str(exc))}. {dmv_permission_hint('sys.dm_db_resource_stats')}"
+            )
 
         session_limit_utilization_percent = None
         if session_limit:
@@ -425,6 +517,16 @@ class HealthService:
                     ),
                 )
 
+        units = {
+            "max_session_percent": ("Sessions", f" of {session_limit} sessions" if session_limit else ""),
+            "max_worker_percent": ("Workers", f" of {worker_limit} workers" if worker_limit else ""),
+        }
+        for metric, stats in pressure.items():
+            label, of_limit = units[metric]
+            assessed = self._pressure(label, stats, of_limit)
+            if assessed:
+                status = self._escalate(status, assessed[0], findings, assessed[1])
+
         if idle_with_open_transaction > 20:
             status = self._escalate(
                 status,
@@ -436,6 +538,23 @@ class HealthService:
                 ),
             )
 
+        if session_limit is None and not pressure:
+            reasons = "; ".join(reason for reason in (limit_reason, pressure_error) if reason)
+            status = self._escalate(
+                status,
+                "warning",
+                findings,
+                "Session and worker limits are not available; this is not a pass."
+                + (f" {reasons}" if reasons else ""),
+            )
+        elif pressure_error:
+            status = self._escalate(
+                status,
+                "warning",
+                findings,
+                f"Session and worker pressure are not available; this is not a pass. {pressure_error}",
+            )
+
         return self._build_check(
             status=status,
             details={
@@ -445,11 +564,20 @@ class HealthService:
                 "idle_sessions": idle_sessions,
                 "session_limit": session_limit,
                 "session_limit_utilization_percent": session_limit_utilization_percent,
+                "worker_limit": worker_limit,
+                "session_limit_unavailable_reason": limit_reason,
+                "pressure_unavailable_reason": pressure_error,
+                "max_session_percent_peak": (pressure.get("max_session_percent") or {}).get("max"),
+                "max_worker_percent_peak": (pressure.get("max_worker_percent") or {}).get("max"),
+                "pressure_summary": pressure,
             },
             thresholds={
                 "session_limit_warning_percent": 80.0,
                 "session_limit_critical_percent": 95.0,
                 "idle_with_open_transaction_warning": 20,
+                "pressure_warning_p95": PRESSURE_WARNING_P95,
+                "pressure_critical_p95": PRESSURE_CRITICAL_P95,
+                "pressure_critical_minutes_above_95": PRESSURE_CRITICAL_MINUTES_ABOVE_95,
             },
             findings=findings,
         )
@@ -542,75 +670,104 @@ class HealthService:
         )
 
     async def _replication_health(self, database_name: str) -> dict[str, Any]:
-        query = """
-        SELECT
-            ag.name AS replication_group,
-            drs.partner_server,
-            drs.partner_database,
-            drs.role_desc,
-            drs.replication_state_desc,
-            drs.synchronization_health_desc,
-            drs.replication_lag_sec,
-            drs.last_replication
-        FROM sys.dm_geo_replication_link_status AS drs
-        LEFT JOIN sys.availability_groups AS ag
-            ON drs.group_id = ag.group_id
-        """
-        rows, error = await self._fetch_optional_rows(database_name, query)
+        rows, error = await self._fetch_optional_rows(database_name, GEO_LINK_SQL)
+        replicas, replica_error = await self._fetch_optional_rows(database_name, REPLICA_STATES_SQL)
         configured = bool(rows)
 
         status = "pass"
         findings: list[str] = []
-        critical_links = []
-        warning_links = []
+        informational: list[str] = []
+        seeding = False
         for row in rows:
-            lag_seconds = self._to_int(row.get("replication_lag_sec")) or 0
-            replication_state = str(row.get("replication_state_desc") or "")
-            sync_health = str(row.get("synchronization_health_desc") or "")
+            partner = row.get("partner_database") or "the secondary"
+            state = str(row.get("replication_state_desc") or "").upper()
+            lag_seconds = self._to_int(row.get("replication_lag_sec"))
+            if state in {"SEEDING", "PENDING"}:
+                seeding = True
+                informational.append(
+                    f"Geo-replication link to {partner} is {state}: the secondary is not synchronized yet."
+                )
+                continue
+            if state == "SUSPENDED":
+                status = self._escalate(
+                    status,
+                    "critical",
+                    findings,
+                    f"Geo-replication link to {partner} is SUSPENDED: data movement has stopped, "
+                    "so the secondary falls further behind.",
+                )
+            elif lag_seconds is not None and lag_seconds > 120:
+                status = self._escalate(
+                    status,
+                    "critical",
+                    findings,
+                    f"Geo-replication link to {partner} is {lag_seconds}s behind (critical above 120s).",
+                )
+            elif lag_seconds is not None and lag_seconds > 30:
+                status = self._escalate(
+                    status,
+                    "warning",
+                    findings,
+                    f"Geo-replication link to {partner} is {lag_seconds}s behind (warning above 30s).",
+                )
+            unacknowledged = self._seconds_between(row.get("last_replication"), row.get("last_commit"))
             if (
-                replication_state != "SEEDING"
-                and sync_health == "NOT_HEALTHY"
-            ) or lag_seconds > 120:
-                critical_links.append(row)
-            elif lag_seconds > 30:
-                warning_links.append(row)
+                str(row.get("role_desc") or "").upper() == "PRIMARY"
+                and unacknowledged is not None
+                and unacknowledged > 300
+            ):
+                status = self._escalate(
+                    status,
+                    "critical",
+                    findings,
+                    f"Geo-replication link to {partner}: the last {unacknowledged:.0f}s of commits on the "
+                    "primary are not acknowledged by the secondary (critical above 300s).",
+                )
 
-        if critical_links:
-            status = self._escalate(
-                status,
-                "critical",
-                findings,
-                (
-                    f"{len(critical_links)} geo-replication links are unhealthy or over 120s behind "
-                    f"({self._describe_items(critical_links, 'partner_database')})."
-                ),
-            )
-        elif warning_links:
+        if not seeding:
+            for replica in replicas:
+                if str(replica.get("synchronization_health_desc") or "").upper() == "NOT_HEALTHY":
+                    status = self._escalate(
+                        status,
+                        "critical",
+                        findings,
+                        "A secondary replica of this database is NOT_HEALTHY "
+                        f"(synchronization {replica.get('synchronization_state_desc') or 'unknown'}, "
+                        f"{replica.get('secondary_lag_seconds')}s behind).",
+                    )
+
+        if error:
             status = self._escalate(
                 status,
                 "warning",
                 findings,
-                (
-                    f"{len(warning_links)} geo-replication links are over 30s behind "
-                    f"({self._describe_items(warning_links, 'partner_database')})."
-                ),
+                f"Geo-replication state could not be read; this is not a pass: {error}. "
+                + dmv_permission_hint("sys.dm_geo_replication_link_status"),
             )
 
-        if error:
-            findings.append(f"Geo-replication DMV is unavailable: {error}")
-
+        details: dict[str, Any] = {
+            "available": error is None,
+            "configured": configured,
+            "replication_link_count": len(rows),
+            "links": rows,
+            "replicas": replicas,
+            "replicas_available": replica_error is None,
+            "informational": informational,
+        }
+        if replica_error:
+            details["replicas_unavailable_reason"] = (
+                f"sys.dm_database_replica_states could not be read: {replica_error}. "
+                + dmv_permission_hint("sys.dm_database_replica_states")
+            )
         return self._build_check(
             status=status,
-            details={
-                "available": error is None,
-                "configured": configured,
-                "replication_link_count": len(rows),
-                "links": rows,
-            },
+            details=details,
             thresholds={
                 "replication_lag_warning_seconds": 30,
                 "replication_lag_critical_seconds": 120,
                 "synchronization_health_critical": "NOT_HEALTHY",
+                "replication_state_critical": "SUSPENDED",
+                "unacknowledged_commit_critical_seconds": 300,
             },
             findings=findings,
         )
@@ -862,36 +1019,12 @@ class HealthService:
         )
 
     async def _resource_health(self, database_name: str) -> dict[str, Any]:
-        query = """
-        SELECT TOP (12)
-            end_time,
-            avg_cpu_percent,
-            avg_data_io_percent,
-            avg_log_write_percent,
-            avg_memory_usage_percent,
-            xtp_storage_percent,
-            max_worker_percent,
-            max_session_percent,
-            dtu_limit
-        FROM sys.dm_db_resource_stats
-        ORDER BY end_time DESC
-        """
-        rows = await self.executor.fetch_all(database_name, query)
-
-        governance = await self._fetch_governance_limits(database_name)
-
-        metric_names = (
-            "avg_cpu_percent",
-            "avg_data_io_percent",
-            "avg_log_write_percent",
-            "avg_memory_usage_percent",
-            "xtp_storage_percent",
-            "max_worker_percent",
-            "max_session_percent",
+        history = await self.resource_governance.get_resource_stats_history(
+            database_name, RESOURCE_WINDOW_MINUTES
         )
-        peak_usage: dict[str, float | None] = {}
-        for metric_name in metric_names:
-            peak_usage[metric_name] = self._peak(rows, metric_name)
+        rows: list[dict[str, Any]] = history.get("history") or []
+        summary: dict[str, Any] = history.get("summary") or {}
+        governance = await self._fetch_governance_limits(database_name)
 
         status = "pass"
         findings: list[str] = []
@@ -903,61 +1036,96 @@ class HealthService:
                 "No rows were returned from sys.dm_db_resource_stats.",
             )
 
-        for metric_name, peak_value in peak_usage.items():
-            if peak_value is None:
+        for metric_name, label in PRESSURE_METRICS:
+            stats = summary.get(metric_name)
+            if not stats:
                 continue
-            if peak_value >= 95.0:
-                status = self._escalate(
-                    status,
-                    "critical",
-                    findings,
-                    f"{self._label(metric_name)} peaked at {peak_value}%.",
-                )
-            elif peak_value >= 80.0:
-                status = self._escalate(
-                    status,
-                    "warning",
-                    findings,
-                    f"{self._label(metric_name)} peaked at {peak_value}%.",
-                )
+            assessed = self._pressure(label, stats, self._limit_units(metric_name, governance))
+            if assessed:
+                status = self._escalate(status, assessed[0], findings, assessed[1])
 
-        governance_findings = self._compare_against_governance(peak_usage, governance)
-        for severity, message in governance_findings:
-            status = self._escalate(status, severity, findings, message)
+        # Memory near 100% is expected after ramp-up; it never sets the status.
+        informational = [
+            {
+                "metric": metric_name,
+                "avg": summary[metric_name]["avg"],
+                "p95": summary[metric_name]["p95"],
+                "max": summary[metric_name]["max"],
+                "note": MEMORY_NOTE,
+            }
+            for metric_name in MEMORY_METRICS
+            if metric_name in summary
+        ]
+        if 0 < len(rows) < PRESSURE_MIN_P95_SAMPLES:
+            informational.append(
+                {
+                    "metric": "sample_window",
+                    "sample_count": len(rows),
+                    "note": (
+                        f"Only {len(rows)} samples ({self._window_minutes(len(rows))} min) are retained, for "
+                        "example after a failover, scale operation or serverless resume. p95 is judged from "
+                        f"{PRESSURE_MIN_P95_SAMPLES} samples; peaks are in peak_usage."
+                    ),
+                }
+            )
 
         return self._build_check(
             status=status,
             details={
-                "recent_intervals": rows,
-                "peak_usage": peak_usage,
+                "recent_intervals": rows[:12],
+                "peak_usage": {
+                    metric_name: (summary.get(metric_name) or {}).get("max") for metric_name in PEAK_METRICS
+                },
+                "summary": {
+                    metric_name: summary[metric_name]
+                    for metric_name, _ in PRESSURE_METRICS
+                    if metric_name in summary
+                },
+                "informational": informational,
                 "governance_limits": governance,
+                "window_minutes": RESOURCE_WINDOW_MINUTES,
+                "sample_count": len(rows),
             },
             thresholds={
-                "usage_warning_percent": 80.0,
-                "usage_critical_percent": 95.0,
+                "usage_warning_percent": PRESSURE_WARNING_P95,
+                "usage_critical_percent": PRESSURE_CRITICAL_P95,
+                "critical_minutes_above_95": PRESSURE_CRITICAL_MINUTES_ABOVE_95,
+                "p95_min_samples": PRESSURE_MIN_P95_SAMPLES,
+                "statistic": "p95 of 15-second samples over the last hour",
             },
             findings=findings,
         )
 
+    # Documented columns of sys.dm_user_db_resource_governance (Microsoft Learn);
+    # max_db_memory and checkpoint_rate_* are internal use only and never read.
     _GOVERNANCE_FIELDS = (
-        "primary_max_cpu_percent",
-        "primary_max_log_rate_per_db_in_bytes_per_second",
+        "slo_name",
+        "cpu_limit",
+        "dtu_limit",
+        "primary_group_max_cpu",
+        "primary_max_log_rate",
+        "pool_max_log_rate",
+        "instance_max_log_rate",
         "primary_group_max_io",
         "pool_max_io",
-        "max_db_memory",
-        "checkpoint_rate_mbps",
+        "primary_group_max_workers",
+        "primary_pool_max_workers",
+        "max_sessions",
+        "max_dop",
+        "max_transaction_size",
+        "user_data_directory_space_quota_mb",
+        "user_data_directory_space_usage_mb",
+        "replica_role",
     )
 
     async def _fetch_governance_limits(
         self, database_name: str,
     ) -> dict[str, Any]:
-        # Column availability in sys.dm_user_db_resource_governance varies by
-        # service tier (e.g. primary_max_cpu_percent is absent on serverless
-        # General Purpose): SELECT * and project, so a missing column degrades
-        # to an absent field instead of failing the whole probe.
-        query = "SELECT TOP 1 * FROM sys.dm_user_db_resource_governance"
+        # SELECT * and project: column availability varies by tier, so a
+        # missing column degrades to an absent field instead of failing the
+        # probe. In an elastic pool the view has a row per pool database.
         try:
-            rows = await self.executor.fetch_all(database_name, query)
+            rows = await self.executor.fetch_all(database_name, GOVERNANCE_SQL)
         except Exception as exc:
             # WARNING is below the ERROR-level swallow handler: record it here.
             note_exception(exc, "health.governance_limits")
@@ -975,53 +1143,52 @@ class HealthService:
             for field in self._GOVERNANCE_FIELDS
             if row.get(field) is not None
         }
-        workers = row.get("primary_max_worker_count_for_single_query")
-        if workers is not None:
-            limits["max_workers_per_query"] = workers
+        limits.update({key: value for key, value in log_rate_caps(row).items() if value is not None})
         return limits
 
-    def _compare_against_governance(
-        self,
-        peak_usage: dict[str, float | None],
-        governance: dict[str, Any],
-    ) -> list[tuple[str, str]]:
-        results: list[tuple[str, str]] = []
-        if not governance:
-            return results
+    def _limit_units(self, metric_name: str, governance: dict[str, Any]) -> str:
+        """The absolute limit a percentage refers to, as ' of <n> <unit>' (no new arithmetic)."""
 
-        max_cpu = self._to_float(governance.get("primary_max_cpu_percent"))
-        peak_cpu = peak_usage.get("avg_cpu_percent")
-        if max_cpu and peak_cpu:
-            pct_of_limit = round(peak_cpu / max_cpu * 100, 1)
-            if pct_of_limit >= 95:
-                results.append((
-                    "critical",
-                    f"CPU at {pct_of_limit}% of governance limit ({peak_cpu}% / {max_cpu}%).",
-                ))
-            elif pct_of_limit >= 80:
-                results.append((
-                    "warning",
-                    f"CPU at {pct_of_limit}% of governance limit ({peak_cpu}% / {max_cpu}%).",
-                ))
+        if metric_name == "avg_cpu_percent":
+            vcores = self._to_float(governance.get("cpu_limit"))
+            if vcores:
+                return f" of {vcores:g} vCores"
+            if governance.get("dtu_limit"):
+                return f" of {governance['dtu_limit']} DTUs"
+            return ""
+        source = {
+            "avg_log_write_percent": ("max_log_rate_mb_per_sec", "MB/s"),
+            "avg_data_io_percent": ("primary_group_max_io", "IOPS"),
+            "max_worker_percent": ("primary_group_max_workers", "workers"),
+            "max_session_percent": ("max_sessions", "sessions"),
+        }.get(metric_name)
+        if source and governance.get(source[0]):
+            return f" of {governance[source[0]]} {source[1]}"
+        return ""
 
-        max_io = self._to_int(governance.get("primary_group_max_io"))
-        peak_io = peak_usage.get("avg_data_io_percent")
-        if max_io and peak_io and peak_io >= 80:
-            results.append((
-                "warning",
-                f"Data I/O peaked at {peak_io}% with governance IOPS limit of {max_io}.",
-            ))
+    def _pressure(self, label: str, stats: dict[str, Any], of_limit: str) -> tuple[str, str] | None:
+        """Warning at p95 >= 80%; critical at p95 >= 95% or 5 minutes above 95%.
 
-        max_memory_kb = self._to_int(governance.get("max_db_memory"))
-        peak_memory = peak_usage.get("avg_memory_usage_percent")
-        if max_memory_kb and peak_memory and peak_memory >= 80:
-            max_memory_mb = round(max_memory_kb / 1024, 0)
-            results.append((
-                "warning",
-                f"Memory peaked at {peak_memory}% with governance limit of {max_memory_mb} MB.",
-            ))
+        p95 counts only from PRESSURE_MIN_P95_SAMPLES samples on.
+        """
 
-        return results
+        p95 = self._to_float(stats.get("p95")) or 0.0
+        samples = self._to_int(stats.get("total_samples")) or 0
+        judged_p95 = p95 if samples >= PRESSURE_MIN_P95_SAMPLES else 0.0
+        minutes_above_95 = self._to_float(stats.get("minutes_above_95")) or 0.0
+        if judged_p95 >= PRESSURE_CRITICAL_P95 or minutes_above_95 >= PRESSURE_CRITICAL_MINUTES_ABOVE_95:
+            severity = "critical"
+        elif judged_p95 >= PRESSURE_WARNING_P95:
+            severity = "warning"
+        else:
+            return None
+        return severity, (
+            f"{label} p95 was {p95}% of the limit over the last {self._window_minutes(samples)} min; peak "
+            f"{self._to_float(stats.get('max'))}%{of_limit}, {minutes_above_95} min above 95%."
+        )
+
+    def _window_minutes(self, samples: int) -> float:
+        return round(samples * RECENT_SAMPLE_SECONDS / 60.0, 1)
 
     async def _statistics_health(self, database_name: str) -> dict[str, Any]:
         query = """
@@ -1205,15 +1372,6 @@ class HealthService:
             return next_status
         return current_status
 
-    def _peak(self, rows: list[dict[str, Any]], field_name: str) -> float | None:
-        peak_value = None
-        for row in rows:
-            current_value = self._to_float(row.get(field_name))
-            if current_value is None:
-                continue
-            peak_value = current_value if peak_value is None else max(peak_value, current_value)
-        return self._round(peak_value)
-
     def _describe_items(
         self,
         rows: list[dict[str, Any]],
@@ -1231,9 +1389,6 @@ class HealthService:
         if len(names) > limit:
             preview += ", ..."
         return preview
-
-    def _label(self, field_name: str) -> str:
-        return field_name.replace("_", " ")
 
     def _round(self, value: float | None, digits: int = 2) -> float | None:
         if value is None:
@@ -1253,5 +1408,17 @@ class HealthService:
             return None
         try:
             return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _positive_int(self, value: Any) -> int | None:
+        number = self._to_int(value)
+        return number if number and number > 0 else None
+
+    def _seconds_between(self, start: Any, end: Any) -> float | None:
+        try:
+            first = start if isinstance(start, datetime) else datetime.fromisoformat(str(start))
+            last = end if isinstance(end, datetime) else datetime.fromisoformat(str(end))
+            return (last - first).total_seconds()
         except (TypeError, ValueError):
             return None

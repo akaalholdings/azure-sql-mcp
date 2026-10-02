@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from dataclasses import field
 from typing import Any
 
+from .azure_tier import dmv_permission_hint
 from .connection import AzureSqlExecutor
 from .incident_log import note_exception
 from .observability import sanitize_error_message
@@ -149,7 +150,8 @@ class DeadlockHistoryReader:
                     source,
                     ResultStatus.UNAVAILABLE,
                     "Database-scoped XE sessions could not be read: "
-                    f"{sanitize_error_message(str(exc))}. VIEW DATABASE STATE is required.",
+                    f"{sanitize_error_message(str(exc))}. "
+                    + dmv_permission_hint("sys.dm_xe_database_sessions"),
                 ),
                 [],
             )

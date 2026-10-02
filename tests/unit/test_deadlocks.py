@@ -171,6 +171,9 @@ async def test_unreadable_sources_are_never_reported_as_empty() -> None:
     assert result["result_status"] != "empty"
     database_source = next(s for s in result["sources"] if s["source"] == "database_xe_ring_buffer")
     assert database_source["status"] == "unavailable"
+    # The XE session DMVs are not tier-gated: the database grant is the whole fix.
+    assert database_source["detail"].endswith("VIEW DATABASE STATE is required.")
+    assert "ServerStateReader" not in database_source["detail"]
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from dataclasses import field
 from typing import Any
 
+from .azure_tier import dmv_permission_hint
 from .connection import AzureSqlExecutor
 from .observability import sanitize_error_message
 from .plan_tree import PlanParseError
@@ -187,7 +188,11 @@ class PlanSourceService:
         try:
             rows = await self.executor.fetch_all(database_name, query, params=[int(plan_id or query_id or 0)])
         except Exception as exc:
-            return PlanSource(None, source, _unreadable("sys.dm_exec_query_plan_stats", exc))
+            return PlanSource(
+                None,
+                source,
+                _unreadable("sys.dm_exec_query_stats with sys.dm_exec_query_plan_stats", exc, "sys.dm_exec_query_stats"),
+            )
         if not rows or not rows[0].get("query_plan"):
             return PlanSource(
                 None,
@@ -313,10 +318,10 @@ def _statement_estimated_rows(plan_xml: str) -> float | None:
     return None
 
 
-def _unreadable(what: str, exc: Exception) -> dict[str, Any]:
+def _unreadable(what: str, exc: Exception, dmv: str | None = None) -> dict[str, Any]:
     return status_payload(
         ResultStatus.UNAVAILABLE,
-        f"{what} could not be read: {sanitize_error_message(str(exc))}. VIEW DATABASE STATE is required.",
+        f"{what} could not be read: {sanitize_error_message(str(exc))}. {dmv_permission_hint(dmv or what)}",
     )
 
 

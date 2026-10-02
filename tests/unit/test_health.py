@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from datetime import UTC
+from datetime import datetime
 from typing import Any
 
 import pytest
 
 from azure_sql_mcp.health import HealthService
+from tests.azure_dmv_contract import StrictDmvExecutor
+from tests.azure_dmv_contract import documented_row
 
 
 class FakeExecutor:
@@ -350,10 +354,10 @@ async def test_threshold_evaluation_for_connection_check():
                         "active_requests": 2,
                         "idle_with_open_transaction": 0,
                         "idle_sessions": 79,
-                        "session_limit": 100,
                     }
                 ],
             ),
+            ("max_sessions", [{"max_sessions": 100, "primary_group_max_workers": 50}]),
         ]
     )
 
@@ -362,7 +366,7 @@ async def test_threshold_evaluation_for_connection_check():
     connection_check = connection_payload["checks"]["connection"]
 
     assert connection_check["status"] == "warning"
-    assert any("session" in finding.lower() for finding in connection_check["findings"])
+    assert connection_check["findings"] == ["Session usage is 81.0% of the limit (81/100)."]
 
 
 @pytest.mark.parametrize("retired_check", ["index", "buffer"])
@@ -414,74 +418,369 @@ async def test_statistics_health_warns_on_stale_and_high_modification():
     assert stats_check["details"]["stale_count"] == 2
 
 
+GOVERNANCE_DMV = "sys.dm_user_db_resource_governance"
+
+
+def governance_row(**overrides: Any) -> dict[str, Any]:
+    values: dict[str, Any] = {
+        "database_id": 5,
+        "slo_name": "SQLDB_OP_GP_GEN5_2",
+        "cpu_limit": 2,
+        "primary_group_max_cpu": 50.0,
+        "primary_max_log_rate": 50331648,
+        "pool_max_log_rate": 104857600,
+        "instance_max_log_rate": 125829120,
+        "primary_group_max_io": 640,
+        "primary_group_max_workers": 200,
+        "max_sessions": 30000,
+        "max_db_memory": 9741328,
+        "checkpoint_rate_mbps": 200,
+        "replica_role": 0,
+    }
+    values.update(overrides)
+    return documented_row(GOVERNANCE_DMV, **values)
+
+
+def resource_rows(count: int = 240, **metrics: float) -> list[dict[str, Any]]:
+    """``count`` 15-second samples, newest first; ``metrics`` override the idle defaults."""
+
+    rows = []
+    for index in range(count):
+        row = {
+            "end_time": f"2026-10-02T10:{59 - index // 4:02d}:{45 - 15 * (index % 4):02d}",
+            "avg_cpu_percent": 12.0,
+            "avg_data_io_percent": 3.0,
+            "avg_log_write_percent": 2.0,
+            "avg_memory_usage_percent": 40.0,
+            "avg_instance_memory_percent": 45.0,
+            "max_worker_percent": 1.0,
+            "max_session_percent": 1.0,
+            "xtp_storage_percent": 0.0,
+            "avg_instance_cpu_percent": 15.0,
+        }
+        row.update(metrics)
+        rows.append(row)
+    return rows
+
+
+def issued(executor: FakeExecutor) -> str:
+    return "\n".join(query for _, query, _ in executor.calls)
+
+
 @pytest.mark.asyncio
-async def test_resource_health_governance_comparison_warns():
+async def test_resource_check_does_not_double_normalize_cpu():
+    # avg_cpu_percent is already a percentage of the CPU limit; dividing by
+    # primary_group_max_cpu again reported 120% of a limit that was not reached.
     service, _, _ = build_service(
         responses=[
-            (
-                "sys.dm_db_resource_stats",
-                [
-                    {
-                        "end_time": "2026-03-30T12:00:00Z",
-                        "avg_cpu_percent": 85.0,
-                        "avg_data_io_percent": 90.0,
-                        "avg_log_write_percent": 10.0,
-                        "avg_memory_usage_percent": 82.0,
-                        "xtp_storage_percent": 0.0,
-                        "max_worker_percent": 4.0,
-                        "max_session_percent": 10.0,
-                        "dtu_limit": 100,
-                    }
-                ],
-            ),
-            (
-                "sys.dm_user_db_resource_governance",
-                [
-                    {
-                        "primary_max_cpu_percent": 100,
-                        "primary_max_log_rate_per_db_in_bytes_per_second": 50000000,
-                        "primary_group_max_io": 5000,
-                        "pool_max_io": 10000,
-                        "max_db_memory": 2097152,
-                        "primary_max_worker_count_for_single_query": 64,
-                        "checkpoint_rate_mbps": 200,
-                    }
-                ],
-            ),
+            ("sys.dm_db_resource_stats", resource_rows(avg_cpu_percent=60.0)),
+            (GOVERNANCE_DMV, [governance_row(primary_group_max_cpu=50.0)]),
         ]
     )
 
-    payload = await service.analyze("appdb", "resource")
-    resource_check = payload["checks"]["resource"]
+    check = (await service.analyze("appdb", "resource"))["checks"]["resource"]
 
-    assert_threshold_payload(resource_check)
-    assert resource_check["details"].get("governance_limits")
-    findings_text = " ".join(resource_check["findings"])
-    assert "governance" in findings_text.lower() or "peaked" in findings_text.lower()
+    assert_threshold_payload(check)
+    assert check["status"] == "pass"
+    assert not any("governance limit" in finding for finding in check["findings"])
 
 
 @pytest.mark.asyncio
-async def test_governance_limits_tolerate_tier_specific_columns():
-    """primary_max_cpu_percent is absent on serverless GP tiers; the probe now
-    SELECTs * and projects, so missing columns degrade to absent fields
-    instead of failing the query (found live on GP_S_Gen5_2)."""
+async def test_sustained_pressure_is_reported_in_absolute_units():
     service, _, _ = build_service(
         responses=[
-            (
-                "sys.dm_user_db_resource_governance",
-                [
-                    {
-                        # serverless-shaped row: no primary_max_cpu_percent
-                        "primary_group_max_io": 640,
-                        "max_db_memory": 9741328,
-                        "slo_name": "SQLDB_GP_S_Gen5_2",
-                        "unrelated_tier_column": 1,
-                    }
-                ],
-            ),
+            ("sys.dm_db_resource_stats", resource_rows(avg_log_write_percent=98.0, avg_cpu_percent=85.0)),
+            (GOVERNANCE_DMV, [governance_row()]),
         ]
     )
+
+    check = (await service.analyze("appdb", "resource"))["checks"]["resource"]
+
+    assert check["status"] == "critical"
+    findings = " ".join(check["findings"])
+    assert "Log write" in findings and "98.0% of 48.0 MB/s" in findings
+    assert "of 2 vCores" in findings
+    assert check["details"]["governance_limits"]["effective_log_rate_cap_mb_per_sec"] == 48.0
+
+
+@pytest.mark.asyncio
+async def test_governance_limits_project_documented_columns_for_this_database():
+    service, executor, _ = build_service(responses=[(GOVERNANCE_DMV, [governance_row()])])
 
     limits = await service._fetch_governance_limits("appdb")
 
-    assert limits == {"primary_group_max_io": 640, "max_db_memory": 9741328}
+    assert "WHERE database_id = DB_ID()" in issued(executor)
+    assert limits["primary_max_log_rate"] == 50331648
+    assert limits["max_log_rate_mb_per_sec"] == 48.0
+    assert limits["pool_max_log_rate_mb_per_sec"] == 100.0
+    assert limits["max_sessions"] == 30000
+    # Documented as internal use only.
+    assert "max_db_memory" not in limits and "checkpoint_rate_mbps" not in limits
+
+
+@pytest.mark.asyncio
+async def test_warm_cache_memory_is_not_pressure():
+    # Microsoft documents memory near 100% after ramp-up as expected on Azure SQL Database.
+    service, _, _ = build_service(
+        responses=[
+            ("sys.dm_db_resource_stats", resource_rows(avg_memory_usage_percent=99.2, avg_instance_memory_percent=98.0)),
+            (GOVERNANCE_DMV, [governance_row()]),
+        ]
+    )
+
+    check = (await service.analyze("appdb", "resource"))["checks"]["resource"]
+
+    assert check["status"] == "pass"
+    assert check["findings"] == []
+    informational = check["details"]["informational"]
+    assert {item["metric"] for item in informational} == {"avg_memory_usage_percent", "avg_instance_memory_percent"}
+    assert all("expected" in item["note"] for item in informational)
+
+
+@pytest.mark.asyncio
+async def test_resource_check_reads_the_full_hour():
+    rows = resource_rows()
+    rows[0]["avg_cpu_percent"] = 96.0
+    service, executor, _ = build_service(responses=[("sys.dm_db_resource_stats", rows)])
+
+    check = (await service.analyze("appdb", "resource"))["checks"]["resource"]
+
+    assert "TOP (12)" not in issued(executor)
+    assert "DATEADD(MINUTE, -60" in issued(executor)
+    # One 15-second spike is reported but never escalates on its own.
+    assert check["status"] == "pass"
+    assert check["details"]["peak_usage"]["avg_cpu_percent"] == 96.0
+    assert check["details"]["summary"]["avg_cpu_percent"]["p95"] == 12.0
+    assert len(check["details"]["recent_intervals"]) == 12
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [8, 19])
+async def test_short_window_spike_does_not_escalate(count: int):
+    # After a failover, scale operation or serverless resume the view holds only a
+    # few minutes; below 20 samples the nearest-rank p95 is the single maximum.
+    rows = resource_rows(count=count)
+    rows[0]["avg_cpu_percent"] = 99.0
+    service, _, _ = build_service(responses=[("sys.dm_db_resource_stats", rows)])
+
+    check = (await service.analyze("appdb", "resource"))["checks"]["resource"]
+
+    assert check["status"] == "pass"
+    assert check["findings"] == []
+    assert check["details"]["peak_usage"]["avg_cpu_percent"] == 99.0
+    notes = [item for item in check["details"]["informational"] if item["metric"] == "sample_window"]
+    assert notes and f"{count} samples" in notes[0]["note"]
+
+
+@pytest.mark.asyncio
+async def test_sustained_pressure_in_a_short_window_reports_the_real_window():
+    service, _, _ = build_service(
+        responses=[("sys.dm_db_resource_stats", resource_rows(count=40, avg_cpu_percent=97.0))]
+    )
+
+    check = (await service.analyze("appdb", "resource"))["checks"]["resource"]
+
+    assert check["status"] == "critical"
+    assert any("over the last 10.0 min" in finding for finding in check["findings"])
+    assert not any("hour" in finding for finding in check["findings"])
+
+
+@pytest.mark.asyncio
+async def test_recent_intervals_keep_the_dtu_and_cpu_limits():
+    # 2.6.0 returned dtu_limit in every recent_intervals row; 2.6.1 only adds fields.
+    sample = documented_row(
+        "sys.dm_db_resource_stats",
+        end_time="2026-10-02T10:59:45",
+        avg_cpu_percent=12.0,
+        dtu_limit=100,
+    )
+    executor = StrictDmvExecutor({"sys.dm_db_resource_stats": [sample]})
+    service = HealthService(executor, FakeQueryStoreService())  # type: ignore[arg-type]
+
+    check = (await service.analyze("appdb", "resource"))["checks"]["resource"]
+
+    row = check["details"]["recent_intervals"][0]
+    assert row["dtu_limit"] == 100
+    assert "cpu_limit" in row
+
+
+@pytest.mark.asyncio
+async def test_five_minutes_at_the_limit_is_critical_even_with_a_low_p95():
+    rows = resource_rows()
+    for row in rows[:20]:
+        row["max_worker_percent"] = 100.0
+    service, _, _ = build_service(responses=[("sys.dm_db_resource_stats", rows)])
+
+    check = (await service.analyze("appdb", "resource"))["checks"]["resource"]
+
+    assert check["status"] == "critical"
+    assert any("Workers" in finding and "5.0 min" in finding for finding in check["findings"])
+
+
+@pytest.mark.asyncio
+async def test_replication_suspended_link_is_critical():
+    link = documented_row(
+        "sys.dm_geo_replication_link_status",
+        partner_database="appdb",
+        role_desc="PRIMARY",
+        replication_state_desc="SUSPENDED",
+        replication_lag_sec=0,
+    )
+    service, _, _ = build_service(responses=[("sys.dm_geo_replication_link_status", [link])])
+
+    check = (await service.analyze("appdb", "replication"))["checks"]["replication"]
+
+    assert check["status"] == "critical"
+    assert any("SUSPENDED" in finding for finding in check["findings"])
+
+
+@pytest.mark.asyncio
+async def test_replication_unreadable_is_never_pass():
+    service, _, _ = build_service(
+        errors=[("sys.dm_geo_replication_link_status", PermissionError("VIEW DATABASE STATE permission denied"))]
+    )
+
+    check = (await service.analyze("appdb", "replication"))["checks"]["replication"]
+
+    assert check["status"] == "warning"
+    assert check["details"]["available"] is False
+    assert any("this is not a pass" in finding for finding in check["findings"])
+
+
+@pytest.mark.asyncio
+async def test_unacknowledged_commits_on_the_primary_are_critical():
+    link = documented_row(
+        "sys.dm_geo_replication_link_status",
+        partner_database="appdb",
+        role_desc="PRIMARY",
+        replication_state_desc="CATCH_UP",
+        replication_lag_sec=5,
+        last_replication=datetime(2026, 10, 2, 10, 0, tzinfo=UTC),
+        last_commit=datetime(2026, 10, 2, 10, 10, tzinfo=UTC),
+    )
+    service, _, _ = build_service(responses=[("sys.dm_geo_replication_link_status", [link])])
+
+    check = (await service.analyze("appdb", "replication"))["checks"]["replication"]
+
+    assert check["status"] == "critical"
+    assert any("600" in finding for finding in check["findings"])
+
+
+@pytest.mark.asyncio
+async def test_seeding_link_is_information_not_a_failure():
+    link = documented_row(
+        "sys.dm_geo_replication_link_status",
+        partner_database="appdb",
+        role_desc="PRIMARY",
+        replication_state_desc="SEEDING",
+        replication_lag_sec=None,
+    )
+    service, _, _ = build_service(responses=[("sys.dm_geo_replication_link_status", [link])])
+
+    check = (await service.analyze("appdb", "replication"))["checks"]["replication"]
+
+    assert check["status"] == "pass"
+    assert check["details"]["informational"]
+
+
+@pytest.mark.asyncio
+async def test_not_healthy_secondary_replica_is_critical():
+    replica = {"synchronization_health_desc": "NOT_HEALTHY", "secondary_lag_seconds": 40, "redo_queue_size": 0}
+    service, executor, _ = build_service(responses=[("sys.dm_database_replica_states", [replica])])
+
+    check = (await service.analyze("appdb", "replication"))["checks"]["replication"]
+
+    assert "is_local = 0" in issued(executor)
+    assert "availability_groups" not in issued(executor)
+    assert check["status"] == "critical"
+    assert check["details"]["replicas"] == [replica]
+
+
+@pytest.mark.asyncio
+async def test_connection_session_limit_from_max_sessions():
+    service, _, _ = build_service(
+        responses=[
+            ("AS idle_with_open_transaction", [{"total_sessions": 300, "active_requests": 4, "idle_sessions": 290}]),
+            ("max_sessions", [{"max_sessions": 30000, "primary_group_max_workers": 200}]),
+            ("sys.dm_db_resource_stats", resource_rows()),
+        ]
+    )
+
+    check = (await service.analyze("appdb", "connection"))["checks"]["connection"]
+
+    assert check["status"] == "pass"
+    assert check["details"]["session_limit"] == 30000
+    assert check["details"]["worker_limit"] == 200
+    assert check["details"]["session_limit_utilization_percent"] == 1.0
+    assert check["details"]["max_worker_percent_peak"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_connection_worker_pressure_comes_from_resource_stats():
+    service, _, _ = build_service(
+        responses=[
+            ("AS idle_with_open_transaction", [{"total_sessions": 40}]),
+            ("max_sessions", [{"max_sessions": 30000, "primary_group_max_workers": 200}]),
+            ("sys.dm_db_resource_stats", resource_rows(max_worker_percent=97.0)),
+        ]
+    )
+
+    check = (await service.analyze("appdb", "connection"))["checks"]["connection"]
+
+    assert check["status"] == "critical"
+    assert any("of 200 workers" in finding for finding in check["findings"])
+
+
+@pytest.mark.asyncio
+async def test_connection_limits_permission_failure_keeps_the_check_with_a_hint():
+    service, _, _ = build_service(
+        responses=[
+            ("AS idle_with_open_transaction", [{"total_sessions": 40}]),
+            ("sys.dm_db_resource_stats", resource_rows()),
+        ],
+        errors=[("max_sessions", PermissionError("VIEW SERVER STATE permission denied"))],
+    )
+
+    check = (await service.analyze("appdb", "connection"))["checks"]["connection"]
+
+    # Session and worker pressure still come from sys.dm_db_resource_stats.
+    assert check["status"] == "pass"
+    assert check["details"]["session_limit"] is None
+    assert "##MS_ServerStateReader##" in check["details"]["session_limit_unavailable_reason"]
+
+
+@pytest.mark.asyncio
+async def test_connection_with_no_readable_limit_source_is_not_a_pass():
+    service, _, _ = build_service(
+        responses=[("AS idle_with_open_transaction", [{"total_sessions": 40}])],
+        errors=[
+            ("max_sessions", PermissionError("denied")),
+            ("sys.dm_db_resource_stats", PermissionError("denied")),
+        ],
+    )
+
+    check = (await service.analyze("appdb", "connection"))["checks"]["connection"]
+
+    assert check["status"] == "warning"
+    assert any("this is not a pass" in finding for finding in check["findings"])
+    assert len(check["findings"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_connection_with_unreadable_pressure_is_not_a_pass():
+    # max_sessions (30000) almost never trips; worker percent is the signal for
+    # worker exhaustion, so losing it must not read as a pass.
+    service, _, _ = build_service(
+        responses=[
+            ("AS idle_with_open_transaction", [{"total_sessions": 40}]),
+            ("max_sessions", [{"max_sessions": 30000, "primary_group_max_workers": 200}]),
+        ],
+        errors=[("sys.dm_db_resource_stats", TimeoutError("Query timeout expired"))],
+    )
+
+    check = (await service.analyze("appdb", "connection"))["checks"]["connection"]
+
+    assert check["status"] == "warning"
+    assert "Query timeout expired" in check["details"]["pressure_unavailable_reason"]
+    assert any("worker" in finding and "this is not a pass" in finding for finding in check["findings"])
+    assert check["details"]["session_limit"] == 30000
