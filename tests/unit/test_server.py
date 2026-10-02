@@ -1846,28 +1846,32 @@ def _tuning_row(query_id: int, state: str, *, live: bool) -> dict[str, Any]:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("supplied_query_id", "stored_query_id", "expected_query_ids", "scope"),
+    ("supplied_query_id", "stored_query_id", "expected_rows", "scope"),
     [
-        (42, None, [42], "query_store_query_id"),
-        (None, 42, [42], "query_store_query_id"),
-        (None, None, [77], "live_active"),
+        (42, None, [(42, "Active")], "query_store_query_id"),
+        (None, 42, [(42, "Active")], "query_store_query_id"),
+        (None, None, [(42, "Active"), (77, "Active")], "live_active"),
     ],
 )
 async def test_case_regressions_receive_only_tuning_rows_that_bear_on_the_case(
     app: AzureSqlMcpApplication,
     supplied_query_id: int | None,
     stored_query_id: int | None,
-    expected_query_ids: list[int],
+    expected_rows: list[tuple[int, str]],
     scope: str,
 ) -> None:
-    """sys.dm_db_tuning_recommendations holds every query's rows, Expired ones
-    included. The case gets its own query's open (Active) rows when the
-    query_id is known, else only live Active rows; the tool itself still
-    returns COUNT(*)."""
+    """sys.dm_db_tuning_recommendations holds every query's rows, engine-owned
+    ones (Expired, Success, Reverted, Verifying) included. The case gets only
+    Active rows whose regressed plan ran in the window, narrowed to its own
+    query when the query_id is known, so knowing it never adds rows; the tool
+    itself still returns COUNT(*)."""
     dmv_rows = [
         _tuning_row(777, "Expired", live=False),
-        _tuning_row(42, "Expired", live=False),
-        _tuning_row(42, "Active", live=False),
+        _tuning_row(42, "Expired", live=True),
+        _tuning_row(42, "Success", live=True),
+        _tuning_row(42, "Reverted", live=True),
+        _tuning_row(42, "Verifying", live=True),
+        _tuning_row(42, "Active", live=True),
         _tuning_row(77, "Active", live=True),
         _tuning_row(78, "Active", live=False),
         _tuning_row(79, "Success", live=True),
@@ -1899,8 +1903,10 @@ async def test_case_regressions_receive_only_tuning_rows_that_bear_on_the_case(
     collectors = app.performance_workflows.collect_case_evidence.await_args.args[3]
     section = await collectors["regressions"]()
 
-    assert [row["query_id"] for row in section["recommendations"]] == expected_query_ids
-    assert section["recommendation_count"] == len(expected_query_ids)
+    assert [
+        (row["query_id"], row["current_state"]) for row in section["recommendations"]
+    ] == expected_rows
+    assert section["recommendation_count"] == len(expected_rows)
     assert section["recommendation_scope"] == scope
     assert section["dmv_recommendation_count"] == len(dmv_rows)
     app.query_regression.detect_regressed_queries.assert_awaited_once_with(

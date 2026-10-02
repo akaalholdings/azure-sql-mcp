@@ -356,26 +356,28 @@ def scope_case_regressions(data: Any, query_store_query_id: int | None) -> Any:
     """Keep only the tuning recommendations that bear on one performance case.
 
     detect_regressed_queries returns every sys.dm_db_tuning_recommendations row,
-    Expired/Success/Reverted rows included. Only Active rows are open; the others
-    record what the engine already did or can no longer do. With the case's
-    Query Store query_id known, keep that query's Active rows; otherwise keep
-    only Active rows whose regressed plan still runs. dmv_recommendation_count
-    keeps the unscoped COUNT(*).
+    Expired/Success/Reverted/Verifying rows included. Only Active rows wait for
+    an action; the engine owns the others (on Verifying it already forced the
+    last good plan, so "live" counts runs from before the forcing), as in
+    review_plan_enforcement. Keep Active rows whose regressed plan ran in the
+    window, and with the case's Query Store query_id known, only that query's,
+    so knowing the id never adds rows. dmv_recommendation_count keeps the
+    unscoped COUNT(*).
     """
     if not isinstance(data, Mapping) or not isinstance(data.get("recommendations"), list):
         return data
-    active = [
+    kept = [
         row
         for row in data["recommendations"]
         if isinstance(row, Mapping)
         and str(row.get("current_state") or "").casefold() == "active"
+        and row.get("live") is True
     ]
     if query_store_query_id is not None:
         scope = "query_store_query_id"
-        kept = [row for row in active if row.get("query_id") == query_store_query_id]
+        kept = [row for row in kept if row.get("query_id") == query_store_query_id]
     else:
         scope = "live_active"
-        kept = [row for row in active if row.get("live") is True]
     return {
         **data,
         "recommendation_scope": scope,

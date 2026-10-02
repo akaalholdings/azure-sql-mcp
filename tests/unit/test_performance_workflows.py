@@ -2988,6 +2988,8 @@ async def test_unrelated_expired_tuning_recommendation_leaves_the_case_healthy(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("case_query_id", [42, None])
+@pytest.mark.parametrize("regressed_runs", [0, 30])
 @pytest.mark.parametrize(
     "state",
     [
@@ -2997,15 +2999,21 @@ async def test_unrelated_expired_tuning_recommendation_leaves_the_case_healthy(
         '{"currentValue":"Expired","reason":"SchemaChanged"}',
         # The engine found no gain and unforced the plan.
         '{"currentValue":"Reverted","reason":"VerificationForcedQueryRecompile"}',
+        # The engine forced the last good plan and is verifying it; it owns the row.
+        '{"currentValue":"Verifying"}',
     ],
-    ids=["Success", "Expired", "Reverted"],
+    ids=["Success", "Expired", "Reverted", "Verifying"],
 )
-async def test_closed_tuning_recommendation_for_the_case_query_leaves_it_healthy(
+async def test_engine_owned_tuning_recommendation_for_the_case_query_leaves_it_healthy(
     state: str,
+    regressed_runs: int,
+    case_query_id: int | None,
 ) -> None:
     """With FORCE_LAST_GOOD_PLAN on (the Azure SQL Database default) the DMV keeps
-    the engine's closed rows for the case's own query. They are history, not an
-    action: knowing the query_id must not make the case worse than not knowing it."""
+    the engine's rows for the case's own query: closed ones, and Verifying ones
+    where the engine already forced the last good plan. They are not an action,
+    even when the regressed plan ran earlier in the window (before the forcing):
+    knowing the query_id must not make the case worse than not knowing it."""
     service, _store, _plans, _executor = _service()
     sql = "SELECT id FROM dbo.Items"
     case = service.start_case("appdb", sql)
@@ -3013,7 +3021,7 @@ async def test_closed_tuning_recommendation_for_the_case_query_leaves_it_healthy
         **_dmv_row(_plan_force_details(42, 103, 101), state=state),
         "execute_action_initiated_by": "System",
     }
-    # The regressed plan 103 did not run; the forced last good plan 101 did.
+    # The forced last good plan 101 ran; the regressed plan 103 ran or not.
     activity = [
         {
             "plan_id": 101,
@@ -3021,16 +3029,23 @@ async def test_closed_tuning_recommendation_for_the_case_query_leaves_it_healthy
             "is_forced_plan": True,
             "last_seen_utc": "2026-10-01T11:00:00",
             "recent_execution_count": 900,
-        }
+        },
+        {
+            "plan_id": 103,
+            "query_id": 42,
+            "is_forced_plan": False,
+            "last_seen_utc": "2026-10-01T10:05:00",
+            "recent_execution_count": regressed_runs,
+        },
     ]
 
     result = await service.collect_case_evidence(
         case.case_id,
         "appdb",
         sql,
-        {"regressions": _regressions_collector([closed], activity, 42)},
+        {"regressions": _regressions_collector([closed], activity, case_query_id)},
         window_minutes=60,
-        query_store_query_id=42,
+        query_store_query_id=case_query_id,
     )
 
     assert result["outcome"] == "healthy"
@@ -3041,20 +3056,45 @@ async def test_closed_tuning_recommendation_for_the_case_query_leaves_it_healthy
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("case_query_id", "state", "regressed_runs"),
-    [
-        # Known query: its own open (Active) row counts, live or not.
-        (42, '{"currentValue":"Active","reason":"AutomaticTuningOptionNotEnabled"}', 0),
-        # Unknown query: only a regression that is Active and still running.
-        (None, '{"currentValue":"Active","reason":"AutomaticTuningOptionNotEnabled"}', 250),
-    ],
-)
+@pytest.mark.parametrize("case_query_id", [42, None])
+async def test_open_tuning_recommendation_whose_regressed_plan_did_not_run_leaves_the_case_healthy(
+    case_query_id: int | None,
+) -> None:
+    """An Active row whose regressed plan did not run in the window is not a
+    current regression (review_plan_enforcement excludes it the same way). The
+    known-query and unknown-query paths agree."""
+    service, _store, _plans, _executor = _service()
+    sql = "SELECT id FROM dbo.Items"
+    case = service.start_case("appdb", sql)
+
+    result = await service.collect_case_evidence(
+        case.case_id,
+        "appdb",
+        sql,
+        {
+            "regressions": _regressions_collector(
+                [_dmv_row(_plan_force_details(42, 103, 101))], [], case_query_id
+            )
+        },
+        window_minutes=60,
+        query_store_query_id=case_query_id,
+    )
+
+    assert result["outcome"] == "healthy"
+    data = result["sections"]["regressions"]["data"]
+    assert data["recommendations"] == []
+    assert data["recommendation_count"] == 0
+    assert data["dmv_recommendation_count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case_query_id", [42, None])
 async def test_tuning_recommendation_that_bears_on_the_case_makes_it_actionable(
     case_query_id: int | None,
-    state: str,
-    regressed_runs: int,
 ) -> None:
+    """An Active row (not applied; a DBA can apply it) whose regressed plan ran
+    in the window is a current regression, with the case's query known or not."""
+    state = '{"currentValue":"Active","reason":"AutomaticTuningOptionNotEnabled"}'
     service, _store, _plans, _executor = _service()
     sql = "SELECT id FROM dbo.Items"
     case = service.start_case("appdb", sql)
@@ -3064,7 +3104,7 @@ async def test_tuning_recommendation_that_bears_on_the_case_makes_it_actionable(
             "query_id": 42,
             "is_forced_plan": False,
             "last_seen_utc": "2026-10-01T11:00:00",
-            "recent_execution_count": regressed_runs,
+            "recent_execution_count": 250,
         }
     ]
 
