@@ -278,11 +278,11 @@ async def test_review_leaves_active_recommendations_to_automatic_tuning_when_it_
 
 
 @pytest.mark.asyncio
-async def test_review_ranks_ready_actions_above_force_that_needs_an_owner_decision():
-    """prepare_plan_action treats every Active FORCE_LAST_GOOD_PLAN recommendation
-    as automatic ownership and rejects it, so even a manual-apply force cannot be
-    prepared until a human settles ownership. It is flagged and must not crowd
-    out an unforce that can proceed: plan_enforcer_tick previews only the top."""
+async def test_review_ranks_manual_apply_force_by_priority_with_no_owner_hold():
+    """State reason AutomaticTuningOptionNotEnabled means automatic tuning is off
+    and Microsoft says to apply the recommendation manually. prepare_plan_action
+    accepts it as manual ownership, so the force is a ready action: it ranks by
+    priority above an unforce and plan_enforcer_tick previews it first."""
     failing_now = _forced_plan(
         force_failure_count=3,
         last_force_failure_reason_desc="NO_INDEX",
@@ -296,10 +296,10 @@ async def test_review_ranks_ready_actions_above_force_that_needs_an_owner_decisi
     result = await _service(regression).review("appdb")
 
     ranked = [(a["rank"], a["action"]) for a in result["recommended_actions"]]
-    assert ranked == [(1, "unforce"), (2, "force")]
-    force = result["recommended_actions"][1]
-    assert force["owner_decision_required"] is True
-    assert "prepare_plan_action" in force["owner_decision"]
+    assert ranked == [(1, "force"), (2, "unforce")]
+    force = result["recommended_actions"][0]
+    assert "owner_decision_required" not in force
+    assert "owner_decision" not in force
 
     policy = FakeAdminPolicy()
     tick = await PlanEnforcementService(
@@ -307,7 +307,7 @@ async def test_review_ranks_ready_actions_above_force_that_needs_an_owner_decisi
         query_regression=regression,  # type: ignore[arg-type]
         admin_policy=policy,  # type: ignore[arg-type]
     ).tick("appdb")
-    assert [a["plan_action"] for a in tick["actions"]] == ["unforce"]
+    assert [a["plan_action"] for a in tick["actions"]] == ["force"]
 
 
 @pytest.mark.asyncio

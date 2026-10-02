@@ -61,14 +61,9 @@ class PlanEnforcementService:
             if exclusion:
                 excluded.append(exclusion)
 
-        # Actions that can be prepared now rank above ones waiting on an owner.
         ranked = sorted(
             actions,
-            key=lambda item: (
-                not item.get("owner_decision_required", False),
-                item.get("priority", 0),
-                item.get("score", 0),
-            ),
+            key=lambda item: (item.get("priority", 0), item.get("score", 0)),
             reverse=True,
         )[:top_n]
         for rank, action in enumerate(ranked, start=1):
@@ -326,13 +321,6 @@ class PlanEnforcementService:
                     "estimated_cpu_gain_unit": row.get("estimated_cpu_gain_unit"),
                     "estimated_duration_gain": row.get("estimated_duration_gain"),
                     "state": state,
-                    "owner_decision_required": True,
-                    "owner_decision": (
-                        "prepare_plan_action treats every Active FORCE_LAST_GOOD_PLAN "
-                        "recommendation as automatic ownership and rejects it. "
-                        "Microsoft documents this state reason as 'apply manually'; "
-                        "a human must confirm manual ownership before it can be prepared."
-                    ),
                 },
                 None,
             )

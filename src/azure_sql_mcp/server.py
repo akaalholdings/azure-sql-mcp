@@ -104,6 +104,7 @@ from .performance_workflows import parameter_case_fingerprint
 from .performance_workflows import parameter_case_mismatch
 from .performance_workflows import parameter_case_receipt
 from .performance_workflows import profile_result_fingerprint
+from .performance_workflows import scope_case_regressions
 from .plan_action_service import PlanActionService
 from .plan_cache import PlanCacheService
 from .plan_enforcement import PlanEnforcementService
@@ -5468,6 +5469,23 @@ class AzureSqlMcpApplication:
                 sql,
                 parameter_case,
             )
+
+        async def collect_regressions() -> Any:
+            # The DMV holds every query's recommendations, Expired ones too;
+            # the case gets only those that bear on it.
+            case_query_id = (
+                query_store_query_id
+                if query_store_query_id is not None
+                else self.performance_store.get_performance_case(case_id).query_store_query_id
+            )
+            return scope_case_regressions(
+                await self.query_regression.detect_regressed_queries(
+                    database_name,
+                    window_minutes=window_minutes,
+                ),
+                case_query_id,
+            )
+
         collectors: dict[str, Callable[..., Awaitable[Any]]] = {
             "resource_limits": lambda: self.resource_governance.get_resource_limits(
                 database_name
@@ -5499,10 +5517,7 @@ class AzureSqlMcpApplication:
                 window_minutes=window_minutes,
                 top_n=20,
             ),
-            "regressions": lambda: self.query_regression.detect_regressed_queries(
-                database_name,
-                window_minutes=window_minutes,
-            ),
+            "regressions": collect_regressions,
         }
         return await self.performance_workflows.collect_case_evidence(
             case_id,

@@ -519,7 +519,11 @@ class PlanActionService:
                 "('Active', 'Verifying', 'Success') "
                 "AND (execute_action_initiated_by = 'System' "
                 "OR (type = 'FORCE_LAST_GOOD_PLAN' "
-                "AND JSON_VALUE(state, '$.currentValue') = 'Active'))"
+                "AND JSON_VALUE(state, '$.currentValue') = 'Active' "
+                # Microsoft: automatic tuning is off; apply manually. ISNULL
+                # keeps a NULL reason engine-owned.
+                "AND ISNULL(JSON_VALUE(state, '$.reason'), '') "
+                "<> 'AutomaticTuningOptionNotEnabled'))"
             ),
             "ROLLBACK TRANSACTION",
         ]

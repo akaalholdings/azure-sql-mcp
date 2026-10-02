@@ -1833,6 +1833,82 @@ async def test_tune_query_returns_structured_evidence_pack(app: AzureSqlMcpAppli
     )
 
 
+def _tuning_row(query_id: int, state: str, *, live: bool) -> dict[str, Any]:
+    """A parsed detect_regressed_queries row (only the fields scoping reads)."""
+    return {
+        "type": "FORCE_LAST_GOOD_PLAN",
+        "query_id": query_id,
+        "current_state": state,
+        "state_reason": None,
+        "live": live,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("supplied_query_id", "stored_query_id", "expected_query_ids", "scope"),
+    [
+        (42, None, [42], "query_store_query_id"),
+        (None, 42, [42], "query_store_query_id"),
+        (None, None, [77], "live_active"),
+    ],
+)
+async def test_case_regressions_receive_only_tuning_rows_that_bear_on_the_case(
+    app: AzureSqlMcpApplication,
+    supplied_query_id: int | None,
+    stored_query_id: int | None,
+    expected_query_ids: list[int],
+    scope: str,
+) -> None:
+    """sys.dm_db_tuning_recommendations holds every query's rows, Expired ones
+    included. The case gets its own query's open (Active) rows when the
+    query_id is known, else only live Active rows; the tool itself still
+    returns COUNT(*)."""
+    dmv_rows = [
+        _tuning_row(777, "Expired", live=False),
+        _tuning_row(42, "Expired", live=False),
+        _tuning_row(42, "Active", live=False),
+        _tuning_row(77, "Active", live=True),
+        _tuning_row(78, "Active", live=False),
+        _tuning_row(79, "Success", live=True),
+    ]
+    app.query_regression.detect_regressed_queries = AsyncMock(  # type: ignore[method-assign]
+        return_value={
+            "database_name": "appdb",
+            "window_minutes": 60,
+            "recommendation_count": len(dmv_rows),
+            "recommendations": dmv_rows,
+        }
+    )
+    app.performance_store.get_performance_case = Mock(  # type: ignore[method-assign]
+        return_value=Mock(query_store_query_id=stored_query_id),
+    )
+    app.performance_workflows.collect_case_evidence = AsyncMock(  # type: ignore[method-assign]
+        return_value={"outcome": "healthy"}
+    )
+
+    await app._collect_performance_evidence(
+        "appdb",
+        "case-1",
+        "SELECT id FROM dbo.Items",
+        60,
+        False,
+        None,
+        query_store_query_id=supplied_query_id,
+    )
+    collectors = app.performance_workflows.collect_case_evidence.await_args.args[3]
+    section = await collectors["regressions"]()
+
+    assert [row["query_id"] for row in section["recommendations"]] == expected_query_ids
+    assert section["recommendation_count"] == len(expected_query_ids)
+    assert section["recommendation_scope"] == scope
+    assert section["dmv_recommendation_count"] == len(dmv_rows)
+    app.query_regression.detect_regressed_queries.assert_awaited_once_with(
+        "appdb",
+        window_minutes=60,
+    )
+
+
 @pytest.mark.asyncio
 async def test_start_tuning_session_passes_multi_hour_budget_to_durable_state(
     app: AzureSqlMcpApplication,

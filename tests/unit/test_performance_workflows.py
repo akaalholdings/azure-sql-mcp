@@ -34,13 +34,17 @@ from azure_sql_mcp.performance_workflows import extract_profile_metrics
 from azure_sql_mcp.performance_workflows import profile_result_fingerprint
 from azure_sql_mcp.performance_workflows import parameter_case_fingerprint
 from azure_sql_mcp.performance_workflows import parameter_case_receipt
+from azure_sql_mcp.performance_workflows import scope_case_regressions
 from azure_sql_mcp.plans import ProfiledPlanResult
+from azure_sql_mcp.query_regression import QueryRegressionService
 from azure_sql_mcp.query_identity import legacy_database_fingerprint
 from azure_sql_mcp.query_identity import legacy_query_fingerprint
 from azure_sql_mcp.safe_sql import SafeSqlValidator
 from azure_sql_mcp.tuning_sessions import InvalidTransitionError
 from azure_sql_mcp.tuning_sessions import TuningBudgetExceeded
 from azure_sql_mcp.tuning_sessions import TuningSessionStateMachine
+from tests.unit.test_query_regression import FakeExecutor as TuningDmvExecutor
+from tests.unit.test_query_regression import _dmv_row
 
 
 def _policy(max_executions: int = 80) -> DatabasePolicySet:
@@ -2918,6 +2922,170 @@ async def test_query_store_status_object_is_not_hashed_as_actionable_status() ->
     )
 
     assert result["outcome"] == "healthy"
+
+
+def _plan_force_details(query_id: int, regressed_plan_id: int, recommended_plan_id: int) -> str:
+    return json.dumps(
+        {
+            "planForceDetails": {
+                "queryId": query_id,
+                "regressedPlanId": regressed_plan_id,
+                "recommendedPlanId": recommended_plan_id,
+            }
+        }
+    )
+
+
+def _regressions_collector(
+    dmv_rows: list[dict[str, Any]],
+    activity_rows: list[dict[str, Any]],
+    case_query_id: int | None,
+):
+    """The collect_performance_evidence regressions collector over a fake DMV."""
+    regression = QueryRegressionService(
+        TuningDmvExecutor([dmv_rows, activity_rows])  # type: ignore[arg-type]
+    )
+
+    async def collect() -> Any:
+        return scope_case_regressions(
+            await regression.detect_regressed_queries("appdb", window_minutes=60),
+            case_query_id,
+        )
+
+    return collect
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case_query_id", [42, None])
+async def test_unrelated_expired_tuning_recommendation_leaves_the_case_healthy(
+    case_query_id: int | None,
+) -> None:
+    """sys.dm_db_tuning_recommendations keeps Expired rows for every query. One
+    for another query says nothing about this case and must not make it
+    actionable."""
+    service, _store, _plans, _executor = _service()
+    sql = "SELECT id FROM dbo.Items"
+    case = service.start_case("appdb", sql)
+    expired = _dmv_row(
+        _plan_force_details(777, 903, 901),
+        state='{"currentValue":"Expired","reason":"StatisticsChanged"}',
+    )
+
+    result = await service.collect_case_evidence(
+        case.case_id,
+        "appdb",
+        sql,
+        {"regressions": _regressions_collector([expired], [], case_query_id)},
+        window_minutes=60,
+        query_store_query_id=case_query_id,
+    )
+
+    assert result["outcome"] == "healthy"
+    data = result["sections"]["regressions"]["data"]
+    assert data["recommendations"] == []
+    assert data["recommendation_count"] == 0
+    assert data["dmv_recommendation_count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state",
+    [
+        # The engine already forced the last good plan.
+        '{"currentValue":"Success","reason":"LastGoodPlanForced"}',
+        # The recommendation can no longer be applied.
+        '{"currentValue":"Expired","reason":"SchemaChanged"}',
+        # The engine found no gain and unforced the plan.
+        '{"currentValue":"Reverted","reason":"VerificationForcedQueryRecompile"}',
+    ],
+    ids=["Success", "Expired", "Reverted"],
+)
+async def test_closed_tuning_recommendation_for_the_case_query_leaves_it_healthy(
+    state: str,
+) -> None:
+    """With FORCE_LAST_GOOD_PLAN on (the Azure SQL Database default) the DMV keeps
+    the engine's closed rows for the case's own query. They are history, not an
+    action: knowing the query_id must not make the case worse than not knowing it."""
+    service, _store, _plans, _executor = _service()
+    sql = "SELECT id FROM dbo.Items"
+    case = service.start_case("appdb", sql)
+    closed = {
+        **_dmv_row(_plan_force_details(42, 103, 101), state=state),
+        "execute_action_initiated_by": "System",
+    }
+    # The regressed plan 103 did not run; the forced last good plan 101 did.
+    activity = [
+        {
+            "plan_id": 101,
+            "query_id": 42,
+            "is_forced_plan": True,
+            "last_seen_utc": "2026-10-01T11:00:00",
+            "recent_execution_count": 900,
+        }
+    ]
+
+    result = await service.collect_case_evidence(
+        case.case_id,
+        "appdb",
+        sql,
+        {"regressions": _regressions_collector([closed], activity, 42)},
+        window_minutes=60,
+        query_store_query_id=42,
+    )
+
+    assert result["outcome"] == "healthy"
+    data = result["sections"]["regressions"]["data"]
+    assert data["recommendations"] == []
+    assert data["recommendation_count"] == 0
+    assert data["dmv_recommendation_count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case_query_id", "state", "regressed_runs"),
+    [
+        # Known query: its own open (Active) row counts, live or not.
+        (42, '{"currentValue":"Active","reason":"AutomaticTuningOptionNotEnabled"}', 0),
+        # Unknown query: only a regression that is Active and still running.
+        (None, '{"currentValue":"Active","reason":"AutomaticTuningOptionNotEnabled"}', 250),
+    ],
+)
+async def test_tuning_recommendation_that_bears_on_the_case_makes_it_actionable(
+    case_query_id: int | None,
+    state: str,
+    regressed_runs: int,
+) -> None:
+    service, _store, _plans, _executor = _service()
+    sql = "SELECT id FROM dbo.Items"
+    case = service.start_case("appdb", sql)
+    activity = [
+        {
+            "plan_id": 103,
+            "query_id": 42,
+            "is_forced_plan": False,
+            "last_seen_utc": "2026-10-01T11:00:00",
+            "recent_execution_count": regressed_runs,
+        }
+    ]
+
+    result = await service.collect_case_evidence(
+        case.case_id,
+        "appdb",
+        sql,
+        {
+            "regressions": _regressions_collector(
+                [_dmv_row(_plan_force_details(42, 103, 101), state=state)],
+                activity,
+                case_query_id,
+            )
+        },
+        window_minutes=60,
+        query_store_query_id=case_query_id,
+    )
+
+    assert result["outcome"] == "actionable"
+    data = result["sections"]["regressions"]["data"]
+    assert [row["query_id"] for row in data["recommendations"]] == [42]
 
 
 @pytest.mark.asyncio

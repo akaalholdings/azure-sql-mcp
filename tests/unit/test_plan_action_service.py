@@ -548,6 +548,47 @@ async def test_automatic_tuning_ownership_is_detected_and_never_applied(
 
 
 @pytest.mark.asyncio
+async def test_manual_apply_recommendation_is_not_automatic_ownership(
+    server_config_factory,
+) -> None:
+    """Microsoft documents state reason AutomaticTuningOptionNotEnabled as
+    'apply the recommendation manually': automatic tuning is off and will not
+    act on it. Every other Active FORCE_LAST_GOOD_PLAN row stays engine-owned,
+    and a NULL reason must not open the gate (NULL <> 'x' is not true)."""
+    service, _store, _admin, session_id = _service(
+        server_config_factory,
+        [_state(None, None)],
+    )
+
+    await service.prepare(
+        "appdb",
+        session_id=session_id,
+        candidate_id=None,
+        operation="force_plan",
+        query_id=42,
+        plan_id=7,
+        query_hints=None,
+        evidence=_baseline(),
+        reviewed_by="operator",
+        reason="manual-apply recommendation",
+        idempotency_key="manual-apply-owner",
+    )
+
+    ownership_query = " ".join(
+        service.executor.statements[0][4].split()  # type: ignore[attr-defined]
+    )
+    assert (
+        "(type = 'FORCE_LAST_GOOD_PLAN' "
+        "AND JSON_VALUE(state, '$.currentValue') = 'Active' "
+        "AND ISNULL(JSON_VALUE(state, '$.reason'), '') "
+        "<> 'AutomaticTuningOptionNotEnabled')"
+    ) in ownership_query
+    # Rows the engine executed or is verifying stay engine-owned.
+    assert "IN ('Active', 'Verifying', 'Success')" in ownership_query
+    assert "execute_action_initiated_by = 'System'" in ownership_query
+
+
+@pytest.mark.asyncio
 async def test_kill_switch_blocks_prepared_apply(server_config_factory) -> None:
     service, _store, admin, session_id = _service(
         server_config_factory,
