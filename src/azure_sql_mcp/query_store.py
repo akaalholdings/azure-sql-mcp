@@ -167,6 +167,10 @@ _MAX_INDEX_CANDIDATE_COLUMNS = 256
 _MAX_INDEX_EVIDENCE_ROWS = 10_000
 
 
+# The hint-source caps count only rows that can hold an INDEX or FORCESEEK
+# hint. The explicit CI collation keeps lowercase hints on a case-sensitive
+# database. Capped query text keeps the oldest rows: an index named only by a
+# long-idle query looks unused, while recent queries' indexes show reads.
 QUERY_STORE_TEXT_HINTS_SQL = """
 SELECT TOP (?)
     q.query_id,
@@ -174,7 +178,9 @@ SELECT TOP (?)
 FROM sys.query_store_query AS q
 INNER JOIN sys.query_store_query_text AS qt
     ON qt.query_text_id = q.query_text_id
-ORDER BY q.last_execution_time DESC, q.query_id DESC
+WHERE qt.query_sql_text COLLATE Latin1_General_CI_AS LIKE N'%INDEX%'
+    OR qt.query_sql_text COLLATE Latin1_General_CI_AS LIKE N'%FORCESEEK%'
+ORDER BY q.last_execution_time ASC, q.query_id ASC
 """
 
 
@@ -183,6 +189,8 @@ SELECT TOP (?)
     query_id,
     query_hint_text
 FROM sys.query_store_query_hints
+WHERE query_hint_text COLLATE Latin1_General_CI_AS LIKE N'%INDEX%'
+    OR query_hint_text COLLATE Latin1_General_CI_AS LIKE N'%FORCESEEK%'
 ORDER BY query_id DESC
 """
 
@@ -193,6 +201,8 @@ SELECT TOP (?)
     name AS plan_guide_name,
     hints AS plan_guide_hints
 FROM sys.plan_guides
+WHERE hints COLLATE Latin1_General_CI_AS LIKE N'%INDEX%'
+    OR hints COLLATE Latin1_General_CI_AS LIKE N'%FORCESEEK%'
 ORDER BY plan_guide_id DESC
 """
 
@@ -202,7 +212,8 @@ SELECT TOP (?)
     object_id,
     definition AS module_definition
 FROM sys.sql_modules
-WHERE definition IS NOT NULL
+WHERE definition COLLATE Latin1_General_CI_AS LIKE N'%INDEX%'
+    OR definition COLLATE Latin1_General_CI_AS LIKE N'%FORCESEEK%'
 ORDER BY object_id
 """
 
@@ -301,19 +312,26 @@ def _unquote_hint_identifier(value: str) -> str:
     return text
 
 
+def _fold(value: Any) -> str:
+    # casefold matches Azure SQL's default case-insensitive collation; on a
+    # case-sensitive database it can only pin more indexes, never fewer.
+    # SQL ignores trailing spaces when it compares identifiers (ANSI padding).
+    return value.casefold().rstrip(" ") if isinstance(value, str) else ""
+
+
 def _hint_table_matches(target: str | None, identity: Mapping[str, Any]) -> bool:
     if not target:
         return True
     pieces = [
-        _unquote_hint_identifier(piece)
+        _fold(_unquote_hint_identifier(piece))
         for piece in target.strip().split(".")
         if piece.strip()
     ]
-    if not pieces:
-        return False
-    if len(pieces) == 1:
-        return pieces[0] == identity["table"]
-    return pieces[-1] == identity["table"] and pieces[-2] == identity["schema"]
+    if len(pieces) < 2:
+        # A one-part target can be an alias, and an alias can share another
+        # table's name, so it narrows nothing.
+        return True
+    return pieces[-1] == _fold(identity["table"]) and pieces[-2] == _fold(identity["schema"])
 
 
 _HINT_IDENTIFIER = re.compile(
@@ -466,40 +484,43 @@ def _resolve_index_hints(
         if table_hint:
             table_target = table_hint.group("table").strip()
         if numeric is not None:
+            if numeric in {0, 1}:
+                # The heap or clustered index; neither is ever advised for removal.
+                continue
             candidates = [
-                identity
-                for identity in identities
-                if identity["index_id"] == numeric
-                and _hint_table_matches(table_target, identity)
+                identity for identity in identities if identity["index_id"] == numeric
             ]
             hint_kind = "numeric_index_id"
         else:
-            name = _unquote_hint_identifier(value)
+            name = _fold(_unquote_hint_identifier(value))
             candidates = [
                 identity
                 for identity in identities
-                if identity["index_name"] == name
-                and _hint_table_matches(table_target, identity)
+                if _fold(identity["index_name"]) == name
             ]
             hint_kind = "index_name"
-        if len(candidates) != 1:
-            blockers.append(
-                "unresolved_or_ambiguous_numeric_index_hint"
-                if numeric is not None
-                else "unresolved_or_ambiguous_index_hint"
-            )
+        # Only a multi-part TABLE HINT target narrows; one that matches no
+        # candidate narrows nothing. Every remaining candidate is pinned (fail closed).
+        candidates = [
+            identity
+            for identity in candidates
+            if _hint_table_matches(table_target, identity)
+        ] or candidates
+        if not candidates:
+            # A temp-table, cross-database or stale hint: it names no index here.
+            blockers.append("index_hint_names_no_index")
             continue
-        identity = candidates[0]
-        key = (identity["object_id"], identity["index_id"], hint_kind)
-        matches[key] = {
-            "hint_kind": hint_kind,
-            "index": dict(identity),
-            "object_id": identity["object_id"],
-            "index_id": identity["index_id"],
-            "schema": identity["schema"],
-            "table": identity["table"],
-            "index_name": identity["index_name"],
-        }
+        for identity in candidates:
+            key = (identity["object_id"], identity["index_id"], hint_kind)
+            matches[key] = {
+                "hint_kind": hint_kind,
+                "index": dict(identity),
+                "object_id": identity["object_id"],
+                "index_id": identity["index_id"],
+                "schema": identity["schema"],
+                "table": identity["table"],
+                "index_name": identity["index_name"],
+            }
     return list(matches.values()), list(dict.fromkeys(blockers))
 
 

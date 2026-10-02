@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from azure_sql_mcp.index_optimizer import score_index_candidate
 from azure_sql_mcp.query_store import INDEX_EVIDENCE_QUERY
+from azure_sql_mcp.query_store import MODULE_HINTS_SQL
+from azure_sql_mcp.query_store import PLAN_GUIDE_HINTS_SQL
+from azure_sql_mcp.query_store import QUERY_STORE_QUERY_HINTS_SQL
 from azure_sql_mcp.query_store import QUERY_STORE_TEXT_HINTS_SQL
 from azure_sql_mcp.query_store import QueryStoreService
 from azure_sql_mcp.query_store import _resolve_index_hints
@@ -87,8 +92,122 @@ def test_index_hint_parser_blocks_unresolved_or_unscoped_hints() -> None:
     )
 
     assert {item["index_name"] for item in matches} == {"IX_A"}
-    assert "unresolved_or_ambiguous_index_hint" in blockers
+    assert "index_hint_names_no_index" in blockers
     assert "unresolved_forceseek_index_hint" in blockers
+
+
+def _identity(object_id: int, index_id: int, table: str, name: str, schema: str = "Sales") -> dict[str, object]:
+    return {"object_id": object_id, "index_id": index_id, "schema": schema, "table": table, "index_name": name}
+
+
+SAME_NAME_ON_TWO_TABLES = [
+    _identity(101, 2, "Orders", "IX_Date"),
+    _identity(101, 3, "Orders", "IX_Orders_Customer"),
+    _identity(202, 2, "Invoices", "IX_Date"),
+]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Azure SQL Database collations are case-insensitive by default, so
+        # every one of these hints runs and fails with Msg 308 after a DROP.
+        "SELECT * FROM Sales.Orders WITH (INDEX(ix_orders_customer))",
+        "SELECT * FROM Sales.Orders WITH (INDEX = [IX_ORDERS_CUSTOMER])",
+        "SELECT * FROM Sales.Orders WITH (FORCESEEK(ix_Orders_Customer (CustomerID)))",
+        "SELECT * FROM Sales.Orders o OPTION (TABLE HINT(sales.orders, INDEX(ix_orders_customer)))",
+    ],
+)
+def test_index_hint_names_resolve_case_insensitively(text: str) -> None:
+    matches, blockers = _resolve_index_hints(text, SAME_NAME_ON_TWO_TABLES)
+
+    assert blockers == []
+    assert [(item["table"], item["index_name"]) for item in matches] == [("Orders", "IX_Orders_Customer")]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "SELECT * FROM Sales.Orders o WITH (INDEX(IX_Date))",
+        # A TABLE HINT target may be an alias; it narrows nothing, so keep every candidate.
+        "SELECT * FROM Sales.Orders o OPTION (TABLE HINT(o, INDEX(IX_Date)))",
+        # TABLE HINT must name the alias, and an alias can share another table's
+        # name: these hints name Sales.Orders indexes, not Sales.Invoices ones.
+        "SELECT * FROM Sales.Orders AS Invoices OPTION (TABLE HINT(Invoices, INDEX(IX_Date)))",
+        "SELECT * FROM Sales.Orders AS Invoices OPTION (TABLE HINT([Invoices], INDEX(2)))",
+        # INDEX(n) without a target can mean index_id n on any table.
+        "SELECT * FROM Sales.Orders o WITH (INDEX(2))",
+    ],
+)
+def test_index_hint_matching_several_tables_pins_every_candidate(text: str) -> None:
+    matches, blockers = _resolve_index_hints(text, SAME_NAME_ON_TWO_TABLES)
+
+    assert blockers == []
+    assert {(item["table"], item["index_name"]) for item in matches} == {
+        ("Orders", "IX_Date"),
+        ("Invoices", "IX_Date"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("text", "identities"),
+    [
+        ("SELECT * FROM Sales.Orders WITH (INDEX([IX_Orders_Customer ]))", SAME_NAME_ON_TWO_TABLES),
+        (
+            "SELECT * FROM Sales.Orders WITH (INDEX(IX_Orders_Customer))",
+            [_identity(101, 3, "Orders", "IX_Orders_Customer ")],
+        ),
+    ],
+)
+def test_index_hint_names_ignore_trailing_spaces_as_sql_does(
+    text: str, identities: list[dict[str, object]]
+) -> None:
+    # SQL compares identifiers with ANSI padding, so the hint runs against this
+    # index and fails with Msg 308 after a DROP.
+    matches, blockers = _resolve_index_hints(text, identities)
+
+    assert blockers == []
+    assert [(item["object_id"], item["index_id"]) for item in matches] == [(101, 3)]
+
+
+def test_table_hint_target_still_narrows_a_shared_index_name() -> None:
+    matches, blockers = _resolve_index_hints(
+        "SELECT * FROM Sales.Invoices OPTION (TABLE HINT([Sales].[Invoices], INDEX(IX_Date)))",
+        SAME_NAME_ON_TWO_TABLES,
+    )
+
+    assert blockers == []
+    assert [(item["object_id"], item["index_id"]) for item in matches] == [(202, 2)]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "SELECT * FROM Sales.Orders WITH (INDEX(0))",
+        "SELECT * FROM Sales.Orders WITH (INDEX = 1)",
+        "SELECT * FROM Sales.Orders OPTION (TABLE HINT(Sales.Orders, INDEX(1)))",
+        "SELECT * FROM Sales.Orders WITH (FORCESEEK(1 (OrderID)))",
+    ],
+)
+def test_heap_and_clustered_index_ids_are_skipped(text: str) -> None:
+    identities = [*SAME_NAME_ON_TWO_TABLES, _identity(101, 1, "Orders", "PK_Orders")]
+
+    assert _resolve_index_hints(text, identities) == ([], [])
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "SELECT * FROM #work WITH (INDEX(IX_Work))",
+        "SELECT * FROM OtherDb.Sales.Orders WITH (INDEX(IX_Elsewhere))",
+        "SELECT * FROM Sales.Orders WITH (INDEX(9))",
+    ],
+)
+def test_hint_that_names_no_index_here_has_its_own_blocker(text: str) -> None:
+    matches, blockers = _resolve_index_hints(text, SAME_NAME_ON_TWO_TABLES)
+
+    assert matches == []
+    assert blockers == ["index_hint_names_no_index"]
 
 
 def _evidence_rows() -> list[dict[str, object]]:
@@ -722,6 +841,170 @@ async def test_index_hint_coverage_keeps_retained_hint_outside_runtime_window() 
     [evidence] = result["evidence"]
     assert evidence["source"] == "query_store_text"
     assert evidence["resolved_indexes"][0]["index"]["index_id"] == 2
+
+
+class HintSourceDatabase:
+    """In-memory hint sources; applies the SQL's LIKE filter, ORDER BY and TOP.
+
+    The LIKE filter is applied case-insensitively, as the hint SQL forces a
+    case-insensitive collation, and its terms are joined as the SQL joins them
+    (AND or OR).
+    """
+
+    ROUTES = (
+        ("AS retained_query_text", "query_store_text", "retained_query_text"),
+        ("FROM sys.query_store_query_hints", "query_store_query_hints", "query_hint_text"),
+        ("FROM sys.plan_guides", "plan_guides", "plan_guide_hints"),
+        ("FROM sys.sql_modules", "module_definitions", "module_definition"),
+    )
+
+    def __init__(self, rows: dict[str, list[dict[str, object]]]) -> None:
+        self.rows = rows
+
+    async def fetch_all(self, database_name, query, params=None):
+        source, text_key = next((source, key) for marker, source, key in self.ROUTES if marker in query)
+        rows = list(self.rows.get(source, []))
+        where = re.search(r"\bWHERE\b(.*?)\bORDER BY\b", query, re.DOTALL)
+        if where:
+            patterns = [pattern.casefold() for pattern in re.findall(r"LIKE N'%(\w+)%'", where.group(1))]
+            combine = all if re.search(r"\bAND\b", where.group(1)) else any
+            rows = [row for row in rows if combine(p in str(row[text_key]).casefold() for p in patterns)]
+        order = re.search(r"ORDER BY q\.last_execution_time(?:\s+(ASC|DESC))?", query)
+        if order:
+            rows.sort(
+                key=lambda row: (row["last_execution_time"], row["query_id"]),
+                reverse=order.group(1) == "DESC",
+            )
+        return rows[: params[0]]
+
+
+_HINT_SOURCE_ID = {
+    "query_store_text": ("query_id", "retained_query_text"),
+    "query_store_query_hints": ("query_id", "query_hint_text"),
+    "plan_guides": ("plan_guide_id", "plan_guide_hints"),
+    "module_definitions": ("object_id", "module_definition"),
+}
+
+
+def _hint_rows(source: str, texts: list[str]) -> list[dict[str, object]]:
+    id_key, text_key = _HINT_SOURCE_ID[source]
+    # Row n last ran on day n, so the first text is the oldest.
+    return [{id_key: n + 1, "last_execution_time": n, text_key: text} for n, text in enumerate(texts)]
+
+
+@pytest.mark.parametrize("source", sorted(_HINT_SOURCE_ID))
+@pytest.mark.asyncio
+async def test_hint_scan_cap_counts_only_hint_candidates(source: str) -> None:
+    # The hinted text is the oldest row: a month-end query whose index looks unused.
+    texts = ["SELECT 1 FROM Sales.Orders WITH (INDEX(IX_Date))"] + [
+        f"SELECT OrderID FROM Sales.Orders WHERE OrderID = {n}" for n in range(5_000)
+    ]
+    service = QueryStoreService(HintSourceDatabase({source: _hint_rows(source, texts)}))
+
+    result = await service.get_index_hint_coverage(
+        "appdb", index_identities=SAME_NAME_ON_TWO_TABLES[:1], limit=2_000
+    )
+
+    source_coverage = result["coverage"]["sources"][source]
+    assert result["coverage"]["status"] == "complete"
+    assert source_coverage["capped"] is False
+    assert source_coverage["scanned"] == 1
+    [evidence] = result["evidence"]
+    assert evidence["source"] == source
+    assert [item["index_name"] for item in evidence["resolved_indexes"]] == ["IX_Date"]
+
+
+@pytest.mark.parametrize("source", sorted(_HINT_SOURCE_ID))
+@pytest.mark.asyncio
+async def test_hint_source_filter_keeps_index_only_and_forceseek_only_texts(source: str) -> None:
+    # Most hinted texts hold only one of the two keywords; a filter that needs
+    # both drops them, and coverage would still report complete.
+    texts = [
+        "SELECT 1 FROM Sales.Orders WITH (INDEX(IX_Date))",
+        "SELECT 1 FROM Sales.Orders WITH (FORCESEEK(IX_Orders_Customer (CustomerID)))",
+        "SELECT OrderID FROM Sales.Orders",
+    ]
+    service = QueryStoreService(HintSourceDatabase({source: _hint_rows(source, texts)}))
+
+    result = await service.get_index_hint_coverage(
+        "appdb", index_identities=SAME_NAME_ON_TWO_TABLES[:2], limit=10
+    )
+
+    assert result["coverage"]["sources"][source]["scanned"] == 2
+    assert {
+        (item["object_id"], item["index_id"])
+        for evidence in result["evidence"]
+        for item in evidence["resolved_indexes"]
+    } == {(101, 2), (101, 3)}
+
+
+@pytest.mark.asyncio
+async def test_capped_query_text_scan_keeps_the_oldest_hint_candidates() -> None:
+    # Indexes named only by long-idle texts look unused, so those texts must
+    # survive the cap; recent texts' indexes show reads and in-window plan pins.
+    texts = ["SELECT 1 FROM Sales.Orders WITH (INDEX(IX_Date))"] + [
+        f"SELECT 1 FROM Sales.Orders WITH (INDEX(IX_Orders_Customer)) WHERE OrderID = {n}" for n in range(3)
+    ]
+    service = QueryStoreService(HintSourceDatabase({"query_store_text": _hint_rows("query_store_text", texts)}))
+
+    result = await service.get_index_hint_coverage(
+        "appdb", index_identities=SAME_NAME_ON_TWO_TABLES, limit=2
+    )
+
+    assert result["coverage"]["status"] == "incomplete"
+    assert "query_store_text_cap_reached" in result["coverage"]["blockers"]
+    assert any(
+        item["index_name"] == "IX_Date"
+        for evidence in result["evidence"]
+        for item in evidence["resolved_indexes"]
+    )
+
+
+def test_hint_source_filters_ignore_the_database_collation() -> None:
+    # On a case-sensitive database a plain LIKE N'%INDEX%' misses "with (index(ix))".
+    for query in (QUERY_STORE_TEXT_HINTS_SQL, QUERY_STORE_QUERY_HINTS_SQL, PLAN_GUIDE_HINTS_SQL, MODULE_HINTS_SQL):
+        normalized = " ".join(query.split())
+        for keyword in ("INDEX", "FORCESEEK"):
+            assert re.search(rf"COLLATE Latin1_General_CI_AS LIKE N'%{keyword}%'", normalized), (keyword, query)
+
+
+@pytest.mark.asyncio
+async def test_case_and_ambiguous_hints_resolve_so_the_scan_stays_complete() -> None:
+    texts = [
+        "SELECT 1 FROM Sales.Orders WITH (index(ix_orders_customer))",
+        "SELECT 1 FROM Sales.Orders o WITH (INDEX(IX_Date))",
+        "SELECT 1 FROM Sales.Orders WITH (INDEX(0)) OPTION (TABLE HINT(Sales.Orders, INDEX(1)))",
+    ]
+    service = QueryStoreService(HintSourceDatabase({"module_definitions": _hint_rows("module_definitions", texts)}))
+
+    result = await service.get_index_hint_coverage(
+        "appdb", index_identities=SAME_NAME_ON_TWO_TABLES, limit=10
+    )
+
+    assert result["coverage"]["status"] == "complete"
+    assert result["coverage"]["blockers"] == []
+    assert {
+        (item["object_id"], item["index_id"])
+        for evidence in result["evidence"]
+        for item in evidence["resolved_indexes"]
+    } == {(101, 2), (101, 3), (202, 2)}
+
+
+@pytest.mark.asyncio
+async def test_hint_naming_no_index_is_incomplete_but_not_unresolved() -> None:
+    service = QueryStoreService(
+        HintSourceDatabase(
+            {"module_definitions": _hint_rows("module_definitions", ["SELECT 1 FROM #t WITH (INDEX(IX_Temp))"])}
+        )
+    )
+
+    result = await service.get_index_hint_coverage(
+        "appdb", index_identities=SAME_NAME_ON_TWO_TABLES, limit=10
+    )
+
+    assert result["evidence"] == []
+    assert result["coverage"]["status"] == "incomplete"
+    assert result["coverage"]["sources"]["module_definitions"]["blockers"] == ["index_hint_names_no_index"]
 
 
 @pytest.mark.asyncio
