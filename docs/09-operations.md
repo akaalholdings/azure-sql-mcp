@@ -210,7 +210,7 @@ history-table contract version remains `2.3.0`; the public MCP contract is
 The public tools are `capture_index_review_snapshot`, `review_index_portfolio`,
 and `get_index_review`. Capture requires both database-policy `allow_read` and
 `allow_index_history_write`; review and retrieval require `allow_read` and a
-valid contract probe. The fixed minimum observation period is 90 days, with an
+valid contract probe. The minimum observation window is 35 trailing days, with an
 optional business-cycle extension. A capture reuses the UTC-day idempotency
 hash when already present, and a mismatched request is rejected.
 

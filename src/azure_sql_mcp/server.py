@@ -5318,7 +5318,7 @@ class AzureSqlMcpApplication:
             **checks,
             "azure_sql_database": platform,
             "mcp_contract": {
-                "contract_version": "2.6.0",
+                "contract_version": "2.6.1",
                 "performance_tuning": 1,
                 "durable_view_change": 1,
                 "prepared_plan_action": 1,
@@ -5326,7 +5326,7 @@ class AzureSqlMcpApplication:
                 "index_learning_mode": "recall_only",
                 "index_history_schema_version": "index-history-v1",
                 "index_history_schema_fingerprint": CONTRACT_SCHEMA_FINGERPRINT,
-                "index_review_min_observation_days": 90,
+                "index_review_min_observation_days": 35,
                 "index_review_snapshot_reuse_hours": 48,
                 "workload_index_advisor": 1,
                 "result_status": 1,

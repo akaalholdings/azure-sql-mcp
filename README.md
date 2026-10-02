@@ -820,10 +820,14 @@ occurs only when database policy permits it.
 Reviews are deterministic projections of validated history. States are
 `keep`, `create_candidate`, `consolidate_candidate`, `drop_candidate`, and
 `observe`; overall results are `actionable`, `no_change`, `partial`, or
-`inconclusive`. The fixed minimum observation floor is 90 days. Any protection,
-valid read delta, executed Query Store reference, incomplete evidence, epoch
-change, counter reset, definition change, or unsupported index type keeps the
-workflow from proposing removal. Generated JSON, Markdown, and SQL files are
+`inconclusive`. The minimum observation window is 35 days, extendable per
+database with `business_cycle_extension_days` (for example for quarter-end jobs).
+The gate reads only that trailing window and sums reads across counter resets;
+captures with usable counters must be at most 48 hours apart and cover at least
+95% of the window. Any protection, read in the window, executed Query Store
+reference in the window, incomplete evidence, counter reset of unknown cause,
+definition change, or unsupported index type keeps the workflow from proposing
+removal. Generated JSON, Markdown, and SQL files are
 recommend-only artifacts; every SQL statement is inert and must be reviewed
 and separately authorised.
 

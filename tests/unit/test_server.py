@@ -609,7 +609,7 @@ async def test_runtime_status_is_db_free_stable_and_sanitized(
 
     assert first == second
     assert first["startup_timestamp"] == app._startup_timestamp
-    assert first["package_version"] == "2.6.0"
+    assert first["package_version"] == "2.6.1"
     assert first["profile"] is None
     assert first["transport"] == "stdio"
     assert first["tool_groups"] == ["all"]
@@ -2708,7 +2708,7 @@ async def test_capability_check_publishes_tuning_contract(
     result = await app._check_database_capabilities("appdb")
 
     assert result["mcp_contract"] == {
-        "contract_version": "2.6.0",
+        "contract_version": "2.6.1",
         "performance_tuning": 1,
         "durable_view_change": 1,
         "prepared_plan_action": 1,
@@ -2716,7 +2716,7 @@ async def test_capability_check_publishes_tuning_contract(
         "index_learning_mode": "recall_only",
         "index_history_schema_version": "index-history-v1",
         "index_history_schema_fingerprint": CONTRACT_SCHEMA_FINGERPRINT,
-        "index_review_min_observation_days": 90,
+        "index_review_min_observation_days": 35,
         "index_review_snapshot_reuse_hours": 48,
         "workload_index_advisor": 1,
         "result_status": 1,

@@ -6,6 +6,102 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [2.6.1] - 2026-10-02
+
+### Changed
+
+- Index removal (`review_index_portfolio`): the observation window is now 35
+  days, was 90. `business_cycle_extension_days` still lengthens it per
+  database, for example +60 for quarter-end jobs. The gate reads only the
+  trailing window:
+  - It sums reads across counter resets, per counter epoch.
+  - Captures with usable counters must be at most 48 h apart and cover at
+    least 95% of the window. One missed daily capture is tolerated.
+  - A counter decrease with no engine-start change is a reset of unknown
+    cause, and the index stays in `observe`. A read proven anywhere in the
+    window keeps the index.
+  - A Query Store retention shorter than the window is reported as a gap.
+  - `mcp_contract.index_review_min_observation_days` is now 35.
+- `review_workload_indexes`: a high-confidence unused-index drop needs at
+  least 35 days of usage counters, was 30, and a Query Store plan-reference
+  check over the same span.
+- `analyze_db_health` resource checks judge the full hour of 15-second samples
+  at p95 (warning at 80%, critical at 95%), not the last 3 minutes. Memory
+  near 100% is information, as Microsoft documents for Azure SQL Database:
+  - the `sustained_avg_memory_usage_percent` warning is replaced by an
+    `informational` entry;
+  - `details.governance_limits` drops `max_db_memory`,
+    `checkpoint_rate_mbps` and `max_workers_per_query`. Documented limits
+    replace them.
+- `collect_performance_evidence`: the `regressions` section now holds only
+  the automatic-tuning recommendations that bear on the case. These are live
+  `Active` rows, scoped to the case's Query Store query when it is known.
+  Engine-owned rows (`Verifying`, `Success`, `Reverted`, `Expired`) never
+  make a case actionable.
+- `review_plan_enforcement` ranks force actions only for recommendations
+  marked "apply manually" (`AutomaticTuningOptionNotEnabled`). It no longer
+  ranks unforce for plans that automatic tuning forced.
+- Index creates, extends and widens carry a `prerequisites` list. An index
+  with a computed key or INCLUDE column states the SET options every writer
+  needs, or its writes fail with Msg 1934.
+
+### Fixed
+
+- Index advice no longer gives destructive DDL:
+  - It never consolidates a covering index into a primary key or unique
+    constraint. It never emits two rebuilds of one survivor that undo each
+    other.
+  - Foreign-key protection is read one row per index and fails closed when
+    incomplete. The last unfiltered index supporting a foreign key is never
+    a drop candidate.
+  - A filtered index is never extended for queries outside its filter.
+  - New keys stay within 1,700 bytes.
+  - Compressed and partitioned rebuilds are one online statement that keeps
+    per-partition compression.
+- An index named by an index hint or a forced Query Store plan is never given
+  executable DROP DDL. Hints match case-insensitively; a name on several
+  tables pins every candidate; INDEX(0) and INDEX(1) are ignored. The
+  2,000-row hint scans count only rows that contain hints.
+- The Query Store window that actually exists is reported, and writes are
+  priced over it. Before, a longer lookback made indexes look cheaper.
+- `detect_regressed_queries` always returned empty. It read
+  `$.queryId` instead of `$.planForceDetails.queryId`.
+- Plan reading:
+  - Booleans are read in every form (`1` and `true`).
+  - `GrantWaitTime` is converted from seconds.
+  - Key lookups are judged on actual executions.
+  - Scalar UDFs are found in filters and scans.
+  - Dynamic seeks are no longer reported as "cannot seek".
+- `analyze_db_health` read DMV columns that do not exist on Azure SQL
+  Database. The connection check always failed, and the replication check
+  passed when its read failed. An unreadable source is now a warning, never
+  a pass.
+- `get_resource_limits` returned no log rate cap. It now reads
+  `primary_max_log_rate`.
+- Permission messages for tier-gated DMVs name the fix for Basic, S0, S1
+  and elastic-pool databases.
+- Computed columns can again be index keys or includes when they are
+  indexable and deterministic.
+- Lock hints written as quoted identifiers (`[UPDLOCK]`, `"TABLOCK"`) are
+  rejected by the read-only validator.
+
+### Added
+
+- The 2026-10-02 validator attack corpus (1,422 inputs, plus 107 expanded
+  forms) is pinned as a regression test.
+- A DMV column contract test and `scripts/capture_dmv_columns.py`, which
+  the owner runs per Azure tier to check documented columns.
+- `get_resource_limits`: pool, instance and effective log-rate caps in MB/s.
+  `get_resource_stats_history`: `p95` and minutes above 80% and 95% per
+  metric.
+
+### Upgrade notes
+
+- Review ids issued by 2.6.0 `review_index_portfolio` no longer resolve. Run
+  the review again.
+- A second portfolio capture on the upgrade day is rejected as an idempotency
+  conflict, because its windows differ. Capture again the next UTC day.
+
 ## [2.6.0] - 2026-10-02
 
 ### Added
