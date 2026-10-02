@@ -1,9 +1,50 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any
 
 from .connection import AzureSqlExecutor
+
+# Raw DMV read: no JSON paths, joins or filters, so no row can be lost in SQL.
+_TUNING_RECOMMENDATIONS_SQL = """
+SELECT
+    type,
+    reason,
+    score,
+    state,
+    details,
+    is_executable_action,
+    is_revertable_action,
+    execute_action_initiated_by,
+    revert_action_initiated_by,
+    valid_since,
+    last_refresh
+FROM sys.dm_db_tuning_recommendations
+"""
+
+# Window activity per named plan. The LEFT JOIN keeps a plan that did not run,
+# so is_forced_plan is known for it; a plan purged from Query Store has no row.
+_PLAN_ACTIVITY_SQL = """
+SELECT
+    p.plan_id,
+    p.query_id,
+    p.is_forced_plan,
+    MAX(rsi.end_time) AS last_seen_utc,
+    SUM(rs.count_executions) AS recent_execution_count
+FROM sys.query_store_plan AS p
+LEFT JOIN (
+    sys.query_store_runtime_stats AS rs
+    INNER JOIN sys.query_store_runtime_stats_interval AS rsi
+        ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
+       AND rsi.end_time >= DATEADD(MINUTE, -?, SYSUTCDATETIME())
+)
+    ON rs.plan_id = p.plan_id
+WHERE p.plan_id IN ({placeholders})
+GROUP BY p.plan_id, p.query_id, p.is_forced_plan
+"""
+
+_PLAN_ID_CHUNK = 1000
 
 
 class QueryRegressionService:
@@ -71,88 +112,51 @@ class QueryRegressionService:
         database_name: str,
         window_minutes: int = 1440,
     ) -> dict[str, Any]:
-        """Surface automatic tuning regression recommendations."""
+        """Surface automatic tuning regression recommendations.
+
+        Every DMV row is returned. JSON is parsed in Python (the ids live under
+        $.planForceDetails), then each row is annotated with the window activity
+        of its regressed and recommended plans. A regression is live when the
+        regressed plan ran in the window, even if the last-good plan did not.
+        """
         if window_minutes <= 0:
             raise ValueError("window_minutes must be greater than 0.")
-        query = """
-        WITH TuningRecommendations AS (
-            SELECT
-                reason,
-                score,
-                JSON_VALUE(state, '$.currentValue') AS current_state,
-                JSON_VALUE(state, '$.reason') AS state_reason,
-                JSON_VALUE(details, '$.implementationDetails.script') AS tuning_script,
-                JSON_VALUE(details, '$.queryId') AS query_id,
-                JSON_VALUE(details, '$.regressedPlanId') AS regressed_plan_id,
-                JSON_VALUE(details, '$.recommendedPlanId') AS recommended_plan_id,
-                JSON_VALUE(details, '$.estimatedCpuGain') AS estimated_cpu_gain,
-                JSON_VALUE(details, '$.estimatedDurationGain') AS estimated_duration_gain,
-                is_executable_action,
-                is_revertable_action,
-                execute_action_initiated_by,
-                revert_action_initiated_by,
-                valid_since,
-                last_refresh,
-                details
-            FROM sys.dm_db_tuning_recommendations
-        ),
-        RecentPlanActivity AS (
-            SELECT
-                p.query_id,
-                p.plan_id,
-                MAX(rsi.end_time) AS last_seen_utc,
-                SUM(rs.count_executions) AS recent_execution_count
-            FROM sys.query_store_plan AS p
-            INNER JOIN sys.query_store_runtime_stats AS rs
-                ON p.plan_id = rs.plan_id
-            INNER JOIN sys.query_store_runtime_stats_interval AS rsi
-                ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
-            WHERE rsi.end_time >= DATEADD(MINUTE, -?, SYSUTCDATETIME())
-            GROUP BY p.query_id, p.plan_id
-        )
-        SELECT
-            tr.reason,
-            tr.score,
-            tr.current_state,
-            tr.state_reason,
-            tr.tuning_script,
-            tr.query_id,
-            tr.regressed_plan_id,
-            tr.recommended_plan_id,
-            tr.estimated_cpu_gain,
-            tr.estimated_duration_gain,
-            tr.is_executable_action,
-            tr.is_revertable_action,
-            tr.execute_action_initiated_by,
-            tr.revert_action_initiated_by,
-            tr.valid_since,
-            tr.last_refresh,
-            rpa.last_seen_utc,
-            rpa.recent_execution_count,
-            tr.details
-        FROM TuningRecommendations AS tr
-        LEFT JOIN RecentPlanActivity AS rpa
-            ON rpa.query_id = TRY_CONVERT(bigint, tr.query_id)
-           AND rpa.plan_id = TRY_CONVERT(bigint, tr.recommended_plan_id)
-        WHERE rpa.last_seen_utc IS NOT NULL
-        ORDER BY tr.score DESC
-        """
-        rows = await self.executor.fetch_all(database_name, query, params=[int(window_minutes)])
+        rows = await self.executor.fetch_all(database_name, _TUNING_RECOMMENDATIONS_SQL)
+        recommendations = [parse_tuning_recommendation(row) for row in rows]
 
-        # Parse the details JSON for richer output
-        for row in rows:
-            details = row.get("details")
-            if isinstance(details, str):
-                try:
-                    row["details"] = json.loads(details)
-                except (json.JSONDecodeError, TypeError):
-                    pass
+        plan_ids = sorted(
+            {
+                plan_id
+                for rec in recommendations
+                for plan_id in (rec["regressed_plan_id"], rec["recommended_plan_id"])
+                if plan_id is not None
+            }
+        )
+        activity: dict[int, dict[str, Any]] = {}
+        # One placeholder per id (any compat level, unlike OPENJSON); chunked
+        # to stay far below the 2100-parameter limit.
+        for start in range(0, len(plan_ids), _PLAN_ID_CHUNK):
+            chunk = plan_ids[start : start + _PLAN_ID_CHUNK]
+            query = _PLAN_ACTIVITY_SQL.format(placeholders=", ".join("?" for _ in chunk))
+            for row in await self.executor.fetch_all(
+                database_name, query, params=[int(window_minutes), *chunk]
+            ):
+                plan_id = _int_or_none(row.get("plan_id"))
+                if plan_id is not None:
+                    activity[plan_id] = row
+
+        for rec in recommendations:
+            _annotate_plan_activity(rec, activity)
+        # Live regressions first, then the engine's score.
+        recommendations.sort(
+            key=lambda rec: (not rec["live"], -(_float_or_none(rec["score"]) or 0.0))
+        )
 
         return {
             "database_name": database_name,
             "window_minutes": window_minutes,
-            "recommendation_count": len(rows),
-            "recommendations": rows,
+            "recommendation_count": len(recommendations),
+            "recommendations": recommendations,
         }
 
     async def compare_query_plans(
@@ -305,24 +309,39 @@ class QueryRegressionService:
                 p.last_force_failure_reason_desc
         )
         SELECT
-            plan_id,
-            query_id,
-            query_sql_text,
-            is_forced_plan,
-            plan_forcing_type_desc,
-            force_failure_count,
-            last_force_failure_reason_desc,
-            avg_duration_ms,
-            avg_cpu_ms,
-            avg_logical_io_reads,
-            count_executions,
-            recent_execution_count,
-            last_execution_time,
-            DATEDIFF(DAY, last_execution_time, SYSUTCDATETIME()) AS days_since_last_exec
-        FROM ForcedPlanStats
-        ORDER BY last_execution_time DESC
+            f.plan_id,
+            f.query_id,
+            f.query_sql_text,
+            f.is_forced_plan,
+            f.plan_forcing_type_desc,
+            f.force_failure_count,
+            f.last_force_failure_reason_desc,
+            f.avg_duration_ms,
+            f.avg_cpu_ms,
+            f.avg_logical_io_reads,
+            f.count_executions,
+            f.recent_execution_count,
+            ISNULL(qa.query_recent_execution_count, 0) AS query_recent_execution_count,
+            f.last_execution_time,
+            DATEDIFF(DAY, f.last_execution_time, SYSUTCDATETIME()) AS days_since_last_exec
+        FROM ForcedPlanStats AS f
+        OUTER APPLY (
+            -- Executions of any plan of the query: the query runs while the
+            -- forced plan does not when forcing is failing now.
+            SELECT SUM(rs2.count_executions) AS query_recent_execution_count
+            FROM sys.query_store_plan AS p2
+            INNER JOIN sys.query_store_runtime_stats AS rs2
+                ON rs2.plan_id = p2.plan_id
+            INNER JOIN sys.query_store_runtime_stats_interval AS rsi2
+                ON rs2.runtime_stats_interval_id = rsi2.runtime_stats_interval_id
+            WHERE p2.query_id = f.query_id
+              AND rsi2.end_time >= DATEADD(MINUTE, -?, SYSUTCDATETIME())
+        ) AS qa
+        ORDER BY f.last_execution_time DESC
         """
-        rows = await self.executor.fetch_all(database_name, query, params=[int(window_minutes)])
+        rows = await self.executor.fetch_all(
+            database_name, query, params=[int(window_minutes), int(window_minutes)]
+        )
 
         stale = [r for r in rows if (r.get("days_since_last_exec") or 0) > 7]
         failing = [r for r in rows if (r.get("force_failure_count") or 0) > 0]
@@ -474,3 +493,138 @@ class QueryRegressionService:
             if len(operators) >= 10:
                 break
         return operators
+
+
+def parse_tuning_recommendation(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Flatten one raw sys.dm_db_tuning_recommendations row.
+
+    ``state`` is JSON {currentValue, reason}. ``details`` is JSON with the ids
+    and pre-detection stats under ``planForceDetails`` (CPU averages in
+    microseconds) and the script under ``implementationDetails``. Unreadable
+    JSON yields None fields, never an error; the raw text stays in ``details``.
+    """
+    state = _json_object(row.get("state"))
+    parsed_details = _load_json(row.get("details"))
+    details = parsed_details if isinstance(parsed_details, dict) else {}
+    force = _json_object(details.get("planForceDetails"))
+    implementation = _json_object(details.get("implementationDetails"))
+
+    regressed_exec = _int_or_none(force.get("regressedPlanExecutionCount"))
+    recommended_exec = _int_or_none(force.get("recommendedPlanExecutionCount"))
+    regressed_cpu = _float_or_none(force.get("regressedPlanCpuTimeAverage"))
+    recommended_cpu = _float_or_none(force.get("recommendedPlanCpuTimeAverage"))
+    # Microsoft's samples read *ErrorCount; the column reference says *AbortedCount.
+    regressed_errors = _int_or_none(
+        force.get("regressedPlanErrorCount", force.get("regressedPlanAbortedCount"))
+    )
+    recommended_errors = _int_or_none(
+        force.get("recommendedPlanErrorCount", force.get("recommendedPlanAbortedCount"))
+    )
+
+    estimated_cpu_gain = None
+    if (
+        regressed_exec is not None
+        and recommended_exec is not None
+        and regressed_cpu is not None
+        and recommended_cpu is not None
+    ):
+        # Documented estimate: total executions times the per-execution CPU
+        # difference, microseconds to seconds.
+        estimated_cpu_gain = (
+            (regressed_exec + recommended_exec) * (regressed_cpu - recommended_cpu) / 1_000_000
+        )
+    error_prone = (
+        regressed_errors > recommended_errors
+        if regressed_errors is not None and recommended_errors is not None
+        else None
+    )
+    current_state = state.get("currentValue")
+
+    return {
+        "type": row.get("type"),
+        "reason": row.get("reason"),
+        "score": row.get("score"),
+        "current_state": current_state if isinstance(current_state, str) else None,
+        "state_reason": state.get("reason"),
+        "tuning_script": implementation.get("script"),
+        "query_id": _int_or_none(force.get("queryId")),
+        "regressed_plan_id": _int_or_none(force.get("regressedPlanId")),
+        "recommended_plan_id": _int_or_none(force.get("recommendedPlanId")),
+        "regressed_plan_execution_count": regressed_exec,
+        "recommended_plan_execution_count": recommended_exec,
+        "regressed_plan_error_count": regressed_errors,
+        "recommended_plan_error_count": recommended_errors,
+        "regressed_plan_cpu_time_average_us": regressed_cpu,
+        "recommended_plan_cpu_time_average_us": recommended_cpu,
+        "estimated_cpu_gain": estimated_cpu_gain,
+        "estimated_cpu_gain_unit": "cpu_seconds",
+        # Not in the DMV; kept as null for output compatibility.
+        "estimated_duration_gain": None,
+        "error_prone": error_prone,
+        "is_executable_action": row.get("is_executable_action"),
+        "is_revertable_action": row.get("is_revertable_action"),
+        "execute_action_initiated_by": row.get("execute_action_initiated_by"),
+        "revert_action_initiated_by": row.get("revert_action_initiated_by"),
+        "valid_since": row.get("valid_since"),
+        "last_refresh": row.get("last_refresh"),
+        "details": parsed_details if parsed_details is not None else row.get("details"),
+    }
+
+
+def _annotate_plan_activity(
+    recommendation: dict[str, Any],
+    activity: Mapping[int, Mapping[str, Any]],
+) -> None:
+    regressed_id = recommendation["regressed_plan_id"]
+    recommended_id = recommendation["recommended_plan_id"]
+    regressed = activity.get(regressed_id) if regressed_id is not None else None
+    recommended = activity.get(recommended_id) if recommended_id is not None else None
+    regressed_runs = _int_or_none((regressed or {}).get("recent_execution_count")) or 0
+    recommended_runs = _int_or_none((recommended or {}).get("recent_execution_count")) or 0
+    seen = [
+        row["last_seen_utc"]
+        for row in (regressed, recommended)
+        if row is not None and row.get("last_seen_utc") is not None
+    ]
+    recommendation["regressed_plan_recent_execution_count"] = regressed_runs
+    recommendation["recommended_plan_recent_execution_count"] = recommended_runs
+    recommendation["recent_execution_count"] = regressed_runs + recommended_runs
+    recommendation["last_seen_utc"] = max(seen) if seen else None
+    # None: the plan is no longer in Query Store, so forcing it would fail.
+    recommendation["recommended_plan_is_forced"] = (
+        bool(recommended.get("is_forced_plan")) if recommended is not None else None
+    )
+    # Live: the regressed plan is still running in the window.
+    recommendation["live"] = regressed_runs > 0
+
+
+def _load_json(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _json_object(value: Any) -> dict[str, Any]:
+    loaded = _load_json(value)
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
