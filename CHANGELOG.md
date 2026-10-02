@@ -6,6 +6,32 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [2.5.1] - 2026-10-02
+
+### Security
+
+- The read-only validator admitted a write hidden after a SELECT with no
+  semicolon, for example `SELECT 1 DELETE FROM dbo.t`: the parser read
+  `DELETE` as a column alias, while SQL Server runs it as a second statement
+  and commits it on the autocommit connection. This affected `execute_sql`,
+  `explain_query(analyze=true)` and the benchmark tools. Any T-SQL reserved
+  statement keyword in code is now rejected, whatever the parser makes of it.
+- T-SQL is now lexed in one pass, the way SQL Server reads it (nested block
+  comments, strings, bracketed and double-quoted identifiers), so `/*` inside a
+  string or a line comment can no longer hide code. Unterminated strings,
+  identifiers and comments are rejected.
+
+### Changed
+
+- Locking hints are rejected in any position of the hint list and in the
+  legacy form without `WITH`. `TABLOCK`, `HOLDLOCK`, `SERIALIZABLE`,
+  `REPEATABLEREAD` and `READCOMMITTEDLOCK` are now rejected too: under RCSI they
+  make a read block writers. `NOLOCK` is still admitted. Index analysis skips
+  workload queries that use these hints, as it already did for `UPDLOCK`.
+- `NEXT VALUE FOR` (advances a sequence) and `RAND(seed)` (reseeds the
+  connection's generator, which outlives the call on pooled connections) are
+  rejected. Unseeded `RAND()` is still admitted.
+
 ## [2.5.0] - 2026-10-01
 
 ### Added
