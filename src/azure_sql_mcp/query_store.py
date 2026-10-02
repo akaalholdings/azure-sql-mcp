@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+import unicodedata
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable, Mapping
 from datetime import datetime
 from datetime import timedelta
 from typing import Any
+from xml.sax.saxutils import unescape
 
 from .connection import AzureSqlExecutor
 from .index_optimizer import INDEX_CANDIDATE_IMPACT_FLOOR_PCT
@@ -207,12 +209,15 @@ ORDER BY plan_guide_id DESC
 """
 
 
+# definition is NULL for a WITH ENCRYPTION module (or one the login cannot
+# view); those rows are kept so the scan reports them as unreadable.
 MODULE_HINTS_SQL = """
 SELECT TOP (?)
     object_id,
     definition AS module_definition
 FROM sys.sql_modules
-WHERE definition COLLATE Latin1_General_CI_AS LIKE N'%INDEX%'
+WHERE definition IS NULL
+    OR definition COLLATE Latin1_General_CI_AS LIKE N'%INDEX%'
     OR definition COLLATE Latin1_General_CI_AS LIKE N'%FORCESEEK%'
 ORDER BY object_id
 """
@@ -309,14 +314,29 @@ def _unquote_hint_identifier(value: str) -> str:
     text = value.strip()
     if len(text) >= 2 and text[0] == "[" and text[-1] == "]":
         return text[1:-1].replace("]]", "]")
+    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+        return text[1:-1].replace('""', '"')
     return text
 
 
 def _fold(value: Any) -> str:
-    # casefold matches Azure SQL's default case-insensitive collation; on a
-    # case-sensitive database it can only pin more indexes, never fewer.
+    # A superset of the catalog collation, so it can only pin more indexes,
+    # never fewer: SQL_Latin1_General_CP1_CI_AS ignores case, width and kana
+    # type, and a DATABASE_DEFAULT catalog can also ignore accents.
     # SQL ignores trailing spaces when it compares identifiers (ANSI padding).
-    return value.casefold().rstrip(" ") if isinstance(value, str) else ""
+    if not isinstance(value, str):
+        return ""
+    if value.isascii():
+        # The Unicode steps change nothing in ASCII, the common and hot case.
+        folded = value.casefold()
+    else:
+        text = unicodedata.normalize("NFKD", unicodedata.normalize("NFKD", value).casefold())
+        folded = "".join(
+            chr(ord(character) + 0x60) if "\u3041" <= character <= "\u3096" else character
+            for character in text
+            if not unicodedata.combining(character)
+        )
+    return folded.rstrip(" ")
 
 
 def _hint_table_matches(target: str | None, identity: Mapping[str, Any]) -> bool:
@@ -325,18 +345,22 @@ def _hint_table_matches(target: str | None, identity: Mapping[str, Any]) -> bool
     pieces = [
         _fold(_unquote_hint_identifier(piece))
         for piece in target.strip().split(".")
-        if piece.strip()
     ]
     if len(pieces) < 2:
         # A one-part target can be an alias, and an alias can share another
         # table's name, so it narrows nothing.
         return True
-    return pieces[-1] == _fold(identity["table"]) and pieces[-2] == _fold(identity["schema"])
+    # In db..table the empty schema is the default schema, which can be any.
+    return pieces[-1] == _fold(identity["table"]) and pieces[-2] in {"", _fold(identity["schema"])}
 
 
+# \w is Unicode-aware: a regular identifier may use any Unicode letter.
 _HINT_IDENTIFIER = re.compile(
-    r"\[(?:[^\]]|\]\])+\]|[A-Za-z_#$@][A-Za-z0-9_#$@]*|[0-9]+"
+    r'\[(?:[^\]]|\]\])+\]|"(?:[^"]|"")+"|(?:[^\W\d]|[#$@])[\w#$@]*|[0-9]+'
 )
+# Showplan XML, as USE PLAN carries it, names each index the plan reads or
+# maintains as Index="[name]"; the forced plan fails once that index is gone.
+_SHOWPLAN_INDEX_ATTRIBUTE = re.compile(r'\bIndex="(\[(?:[^\]"]|\]\])+\])"')
 
 
 def _matching_hint_parenthesis(text: str, opening: int) -> int | None:
@@ -344,13 +368,14 @@ def _matching_hint_parenthesis(text: str, opening: int) -> int | None:
     position = opening
     while position < len(text):
         character = text[position]
-        if character == "[":
+        if character in '["':
+            quote_end = "]" if character == "[" else '"'
             position += 1
             while position < len(text):
-                if text[position] != "]":
+                if text[position] != quote_end:
                     position += 1
                     continue
-                if position + 1 < len(text) and text[position + 1] == "]":
+                if position + 1 < len(text) and text[position + 1] == quote_end:
                     position += 2
                     continue
                 position += 1
@@ -396,24 +421,29 @@ def _parse_index_hint_values(
         position += 1
     if position >= len(text) or text[position] not in {"=", "("}:
         return None, position, False
-    if text[position] == "=":
+    single = text[position] == "="
+    if single:
         position += 1
         while position < len(text) and text[position].isspace():
             position += 1
-        match = _HINT_IDENTIFIER.match(text, position)
-        return (
-            [match.group(0)] if match is not None else None,
-            match.end() if match is not None else position,
-            True,
-        )
+        if position >= len(text) or text[position] != "(":
+            match = _HINT_IDENTIFIER.match(text, position)
+            end = match.end() if match is not None else position
+            delimiter = end
+            while delimiter < len(text) and text[delimiter].isspace():
+                delimiter += 1
+            # A name cut short by a character the pattern lacks is not the name.
+            if match is None or (delimiter < len(text) and text[delimiter] not in ",)"):
+                return None, end, True
+            return [match.group(0)], end, True
     closing = _matching_hint_parenthesis(text, position)
     if closing is None:
         return None, len(text), True
-    return (
-        _parse_hint_identifier_list(text[position + 1 : closing]),
-        closing + 1,
-        True,
-    )
+    values = _parse_hint_identifier_list(text[position + 1 : closing])
+    if single and values is not None and len(values) != 1:
+        # INDEX = ( index_value ) takes exactly one index.
+        values = None
+    return values, closing + 1, True
 
 
 def _parse_forceseek_index(
@@ -456,7 +486,16 @@ def _resolve_index_hints(
     matches: dict[tuple[int, int, str], dict[str, Any]] = {}
     blockers: list[str] = []
     hints: list[tuple[int, str]] = []
-    for match in re.finditer(r"\bINDEX\b", text, re.IGNORECASE):
+    showplan_starts: set[int] = set()
+    for match in _SHOWPLAN_INDEX_ATTRIBUTE.finditer(text):
+        showplan_starts.add(match.start())
+        # Undo the N'...' literal's doubled quotes, then the XML escapes.
+        value = unescape(match.group(1).replace("''", "'"), {"&quot;": '"', "&apos;": "'"})
+        hints.append((match.start(), value))
+    # @index and #index are a variable and a temp table, never a hint.
+    for match in re.finditer(r"(?<![@#])\bINDEX\b", text, re.IGNORECASE):
+        if match.start() in showplan_starts:
+            continue
         values, _end, recognized = _parse_index_hint_values(text, match.end())
         if not recognized:
             continue
@@ -464,7 +503,8 @@ def _resolve_index_hints(
             blockers.append("malformed_index_hint")
             continue
         hints.extend((match.start(), value) for value in values)
-    for match in re.finditer(r"\bFORCESEEK\b", text, re.IGNORECASE):
+    # ForceSeek="true" is a showplan attribute; its Index attribute is read above.
+    for match in re.finditer(r'\bFORCESEEK\b(?!=")', text, re.IGNORECASE):
         value, _end = _parse_forceseek_index(text, match.end())
         if value is None:
             blockers.append("unresolved_forceseek_index_hint")

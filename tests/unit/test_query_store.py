@@ -180,6 +180,19 @@ def test_table_hint_target_still_narrows_a_shared_index_name() -> None:
     assert [(item["object_id"], item["index_id"]) for item in matches] == [(202, 2)]
 
 
+def test_database_dot_dot_table_hint_target_narrows_by_table_only() -> None:
+    # Sales..Orders is database Sales and the default schema, so in a database
+    # named Sales it names dbo.Orders, not Sales.Orders.
+    identities = [*SAME_NAME_ON_TWO_TABLES, _identity(303, 2, "Orders", "IX_Date", schema="dbo")]
+
+    matches, blockers = _resolve_index_hints(
+        "SELECT * FROM Sales..Orders OPTION (TABLE HINT(Sales..Orders, INDEX(IX_Date)))", identities
+    )
+
+    assert blockers == []
+    assert {(item["object_id"], item["index_id"]) for item in matches} == {(101, 2), (303, 2)}
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -193,6 +206,87 @@ def test_heap_and_clustered_index_ids_are_skipped(text: str) -> None:
     identities = [*SAME_NAME_ON_TWO_TABLES, _identity(101, 1, "Orders", "PK_Orders")]
 
     assert _resolve_index_hints(text, identities) == ([], [])
+
+
+USE_PLAN_XML = (
+    '<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan"><BatchSequence><Batch>'
+    '<Statements><StmtSimple StatementText="SELECT OrderID FROM Sales.Orders WHERE OrderDate = @d"><QueryPlan>'
+    '<RelOp PhysicalOp="Index Seek" LogicalOp="Index Seek"><IndexScan Ordered="true" ScanDirection="FORWARD" '
+    'ForcedIndex="false" ForceSeek="false" ForceScan="false" NoExpandHint="false" Storage="RowStore">'
+    '<Object Database="[appdb]" Schema="[Sales]" Table="[Orders]" Index="{index}" IndexKind="NonClustered" '
+    'Storage="RowStore" /></IndexScan></RelOp></QueryPlan></StmtSimple></Statements></Batch></BatchSequence>'
+    "</ShowPlanXML>"
+)
+
+
+@pytest.mark.parametrize(
+    ("hint", "index_name"),
+    [
+        # Every one of these hints runs on Azure SQL Database and fails with
+        # Msg 308 after a DROP of the index it names, so each must pin it.
+        ("WITH (INDEX = (IX_Date))", "IX_Date"),
+        ("WITH (INDEX=(IX_Date))", "IX_Date"),
+        ('WITH (INDEX("IX_Date"))', "IX_Date"),
+        ('WITH (INDEX = "IX ""Odd"" Name")', 'IX "Odd" Name'),
+        ('WITH (INDEX("IX_Odd) Name"), NOLOCK)', "IX_Odd) Name"),
+        ("WITH (INDEX(IX_Größe))", "IX_Größe"),
+        ("WITH (INDEX = IX_Größe)", "IX_Größe"),
+        ("WITH (INDEX(ÍndiceFecha))", "ÍndiceFecha"),
+        ("WITH (FORCESEEK(IX_Größe(OrderDate)))", "IX_Größe"),
+        # The default catalog collation ignores width and kana type.
+        ("WITH (INDEX([ＩＸ_Date]))", "IX_Date"),
+        ("WITH (INDEX([IX_ヒヅケ]))", "IX_ひづけ"),
+        # A DATABASE_DEFAULT catalog collation can also ignore accents.
+        ("WITH (INDEX(IX_Resume))", "IX_Résumé"),
+        # A forced plan fails to compile once an index it uses is gone.
+        pytest.param("OPTION (USE PLAN N'" + USE_PLAN_XML.format(index="[IX_Date]") + "')", "IX_Date", id="use-plan"),
+        pytest.param(
+            "OPTION (USE PLAN N'" + USE_PLAN_XML.format(index="[IX_O''Neil &amp; Co]]]") + "')",
+            "IX_O'Neil & Co]",
+            id="use-plan-escaped-name",
+        ),
+    ],
+)
+def test_every_valid_hint_form_pins_the_index_it_names(hint: str, index_name: str) -> None:
+    identities = [_identity(101, 3, "Orders", index_name), _identity(101, 4, "Orders", "IX_Other")]
+
+    matches, blockers = _resolve_index_hints(f"SELECT OrderID FROM Sales.Orders {hint}", identities)
+
+    assert blockers == []
+    assert [(item["object_id"], item["index_id"]) for item in matches] == [(101, 3)]
+
+
+@pytest.mark.parametrize(
+    "hint",
+    [
+        # A combining mark is not an identifier character. Reading only the
+        # prefix "IX_Gro" pins the wrong index and misses the one the hint names.
+        "INDEX = IX_Gro\u0308sse",
+        # INDEX = ( index_value ) takes one index; two is not this hint.
+        "INDEX = (IX_Gro, IX_Other)",
+    ],
+)
+def test_index_equals_hint_that_is_not_one_whole_name_is_malformed(hint: str) -> None:
+    identities = [_identity(101, 3, "Orders", "IX_Gro"), _identity(101, 4, "Orders", "IX_Other")]
+
+    matches, blockers = _resolve_index_hints(f"SELECT * FROM Sales.Orders WITH ({hint})", identities)
+
+    assert matches == []
+    assert blockers == ["malformed_index_hint"]
+
+
+def test_variables_and_temp_tables_named_index_are_not_hints() -> None:
+    # Loop counters named @index are common in modules; read as hints they pin
+    # every index_id 2 or make the scan incomplete.
+    text = (
+        "DECLARE @index int = 2; SET @index = @index + 1; SET @Index = 2;"
+        " CREATE TABLE #index (id int); SELECT * FROM Sales.Orders WITH (INDEX(IX_Orders_Customer))"
+    )
+
+    matches, blockers = _resolve_index_hints(text, SAME_NAME_ON_TWO_TABLES)
+
+    assert blockers == []
+    assert [(item["object_id"], item["index_id"]) for item in matches] == [(101, 3)]
 
 
 @pytest.mark.parametrize(
@@ -848,7 +942,8 @@ class HintSourceDatabase:
 
     The LIKE filter is applied case-insensitively, as the hint SQL forces a
     case-insensitive collation, and its terms are joined as the SQL joins them
-    (AND or OR).
+    (AND or OR). As in SQL, LIKE on a NULL text is never true; only an
+    IS NULL term keeps a NULL row.
     """
 
     ROUTES = (
@@ -866,9 +961,18 @@ class HintSourceDatabase:
         rows = list(self.rows.get(source, []))
         where = re.search(r"\bWHERE\b(.*?)\bORDER BY\b", query, re.DOTALL)
         if where:
-            patterns = [pattern.casefold() for pattern in re.findall(r"LIKE N'%(\w+)%'", where.group(1))]
-            combine = all if re.search(r"\bAND\b", where.group(1)) else any
-            rows = [row for row in rows if combine(p in str(row[text_key]).casefold() for p in patterns)]
+            clause = where.group(1)
+            patterns = [pattern.casefold() for pattern in re.findall(r"LIKE N'%(\w+)%'", clause)]
+            combine = all if re.search(r"\bAND\b", clause) else any
+            keeps_null = re.search(r"\bIS NULL\b", clause) is not None
+
+            def kept(text: object) -> bool:
+                terms = [isinstance(text, str) and p in text.casefold() for p in patterns]
+                if keeps_null:
+                    terms.append(text is None)
+                return combine(terms)
+
+            rows = [row for row in rows if kept(row[text_key])]
         order = re.search(r"ORDER BY q\.last_execution_time(?:\s+(ASC|DESC))?", query)
         if order:
             rows.sort(
@@ -988,6 +1092,26 @@ async def test_case_and_ambiguous_hints_resolve_so_the_scan_stays_complete() -> 
         for evidence in result["evidence"]
         for item in evidence["resolved_indexes"]
     } == {(101, 2), (101, 3), (202, 2)}
+
+
+@pytest.mark.asyncio
+async def test_encrypted_module_text_makes_hint_coverage_incomplete() -> None:
+    # sys.sql_modules.definition is NULL for a WITH ENCRYPTION module. Its
+    # hints cannot be read, so the scan must not report complete.
+    rows = [
+        {"object_id": 1, "module_definition": None},
+        {"object_id": 2, "module_definition": "SELECT 1 FROM Sales.Orders WITH (INDEX(IX_Orders_Customer))"},
+    ]
+    service = QueryStoreService(HintSourceDatabase({"module_definitions": rows}))
+
+    result = await service.get_index_hint_coverage(
+        "appdb", index_identities=SAME_NAME_ON_TWO_TABLES, limit=10
+    )
+
+    module = result["coverage"]["sources"]["module_definitions"]
+    assert result["coverage"]["status"] == "incomplete"
+    assert module["scanned"] == 2
+    assert module["blockers"] == ["module_definitions_text_unavailable"]
 
 
 @pytest.mark.asyncio
