@@ -609,6 +609,71 @@ async def test_nondeterministic_computed_column_is_never_used_and_is_reported(cl
     assert "withheld" in gap
 
 
+@pytest.mark.asyncio
+async def test_deterministic_unindexable_computed_column_is_still_included(clustered_only) -> None:
+    # A deterministic computed column that IsIndexable rejects (an imprecise,
+    # non-persisted expression) cannot be a key but can be INCLUDEd, so the
+    # lookup is still covered and the gap must not say that advice is withheld.
+    report = await WorkloadIndexAdvisor(_computed("Comments", 0, 1)).review("appdb", now=NOW)
+
+    [rec] = _orders_create(report)
+    assert rec["include_columns"] == ["Comments"]
+    [gap] = [gap for gap in report["gaps"] if "Sales.Orders.Comments" in gap]
+    assert "Comments (not indexable)" in gap
+    assert "key lookup" not in gap
+
+
+@pytest.mark.parametrize(("column", "is_indexable"), [("Comments", 1), ("CustomerID", 1), ("Comments", 0)])
+@pytest.mark.asyncio
+async def test_computed_column_advice_requires_writer_set_options(clustered_only, column, is_indexable) -> None:
+    # A key or INCLUDE computed column makes every writer of the table need the
+    # indexed-view SET options, or its INSERT/UPDATE/DELETE fails with Msg 1934.
+    report = await WorkloadIndexAdvisor(_computed(column, is_indexable, 1)).review("appdb", now=NOW)
+    plain = await WorkloadIndexAdvisor(
+        RoutingExecutor(workload=[_workload_row(1, "seek_residual_lookup_sort.xml", 900_000)])
+    ).review("appdb", now=NOW)
+
+    [rec] = _orders_create(report)
+    assert column in _used_columns(rec)
+    [step] = rec["prerequisites"]
+    assert f"Sales.Orders.{column}" in step
+    assert "QUOTED_IDENTIFIER" in step and "NUMERIC_ROUNDABORT OFF" in step and "Msg 1934" in step
+    [plain_rec] = _orders_create(plain)
+    assert plain_rec["prerequisites"] == []
+
+
+@pytest.mark.parametrize("columns", [RuntimeError("timeout"), []], ids=["read_failed", "no_rows"])
+@pytest.mark.asyncio
+async def test_unread_column_metadata_is_never_reported_as_no_computed_column(clustered_only, columns) -> None:
+    # Without sys.columns rows the advisor cannot know whether an INCLUDE is
+    # computed; prerequisites=[] would look checked while writers may hit Msg 1934.
+    report = await WorkloadIndexAdvisor(
+        RoutingExecutor(columns=columns, workload=[_workload_row(1, "seek_residual_lookup_sort.xml", 900_000)])
+    ).review("appdb", now=NOW)
+
+    [rec] = _orders_create(report)
+    assert "Comments" in rec["include_columns"]
+    [step] = rec["prerequisites"]
+    assert "Sales.Orders.Comments" in step and "not read" in step and "Msg 1934" in step
+
+
+@pytest.mark.asyncio
+async def test_tables_past_the_detail_cap_are_reported_as_a_gap(clustered_only, monkeypatch) -> None:
+    # Past the cap no column, computed-column or selectivity read is issued, so
+    # the skipped tables must show as a gap and their advice must not look checked.
+    monkeypatch.setattr(module, "MAX_DETAIL_TABLES", 0)
+    executor = _computed("Comments", 1, 1)
+
+    report = await WorkloadIndexAdvisor(executor).review("appdb", now=NOW)
+
+    assert not any(call[0] == "columns" for call in executor.calls)
+    [gap] = [gap for gap in report["gaps"] if "detail limit" in gap]
+    assert "1 workload table(s)" in gap and "Sales.Orders" in gap
+    [rec] = _orders_create(report)
+    [step] = rec["prerequisites"]
+    assert "Sales.Orders.Comments" in step and "not read" in step
+
+
 def _foreign_key_rows(count: int, columns_per_key: int) -> list[dict[str, Any]]:
     columns = ("StockItemID", "PackageTypeID", "Quantity")[:columns_per_key]
     return [

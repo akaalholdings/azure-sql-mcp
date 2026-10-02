@@ -1130,6 +1130,86 @@ def test_computed_columns_without_metadata_are_reported_as_a_gap() -> None:
     assert not any("Comments" in gap for gap in read["gaps"])
 
 
+@pytest.mark.parametrize(
+    ("action", "existing"),
+    [("create_index", lambda: [_orders_clustered()]), ("widen_index", _orders_indexes)],
+)
+@pytest.mark.parametrize("computed", [False, True])
+def test_index_on_computed_column_lists_writer_set_options_as_prerequisite(action, existing, computed) -> None:
+    # Once an index holds a computed column, every INSERT/UPDATE/DELETE that
+    # maintains it fails with Msg 1934 unless the writer runs with the required
+    # SET options. A module created with QUOTED_IDENTIFIER OFF breaks on deploy.
+    columns = dict(ORDERS_COLUMNS)
+    if computed:
+        columns["comments"] = ColumnInfo(
+            "Comments", "nvarchar", 400, is_computed=True, is_indexable=True, is_deterministic=True
+        )
+    inputs = _inputs(
+        [_query(1, "seek_residual_lookup_sort.xml", cpu_us=900_000)],
+        existing(),
+        selectivity=ORDERS_SELECTIVITY,
+    )
+    inputs.columns[("sales", "orders")] = columns
+
+    [rec] = _recs(build_index_advice(inputs), action, "Orders")
+
+    assert "Comments" in rec["include_columns"]
+    if not computed:
+        assert rec["prerequisites"] == []
+        return
+    [step] = rec["prerequisites"]
+    assert "Sales.Orders.Comments" in step
+    for option in (
+        "ANSI_NULLS",
+        "ANSI_PADDING",
+        "ANSI_WARNINGS",
+        "ARITHABORT",
+        "CONCAT_NULL_YIELDS_NULL",
+        "QUOTED_IDENTIFIER",
+    ):
+        assert option in step
+    assert "NUMERIC_ROUNDABORT OFF" in step
+    assert "Msg 1934" in step
+    assert "sys.sql_modules" in step
+    # ANSI_WARNINGS ON implies ARITHABORT ON at every Azure SQL Database
+    # compatibility level, so driver connections (ARITHABORT OFF) are not writers
+    # to chase; only ODBC sqlcmd defaults QUOTED_IDENTIFIER OFF (go-sqlcmd ignores -I).
+    assert "connections that leave ARITHABORT OFF are fine" in step
+    assert "ODBC sqlcmd without -I" in step
+    # A prerequisite to check, not missing evidence: the DDL stays executable.
+    assert rec["ddl"] is not None
+
+
+@pytest.mark.parametrize("metadata", ["table_unread", "column_missing"])
+def test_index_on_columns_without_metadata_asks_to_check_for_computed_columns(metadata) -> None:
+    # Unread column metadata is not "no computed column": an empty prerequisite
+    # list would read as checked, while a computed INCLUDE can still break writers
+    # with Msg 1934.
+    inputs = _inputs(
+        [_query(1, "seek_residual_lookup_sort.xml", cpu_us=900_000)],
+        [_orders_clustered()],
+        selectivity=ORDERS_SELECTIVITY,
+    )
+    if metadata == "table_unread":
+        del inputs.columns[("sales", "orders")]
+    else:
+        inputs.columns[("sales", "orders")] = {
+            key: info for key, info in ORDERS_COLUMNS.items() if key != "comments"
+        }
+
+    [rec] = _recs(build_index_advice(inputs), "create_index", "Orders")
+
+    assert "Comments" in rec["include_columns"]
+    [step] = rec["prerequisites"]
+    assert "Sales.Orders.Comments" in step
+    assert "not read" in step
+    assert "sys.columns" in step and "is_computed" in step
+    assert "NUMERIC_ROUNDABORT OFF" in step and "Msg 1934" in step
+    if metadata == "column_missing":
+        # Columns whose metadata was read are not named.
+        assert "Sales.Orders.CustomerID" not in step
+
+
 def test_fitted_key_with_only_low_selectivity_columns_is_capped_at_medium() -> None:
     columns = dict(ORDERS_COLUMNS)
     columns["status"] = ColumnInfo("Status", "nvarchar", 1800)

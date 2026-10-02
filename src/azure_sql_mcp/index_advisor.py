@@ -2261,6 +2261,7 @@ def _candidate_recommendation(
         "confidence": confidence,
         "reason_codes": reason_codes,
         "blockers": blockers,
+        "prerequisites": _computed_column_prerequisites(candidate, keys, includes, columns),
         "rationale": rationale,
         "risks": _candidate_risks(action, candidate, penalty),
         "ddl": ddl,
@@ -2280,6 +2281,51 @@ def _candidate_recommendation(
         + (["missing_index_hint"] if candidate.hint_agreement else []),
         "_supports": list(supports),
     }
+
+
+def _computed_column_prerequisites(
+    candidate: _Candidate,
+    keys: list[tuple[str, str]],
+    includes: list[str],
+    columns: dict[str, ColumnInfo],
+) -> list[str]:
+    """Writer SET options an index on a computed column (key or INCLUDE) depends on.
+
+    A column without catalog metadata may be computed too, so it gets a check
+    step; an empty list means every column was read and none is computed.
+    """
+
+    names = list(dict.fromkeys([n for n, _ in keys] + list(includes)))
+    computed = [name for name in names if (info := columns.get(_norm(name))) and info.is_computed]
+    unread = [name for name in names if _norm(name) not in columns]
+    table = f"{candidate.schema}.{candidate.table}"
+    options = (
+        "ANSI_NULLS, ANSI_PADDING, ANSI_WARNINGS, ARITHABORT, CONCAT_NULL_YIELDS_NULL and "
+        "QUOTED_IDENTIFIER ON and NUMERIC_ROUNDABORT OFF"
+    )
+    steps: list[str] = []
+    if computed:
+        shown = ", ".join(f"{table}.{name}" for name in computed)
+        steps.append(
+            f"This index uses computed column(s) {shown}. Every session and module that runs INSERT, "
+            f"UPDATE, DELETE or MERGE against {table} must have {options}, or the statement fails "
+            "with Msg 1934 once the index exists; the session that runs this DDL needs them too. "
+            "ARITHABORT ON is implied by ANSI_WARNINGS ON at every Azure SQL Database compatibility "
+            "level, so connections that leave ARITHABORT OFF are fine. Before you create it, find "
+            "the modules that write the table and were created with uses_quoted_identifier = 0 or "
+            "uses_ansi_nulls = 0 in sys.sql_modules, and the clients that set QUOTED_IDENTIFIER, "
+            "ANSI_NULLS, ANSI_PADDING, ANSI_WARNINGS or CONCAT_NULL_YIELDS_NULL OFF or "
+            "NUMERIC_ROUNDABORT ON (ODBC sqlcmd without -I runs with QUOTED_IDENTIFIER OFF)."
+        )
+    if unread:
+        shown = ", ".join(f"{table}.{name}" for name in unread)
+        steps.append(
+            f"Column metadata for {shown} was not read, so the advisor cannot tell whether any of "
+            "them is a computed column. Before you create this index, check sys.columns.is_computed "
+            f"for them. If one is computed, every session and module that writes {table} must have "
+            f"{options}, or its INSERT, UPDATE, DELETE or MERGE fails with Msg 1934."
+        )
+    return steps
 
 
 def _candidate_rationale(

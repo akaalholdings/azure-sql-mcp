@@ -444,12 +444,25 @@ class WorkloadIndexAdvisor:
             focus_schema=schema_name if not table_names else None,
         )
 
-        detail_keys = self._detail_tables(queries, tables, focus_tables, schema_name)
+        detail_keys = [
+            key
+            for key in self._detail_tables(queries, tables, focus_tables, schema_name)
+            if key in tables and tables[key].object_id is not None
+        ]
+        if len(detail_keys) > MAX_DETAIL_TABLES:
+            skipped = [f"{tables[key].schema}.{tables[key].table}" for key in detail_keys[MAX_DETAIL_TABLES:]]
+            shown = ", ".join(skipped[:10]) + (f" and {len(skipped) - 10} more" if len(skipped) > 10 else "")
+            gaps.append(
+                f"{len(skipped)} workload table(s) are past the {MAX_DETAIL_TABLES}-table detail limit "
+                f"({shown}); their column metadata and statistics were not read, so advice for them "
+                "did not check computed columns, LOB columns or key width, and key order uses "
+                "workload frequency only"
+            )
         detail_ids = [
             object_id
-            for key in detail_keys
-            if key in tables and (object_id := tables[key].object_id) is not None
-        ][:MAX_DETAIL_TABLES]
+            for key in detail_keys[:MAX_DETAIL_TABLES]
+            if (object_id := tables[key].object_id) is not None
+        ]
         heap_ids = [
             object_id
             for info in tables.values()
@@ -1125,7 +1138,7 @@ def _unusable_computed_column_gaps(
     shown = ", ".join(unusable[:10]) + (f" and {len(unusable) - 10} more" if len(unusable) > 10 else "")
     return [
         f"Computed column(s) {shown} cannot be index keys, and non-deterministic ones cannot be "
-        "included columns; index advice that needs them, such as covering a key lookup, is withheld"
+        "included columns; index advice that needs them in those roles is withheld"
     ]
 
 
