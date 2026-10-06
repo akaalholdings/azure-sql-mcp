@@ -698,6 +698,27 @@ def test_the_watchdog_records_each_leaked_connection_once_without_a_stats_call(
     assert "Sentinel" not in json.dumps(leaks())
 
 
+def test_a_connection_held_by_a_running_call_is_not_reported_as_leaked(tmp_path: Path) -> None:
+    # Live incident 2026-10-05: a long query's own connection was reported as leaked.
+    app = sentinel_app(tmp_path)
+    app.pool._leases[1] = ("SentinelDb", time.monotonic() - 3600, "stack")
+
+    def leaks() -> list[dict]:
+        return [r for r in records(app) if r.get("site") == "connection_pool.leaked_connection"]
+
+    app.incidents.start()
+    try:
+        call = app.incidents.begin("execute_sql", {"sql": "SELECT 1"})
+        app.incidents.tick()
+        assert leaks() == []
+
+        app.incidents.end(call, result={"result_status": "ok"})
+        app.incidents.tick()
+        assert len(leaks()) == 1
+    finally:
+        app.incidents.close()
+
+
 # --- process lifecycle ----------------------------------------------------------
 
 

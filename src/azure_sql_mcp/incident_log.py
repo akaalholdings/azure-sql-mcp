@@ -525,6 +525,10 @@ def _classify_driver(
     driver_error = getattr(root, "driver_error", None)
     if isinstance(driver_error, str):
         error["driver_category"] = redact_text(driver_error, limit=80)
+    if sqlstate in ("HYT00", "HYT01") and _is_query_timeout(root):
+        # The statement ran for the whole query timeout; a retry does the same.
+        error["transient"] = False
+        return "timeout", "P3"
     transient = native in TRANSIENT_ERROR_CODES or (
         sqlstate is not None
         and (sqlstate.startswith("08") or sqlstate in _TRANSIENT_SQLSTATES)
@@ -539,6 +543,13 @@ def _classify_driver(
     if sql_arguments:
         return "caller_error", "P4"
     return "product_bug", "P2"
+
+
+def _is_query_timeout(root: BaseException) -> bool:
+    """True for a statement timeout; a login timeout shares its SQLSTATE."""
+
+    texts = [getattr(root, "ddbc_error", None), *getattr(root, "args", ())]
+    return any(isinstance(text, str) and "query timeout" in text.lower() for text in texts)
 
 
 def native_codes(exc: BaseException) -> tuple[int | None, str | None]:
@@ -1575,7 +1586,8 @@ class IncidentLog:
         except Exception:
             pass
         try:
-            if self._on_tick is not None:
+            # A connection held while a call runs is in use, not leaked.
+            if self._on_tick is not None and not self._inflight:
                 self._on_tick()  # e.g. connections held past their lease
         except Exception:
             pass

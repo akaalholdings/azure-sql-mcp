@@ -502,6 +502,32 @@ def test_tokenizer_failure_is_a_caller_error_without_sql() -> None:
     assert "SENTINEL" not in json.dumps(described)
 
 
+def test_missing_showplan_shape_survives_redaction() -> None:
+    # The shape says why no plan came back; redaction must not blank it.
+    error = RuntimeError(
+        "No SHOWPLAN XML was returned; result sets: two; values seen: text, null. "
+        "Confirm SHOWPLAN access and that the statement is supported."
+    )
+    message = describe_exception(tool_error_chain(error))["error"]["message"]
+    assert "result sets: two; values seen: text, null" in message
+
+
+def test_query_timeout_is_a_timeout_not_a_transient_error() -> None:
+    # Live incident 2026-10-05: a statement that ran for the whole 30-minute
+    # query timeout was filed as transient, the label that means "retry".
+    ran_out = OperationalError("Timeout expired", "Query timeout expired")
+    described = describe_exception(tool_error_chain(ran_out))
+    assert (described["category"], described["priority"]) == ("timeout", "P3")
+    assert described["error"]["sqlstate"] == "HYT00"
+    assert described["error"]["transient"] is False
+
+    login = describe_exception(
+        tool_error_chain(OperationalError("Timeout expired", "Login timeout expired"))
+    )
+    assert login["category"] == "transient"
+    assert login["error"]["transient"] is True
+
+
 def test_driver_errors_classify_by_native_code_sqlstate_and_origin() -> None:
     transient = OperationalError(
         "Communication link failure",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import asyncio
 import time
 from unittest.mock import MagicMock
@@ -384,6 +385,20 @@ def test_leak_detection_reports_long_held_connections(sample_server_config) -> N
     assert len(leaked) == 1
     assert leaked[0]["database_name"] == "appdb"
     assert leaked[0]["held_seconds"] > 300
+
+
+def test_leak_detection_allows_for_the_configured_query_timeout(sample_server_config) -> None:
+    # Live incident 2026-10-05: with a 30-minute query timeout, a query that ran
+    # for 9 minutes was reported as a leaked connection after 5.
+    config = dataclasses.replace(sample_server_config, query_timeout_seconds=1800)
+    pool = ConnectionPool(config, MagicMock())
+    pool._leases[1] = ("appdb", time.monotonic() - 600, "stack")
+
+    assert pool.check_leaked_connections() == []
+
+    pool._leases[2] = ("appdb", time.monotonic() - 2000, "stack")
+
+    assert [leak["connection_id"] for leak in pool.check_leaked_connections()] == [2]
 
 
 def test_leak_detection_ignores_fresh_connections(sample_server_config) -> None:

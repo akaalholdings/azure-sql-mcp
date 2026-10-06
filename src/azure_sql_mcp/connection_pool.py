@@ -29,6 +29,7 @@ CIRCUIT_BREAKER_COOLDOWN = 30.0
 
 # Connection leak detection
 LEASE_TIMEOUT_SECONDS = 300.0  # 5 minutes
+LEASE_TIMEOUT_MARGIN_SECONDS = 60.0
 
 
 @dataclass
@@ -89,6 +90,11 @@ class ConnectionPool:
     ):
         self.config = config
         self.authenticator = authenticator
+        # A statement may run for the whole query timeout: that is use, not a leak.
+        self._lease_timeout_seconds = max(
+            LEASE_TIMEOUT_SECONDS,
+            config.query_timeout_seconds + LEASE_TIMEOUT_MARGIN_SECONDS,
+        )
         self._pools: dict[str, asyncio.Queue] = defaultdict(
             lambda: asyncio.Queue(maxsize=config.pool_size)
         )
@@ -160,7 +166,7 @@ class ConnectionPool:
         self._leases.pop(id(connection), None)
 
     def note_leaked_connections(self) -> None:
-        """Record each connection held past LEASE_TIMEOUT_SECONDS once.
+        """Record each connection held past the lease timeout once.
 
         The incident watchdog thread calls this: it reads a snapshot only.
         """
@@ -168,18 +174,18 @@ class ConnectionPool:
         held = list(self._leases.items())
         self._noted_leaks &= {conn_id for conn_id, _lease in held}
         for conn_id, (_db, acquired_at, _stack) in held:
-            if now - acquired_at > LEASE_TIMEOUT_SECONDS and conn_id not in self._noted_leaks:
+            if now - acquired_at > self._lease_timeout_seconds and conn_id not in self._noted_leaks:
                 self._noted_leaks.add(conn_id)
                 note_condition("connection_pool.leaked_connection", category="product_bug")
 
     def check_leaked_connections(self) -> list[dict[str, Any]]:
-        """Return info about connections held longer than LEASE_TIMEOUT_SECONDS."""
+        """Return info about connections held longer than the lease timeout."""
         self.note_leaked_connections()
         now = time.monotonic()
         leaked: list[dict[str, Any]] = []
         for conn_id, (db, acquired_at, stack) in self._leases.items():
             held_seconds = now - acquired_at
-            if held_seconds > LEASE_TIMEOUT_SECONDS:
+            if held_seconds > self._lease_timeout_seconds:
                 leaked.append(
                     {
                         "connection_id": conn_id,
