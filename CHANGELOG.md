@@ -6,6 +6,31 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [2.6.2] - 2026-10-06
+
+Fixes from the first live incident log (Windows, Python 3.14, Copilot CLI).
+
+### Fixed
+
+- `prepare_view_change` failed on every view with "Invalid column name". Its
+  dependency read joined on `referenced_schema_id`, which
+  `sys.sql_expression_dependencies` does not have. The schema is now resolved
+  through `referenced_id`, and the catalog view is in the DMV column contract
+  test.
+- `explain_query` could fail with "No SHOWPLAN XML was returned" although the
+  driver returned a plan. Plans are now recognized as text, as UTF-8 or
+  UTF-16 bytes, with a byte-order mark or an XML prolog, hex-encoded, or
+  split across rows. `review_workload_indexes` plan reads and the index
+  optimizer use the same recognizer.
+- When no plan is found, the error now says what came back by kind only, for
+  example `result sets: one; values seen: null`. It never includes a value.
+- A connection running a long query was reported as leaked after 5 minutes.
+  The leak threshold now allows for the configured query timeout, and the
+  incident log does not report a leak while a tool call is running.
+- Incident log: a statement that ran for the whole query timeout (SQLSTATE
+  HYT00, "Query timeout expired") is filed as `timeout`, not `transient`. A
+  login timeout is still `transient`.
+
 ## [2.6.1] - 2026-10-02
 
 ### Changed
