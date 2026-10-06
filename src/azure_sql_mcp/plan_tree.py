@@ -22,6 +22,7 @@ import math
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from dataclasses import field
+from typing import Any
 
 NS = "http://schemas.microsoft.com/sqlserver/2004/07/showplan"
 _Q = f"{{{NS}}}"
@@ -79,6 +80,129 @@ def clean_text(value: object, limit: int | None = 300) -> str | None:
     if limit is not None and len(text) > limit:
         text = text[: max(0, limit - 3)].rstrip() + "..."
     return text
+
+
+_SHOWPLAN_ROOT = "<ShowPlanXML"
+# Leading bytes of a showplan in UTF-16 (with or without a byte-order mark) or
+# UTF-8, as upper-case hex: what a hex-encoded plan starts with.
+_SHOWPLAN_HEX_LEADS = ("FFFE", "FEFF", "EFBBBF", "3C00", "003C", "3C")
+_VALUE_KIND_SCAN_LIMIT = 200
+_COUNT_WORDS = ("none", "one", "two", "three")
+
+
+def showplan_text(value: Any) -> str | None:
+    """Return showplan XML from one driver value, or None when it is not a plan.
+
+    Drivers hand the plan back as text, or as UTF-8 or UTF-16 bytes, with or
+    without a byte-order mark or an XML prolog. The executor also turns bytes
+    into text: UTF-8 when the bytes decode, hex otherwise. So UTF-16 can arrive
+    with a NUL after every character, or as a 0x string.
+    """
+
+    if isinstance(value, memoryview):
+        value = value.tobytes()
+    if isinstance(value, (bytes, bytearray)):
+        text = _decode_showplan_bytes(bytes(value))
+    elif not isinstance(value, str):
+        return None
+    elif value[:2] in ("0x", "0X"):
+        if not value[2:10].upper().startswith(_SHOWPLAN_HEX_LEADS):
+            return None
+        try:
+            text = _decode_showplan_bytes(bytes.fromhex(value[2:]))
+        except ValueError:
+            return None
+    elif "\x00" in value[:8]:
+        text = _decode_showplan_bytes(value.encode("utf-8", "surrogatepass"))
+    else:
+        text = value
+    if text is None:
+        return None
+    text = text.lstrip("\ufeff").lstrip()
+    if text.startswith("<?xml"):
+        end = text.find("?>")
+        if end < 0:
+            return None
+        text = text[end + 2 :].lstrip()
+    return text if text.startswith(_SHOWPLAN_ROOT) else None
+
+
+def _decode_showplan_bytes(data: bytes) -> str | None:
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encoding = "utf-16"
+    elif data.startswith(b"\xef\xbb\xbf"):
+        encoding = "utf-8-sig"
+    elif data[1:2] == b"\x00":
+        encoding = "utf-16-le"
+    elif data[:1] == b"\x00":
+        encoding = "utf-16-be"
+    else:
+        encoding = "utf-8"
+    try:
+        return data.decode(encoding)
+    except UnicodeDecodeError:
+        return None
+
+
+def showplan_from_results(results: Any) -> str | None:
+    """Return the longest showplan in driver result sets, or None.
+
+    A plan split across the rows of a one-column result set is joined.
+    """
+
+    candidates: list[str] = []
+    for result in results:
+        values = [value for row in result.rows for value in row.values()]
+        found = [text for value in values if (text := showplan_text(value)) is not None]
+        whole = any(text.rstrip().endswith("</ShowPlanXML>") for text in found)
+        if not whole and len(result.columns) == 1 and len(values) > 1:
+            if all(isinstance(value, str) for value in values):
+                joined = showplan_text("".join(values))
+                if joined is not None and joined.rstrip().endswith("</ShowPlanXML>"):
+                    found = [joined]
+        candidates.extend(found)
+    return max(candidates, key=len) if candidates else None
+
+
+def describe_result_shape(results: Any) -> str:
+    """Say what result sets held, by kind only: never a value, name or count of rows."""
+
+    results = list(results)
+    kinds: list[str] = []
+    scanned = 0
+    for result in results:
+        for row in result.rows:
+            for value in row.values():
+                if scanned >= _VALUE_KIND_SCAN_LIMIT:
+                    break
+                scanned += 1
+                kind = _value_kind(value)
+                if kind not in kinds:
+                    kinds.append(kind)
+    count = _COUNT_WORDS[len(results)] if len(results) < len(_COUNT_WORDS) else "several"
+    seen = ", ".join(kinds) if kinds else "no values"
+    return f"result sets: {count}; values seen: {seen}"
+
+
+def _value_kind(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return "bytes"
+    if isinstance(value, bool) or isinstance(value, (int, float)):
+        return "number"
+    if not isinstance(value, str):
+        return "other"
+    stripped = value.lstrip("\ufeff").lstrip()
+    if not stripped:
+        return "empty text"
+    if value[:2] in ("0x", "0X"):
+        return "hex text"
+    if "\x00" in value[:8]:
+        return "text with NUL characters"
+    if stripped.startswith("<"):
+        return "xml-like text"
+    return "text"
 
 
 def parse_showplan(plan_xml: str | None) -> ET.Element:

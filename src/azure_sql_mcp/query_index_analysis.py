@@ -16,6 +16,8 @@ from .incident_log import note_exception
 from .observability import sanitize_error_message
 from .param_binding import ParameterBindingService
 from .param_binding import ParameterExecutionContract
+from .plan_tree import describe_result_shape
+from .plan_tree import showplan_from_results
 from .query_text import strip_query_store_parameter_declarations
 from .safe_sql import SafeSqlValidator
 
@@ -278,12 +280,10 @@ class QueryIndexAnalysisService:
             **kwargs,
         )
         plan_results = per_statement_results[1] if len(per_statement_results) > 1 else []
-        for result in plan_results:
-            for row in result.rows:
-                for value in row.values():
-                    if isinstance(value, str) and value.lstrip().startswith("<ShowPlanXML"):
-                        return value
-        raise RuntimeError("No SHOWPLAN XML returned.")
+        plan_xml = showplan_from_results(plan_results)
+        if plan_xml is None:
+            raise RuntimeError(f"No SHOWPLAN XML returned; {describe_result_shape(plan_results)}.")
+        return plan_xml
 
     def _extract_missing_indexes(self, plan_xml: str) -> list[dict[str, Any]]:
         root = ET.fromstring(plan_xml)

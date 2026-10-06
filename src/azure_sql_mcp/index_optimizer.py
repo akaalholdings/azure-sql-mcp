@@ -27,6 +27,8 @@ from .index_metadata import parse_candidate_key
 from .index_recommendations import split_index_columns
 from .observability import sanitize_error_message
 from .param_binding import ParameterBindingService
+from .plan_tree import describe_result_shape
+from .plan_tree import showplan_from_results
 from .safe_sql import SafeSqlValidator
 
 SHOWPLAN_NAMESPACE = {"sp": "http://schemas.microsoft.com/sqlserver/2004/07/showplan"}
@@ -1136,12 +1138,10 @@ class IndexOptimizer:
             max_rows=self.executor.config.row_limit + 1,
         )
         plan_results = per_statement_results[1] if len(per_statement_results) > 1 else []
-        for result in plan_results:
-            for row in result.rows:
-                for value in row.values():
-                    if isinstance(value, str) and value.lstrip().startswith("<ShowPlanXML"):
-                        return value
-        raise RuntimeError("No SHOWPLAN XML returned.")
+        plan_xml = showplan_from_results(plan_results)
+        if plan_xml is None:
+            raise RuntimeError(f"No SHOWPLAN XML returned; {describe_result_shape(plan_results)}.")
+        return plan_xml
 
     async def _get_dmv_missing_indexes(
         self, database_name: str,

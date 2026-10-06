@@ -17,7 +17,9 @@ from .param_binding import ParameterExecutionContract
 from .plan_diagnostics import parse_statistics_io_messages
 from .plan_diagnostics import summarize_statistics_io_samples
 from .plan_tree import child_relops
+from .plan_tree import describe_result_shape
 from .plan_tree import is_true
+from .plan_tree import showplan_from_results
 from .safe_sql import SafeSqlValidator
 
 SHOWPLAN_NAMESPACE = {"sp": "http://schemas.microsoft.com/sqlserver/2004/07/showplan"}
@@ -1236,24 +1238,19 @@ class PlansService:
 
     @staticmethod
     def _result_contains_plan_xml(result: QueryResult) -> bool:
-        return any(
-            isinstance(value, str) and value.lstrip().startswith("<ShowPlanXML")
-            for row in result.rows
-            for value in row.values()
-        )
+        return showplan_from_results([result]) is not None
 
     def _extract_plan_xml(self, results) -> str:
-        xml_candidates: list[str] = []
-        for result in results:
-            for row in result.rows:
-                for value in row.values():
-                    if isinstance(value, str) and value.lstrip().startswith("<ShowPlanXML"):
-                        xml_candidates.append(value)
-        if not xml_candidates:
+        results = list(results)
+        plan_xml = showplan_from_results(results)
+        if plan_xml is None:
+            # The shape names kinds only, so it is safe in errors and incident
+            # records. No parentheses: incident redaction blanks them.
             raise RuntimeError(
-                "No SHOWPLAN XML was returned. Confirm SHOWPLAN access and that the statement is supported."
+                f"No SHOWPLAN XML was returned; {describe_result_shape(results)}. "
+                "Confirm SHOWPLAN access and that the statement is supported."
             )
-        return max(xml_candidates, key=len)
+        return plan_xml
 
     @staticmethod
     def _quote_identifier(identifier: str) -> str:

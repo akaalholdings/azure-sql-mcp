@@ -699,3 +699,68 @@ async def test_actual_parameterized_plan_executes_one_typed_profile_sample():
         )
     ]
     assert executor.profile_input_sizes == [contract.sp_executesql_input_sizes]
+
+
+# Live incident 2026-10-05 (Windows, Python 3.14): explain_query failed four
+# times with "No SHOWPLAN XML was returned". The driver can hand back the plan
+# in forms other than a str that starts with "<ShowPlanXML", and the old error
+# did not say what came back.
+_PLAN = (
+    '<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan" '
+    'Version="1.564" Build="17.0.1000.7"><BatchSequence /></ShowPlanXML>'
+)
+
+
+def _plan_result(*values: object) -> list[QueryResult]:
+    column = "Microsoft SQL Server 2005 XML Showplan"
+    return [QueryResult(columns=(column,), rows=[{column: value} for value in values])]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(_PLAN, id="plain"),
+        pytest.param("﻿" + _PLAN, id="byte-order-mark"),
+        pytest.param('<?xml version="1.0" encoding="utf-16"?>\n' + _PLAN, id="xml-prolog"),
+        # UTF-16 bytes that the executor's UTF-8 decode accepted: NUL after every character.
+        pytest.param(_PLAN.encode("utf-16-le").decode("utf-8"), id="utf16-read-as-utf8"),
+        # UTF-16 with a byte-order mark is not UTF-8, so the executor hex-encodes it.
+        pytest.param("0x" + _PLAN.encode("utf-16").hex().upper(), id="hex-encoded-utf16"),
+        pytest.param(_PLAN.encode("utf-16"), id="utf16-bytes"),
+        pytest.param(_PLAN.encode("utf-8"), id="utf8-bytes"),
+    ],
+)
+def test_extract_plan_xml_reads_every_form_a_driver_returns(value) -> None:
+    service = PlansService(executor=None, validator=SafeSqlValidator())  # type: ignore[arg-type]
+
+    assert service._extract_plan_xml(_plan_result(value)) == _PLAN
+
+
+def test_extract_plan_xml_joins_a_plan_split_across_rows() -> None:
+    service = PlansService(executor=None, validator=SafeSqlValidator())  # type: ignore[arg-type]
+    chunks = [_PLAN[index : index + 40] for index in range(0, len(_PLAN), 40)]
+
+    assert service._extract_plan_xml(_plan_result(*chunks)) == _PLAN
+
+
+def test_missing_plan_error_describes_what_came_back_without_values() -> None:
+    service = PlansService(executor=None, validator=SafeSqlValidator())  # type: ignore[arg-type]
+    results = [
+        QueryResult(columns=("name",), rows=[{"name": "customer-secret"}]),
+        QueryResult(columns=("plan",), rows=[{"plan": None}]),
+    ]
+
+    with pytest.raises(RuntimeError, match="No SHOWPLAN XML was returned") as raised:
+        service._extract_plan_xml(results)
+
+    message = str(raised.value)
+    assert "customer-secret" not in message
+    assert "result sets: two" in message
+    assert "text" in message and "null" in message
+
+
+def test_missing_plan_error_reports_no_result_sets() -> None:
+    service = PlansService(executor=None, validator=SafeSqlValidator())  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="result sets: none"):
+        service._extract_plan_xml([])
