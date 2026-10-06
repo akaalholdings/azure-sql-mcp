@@ -1135,6 +1135,33 @@
         "basic_s0_s1_pool": null,
         "note": "Also needs VIEW DEFINITION; the page gives the same requirement on every service objective."
       }
+    },
+    "sys.sql_expression_dependencies": {
+      "doc_page": "sql/relational-databases/system-catalog-views/sys-sql-expression-dependencies-transact-sql",
+      "retrieved_utc": "2026-10-06",
+      "kind": "view",
+      "columns": [
+        "referencing_id",
+        "referencing_minor_id",
+        "referencing_class",
+        "referencing_class_desc",
+        "is_schema_bound_reference",
+        "referenced_class",
+        "referenced_class_desc",
+        "referenced_server_name",
+        "referenced_database_name",
+        "referenced_schema_name",
+        "referenced_entity_name",
+        "referenced_id",
+        "referenced_minor_id",
+        "is_caller_dependent",
+        "is_ambiguous"
+      ],
+      "permission": {
+        "default": "VIEW DEFINITION on the database and SELECT on sys.sql_expression_dependencies",
+        "basic_s0_s1_pool": null,
+        "note": "The view has no referenced_schema_id; resolve the schema through referenced_id."
+      }
     }
   }
 }

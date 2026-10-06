@@ -46,8 +46,10 @@ INNER JOIN sys.views AS v
     ON v.object_id = d.referencing_id
 INNER JOIN sys.schemas AS s
     ON s.schema_id = v.schema_id
+LEFT JOIN sys.objects AS ro
+    ON ro.object_id = d.referenced_id
 LEFT JOIN sys.schemas AS rs
-    ON rs.schema_id = d.referenced_schema_id
+    ON rs.schema_id = ro.schema_id
 WHERE s.name = ?
   AND v.name = ?
 ORDER BY referenced_database_name, referenced_schema_name, referenced_entity_name

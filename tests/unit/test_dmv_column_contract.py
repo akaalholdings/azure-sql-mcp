@@ -19,6 +19,7 @@ from azure_sql_mcp.plan_cache import PlanCacheService
 from azure_sql_mcp.resource_governance import ResourceGovernanceService
 from azure_sql_mcp.tempdb_memory import TempdbMemoryService
 from azure_sql_mcp.version_store import VersionStoreService
+from azure_sql_mcp.view_workflows import VIEW_DEPENDENCIES_SQL
 from azure_sql_mcp.wait_stats import WaitStatsService
 from azure_sql_mcp.workload_index_advisor import TABLES_SQL
 from tests.azure_dmv_contract import LIVE_DIR
@@ -269,5 +270,16 @@ async def test_owner_live_captures_cover_every_projected_column(capture: Path) -
     await service.get_resource_limits("appdb")
     await service.get_io_stats("appdb")
     await service.get_resource_stats_history("appdb", 60)
+
+    assert executor.violations == []
+
+
+def test_view_dependency_read_uses_documented_columns() -> None:
+    # Live incident 2026-10-05: prepare_view_change failed on every view with
+    # "Invalid column name" because the read joined on a column that
+    # sys.sql_expression_dependencies does not have.
+    executor = StrictDmvExecutor()
+
+    executor.check(VIEW_DEPENDENCIES_SQL)
 
     assert executor.violations == []
