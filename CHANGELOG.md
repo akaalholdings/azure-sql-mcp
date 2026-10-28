@@ -6,6 +6,30 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+### Fixed
+
+- Plan reading: self CPU of a parallel row-mode operator took the busiest
+  thread, so a scan whose four workers burned 400 ms reported 100 ms. CPU now
+  sums across threads, and elapsed still takes the slowest thread. The
+  "waited" note compares CPU per worker thread with elapsed, so an operator
+  that waited on every thread is still called waited.
+- Plan reading: under a row goal, the "may stop early" note replaced the
+  "reads far more rows than it returns" flag. A seek that read 1.37 billion
+  rows to return 5,718 was not flagged.
+  - The flag now always shows.
+  - The note uses `ActualEndOfScans` to say how many executions stopped early,
+    or that every execution read to the end.
+  - The node drill-down reports `end_of_scans`.
+- Plan reading: cursor statements (`StmtCursor`) got no digest and no
+  findings. Each cursor operation's plan is now analyzed. Predicate findings
+  stay on the correct statement in a batch that mixes cursors and other
+  statements.
+- Plan rules and index review: a constant `LIKE` pattern that starts with `%`
+  or `_` was an ordinary residual. It is now a non-SARGable predicate
+  (`leading_wildcard`) with its own advice: prefix search, an indexed
+  `REVERSE()` computed column, or full-text search. The index review routes it
+  to `sql-optimizer`.
+
 ## [2.6.2] - 2026-10-06
 
 Fixes from the first live incident log (Windows, Python 3.14, Copilot CLI).

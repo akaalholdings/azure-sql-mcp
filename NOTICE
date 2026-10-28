@@ -3,10 +3,20 @@ Copyright (c) 2026 Azure SQL MCP contributors
 
 This product includes plan-reading logic adapted from the sqlserver-query-plans
 plugin by Erik Darling (https://github.com/erikdarlingdata/claude-plugins):
-self-time attribution across row mode, batch mode, exchanges and threads,
-per-execution estimate checks, fixed-guess estimate fingerprints, and handling
-of untrusted plan text. See src/azure_sql_mcp/plan_tree.py. That work is
-licensed as follows:
+self-time attribution across row mode, batch mode, exchanges and threads
+(including self CPU summed across threads, from version 1.5.6),
+per-execution estimate checks, fixed-guess estimate fingerprints, the runtime
+row-goal result read from ActualEndOfScans (from version 1.5.5), and handling
+of untrusted plan text. See src/azure_sql_mcp/plan_tree.py and
+src/azure_sql_mcp/plan_digest.py. Tests for those two versions are ported in
+tests/unit/test_plan_tree.py and tests/unit/test_plan_digest.py.
+
+Cursor-statement coverage and the leading-wildcard LIKE check close gaps that
+were found by comparison with PerformanceMonitor by Erik Darling and Darling
+Data, LLC (https://github.com/erikdarlingdata/PerformanceMonitor, MIT
+License). No PerformanceMonitor code is included.
+
+The sqlserver-query-plans work is licensed as follows:
 
 MIT License
 
