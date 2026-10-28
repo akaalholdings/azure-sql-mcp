@@ -811,19 +811,13 @@ def _child_threads(
     return totals
 
 
-def _per_thread_self(node: PlanNode, key: str, by_thread: dict[PlanNode, dict[int, float]]) -> float:
-    """Subtract within each thread, never across threads, and keep the slowest thread."""
+def _per_thread_self(node: PlanNode, key: str, by_thread: dict[PlanNode, dict[int, float]]) -> list[float]:
+    """Self time of each worker thread: subtract within a thread, never across threads."""
 
     children: dict[int, float] = {}
     for child in node.children:
         _merge(children, by_thread[child])
-    return max(
-        (
-            max(0.0, _thread_value(counter, key) - children.get(counter.thread, 0.0))
-            for counter in node.work_threads
-        ),
-        default=0.0,
-    )
+    return [max(0.0, _thread_value(counter, key) - children.get(counter.thread, 0.0)) for counter in node.work_threads]
 
 
 def _self_elapsed(
@@ -839,7 +833,8 @@ def _self_elapsed(
             return 0.0
         return max(0.0, max(workers) - sum(contribution[child] for child in node.children))
     if len(node.threads) > 1:
-        return _per_thread_self(node, "elapsed", by_thread)
+        # Wall clock: the operator finished when its slowest thread did.
+        return max(_per_thread_self(node, "elapsed", by_thread), default=0.0)
     return max(0.0, node.elapsed_ms - sum(contribution[child] for child in node.children))
 
 
@@ -851,7 +846,9 @@ def _self_cpu(
     if node.mode == "Batch":
         return node.cpu_ms
     if len(node.threads) > 1:
-        return _per_thread_self(node, "cpu", by_thread)
+        # Every thread burned its own CPU, so the threads add up; the slowest
+        # one alone is a single worker's share.
+        return sum(_per_thread_self(node, "cpu", by_thread))
     return max(0.0, node.cpu_ms - sum(contribution[child] for child in node.children))
 
 

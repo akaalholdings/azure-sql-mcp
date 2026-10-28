@@ -108,6 +108,25 @@ def test_operator_that_waited_is_distinguished_from_one_that_worked(showplan) ->
     assert any("waited" in note for note in top["notes"])
 
 
+def test_parallel_operator_that_waited_on_every_thread_is_still_called_waited(showplan) -> None:
+    # Self CPU sums the threads (200 ms here) while self elapsed is one thread's
+    # wall clock (1,000 ms). Each worker burned 5% of its time, so it waited;
+    # comparing the sum with one thread's clock would hide that at DOP 4.
+    rt = showplan.runtime
+    scan = showplan.scan(
+        1,
+        runtime=rt((0, 0, 0, 0, 0), *((thread, 10, 1, 1000, 50) for thread in range(1, 5))),
+        attrs='Parallel="1"',
+    )
+    gather = showplan.relop(0, "Parallelism", "Gather Streams", scan, runtime=rt((0, 40, 1, 1005, 0)), attrs='Parallel="1"')
+
+    top = _statement(build_plan_digest(showplan.plan(gather, plan_attrs='DegreeOfParallelism="4"')))["top_operators"][0]
+
+    assert top["node_id"] == 1
+    assert top["self_cpu_ms"] == 200
+    assert any("waited" in note for note in top["notes"])
+
+
 def test_rows_read_far_above_rows_returned_is_called_out(showplan) -> None:
     rt = showplan.runtime
     plan = showplan.plan(showplan.scan(0, runtime=rt((0, 10, 1, 400, 390, 2_000_000))))

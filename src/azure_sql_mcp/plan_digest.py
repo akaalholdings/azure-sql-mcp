@@ -367,10 +367,13 @@ def _top_by_time(
         cited.append(node)
         own = node.self_elapsed_ms or 0.0
         has_cpu = any(counter.cpu_ms is not None for counter in node.threads)
+        # Self CPU sums the threads and self elapsed is one thread's clock, so
+        # compare the CPU of an average worker thread with that clock.
+        cpu_per_thread = (node.self_cpu_ms or 0.0) / max(1, len(node.work_threads))
         notes: list[str] = []
         if node.is_exchange:
             notes.append("Exchange: its time includes waiting on other operators; do not call it slow.")
-        elif has_cpu and own >= WAITED_FLOOR_MS and (node.self_cpu_ms or 0.0) < own * WAITED_CPU_RATIO:
+        elif has_cpu and own >= WAITED_FLOOR_MS and cpu_per_thread < own * WAITED_CPU_RATIO:
             notes.append("Elapsed far above CPU: it waited, it did not work. Find what it waited on.")
         item: dict[str, Any] = {
             "node_id": node.node_id,
