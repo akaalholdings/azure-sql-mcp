@@ -342,6 +342,54 @@ def _converted(table: str, column: str, *, implicit: str = "0") -> str:
     )
 
 
+def _like(table: str, column: str, pattern: str) -> str:
+    """A residual ``table.column LIKE pattern`` with a constant pattern."""
+
+    return (
+        '<Predicate><ScalarOperator ScalarString="like"><Intrinsic FunctionName="like"><ScalarOperator><Identifier>'
+        f'<ColumnReference Database="[db]" Schema="[dbo]" Table="[{table}]" Column="{column}" />'
+        f'</Identifier></ScalarOperator><ScalarOperator><Const ConstValue="{pattern}" /></ScalarOperator>'
+        "</Intrinsic></ScalarOperator></Predicate>"
+    )
+
+
+@pytest.mark.parametrize("pattern", ["N'%smith%'", "'_mith'"])
+def test_leading_wildcard_like_is_non_sargable(showplan, pattern: str) -> None:
+    # No prefix to seek: an index on LastName is read end to end, whatever its keys.
+    plan = showplan.plan(showplan.scan(0, "Customers", body=_like("Customers", "LastName", pattern)))
+
+    finding = _rules(analyze_plan(plan))["non_sargable_predicate"]
+
+    assert finding["severity"] == "high"
+    assert finding["evidence"]["column"] == "LastName"
+    assert finding["evidence"]["wrapper"] == "leading_wildcard"
+    assert "leading wildcard" in finding["message"]
+    assert "full-text" in finding["fix"]
+
+
+def test_prefix_like_is_not_called_non_sargable(showplan) -> None:
+    plan = showplan.plan(showplan.scan(0, "Customers", body=_like("Customers", "LastName", "N'smith%'")))
+
+    assert "non_sargable_predicate" not in _rules(analyze_plan(plan))
+
+
+def test_cursor_plans_are_analysed_and_findings_stay_on_their_statement(showplan) -> None:
+    # Rules and predicate access read the statements in two passes joined by
+    # position, so a cursor must count in both or a finding lands on the wrong one.
+    cursor = showplan.cursor(("FetchQuery", showplan.scan(0, "Orders", body=_converted("Orders", "OrderDate"))))
+    select = showplan.simple(showplan.scan(0, "Customers", body=_converted("Customers", "CreatedAt")))
+
+    result = analyze_plan(showplan.batch(cursor, select))
+    found = {
+        (finding["statement_index"], finding["evidence"]["column"])
+        for finding in result["findings"]
+        if finding["rule"] == "non_sargable_predicate"
+    }
+
+    assert found == {(0, "OrderDate"), (1, "CreatedAt")}
+    assert [statement["statement_type"] for statement in result["statements"]] == ["DECLARE CURSOR", "SELECT"]
+
+
 def _order_date_seek(showplan, start: tuple[str, str], end: tuple[str, str], residual: str) -> str:
     """An Index Seek on Orders.OrderDate between two bounds, each (ScanType, value), plus a residual."""
 

@@ -103,7 +103,7 @@ def test_coordinator_thread_is_not_mistaken_for_self_time(showplan) -> None:
     assert _hottest(nodes) == 3
     assert nodes[0].self_elapsed_ms == 0  # thread 0's 2000 ms is the branch's wall clock
     assert nodes[1].self_elapsed_ms == 320  # per thread: max(1500-1200, 1400-1080)
-    assert nodes[1].self_cpu_ms == 240
+    assert nodes[1].self_cpu_ms == 470  # CPU adds across threads: (1400-1170) + (1300-1060)
     assert nodes[3].self_elapsed_ms == 900
 
 
@@ -163,6 +163,54 @@ def test_parallel_row_parent_over_batch_zone_subtracts_per_thread(showplan) -> N
 
     assert nodes[0].self_elapsed_ms == 100
     assert _hottest(nodes) == 2
+
+
+def test_parallel_self_cpu_sums_threads_while_elapsed_takes_the_slowest(showplan) -> None:
+    # Ported from sqlserver-query-plans 1.5.6 (MIT). Taking the busiest thread
+    # reported one worker's share: a real DOP 8 scan that burned 624 ms showed 79,
+    # and "CPU above elapsed means parallelism" could never show on the operator.
+    rt = showplan.runtime
+    scan = showplan.scan(
+        1,
+        runtime=rt((0, 0, 0, 0, 0), *((thread, 10, 1, 110, 100) for thread in range(1, 5))),
+        attrs='Parallel="1"',
+    )
+    gather = showplan.relop(0, "Parallelism", "Gather Streams", scan, runtime=rt((0, 40, 1, 115, 0)), attrs='Parallel="1"')
+
+    nodes = _nodes(showplan.plan(gather, plan_attrs='DegreeOfParallelism="4"'))
+
+    assert nodes[1].self_cpu_ms == 400  # four workers at 100 ms each, not the busiest one's 100
+    assert nodes[1].self_elapsed_ms == 110  # wall clock: the slowest worker
+    assert sum(node.self_cpu_ms or 0.0 for node in nodes.values()) == 400  # adds up to the statement's CPU
+
+
+def test_row_mode_parent_over_a_batch_sort_does_not_absorb_the_zone_cpu(showplan) -> None:
+    # Ported from sqlserver-query-plans 1.5.6 (MIT) as a guard: batch CPU is
+    # standalone, like batch elapsed. Without the zone sum a real serial Stream
+    # Aggregate showed 14,771 ms of self CPU beside 3,059 ms of self elapsed.
+    rt = showplan.runtime
+    seek = showplan.scan(3, physical="Index Seek", runtime=rt((0, 50, 1, 100, 100)))
+    loops = showplan.relop(2, "Nested Loops", "Inner Join", seek, runtime=rt((0, 50, 1, 300, 300)))
+    sort = showplan.relop(1, "Sort", None, loops, runtime=rt((0, 50, 1, 600, 600), mode="Batch"))
+    aggregate = showplan.relop(0, "Stream Aggregate", "Aggregate", sort, runtime=rt((0, 1, 1, 1000, 1000)))
+
+    nodes = _nodes(showplan.plan(aggregate))
+
+    assert nodes[0].self_cpu_ms == 100  # 1000 - (600 batch Sort + 300 row-mode loops below it)
+
+
+def test_cursor_statement_plans_are_read_from_each_operation(showplan) -> None:
+    # DECLARE CURSOR keeps its plans under CursorPlan/Operation, one per populate
+    # or fetch query. Reading only StmtSimple left every cursor unanalysed.
+    plan = showplan.batch(
+        showplan.cursor(("PopulateQuery", showplan.scan(0, "Orders")), ("FetchQuery", showplan.scan(0, "Orders"))),
+        showplan.simple(showplan.scan(0, "Customers")),
+    )
+
+    found = statements(parse_showplan(plan))
+
+    assert [statement.get("StatementType") for statement, _ in found] == ["DECLARE CURSOR", "DECLARE CURSOR", "SELECT"]
+    assert all(query_plan is not None for _, query_plan in found)
 
 
 def test_estimates_are_compared_per_execution(showplan) -> None:

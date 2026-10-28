@@ -75,8 +75,9 @@ def test_scan_residuals_are_classified_by_how_they_can_seek() -> None:
     assert scan.residual["PickingCompletedWhen"] == "eq"  # IS NULL can seek
     assert scan.residual["PackageTypeID"] == "eq"  # an IN list is a multi-seek
     # Columns that only appear across an OR of different columns cannot seek.
-    assert scan.residual["Description"] == "other"
     assert scan.residual["UnitPrice"] == "other"
+    # LIKE N'%blue%' has no prefix to seek, inside the OR or not.
+    assert scan.nonsargable == {"Description": "leading_wildcard"}
     assert scan.output_columns == ("OrderLineID", "Quantity")
     assert scan.cost_share == pytest.approx(1.0)
 

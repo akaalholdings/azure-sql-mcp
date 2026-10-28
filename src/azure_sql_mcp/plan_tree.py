@@ -236,6 +236,7 @@ class ThreadCounters:
     cpu_ms: float | None
     logical_reads: float | None
     mode: str
+    end_of_scans: float | None = None
 
 
 @dataclass(eq=False)
@@ -292,6 +293,13 @@ class PlanNode:
     @property
     def logical_reads(self) -> float | None:
         values = [counter.logical_reads for counter in self.threads if counter.logical_reads is not None]
+        return sum(values) if values else None
+
+    @property
+    def actual_end_of_scans(self) -> float | None:
+        """Executions that read to the end of their input; under a row goal the rest stopped early."""
+
+        values = [counter.end_of_scans for counter in self.threads if counter.end_of_scans is not None]
         return sum(values) if values else None
 
     @property
@@ -412,9 +420,20 @@ class CrossJoinCheck:
 
 
 def statements(root: ET.Element) -> list[tuple[ET.Element, ET.Element | None]]:
-    """Every ``StmtSimple`` with its ``QueryPlan`` (None when the statement has none)."""
+    """Every statement with its ``QueryPlan`` (None when it has none), in document order.
 
-    return [(statement, statement.find(f"{_Q}QueryPlan")) for statement in root.iter(f"{_Q}StmtSimple")]
+    A cursor (``StmtCursor``) keeps its plans under ``CursorPlan/Operation``, one per
+    populate, fetch or refresh query; each is listed with the cursor statement.
+    """
+
+    found: list[tuple[ET.Element, ET.Element | None]] = []
+    for element in root.iter():
+        if element.tag == f"{_Q}StmtSimple":
+            found.append((element, element.find(f"{_Q}QueryPlan")))
+        elif element.tag == f"{_Q}StmtCursor":
+            plans = element.findall(f"{_Q}CursorPlan/{_Q}Operation/{_Q}QueryPlan")
+            found.extend([(element, plan) for plan in plans] or [(element, None)])
+    return found
 
 
 def build_tree(query_plan: ET.Element | None) -> list[PlanNode]:
@@ -698,6 +717,7 @@ def _node(element: ET.Element, parent: PlanNode | None, depth: int) -> PlanNode:
                     cpu_ms=_number(counter.get("ActualCPUms")),
                     logical_reads=_number(counter.get("ActualLogicalReads")),
                     mode=counter.get("ActualExecutionMode") or "",
+                    end_of_scans=_number(counter.get("ActualEndOfScans")),
                 )
             )
     return PlanNode(
@@ -811,19 +831,13 @@ def _child_threads(
     return totals
 
 
-def _per_thread_self(node: PlanNode, key: str, by_thread: dict[PlanNode, dict[int, float]]) -> float:
-    """Subtract within each thread, never across threads, and keep the slowest thread."""
+def _per_thread_self(node: PlanNode, key: str, by_thread: dict[PlanNode, dict[int, float]]) -> list[float]:
+    """Self time of each worker thread: subtract within a thread, never across threads."""
 
     children: dict[int, float] = {}
     for child in node.children:
         _merge(children, by_thread[child])
-    return max(
-        (
-            max(0.0, _thread_value(counter, key) - children.get(counter.thread, 0.0))
-            for counter in node.work_threads
-        ),
-        default=0.0,
-    )
+    return [max(0.0, _thread_value(counter, key) - children.get(counter.thread, 0.0)) for counter in node.work_threads]
 
 
 def _self_elapsed(
@@ -839,7 +853,8 @@ def _self_elapsed(
             return 0.0
         return max(0.0, max(workers) - sum(contribution[child] for child in node.children))
     if len(node.threads) > 1:
-        return _per_thread_self(node, "elapsed", by_thread)
+        # Wall clock: the operator finished when its slowest thread did.
+        return max(_per_thread_self(node, "elapsed", by_thread), default=0.0)
     return max(0.0, node.elapsed_ms - sum(contribution[child] for child in node.children))
 
 
@@ -851,7 +866,9 @@ def _self_cpu(
     if node.mode == "Batch":
         return node.cpu_ms
     if len(node.threads) > 1:
-        return _per_thread_self(node, "cpu", by_thread)
+        # Every thread burned its own CPU, so the threads add up; the slowest
+        # one alone is a single worker's share.
+        return sum(_per_thread_self(node, "cpu", by_thread))
     return max(0.0, node.cpu_ms - sum(contribution[child] for child in node.children))
 
 

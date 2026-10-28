@@ -246,7 +246,14 @@ def _access_rules(accesses: list[Any], add, impact, by_id: dict[int, PlanNode]) 
                 continue  # scalar_udf reports the function and the column it wraps
             column_name = clean_text(column, 128)
             implicit = kind == "convert_implicit"
-            wrapper = "an implicit conversion" if implicit else clean_text(kind.replace("function:", "").upper(), 60)
+            wildcard = kind == "leading_wildcard"
+            wrapper = (
+                "an implicit conversion"
+                if implicit
+                else "a leading-wildcard LIKE"
+                if wildcard
+                else clean_text(kind.replace("function:", "").upper(), 60)
+            )
             # A dynamic seek (CAST to date via GetRangeThroughConvert, an implicit
             # conversion via GetRangeWithMismatchedTypes) still seeks a range on
             # the column and re-checks the wrapped predicate as a residual.
@@ -274,6 +281,15 @@ def _access_rules(accesses: list[Any], add, impact, by_id: dict[int, PlanNode]) 
                     if implicit
                     else "Usually acceptable. If the residual discards most of the rows the seek reads, rewrite "
                     f"it with the column bare, or {_COMPUTED_COLUMN_INDEX}."
+                )
+            elif wildcard:
+                message = (
+                    f"{table}.{column_name} is searched with LIKE and a leading wildcard: there is no prefix to "
+                    "seek, so every row is read and tested."
+                )
+                fix = (
+                    "Search by prefix (LIKE 'abc%') if the requirement allows. For an ends-with search, index a "
+                    "computed REVERSE() column and search it by prefix; for a contains search, use full-text search."
                 )
             else:
                 message = (

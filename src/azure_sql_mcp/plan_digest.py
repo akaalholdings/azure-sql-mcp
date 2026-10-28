@@ -367,10 +367,13 @@ def _top_by_time(
         cited.append(node)
         own = node.self_elapsed_ms or 0.0
         has_cpu = any(counter.cpu_ms is not None for counter in node.threads)
+        # Self CPU sums the threads and self elapsed is one thread's clock, so
+        # compare the CPU of an average worker thread with that clock.
+        cpu_per_thread = (node.self_cpu_ms or 0.0) / max(1, len(node.work_threads))
         notes: list[str] = []
         if node.is_exchange:
             notes.append("Exchange: its time includes waiting on other operators; do not call it slow.")
-        elif has_cpu and own >= WAITED_FLOOR_MS and (node.self_cpu_ms or 0.0) < own * WAITED_CPU_RATIO:
+        elif has_cpu and own >= WAITED_FLOOR_MS and cpu_per_thread < own * WAITED_CPU_RATIO:
             notes.append("Elapsed far above CPU: it waited, it did not work. Find what it waited on.")
         item: dict[str, Any] = {
             "node_id": node.node_id,
@@ -385,14 +388,38 @@ def _top_by_time(
         rows_read = node.actual_rows_read
         if rows_read and rows_read >= ROWS_READ_NOTE_RATIO * max(node.actual_rows, 1.0):
             item["rows_read"] = rows_read
-            if node.row_goal:
-                notes.append("Row goal: a scan may stop early, so rows read is not the whole table.")
-            elif rows_read >= ROWS_READ_FLAG_RATIO * max(node.actual_rows, 1.0):
+            # A row goal does not excuse the reads: an execution can stop early
+            # and still read millions of rows first, or never stop at all.
+            if rows_read >= ROWS_READ_FLAG_RATIO * max(node.actual_rows, 1.0):
                 notes.append("Reads far more rows than it returns: a filter is applied as a residual, not a seek.")
+            if node.row_goal:
+                runtime = _row_goal_runtime(node)
+                notes.append(
+                    f"Row goal: {runtime}." if runtime else "Row goal: a scan may stop early, so rows read is not the whole table."
+                )
         if notes:
             item["notes"] = notes
         rows.append(_compact(item))
     return rows
+
+
+def _row_goal_runtime(node: PlanNode) -> str | None:
+    """What a row goal did at runtime; None when the plan does not record it.
+
+    EstimateRowsWithoutRowGoal only says the optimizer planned to stop early.
+    ActualEndOfScans counts the executions that read to the end anyway, so the
+    rest are the ones that stopped.
+    """
+
+    end_of_scans = node.actual_end_of_scans
+    executions = node.actual_executions
+    if end_of_scans is None or executions <= 0:
+        return None
+    if end_of_scans >= executions:
+        return "it did not stop early, every execution read to the end"
+    if executions == 1:
+        return "it stopped early"
+    return f"{executions - end_of_scans:,.0f} of {executions:,.0f} executions stopped early"
 
 
 def _top_by_cost(nodes: list[PlanNode], cost: float, top_n: int, cited: list[PlanNode]) -> list[dict[str, Any]]:
@@ -643,7 +670,8 @@ def _cited_details(nodes: list[PlanNode], cited: list[PlanNode]) -> list[dict[st
             "outer_references": outer_references(node),
         }
         if node.row_goal:
-            item["row_goal"] = "Active (TOP, FAST, EXISTS): a scan may stop early."
+            runtime = _row_goal_runtime(node)
+            item["row_goal"] = f"Active (TOP, FAST, EXISTS): {runtime or 'a scan may stop early'}."
         warnings = node.element.find(f"{_Q}Warnings")
         if warnings is not None and is_true(warnings.get("NoJoinPredicate")):
             check = cross_join_check(node)
@@ -727,6 +755,7 @@ def _node_detail(index: int, node: PlanNode) -> dict[str, Any]:
                 "estimate_factor": round(check.factor, 1) if check else None,
                 "estimate_direction": check.direction if check else None,
                 "rows_read": node.actual_rows_read,
+                "end_of_scans": node.actual_end_of_scans,
                 "logical_reads": node.logical_reads,
                 "self_elapsed_ms": round(node.self_elapsed_ms, 1) if timed and node.self_elapsed_ms is not None else None,
                 "self_cpu_ms": round(node.self_cpu_ms, 1) if timed and node.self_cpu_ms is not None else None,

@@ -555,6 +555,12 @@ def _rewrite_explanation(pattern: str) -> str:
             "Rewrite it so the column is bare (move the work to the parameter side) "
             "before expecting an index to seek."
         )
+    if pattern == "leading_wildcard":
+        return (
+            "LIKE with a leading wildcard has no prefix, so no index on the column can seek "
+            "it. Search by prefix if the requirement allows; for an ends-with search, index a "
+            "computed REVERSE() column; for a contains search, use full-text search."
+        )
     return (
         "The predicate wraps the column in an expression, so it cannot seek. Rewrite it "
         "with the bare column before adding an index for it."

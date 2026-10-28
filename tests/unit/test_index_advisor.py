@@ -326,12 +326,13 @@ def test_scan_with_residual_filters_creates_a_seekable_index() -> None:
     assert len(create) == 1
     rec = create[0]
     assert _keys(rec) == ["PickingCompletedWhen", "StockItemID", "PackageTypeID"]
-    # The clustered key (OrderLineID) is implicit in every nonclustered index.
-    assert rec["include_columns"] == ["Quantity", "Description", "UnitPrice"]
+    # The clustered key (OrderLineID) is implicit in every nonclustered index. Description
+    # (a leading-wildcard LIKE, evaluated as a residual) is included after UnitPrice.
+    assert rec["include_columns"] == ["Quantity", "UnitPrice", "Description"]
     assert rec["ddl"] == (
         "CREATE NONCLUSTERED INDEX [IX_OrderLines_PickingCompletedWhen_StockItemID_PackageTypeID] "
         "ON [Sales].[OrderLines] ([PickingCompletedWhen] ASC, [StockItemID] ASC, [PackageTypeID] ASC) "
-        "INCLUDE ([Quantity], [Description], [UnitPrice]) WITH (ONLINE = ON);"
+        "INCLUDE ([Quantity], [UnitPrice], [Description]) WITH (ONLINE = ON);"
     )
     assert rec["rollback_ddl"] == (
         "DROP INDEX [IX_OrderLines_PickingCompletedWhen_StockItemID_PackageTypeID] ON [Sales].[OrderLines];"
@@ -352,6 +353,21 @@ def test_non_sargable_predicates_route_to_the_optimizer_not_to_an_index() -> Non
     assert all(item["owner"] == "sql-optimizer" for item in report["rewrite_opportunities"])
     heap = _recs(report, "create_clustered_index", "EventLog")
     assert heap and "heap_scans_in_workload" in heap[0]["reason_codes"]
+
+
+def test_leading_wildcard_like_routes_to_the_optimizer_with_its_own_explanation() -> None:
+    # Description LIKE N'%blue%': the column is bare but the pattern has no prefix, so
+    # "make the column bare" would be wrong advice.
+    report = build_index_advice(
+        _inputs([_query(2, "clustered_scan_residuals.xml", cpu_us=2_000_000)], [], total_cpu=2_000_000)
+    )
+
+    opportunity = next(item for item in report["rewrite_opportunities"] if item["column"] == "Description")
+
+    assert opportunity["pattern"] == "leading_wildcard"
+    assert opportunity["owner"] == "sql-optimizer"
+    assert "leading wildcard" in opportunity["explanation"]
+    assert "bare column" not in opportunity["explanation"]
 
 
 def test_lookup_that_needs_a_lob_column_is_not_covered_and_heap_is_flagged() -> None:

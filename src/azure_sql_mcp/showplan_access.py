@@ -23,6 +23,7 @@ from typing import Iterator
 from .plan_tree import PlanParseError
 from .plan_tree import is_true
 from .plan_tree import parse_showplan
+from .plan_tree import statements
 from .plan_tree import unquote
 
 NS = "http://schemas.microsoft.com/sqlserver/2004/07/showplan"
@@ -210,19 +211,19 @@ def parse_plan_access(plan_xml: str) -> PlanAccessSummary:
     except PlanParseError as exc:
         return PlanAccessSummary(parse_error=str(exc))
     summary = PlanAccessSummary()
-    for statement in root.iter(f"{_Q}StmtSimple"):
-        summary.statements.append(_parse_statement(statement))
+    # The same statement list as plan_tree.statements: rules join the two by position.
+    for statement, query_plan in statements(root):
+        summary.statements.append(_parse_statement(statement, query_plan))
     return summary
 
 
-def _parse_statement(statement: ET.Element) -> StatementAccess:
+def _parse_statement(statement: ET.Element, query_plan: ET.Element | None) -> StatementAccess:
     result = StatementAccess(
         statement_type=(statement.get("StatementType") or "").upper(),
         statement_cost=_float(statement.get("StatementSubTreeCost")),
         query_hash=statement.get("QueryHash"),
         plan_hash=statement.get("QueryPlanHash"),
     )
-    query_plan = statement.find(f"{_Q}QueryPlan")
     if query_plan is None:
         return result
     result.missing_indexes = _missing_indexes(query_plan)
@@ -460,11 +461,15 @@ def _classify_scalar(
         elif tag == "Compare":
             _classify_compare(child, belongs, residual, nonsargable, implicit, under_or=under_or)
         elif tag == "Intrinsic" and (child.get("FunctionName") or "").lower() == "like":
+            operands = child.findall(f"{_Q}ScalarOperator")
+            leading_wildcard = len(operands) > 1 and _leading_wildcard(operands[1])
             for operand_column, wrapped in _operand_columns(child, belongs):
-                if wrapped is None:
-                    _record(residual, operand_column, "other")
-                else:
+                if wrapped is not None:
                     _record_wrapper(nonsargable, operand_column, wrapped)
+                elif leading_wildcard:
+                    _record_wrapper(nonsargable, operand_column, "leading_wildcard")
+                else:
+                    _record(residual, operand_column, "other")
         else:
             for ref, wrapper in _wrapped_columns(child, belongs, wrapper=None):
                 if wrapper is not None:
@@ -540,6 +545,18 @@ def _direct_column(operand: ET.Element) -> ColumnRef | None:
 
 def _references_same_alias_column(operand: ET.Element, belongs) -> bool:
     return any(belongs(ref) for ref in _column_refs(operand))
+
+
+def _leading_wildcard(pattern: ET.Element) -> bool:
+    """A constant LIKE pattern that starts with % or _: there is no prefix to seek on.
+
+    A parameter pattern is left alone: the optimizer seeks it dynamically (LikeRangeStart).
+    """
+
+    const = pattern.find(f"{_Q}Const")
+    value = (const.get("ConstValue") or "") if const is not None else ""
+    literal = value.removeprefix("N")
+    return literal.startswith("'") and literal[1:2] in {"%", "_"}
 
 
 def _operand_columns(element: ET.Element, belongs) -> list[tuple[str, str | None]]:
