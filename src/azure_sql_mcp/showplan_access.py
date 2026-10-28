@@ -461,11 +461,15 @@ def _classify_scalar(
         elif tag == "Compare":
             _classify_compare(child, belongs, residual, nonsargable, implicit, under_or=under_or)
         elif tag == "Intrinsic" and (child.get("FunctionName") or "").lower() == "like":
+            operands = child.findall(f"{_Q}ScalarOperator")
+            leading_wildcard = len(operands) > 1 and _leading_wildcard(operands[1])
             for operand_column, wrapped in _operand_columns(child, belongs):
-                if wrapped is None:
-                    _record(residual, operand_column, "other")
-                else:
+                if wrapped is not None:
                     _record_wrapper(nonsargable, operand_column, wrapped)
+                elif leading_wildcard:
+                    _record_wrapper(nonsargable, operand_column, "leading_wildcard")
+                else:
+                    _record(residual, operand_column, "other")
         else:
             for ref, wrapper in _wrapped_columns(child, belongs, wrapper=None):
                 if wrapper is not None:
@@ -541,6 +545,18 @@ def _direct_column(operand: ET.Element) -> ColumnRef | None:
 
 def _references_same_alias_column(operand: ET.Element, belongs) -> bool:
     return any(belongs(ref) for ref in _column_refs(operand))
+
+
+def _leading_wildcard(pattern: ET.Element) -> bool:
+    """A constant LIKE pattern that starts with % or _: there is no prefix to seek on.
+
+    A parameter pattern is left alone: the optimizer seeks it dynamically (LikeRangeStart).
+    """
+
+    const = pattern.find(f"{_Q}Const")
+    value = (const.get("ConstValue") or "") if const is not None else ""
+    literal = value.removeprefix("N")
+    return literal.startswith("'") and literal[1:2] in {"%", "_"}
 
 
 def _operand_columns(element: ET.Element, belongs) -> list[tuple[str, str | None]]:
