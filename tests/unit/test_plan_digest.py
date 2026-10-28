@@ -137,6 +137,70 @@ def test_rows_read_far_above_rows_returned_is_called_out(showplan) -> None:
     assert any("residual" in note for note in top["notes"])
 
 
+def _row_goal_seek_plan(showplan, *, end_of_scans: int | None) -> str:
+    # Ported from sqlserver-query-plans 1.5.5 (MIT): a Posts seek under a row
+    # goal stopped early on 5,718 of 5,829 executions and read 1.37 billion rows.
+    rt = showplan.runtime
+    seek = showplan.scan(
+        2,
+        "Posts",
+        physical="Index Seek",
+        attrs='EstimateRowsWithoutRowGoal="50000"',
+        runtime=rt((0, 5_718, 5_829, 9_000, 8_900, 1_370_000_000, end_of_scans)),
+    )
+    return showplan.plan(
+        showplan.relop(
+            0,
+            "Nested Loops",
+            "Inner Join",
+            showplan.scan(1, "Users", runtime=rt((0, 5_829, 1, 50, 40))),
+            seek,
+            runtime=rt((0, 5_718, 1, 9_100, 8_960)),
+        )
+    )
+
+
+def _top_operator(statement: dict, node_id: int) -> dict:
+    return next(item for item in statement["top_operators"] if item["node_id"] == node_id)
+
+
+def test_row_goal_does_not_hide_a_seek_that_read_billions(showplan) -> None:
+    plan = _row_goal_seek_plan(showplan, end_of_scans=111)
+
+    statement = _statement(build_plan_digest(plan))
+    seek = _top_operator(statement, 2)
+    cited = next(item for item in statement["cited_nodes"] if item["node_id"] == 2)
+
+    assert any("Reads far more rows" in note for note in seek["notes"])
+    assert any("5,718 of 5,829 executions stopped early" in note for note in seek["notes"])
+    assert "5,718 of 5,829 executions stopped early" in cited["row_goal"]
+    assert describe_plan_node(plan, 2)["actuals"]["end_of_scans"] == 111
+
+
+def test_row_goal_that_read_to_the_end_says_so(showplan) -> None:
+    # Ported from sqlserver-query-plans 1.5.5 (MIT): TOP (1000) over a scan whose
+    # residual filter only 613 rows pass. It never found 1000, so it read them all.
+    rt = showplan.runtime
+    scan = showplan.scan(
+        1, "Users", attrs='EstimateRowsWithoutRowGoal="2465713"', runtime=rt((0, 613, 1, 2_000, 1_900, 2_465_713, 1))
+    )
+    plan = showplan.plan(showplan.relop(0, "Top", None, scan, runtime=rt((0, 613, 1, 2_010, 1_905))))
+
+    top = _top_operator(_statement(build_plan_digest(plan)), 1)
+
+    assert any("Reads far more rows" in note for note in top["notes"])
+    assert any("every execution read to the end" in note for note in top["notes"])
+    assert not any("stopped early" in note for note in top["notes"])
+
+
+def test_row_goal_without_end_of_scans_still_shows_the_reads_flag(showplan) -> None:
+    # Older plans may not record ActualEndOfScans: hedge the row goal, never hide the reads.
+    seek = _top_operator(_statement(build_plan_digest(_row_goal_seek_plan(showplan, end_of_scans=None))), 2)
+
+    assert any("Reads far more rows" in note for note in seek["notes"])
+    assert any("may stop early" in note for note in seek["notes"])
+
+
 def test_statement_time_udf_share_and_waits(showplan) -> None:
     plan = _spool_plan(
         showplan,

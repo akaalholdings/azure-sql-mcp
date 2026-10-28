@@ -236,6 +236,7 @@ class ThreadCounters:
     cpu_ms: float | None
     logical_reads: float | None
     mode: str
+    end_of_scans: float | None = None
 
 
 @dataclass(eq=False)
@@ -292,6 +293,13 @@ class PlanNode:
     @property
     def logical_reads(self) -> float | None:
         values = [counter.logical_reads for counter in self.threads if counter.logical_reads is not None]
+        return sum(values) if values else None
+
+    @property
+    def actual_end_of_scans(self) -> float | None:
+        """Executions that read to the end of their input; under a row goal the rest stopped early."""
+
+        values = [counter.end_of_scans for counter in self.threads if counter.end_of_scans is not None]
         return sum(values) if values else None
 
     @property
@@ -698,6 +706,7 @@ def _node(element: ET.Element, parent: PlanNode | None, depth: int) -> PlanNode:
                     cpu_ms=_number(counter.get("ActualCPUms")),
                     logical_reads=_number(counter.get("ActualLogicalReads")),
                     mode=counter.get("ActualExecutionMode") or "",
+                    end_of_scans=_number(counter.get("ActualEndOfScans")),
                 )
             )
     return PlanNode(
