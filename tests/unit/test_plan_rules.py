@@ -342,6 +342,23 @@ def _converted(table: str, column: str, *, implicit: str = "0") -> str:
     )
 
 
+def test_cursor_plans_are_analysed_and_findings_stay_on_their_statement(showplan) -> None:
+    # Rules and predicate access read the statements in two passes joined by
+    # position, so a cursor must count in both or a finding lands on the wrong one.
+    cursor = showplan.cursor(("FetchQuery", showplan.scan(0, "Orders", body=_converted("Orders", "OrderDate"))))
+    select = showplan.simple(showplan.scan(0, "Customers", body=_converted("Customers", "CreatedAt")))
+
+    result = analyze_plan(showplan.batch(cursor, select))
+    found = {
+        (finding["statement_index"], finding["evidence"]["column"])
+        for finding in result["findings"]
+        if finding["rule"] == "non_sargable_predicate"
+    }
+
+    assert found == {(0, "OrderDate"), (1, "CreatedAt")}
+    assert [statement["statement_type"] for statement in result["statements"]] == ["DECLARE CURSOR", "SELECT"]
+
+
 def _order_date_seek(showplan, start: tuple[str, str], end: tuple[str, str], residual: str) -> str:
     """An Index Seek on Orders.OrderDate between two bounds, each (ScanType, value), plus a residual."""
 

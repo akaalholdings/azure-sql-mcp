@@ -83,6 +83,35 @@ class ShowplanBuilder:
             "</StmtSimple></Statements></Batch></BatchSequence></ShowPlanXML>"
         )
 
+    def batch(self, *statements: str) -> str:
+        """A plan holding several statement elements, in order."""
+
+        return (
+            f'<ShowPlanXML xmlns="{SHOWPLAN_NS}" Version="1.564"><BatchSequence><Batch><Statements>'
+            f"{''.join(statements)}</Statements></Batch></BatchSequence></ShowPlanXML>"
+        )
+
+    def simple(self, root_relop: str, *, text: str = "SELECT 1") -> str:
+        """A ``StmtSimple`` element for ``batch``."""
+
+        return (
+            f'<StmtSimple StatementText="{text}" StatementType="SELECT" StatementSubTreeCost="1">'
+            f"<QueryPlan>{root_relop}</QueryPlan></StmtSimple>"
+        )
+
+    def cursor(self, *operations: tuple[str, str], cursor_type: str = "Dynamic") -> str:
+        """A ``StmtCursor`` element for ``batch``: each operation is (OperationType, root RelOp)."""
+
+        body = "".join(
+            f'<Operation OperationType="{operation}"><QueryPlan>{root_relop}</QueryPlan></Operation>'
+            for operation, root_relop in operations
+        )
+        return (
+            '<StmtCursor StatementText="DECLARE c CURSOR FOR SELECT 1" StatementType="DECLARE CURSOR" StatementSubTreeCost="1">'
+            f'<CursorPlan CursorName="c" CursorActualType="{cursor_type}" CursorRequestedType="{cursor_type}">{body}</CursorPlan>'
+            "</StmtCursor>"
+        )
+
     def runtime(self, *threads: tuple, mode: str = "Row") -> str:
         """Each thread is (thread, rows, executions, elapsed_ms, cpu_ms[, rows_read[, end_of_scans]]); None omits a value."""
 

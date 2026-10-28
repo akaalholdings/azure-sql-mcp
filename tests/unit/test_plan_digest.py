@@ -201,6 +201,16 @@ def test_row_goal_without_end_of_scans_still_shows_the_reads_flag(showplan) -> N
     assert any("may stop early" in note for note in seek["notes"])
 
 
+def test_cursor_statement_is_digested(showplan) -> None:
+    rt = showplan.runtime
+    plan = showplan.batch(showplan.cursor(("FetchQuery", showplan.scan(0, "Orders", runtime=rt((0, 10, 1, 500, 480))))))
+
+    statement = _statement(build_plan_digest(plan))
+
+    assert statement["statement_type"] == "DECLARE CURSOR"
+    assert statement["top_operators"][0]["node_id"] == 0
+
+
 def test_statement_time_udf_share_and_waits(showplan) -> None:
     plan = _spool_plan(
         showplan,

@@ -199,6 +199,20 @@ def test_row_mode_parent_over_a_batch_sort_does_not_absorb_the_zone_cpu(showplan
     assert nodes[0].self_cpu_ms == 100  # 1000 - (600 batch Sort + 300 row-mode loops below it)
 
 
+def test_cursor_statement_plans_are_read_from_each_operation(showplan) -> None:
+    # DECLARE CURSOR keeps its plans under CursorPlan/Operation, one per populate
+    # or fetch query. Reading only StmtSimple left every cursor unanalysed.
+    plan = showplan.batch(
+        showplan.cursor(("PopulateQuery", showplan.scan(0, "Orders")), ("FetchQuery", showplan.scan(0, "Orders"))),
+        showplan.simple(showplan.scan(0, "Customers")),
+    )
+
+    found = statements(parse_showplan(plan))
+
+    assert [statement.get("StatementType") for statement, _ in found] == ["DECLARE CURSOR", "DECLARE CURSOR", "SELECT"]
+    assert all(query_plan is not None for _, query_plan in found)
+
+
 def test_estimates_are_compared_per_execution(showplan) -> None:
     rt = showplan.runtime
     plan = showplan.plan(

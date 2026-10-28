@@ -23,6 +23,7 @@ from typing import Iterator
 from .plan_tree import PlanParseError
 from .plan_tree import is_true
 from .plan_tree import parse_showplan
+from .plan_tree import statements
 from .plan_tree import unquote
 
 NS = "http://schemas.microsoft.com/sqlserver/2004/07/showplan"
@@ -210,19 +211,19 @@ def parse_plan_access(plan_xml: str) -> PlanAccessSummary:
     except PlanParseError as exc:
         return PlanAccessSummary(parse_error=str(exc))
     summary = PlanAccessSummary()
-    for statement in root.iter(f"{_Q}StmtSimple"):
-        summary.statements.append(_parse_statement(statement))
+    # The same statement list as plan_tree.statements: rules join the two by position.
+    for statement, query_plan in statements(root):
+        summary.statements.append(_parse_statement(statement, query_plan))
     return summary
 
 
-def _parse_statement(statement: ET.Element) -> StatementAccess:
+def _parse_statement(statement: ET.Element, query_plan: ET.Element | None) -> StatementAccess:
     result = StatementAccess(
         statement_type=(statement.get("StatementType") or "").upper(),
         statement_cost=_float(statement.get("StatementSubTreeCost")),
         query_hash=statement.get("QueryHash"),
         plan_hash=statement.get("QueryPlanHash"),
     )
-    query_plan = statement.find(f"{_Q}QueryPlan")
     if query_plan is None:
         return result
     result.missing_indexes = _missing_indexes(query_plan)

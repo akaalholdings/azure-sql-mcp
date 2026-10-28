@@ -420,9 +420,20 @@ class CrossJoinCheck:
 
 
 def statements(root: ET.Element) -> list[tuple[ET.Element, ET.Element | None]]:
-    """Every ``StmtSimple`` with its ``QueryPlan`` (None when the statement has none)."""
+    """Every statement with its ``QueryPlan`` (None when it has none), in document order.
 
-    return [(statement, statement.find(f"{_Q}QueryPlan")) for statement in root.iter(f"{_Q}StmtSimple")]
+    A cursor (``StmtCursor``) keeps its plans under ``CursorPlan/Operation``, one per
+    populate, fetch or refresh query; each is listed with the cursor statement.
+    """
+
+    found: list[tuple[ET.Element, ET.Element | None]] = []
+    for element in root.iter():
+        if element.tag == f"{_Q}StmtSimple":
+            found.append((element, element.find(f"{_Q}QueryPlan")))
+        elif element.tag == f"{_Q}StmtCursor":
+            plans = element.findall(f"{_Q}CursorPlan/{_Q}Operation/{_Q}QueryPlan")
+            found.extend([(element, plan) for plan in plans] or [(element, None)])
+    return found
 
 
 def build_tree(query_plan: ET.Element | None) -> list[PlanNode]:
