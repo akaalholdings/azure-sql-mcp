@@ -61,3 +61,58 @@ async def test_query_store_runtime_failure_keeps_the_database_grant() -> None:
 
     assert status["result_status"] == "unavailable"
     assert status["result_status_reason"].endswith("VIEW DATABASE STATE is required.")
+
+
+_NS = "http://schemas.microsoft.com/sqlserver/2004/07/showplan"
+
+
+def _batch_plan(*hashes: str) -> str:
+    body = "".join(
+        f'<StmtSimple StatementText="s{index}" StatementType="SELECT" QueryPlanHash="{plan_hash}"/>'
+        for index, plan_hash in enumerate(hashes)
+    )
+    return (
+        f'<ShowPlanXML xmlns="{_NS}" Version="1.564"><BatchSequence><Batch><Statements>{body}'
+        "</Statements></Batch></BatchSequence></ShowPlanXML>"
+    )
+
+
+@pytest.mark.asyncio
+async def test_last_actual_plan_names_the_requested_statements_in_the_cached_batch() -> None:
+    # The DMV returns the whole cached batch. Without the matching statement indexes the caller
+    # cannot tell which statement it asked about; the hash text case can differ between
+    # CONVERT(varchar(18), ..., 1) and the showplan attribute.
+    plan = _batch_plan("0x0000000000000001", "0xaaaaaaaaaaaaaaaa", "0x0000000000000002", "0xAAAAAAAAAAAAAAAA")
+    executor = ScriptedExecutor(
+        [
+            ("LAST_QUERY_PLAN_STATS", [{"value": "ON"}]),
+            (
+                "sys.dm_exec_query_plan_stats",
+                [{"plan_id": 7, "query_id": 3, "query_plan_hash": "0xAAAAAAAAAAAAAAAA", "query_plan": plan}],
+            ),
+        ]
+    )
+
+    source = await PlanSourceService(executor).last_actual("appdb", plan_id=None, query_id=3)  # type: ignore[arg-type]
+
+    assert source.xml == plan
+    assert source.source["requested_statement_indexes"] == [1, 3]
+
+
+@pytest.mark.asyncio
+async def test_last_actual_plan_says_when_the_requested_statement_is_not_in_the_batch() -> None:
+    plan = _batch_plan("0x0000000000000001", "0x0000000000000002")
+    executor = ScriptedExecutor(
+        [
+            ("LAST_QUERY_PLAN_STATS", [{"value": "ON"}]),
+            (
+                "sys.dm_exec_query_plan_stats",
+                [{"plan_id": 7, "query_id": 3, "query_plan_hash": "0xAAAAAAAAAAAAAAAA", "query_plan": plan}],
+            ),
+        ]
+    )
+
+    source = await PlanSourceService(executor).last_actual("appdb", plan_id=7, query_id=None)  # type: ignore[arg-type]
+
+    assert source.source["requested_statement_indexes"] == []
+    assert "not found" in source.source["source_note"]

@@ -293,3 +293,67 @@ def test_node_drill_down_on_a_fixture_and_a_missing_node() -> None:
     detail = describe_plan_node(plan, 0)
     assert detail is not None and detail["statement_index"] == 0
     assert "actuals" not in detail
+
+
+_NS = "http://schemas.microsoft.com/sqlserver/2004/07/showplan"
+
+
+def _batch_statement(index: int, cost: float, plan_hash: str) -> str:
+    # A last actual plan: actual row counts, no operator times, so the digest ranks by cost.
+    return (
+        f'<StmtSimple StatementText="s{index}" StatementType="SELECT" StatementSubTreeCost="{cost}" '
+        f'QueryPlanHash="{plan_hash}"><QueryPlan><RelOp NodeId="0" PhysicalOp="Clustered Index Scan" '
+        f'LogicalOp="Clustered Index Scan" EstimateRows="1" EstimatedTotalSubtreeCost="{cost}"><OutputList/>'
+        '<RunTimeInformation><RunTimeCountersPerThread Thread="0" ActualRows="1" ActualExecutions="1"/>'
+        f'</RunTimeInformation><IndexScan><Object Database="[db]" Schema="[dbo]" Table="[T{index}]" '
+        'Index="[PK]" IndexKind="Clustered"/></IndexScan></RelOp></QueryPlan></StmtSimple>'
+    )
+
+
+def _batch(*statements: str) -> str:
+    return (
+        f'<ShowPlanXML xmlns="{_NS}" Version="1.564"><BatchSequence><Batch><Statements>'
+        f"{''.join(statements)}</Statements></Batch></BatchSequence></ShowPlanXML>"
+    )
+
+
+def test_pinned_statement_survives_the_statement_cut_in_a_cached_batch() -> None:
+    # sys.dm_exec_query_plan_stats returns the plan of the whole cached procedure. The statement
+    # the caller asked about is often cheap by estimate; ranking by cost alone would cut it, and
+    # the agent would read (and tune) other statements while the result says "ok".
+    target = "0xAAAAAAAAAAAAAAAA"
+    others = [_batch_statement(index, 10 + index, f"0x000000000000000{index}") for index in range(6)]
+    plan = _batch(*others, _batch_statement(6, 0.5, target))
+
+    digest = build_plan_digest(plan, pin_plan_hash=target.lower())  # CONVERT(...,1) and showplan case can differ
+
+    kept = {item["statement_index"]: item for item in digest["statements"]}
+    assert 6 in kept and kept[6]["is_requested_statement"] is True
+    assert sum(item["is_requested_statement"] for item in kept.values()) == 1
+    assert digest["requested_plan_hash"] == target.lower()
+    assert digest["requested_statement_indexes"] == [6]
+    assert digest["statements_truncated"] is True and digest["statement_count"] == 7
+
+
+def test_pinned_hash_keeps_every_repeat_and_falls_back_to_the_batch_when_absent() -> None:
+    # One batch can run the same statement shape twice; both are the requested statement.
+    target = "0xBBBBBBBBBBBBBBBB"
+    others = [_batch_statement(index, 10 + index, f"0x000000000000000{index}") for index in range(5)]
+    plan = _batch(_batch_statement(0, 0.1, target), *others, _batch_statement(6, 0.2, target))
+
+    digest = build_plan_digest(plan, pin_plan_hash=target)
+
+    assert digest["requested_statement_indexes"] == [0, 6]
+    assert [item["statement_index"] for item in digest["statements"] if item["is_requested_statement"]] == [0, 6]
+
+    missing = build_plan_digest(plan, pin_plan_hash="0xCCCCCCCCCCCCCCCC")
+    assert missing["requested_statement_indexes"] == []
+    assert len(missing["statements"]) == 5  # nothing matched: the usual top statements of the batch
+    assert "not found" in missing["requested_statement_note"]
+
+
+def test_digest_without_a_pin_keeps_its_shape(showplan) -> None:
+    digest = build_plan_digest(_spool_plan(showplan))
+
+    assert "requested_plan_hash" not in digest
+    assert "is_requested_statement" not in digest["statements"][0]
