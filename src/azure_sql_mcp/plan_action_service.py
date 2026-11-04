@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from typing import Any, Mapping, Sequence
 
 from .admin_policy import AdminAction, AdminPolicy
@@ -21,6 +23,48 @@ from .query_identity import server_database_identity_matches
 
 
 _OPERATIONS = {"force_plan", "unforce_plan", "set_hints", "clear_hints"}
+DEFAULT_INTENT_TTL = timedelta(hours=24)
+_BASELINE_WINDOW = timedelta(hours=24)
+_MAX_EVIDENCE_ROWS = 200
+_METRIC_TOTALS = (
+    ("avg_duration", "total_duration"),
+    ("avg_cpu_time", "total_cpu_time"),
+    ("avg_logical_io_reads", "total_logical_io_reads"),
+)
+# Only whole Query Store intervals strictly before or after apply are read, so
+# the interval that contains the apply time never mixes pre and post runs.
+_RUNTIME_EVIDENCE_SQL = """
+DECLARE @applied_at datetimeoffset(7) =
+    TODATETIMEOFFSET(CONVERT(datetime2(7), ?, 126), 0);
+SELECT
+    CASE WHEN rsi.start_time >= @applied_at THEN 'post' ELSE 'baseline' END
+        AS window_name,
+    rs.plan_id,
+    SUM(rs.count_executions) AS count_executions,
+    SUM(rs.avg_duration * rs.count_executions) AS total_duration,
+    SUM(rs.avg_cpu_time * rs.count_executions) AS total_cpu_time,
+    SUM(rs.avg_logical_io_reads * rs.count_executions) AS total_logical_io_reads,
+    SUM(rs.count_executions * (SQUARE(rs.stdev_duration) + SQUARE(rs.avg_duration)))
+        AS total_duration_sq,
+    MAX(rs.max_duration) AS max_duration
+FROM sys.query_store_runtime_stats AS rs
+INNER JOIN sys.query_store_runtime_stats_interval AS rsi
+    ON rsi.runtime_stats_interval_id = rs.runtime_stats_interval_id
+INNER JOIN sys.query_store_plan AS p
+    ON p.plan_id = rs.plan_id
+WHERE p.query_id = ?
+  AND (
+        rsi.start_time >= @applied_at
+        OR (
+            rsi.end_time <= @applied_at
+            AND rsi.start_time >= DATEADD(SECOND, ?, @applied_at)
+        )
+  )
+GROUP BY
+    CASE WHEN rsi.start_time >= @applied_at THEN 'post' ELSE 'baseline' END,
+    rs.plan_id
+ORDER BY window_name, rs.plan_id
+"""
 
 
 def _hash_text(value: str) -> str:
@@ -32,6 +76,33 @@ def _database_fingerprint(server_name: str, database_name: str) -> str:
         server_name.strip().casefold(),
         database_name.strip().casefold(),
     )
+
+
+def _parse_utc(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(UTC) if parsed.tzinfo is not None else None
+
+
+def _as_number(value: Any) -> float:
+    if isinstance(value, bool) or value is None:
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _pooled_stdev(count: float, total: float, total_sq: float | None) -> float | None:
+    # Pools per-interval stdevs: variance = E[x^2] - mean^2 over all executions.
+    if count <= 0 or total_sq is None:
+        return None
+    mean = total / count
+    return math.sqrt(max(total_sq / count - mean * mean, 0.0))
 
 
 def _first_rows(results: Sequence[QueryResult]) -> list[dict[str, Any]]:
@@ -52,12 +123,16 @@ class PlanActionService:
         admin_policy: AdminPolicy,
         database_policy: DatabasePolicySet,
         store: PerformanceStore,
+        intent_ttl: timedelta = DEFAULT_INTENT_TTL,
     ) -> None:
+        if intent_ttl <= timedelta(0):
+            raise ValueError("intent_ttl must be positive.")
         self.config = config
         self.executor = executor
         self.admin_policy = admin_policy
         self.database_policy = database_policy
         self.store = store
+        self.intent_ttl = intent_ttl
 
     async def prepare(
         self,
@@ -102,6 +177,8 @@ class PlanActionService:
             f"{database_fingerprint}:{idempotency_key}"
         )[:32]
         status = "prepared" if ownership == "manual" else "rejected"
+        created_at = utc_now()
+        expires_at = (datetime.fromisoformat(created_at) + self.intent_ttl).isoformat()
         intent = PlanActionIntentV1(
             intent_id=intent_id,
             session_id=session_id,
@@ -109,9 +186,10 @@ class PlanActionService:
             query_fingerprint=_hash_text(f"query-store:{query_id}"),
             action=operation,
             status=status,
-            created_at_utc=utc_now(),
-            updated_at_utc=utc_now(),
+            created_at_utc=created_at,
+            updated_at_utc=created_at,
             metadata={
+                "expires_at_utc": expires_at,
                 "database_fingerprint": database_fingerprint,
                 "query_id": query_id,
                 "plan_id": plan_id,
@@ -152,6 +230,7 @@ class PlanActionService:
         return {
             "intent": intent.to_dict(),
             "prepared": intent.status == "prepared",
+            "expires_at_utc": intent.metadata.get("expires_at_utc"),
             "apply_gates": self._gate_status(database_name),
             "raw_sql_persisted": False,
         }
@@ -176,6 +255,17 @@ class PlanActionService:
             }
         if intent.status != "prepared":
             raise PermissionError(f"Only a prepared intent may be applied; status={intent.status}.")
+        if self._intent_expired(intent):
+            updated = self._save_status(
+                intent,
+                "hold",
+                {
+                    "apply_confirmation": "intent_expired",
+                    "apply_refused_at_utc": utc_now(),
+                    "hold_reason": "Prepared intent expired; prepare it again from fresh evidence.",
+                },
+            )
+            return {"intent": updated.to_dict(), "confirmed": False, "expired": True}
         try:
             intent = self._save_status(
                 intent,
@@ -285,9 +375,14 @@ class PlanActionService:
         database_name: str,
         intent_id: str,
         *,
-        candidate_evidence: Mapping[str, Any],
+        candidate_evidence: Mapping[str, Any] | None = None,
         authorization_reference: str,
     ) -> dict[str, Any]:
+        """Decide keep/rollback/hold from Query Store evidence the MCP reads.
+
+        ``candidate_evidence`` from the caller is context only: it can turn a
+        keep into a hold, but it can never produce a keep on its own.
+        """
         intent = self._validated_intent(database_name, intent_id)
         if intent.status not in {"applied", "observing", "hold"}:
             raise ValueError(f"Intent status {intent.status!r} cannot be verified.")
@@ -319,28 +414,121 @@ class PlanActionService:
                 },
             )
             return {"intent": updated.to_dict(), "decision": "hold"}
-        policy = self.database_policy.require(database_name)
-        decision = decide_verification(
-            baseline,
-            candidate_evidence,
-            expected_provenance={
-                "environment": policy.environment,
-                "database_name": database_name,
-                "query_id": int(metadata["query_id"]),
-            },
-        )
-        if decision.action == "hold":
-            updated = self._save_status(
-                intent,
-                "hold",
-                {
-                    "verification": {
-                        "action": decision.action,
-                        "reason": decision.reason,
-                    }
-                },
+        query_id = int(metadata["query_id"])
+        forced_plan_id = expected_state.get("force_plan_id")
+        applied_state = metadata.get("applied_state")
+        failures_at_apply = int(
+            _as_number(
+                applied_state.get("force_failure_count")
+                if isinstance(applied_state, Mapping)
+                else None
             )
-            return {"intent": updated.to_dict(), "decision": "hold"}
+        )
+        failures_now = int(_as_number(current_state.get("force_failure_count")))
+        applied_at = _parse_utc(metadata.get("applied_at_utc"))
+        policy = self.database_policy.require(database_name)
+        provenance = {
+            "environment": policy.environment,
+            "database_name": database_name,
+            "query_id": query_id,
+        }
+        evidence: dict[str, Any] = {
+            "source": "mcp_query_store",
+            "caller_evidence_used_for_keep": False,
+            "forced_plan_id": forced_plan_id,
+            "force_failure_count": failures_now,
+            "force_failure_count_at_apply": failures_at_apply,
+            "last_force_failure_reason_desc": current_state.get(
+                "last_force_failure_reason_desc"
+            ),
+        }
+        hold_reason: str | None = None
+        if forced_plan_id is not None and failures_now > failures_at_apply:
+            hold_reason = (
+                f"Plan forcing failed {failures_now - failures_at_apply} time(s) after "
+                "apply (last reason: "
+                f"{current_state.get('last_force_failure_reason_desc') or 'unknown'})."
+            )
+        elif applied_at is None:
+            hold_reason = "Intent has no valid applied_at_utc; post-apply evidence cannot be read."
+        if hold_reason is not None:
+            return self._verification_hold(intent, hold_reason, evidence)
+        assert applied_at is not None
+        mcp_baseline, mcp_candidate, collected = await self._collect_runtime_evidence(
+            database_name,
+            query_id,
+            applied_at,
+            forced_plan_id,
+            provenance,
+        )
+        evidence.update(collected)
+        share = evidence.get("forced_plan_execution_share")
+        if isinstance(share, float) and share <= 0.5:
+            return self._verification_hold(
+                intent,
+                (
+                    f"The forced plan ran {share:.0%} of executions since apply; "
+                    "most executions must use the forced plan_id."
+                ),
+                evidence,
+            )
+        decision = decide_verification(
+            mcp_baseline,
+            mcp_candidate,
+            expected_provenance=provenance,
+            require_parameter_buckets=False,
+        )
+        if decision.action == "keep" and candidate_evidence:
+            context = decide_verification(
+                baseline,
+                candidate_evidence,
+                expected_provenance=provenance,
+            )
+            evidence["caller_context_decision"] = context.action
+            if context.action == "rollback":
+                decision = replace(
+                    decision,
+                    action="hold",
+                    reason=(
+                        "Query Store evidence improved, but caller evidence shows a "
+                        f"regression ({context.reason}); manual review is required."
+                    ),
+                    regressed_metrics=context.regressed_metrics,
+                )
+        plan_count = evidence.get("baseline_plan_count")
+        if decision.action == "keep" and isinstance(plan_count, int) and plan_count > 1:
+            decision = replace(
+                decision,
+                action="hold",
+                reason=(
+                    f"The baseline window ran {plan_count} plans, so this query is "
+                    "likely parameter-sensitive, and Query Store has no per-parameter "
+                    "runtime stats: the blended improvement can hide a regression for "
+                    "a minority parameter range. Verify each parameter bucket "
+                    "(get_query_parameter_buckets, or a benchmark with representative "
+                    "parameters) before deciding to keep."
+                ),
+            )
+        new_plans = evidence.get("post_plans_without_baseline")
+        if decision.action == "keep" and new_plans:
+            # The tail baseline then comes from other plans, whose outliers
+            # can hide a slower minority of executions on the new plan.
+            decision = replace(
+                decision,
+                action="hold",
+                reason=(
+                    f"Plan(s) {', '.join(str(p) for p in new_plans)} did not run in the "
+                    "baseline window, so their max and spread cannot be compared with "
+                    "their own baseline, and Query Store has no per-parameter runtime "
+                    "stats. Verify each parameter bucket (get_query_parameter_buckets, "
+                    "or a benchmark with representative parameters) before deciding "
+                    "to keep."
+                ),
+            )
+        if decision.action == "hold":
+            return self._verification_hold(
+                intent, decision.reason, evidence, decision.regressed_metrics
+            )
         if decision.action == "keep":
             updated = self._save_status(
                 intent,
@@ -350,10 +538,11 @@ class PlanActionService:
                         "action": decision.action,
                         "reason": decision.reason,
                         "improvement_pct": decision.improvement_pct,
+                        "evidence": evidence,
                     }
                 },
             )
-            return {"intent": updated.to_dict(), "decision": "keep"}
+            return {"intent": updated.to_dict(), "decision": "keep", "evidence": evidence}
         rollback = await self.rollback(
             database_name,
             intent_id,
@@ -361,7 +550,179 @@ class PlanActionService:
             reason=decision.reason,
         )
         rollback["decision"] = "rollback"
+        rollback["evidence"] = evidence
         return rollback
+
+    def _verification_hold(
+        self,
+        intent: PlanActionIntentV1,
+        reason: str,
+        evidence: Mapping[str, Any],
+        regressed_metrics: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        updated = self._save_status(
+            intent,
+            "hold",
+            {
+                "verification": {
+                    "action": "hold",
+                    "reason": reason,
+                    "regressed_metrics": list(regressed_metrics),
+                    "evidence": dict(evidence),
+                }
+            },
+        )
+        return {"intent": updated.to_dict(), "decision": "hold", "evidence": dict(evidence)}
+
+    async def _collect_runtime_evidence(
+        self,
+        database_name: str,
+        query_id: int,
+        applied_at: datetime,
+        forced_plan_id: Any,
+        provenance: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Read pre/post apply runtime stats for the query from Query Store."""
+
+        now = datetime.now(UTC)
+        rows = await self.executor.fetch_all(
+            database_name,
+            _RUNTIME_EVIDENCE_SQL,
+            params=[
+                applied_at.strftime("%Y-%m-%dT%H:%M:%S.%f"),
+                int(query_id),
+                -int(_BASELINE_WINDOW.total_seconds()),
+            ],
+            max_rows=_MAX_EVIDENCE_ROWS + 1,
+        )
+        truncated = len(rows) > _MAX_EVIDENCE_ROWS
+        rows = rows[:_MAX_EVIDENCE_ROWS]
+        per_plan: list[dict[str, Any]] = []
+        windows: dict[str, dict[str, Any]] = {
+            "baseline": {"count": 0.0, "max_duration": 0.0, "total_duration_sq": 0.0},
+            "post": {"count": 0.0, "max_duration": 0.0, "total_duration_sq": 0.0},
+        }
+        forced_executions = 0.0
+        forced_baseline: dict[str, Any] | None = None
+        baseline_plans: set[int] = set()
+        post_plans: set[int] = set()
+        for row in rows:
+            window = str(row.get("window_name") or "")
+            if window not in windows:
+                continue
+            count = _as_number(row.get("count_executions"))
+            totals = windows[window]
+            totals["count"] += count
+            totals["max_duration"] = max(
+                totals["max_duration"], _as_number(row.get("max_duration"))
+            )
+            total_sq = row.get("total_duration_sq")
+            plan_sq = None if total_sq is None else _as_number(total_sq)
+            if plan_sq is None or totals["total_duration_sq"] is None:
+                totals["total_duration_sq"] = None
+            else:
+                totals["total_duration_sq"] += plan_sq
+            plan_id = (
+                int(_as_number(row.get("plan_id"))) if row.get("plan_id") is not None else None
+            )
+            is_forced = forced_plan_id is not None and plan_id == int(forced_plan_id)
+            plan_summary: dict[str, Any] = {
+                "window": window,
+                "plan_id": row.get("plan_id"),
+                "count_executions": int(count),
+                "max_duration": _as_number(row.get("max_duration")),
+                "stdev_duration": _pooled_stdev(
+                    count, _as_number(row.get("total_duration")), plan_sq
+                ),
+            }
+            for metric, total_name in _METRIC_TOTALS:
+                total = _as_number(row.get(total_name))
+                totals[total_name] = totals.get(total_name, 0.0) + total
+                plan_summary[metric] = total / count if count else None
+            per_plan.append(plan_summary)
+            if window == "baseline" and count > 0 and plan_id is not None:
+                baseline_plans.add(plan_id)
+                if is_forced:
+                    forced_baseline = plan_summary
+            if window == "post" and count > 0 and plan_id is not None:
+                post_plans.add(plan_id)
+            if window == "post" and is_forced:
+                forced_executions += count
+
+        def payload(name: str, start: datetime, end: datetime) -> dict[str, Any]:
+            totals = windows[name]
+            count = totals["count"]
+            result: dict[str, Any] = {
+                "count_executions": int(count),
+                "max_duration": totals["max_duration"] if count else None,
+                "stdev_duration": _pooled_stdev(
+                    count, totals.get("total_duration", 0.0), totals["total_duration_sq"]
+                ),
+                "units": {
+                    "avg_duration": "microseconds",
+                    "avg_cpu_time": "microseconds",
+                    "avg_logical_io_reads": "8kb_pages",
+                    "max_duration": "microseconds",
+                    "stdev_duration": "microseconds",
+                },
+                "evidence": {
+                    **provenance,
+                    "source": "query-store",
+                    "provenance": "mcp-runtime-stats-v1",
+                    "window_start": start.isoformat(),
+                    "window_end": end.isoformat(),
+                    "post_change": name == "post",
+                    "truncated": truncated,
+                },
+            }
+            for metric, total_name in _METRIC_TOTALS:
+                result[metric] = totals.get(total_name, 0.0) / count if count else None
+            return result
+
+        baseline = payload("baseline", applied_at - _BASELINE_WINDOW, applied_at)
+        candidate = payload("post", applied_at, now)
+        if forced_baseline is not None:
+            # The slow sniffed plan inflates the all-plan baseline tail, so the
+            # forced plan's tail is compared with its own pre-apply tail.
+            baseline["max_duration"] = forced_baseline["max_duration"]
+            baseline["stdev_duration"] = forced_baseline["stdev_duration"]
+        post_count = windows["post"]["count"]
+        summary_keys = (
+            "count_executions",
+            *(m for m, _ in _METRIC_TOTALS),
+            "max_duration",
+            "stdev_duration",
+        )
+        collected = {
+            "baseline_window": {
+                "start": baseline["evidence"]["window_start"],
+                "end": baseline["evidence"]["window_end"],
+            },
+            "post_window": {
+                "start": candidate["evidence"]["window_start"],
+                "end": candidate["evidence"]["window_end"],
+            },
+            "baseline": {key: baseline[key] for key in summary_keys},
+            "post": {key: candidate[key] for key in summary_keys},
+            "per_plan": per_plan,
+            "forced_plan_execution_share": (
+                forced_executions / post_count
+                if forced_plan_id is not None and post_count
+                else None
+            ),
+            "truncated": truncated,
+            "baseline_plan_count": len(baseline_plans),
+            "post_plans_without_baseline": sorted(post_plans - baseline_plans),
+            "tail_baseline_basis": "forced_plan" if forced_baseline is not None else "all_plans",
+            "parameter_buckets": "unavailable",
+            "parameter_buckets_note": (
+                "Query Store does not record runtime parameter values per execution, "
+                "so no parameter buckets were compared. max_duration and "
+                "stdev_duration are checked against the forced plan's own baseline "
+                "where it ran, to catch a slower minority of executions."
+            ),
+        }
+        return baseline, candidate, collected
 
     async def rollback(
         self,
@@ -384,6 +745,11 @@ class PlanActionService:
             }
         if intent.status not in {"applied", "observing", "hold", "kept"}:
             raise ValueError(f"Intent status {intent.status!r} cannot be rolled back.")
+        if not intent.metadata.get("applied_at_utc"):
+            # Held before apply (expired or precondition changed): this intent
+            # changed nothing, so restoring its prior state would undo someone
+            # else's change.
+            return {"intent": intent.to_dict(), "confirmed": False, "not_applied": True}
         try:
             intent = self._save_status(
                 intent,
@@ -433,6 +799,19 @@ class PlanActionService:
                 "hold",
                 {
                     "rollback_confirmation": "ownership_changed",
+                    "rollback_reason": reason,
+                    "observed_control_state": current_state,
+                },
+            )
+            return {"intent": updated.to_dict(), "confirmed": False, "decision": "hold"}
+        if not self._control_state_matches(
+            current_state, self._expected_applied_state(intent, prior_state)
+        ):
+            updated = self._save_status(
+                intent,
+                "hold",
+                {
+                    "rollback_confirmation": "state_changed",
                     "rollback_reason": reason,
                     "observed_control_state": current_state,
                 },
@@ -502,7 +881,8 @@ class PlanActionService:
             "SET TRANSACTION ISOLATION LEVEL SNAPSHOT",
             "BEGIN TRANSACTION",
             (
-                "SELECT plan_id, plan_forcing_type_desc "
+                "SELECT plan_id, plan_forcing_type_desc, force_failure_count, "
+                "last_force_failure_reason_desc "
                 "FROM sys.query_store_plan "
                 f"WHERE query_id = {int(query_id)} AND is_forced_plan = 1"
             ),
@@ -555,6 +935,14 @@ class PlanActionService:
             ),
             "ownership": ownership,
             "captured": True,
+            "force_failure_count": (
+                int(_as_number(forced_rows[0].get("force_failure_count")))
+                if forced_rows
+                else None
+            ),
+            "last_force_failure_reason_desc": (
+                forced_rows[0].get("last_force_failure_reason_desc") if forced_rows else None
+            ),
         }
 
     async def _execute_action(
@@ -771,6 +1159,16 @@ class PlanActionService:
             raise RuntimeError("Prepared intent evidence hash does not match durable evidence.")
         return intent
 
+    def _intent_expired(self, intent: PlanActionIntentV1) -> bool:
+        # Intents prepared before expiry existed fall back to created + TTL.
+        expires_at = _parse_utc(intent.metadata.get("expires_at_utc"))
+        if expires_at is None:
+            created_at = _parse_utc(intent.created_at_utc)
+            if created_at is None:
+                return True
+            expires_at = created_at + self.intent_ttl
+        return datetime.now(UTC) >= expires_at
+
     def _save_status(
         self,
         intent: PlanActionIntentV1,
@@ -849,4 +1247,4 @@ class PlanActionService:
         return normalized
 
 
-__all__ = ["PlanActionService"]
+__all__ = ["DEFAULT_INTENT_TTL", "PlanActionService"]
