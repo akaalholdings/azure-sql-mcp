@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any
 
 from .connection import AzureSqlExecutor
@@ -16,6 +17,7 @@ from .incident_log import note_exception
 from .observability import sanitize_error_message
 from .param_binding import ParameterBindingService
 from .param_binding import ParameterExecutionContract
+from .plans import require_compiled_plan
 from .plan_tree import describe_result_shape
 from .plan_tree import showplan_from_results
 from .query_text import strip_query_store_parameter_declarations
@@ -82,9 +84,11 @@ class QueryIndexAnalysisService:
             normalized_sql = strip_query_store_parameter_declarations(contract_sql)
             validated = self.validator.validate_read_only(normalized_sql)
             if contract is not None and contract.parameters:
+                # The estimated plan DECLAREs the parameters itself, so a Query
+                # Store "(@p int)" prefix must not be compiled with it.
                 plan_xml = await self._get_estimated_plan(
                     database_name,
-                    contract.sp_executesql_showplan_sql,
+                    replace(contract, sql_text=normalized_sql).estimated_showplan_sql,
                 )
             else:
                 plan_xml = await self._get_estimated_plan(
@@ -92,12 +96,16 @@ class QueryIndexAnalysisService:
                     validated.normalized_sql,
                 )
             missing = self._extract_missing_indexes(plan_xml)
-            query_details.append({
+            detail = {
                 "sql": validated.normalized_sql,
                 "analysis_status": "available",
                 "missing_index_count": len(missing),
                 "missing_index_provenance": dict(MISSING_INDEX_PROVENANCE),
-            })
+            }
+            if contract is not None and contract.parameters:
+                # Same field explain_query reports for a typed estimated plan.
+                detail["estimated_plan_basis"] = contract.estimated_showplan_basis
+            query_details.append(detail)
             for rec in missing:
                 rec["source_query"] = validated.normalized_sql
             all_recommendations.extend(missing)
@@ -281,7 +289,7 @@ class QueryIndexAnalysisService:
         plan_xml = showplan_from_results(plan_results)
         if plan_xml is None:
             raise RuntimeError(f"No SHOWPLAN XML returned; {describe_result_shape(plan_results)}.")
-        return plan_xml
+        return require_compiled_plan(plan_xml)
 
     def _extract_missing_indexes(self, plan_xml: str) -> list[dict[str, Any]]:
         root = ET.fromstring(plan_xml)

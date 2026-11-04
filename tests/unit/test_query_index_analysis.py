@@ -14,6 +14,17 @@ from azure_sql_mcp.param_binding import TypedParameter
 from azure_sql_mcp.query_index_analysis import QueryIndexAnalysisService
 from azure_sql_mcp.safe_sql import SafeSqlValidator
 
+# Smallest plan Azure SQL Database returns for a compiled SELECT: one statement
+# with a QueryPlan and a RelOp.
+MINIMAL_PLAN = (
+    '<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">'
+    "<BatchSequence><Batch><Statements>"
+    '<StmtSimple StatementType="SELECT"><QueryPlan>'
+    '<RelOp NodeId="0" PhysicalOp="Constant Scan" LogicalOp="Constant Scan" />'
+    "</QueryPlan></StmtSimple>"
+    "</Statements></Batch></BatchSequence></ShowPlanXML>"
+)
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -55,7 +66,7 @@ async def test_get_estimated_plan_uses_execute_session() -> None:
     executor.execute_session = AsyncMock(
         return_value=[
             [],
-            [QueryResult(columns=("plan_xml",), rows=[{"plan_xml": "<ShowPlanXML/>"}])],
+            [QueryResult(columns=("plan_xml",), rows=[{"plan_xml": MINIMAL_PLAN}])],
             [],
         ]
     )
@@ -63,7 +74,7 @@ async def test_get_estimated_plan_uses_execute_session() -> None:
 
     result = await service._get_estimated_plan("appdb", "SELECT 1")
 
-    assert result == "<ShowPlanXML/>"
+    assert result == MINIMAL_PLAN
     executor.execute_session.assert_awaited_once_with(
         "appdb",
         ["SET SHOWPLAN_XML ON", "SELECT 1", "SET SHOWPLAN_XML OFF"],
@@ -79,7 +90,7 @@ async def test_analyze_queries_uses_typed_contract_for_estimated_plan() -> None:
     executor.execute_session = AsyncMock(
         return_value=[
             [],
-            [QueryResult(columns=("plan_xml",), rows=[{"plan_xml": "<ShowPlanXML/>"}])],
+            [QueryResult(columns=("plan_xml",), rows=[{"plan_xml": MINIMAL_PLAN}])],
             [],
         ]
     )
@@ -110,7 +121,7 @@ async def test_analyze_queries_uses_typed_contract_for_estimated_plan() -> None:
     plan_call = executor.execute_session.await_args
     # SHOWPLAN_XML returns nothing for parameter markers through mssql-python
     # (live, 2026-11-04): the estimated plan sends constants only.
-    assert plan_call.args[1][1] == contract.sp_executesql_showplan_sql
+    assert plan_call.args[1][1] == contract.estimated_showplan_sql
     assert "statement_params" not in plan_call.kwargs
     assert result["missing_index_provenance"]["source"] == "SHOWPLAN_XML"
     assert result["missing_index_provenance"][
@@ -122,6 +133,57 @@ async def test_analyze_queries_uses_typed_contract_for_estimated_plan() -> None:
     )
     assert result["raw_missing_index_hint_count"] == 0
     assert result["recommendation_count_after_filtering"] == 0
+
+
+@pytest.mark.asyncio
+async def test_typed_query_detail_states_its_estimated_plan_basis() -> None:
+    # A typed plan compiles local variables, not parameters: its missing-index
+    # hints carry the same "PSP/optional-parameter variants not modeled" caveat
+    # explain_query reports. An untyped query compiles itself and has no basis.
+    executor = MagicMock()
+    executor.config.row_limit = 200
+    executor.fetch_all = AsyncMock(return_value=[])
+    executor.execute_session = AsyncMock(
+        return_value=[
+            [],
+            [QueryResult(columns=("plan_xml",), rows=[{"plan_xml": MINIMAL_PLAN}])],
+            [],
+        ]
+    )
+    service = QueryIndexAnalysisService(executor, SafeSqlValidator())
+    typed_sql = "SELECT name FROM dbo.Widgets WHERE WidgetId = @WidgetId"
+    typed = ParameterExecutionContract(
+        sql_text=typed_sql,
+        bucket_id="common",
+        parameters=(
+            TypedParameter(
+                name="@WidgetId",
+                sql_type=SqlParameterType.from_sql("bigint"),
+                value=42,
+                provenance="synthetic",
+            ),
+        ),
+        provenance="synthetic",
+    )
+    untyped = ParameterExecutionContract(
+        sql_text="SELECT 1",
+        bucket_id="common",
+        parameters=(),
+        provenance="synthetic",
+    )
+
+    result = await service.analyze_queries(
+        "appdb",
+        [typed_sql, "SELECT 1"],
+        execution_contracts=[typed, untyped],
+    )
+
+    typed_detail, untyped_detail = result["query_details"]
+    assert typed_detail["estimated_plan_basis"] == typed.estimated_showplan_basis
+    assert "parameter_sensitive_plan" in (
+        typed_detail["estimated_plan_basis"]["not_modeled"]
+    )
+    assert "estimated_plan_basis" not in untyped_detail
 
 
 @pytest.mark.asyncio
@@ -163,7 +225,7 @@ async def test_analyze_workload_binds_query_store_parameterized_sql() -> None:
     executor.execute_session = AsyncMock(
         return_value=[
             [],
-            [QueryResult(columns=("plan_xml",), rows=[{"plan_xml": "<ShowPlanXML/>"}])],
+            [QueryResult(columns=("plan_xml",), rows=[{"plan_xml": MINIMAL_PLAN}])],
             [],
         ]
     )
@@ -318,7 +380,7 @@ async def test_analyze_workload_skips_non_select_statements() -> None:
     executor.execute_session = AsyncMock(
         return_value=[
             [],
-            [QueryResult(columns=("plan_xml",), rows=[{"plan_xml": "<ShowPlanXML/>"}])],
+            [QueryResult(columns=("plan_xml",), rows=[{"plan_xml": MINIMAL_PLAN}])],
             [],
         ]
     )
@@ -331,3 +393,132 @@ async def test_analyze_workload_skips_non_select_statements() -> None:
     assert result["skipped_non_select"] == 2
     assert result["queries_analyzed"] == 1
     assert all("error" not in q for q in result["analyzed_queries"])
+
+
+# Azure SQL Database, live 2026-11-04: SHOWPLAN_XML does not compile the
+# statement inside EXEC sys.sp_executesql; it returns this stub with no plan.
+EXEC_STUB_PLAN = (
+    '<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">'
+    "<BatchSequence><Batch><Statements>"
+    '<StmtSimple StatementText="EXEC sys.sp_executesql N&apos;SELECT ...&apos;" '
+    'StatementType="EXECUTE PROC" RetrievedFromCache="false"></StmtSimple>'
+    "</Statements></Batch></BatchSequence></ShowPlanXML>"
+)
+STATUS_AMOUNT_PLAN = """\
+<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">
+  <BatchSequence><Batch><Statements>
+    <StmtSimple StatementType="SELECT"><QueryPlan>
+      <MissingIndexes><MissingIndexGroup Impact="97.1">
+        <MissingIndex Database="[appdb]" Schema="[dbo]" Table="[orders]">
+          <ColumnGroup Usage="EQUALITY"><Column Name="[status]" /><Column Name="[amount]" /></ColumnGroup>
+        </MissingIndex>
+      </MissingIndexGroup></MissingIndexes>
+      <RelOp NodeId="0" PhysicalOp="Clustered Index Scan" LogicalOp="Clustered Index Scan" />
+    </QueryPlan></StmtSimple>
+  </Statements></Batch></BatchSequence>
+</ShowPlanXML>
+"""
+TYPED_STATUS_AMOUNT_SQL = "SELECT id FROM dbo.orders WHERE status = @st AND amount = @amt"
+
+
+def _azure_shaped_executor(*, compiled_plan: str = STATUS_AMOUNT_PLAN) -> MagicMock:
+    executor = MagicMock()
+    executor.config.row_limit = 200
+    executor.fetch_all = AsyncMock(return_value=[])
+
+    async def execute_session(database_name, statements, **kwargs):
+        sql = statements[1]
+        plan = EXEC_STUB_PLAN if sql.upper().startswith("EXEC SYS.SP_EXECUTESQL") else compiled_plan
+        column = "Microsoft SQL Server 2005 XML Showplan"
+        return [[], [QueryResult(columns=(column,), rows=[{column: plan}])], []]
+
+    executor.execute_session = AsyncMock(side_effect=execute_session)
+    return executor
+
+
+def _status_amount_contract() -> ParameterExecutionContract:
+    return ParameterExecutionContract(
+        sql_text=TYPED_STATUS_AMOUNT_SQL,
+        bucket_id="common",
+        parameters=(
+            TypedParameter(name="@st", sql_type=SqlParameterType.from_sql("tinyint"), value=3, provenance="synthetic"),
+            TypedParameter(name="@amt", sql_type=SqlParameterType.from_sql("decimal(12,2)"), value=150, provenance="synthetic"),
+        ),
+        provenance="synthetic",
+    )
+
+
+@pytest.mark.asyncio
+async def test_typed_parameters_find_the_same_hint_as_the_literal_query() -> None:
+    # Live: the literal query had a (status, amount) hint, the typed one
+    # reported "available" with 0 hints: a false "no missing index".
+    service = QueryIndexAnalysisService(_azure_shaped_executor(), SafeSqlValidator())
+
+    result = await service.analyze_queries(
+        "appdb",
+        [TYPED_STATUS_AMOUNT_SQL],
+        execution_contracts=[_status_amount_contract()],
+    )
+
+    assert result["query_details"][0]["analysis_status"] == "available"
+    assert result["query_details"][0]["missing_index_count"] == 1
+    assert result["recommendations"][0]["equality_columns"] == ["status", "amount"]
+
+
+@pytest.mark.asyncio
+async def test_plan_with_no_compiled_query_plan_is_never_zero_hints() -> None:
+    service = QueryIndexAnalysisService(
+        _azure_shaped_executor(compiled_plan=EXEC_STUB_PLAN),
+        SafeSqlValidator(),
+    )
+
+    with pytest.raises(RuntimeError, match="no compiled query plan"):
+        await service.analyze_queries(
+            "appdb",
+            [TYPED_STATUS_AMOUNT_SQL],
+            execution_contracts=[_status_amount_contract()],
+        )
+
+
+@pytest.mark.asyncio
+async def test_typed_query_store_text_compiles_without_its_declaration_prefix() -> None:
+    # Query Store keeps "(@p int)SELECT ..." for parameterized text. The
+    # estimated plan DECLAREs the parameters itself, so the prefix left in
+    # place would be a syntax error that fails the whole tool call.
+    executor = MagicMock()
+    executor.config.row_limit = 200
+    executor.fetch_all = AsyncMock(return_value=[])
+    executor.execute_session = AsyncMock(
+        return_value=[
+            [],
+            [QueryResult(columns=("plan_xml",), rows=[{"plan_xml": MINIMAL_PLAN}])],
+            [],
+        ]
+    )
+    service = QueryIndexAnalysisService(executor, SafeSqlValidator())
+    sql = "(@p int)SELECT name FROM sys.objects WHERE object_id = @p"
+    contract = ParameterExecutionContract(
+        sql_text=sql,
+        bucket_id="common",
+        parameters=(
+            TypedParameter(
+                name="@p",
+                sql_type=SqlParameterType.from_sql("int"),
+                value=5,
+                provenance="synthetic",
+            ),
+        ),
+        provenance="synthetic",
+    )
+
+    result = await service.analyze_queries(
+        "appdb", [sql], execution_contracts=[contract]
+    )
+
+    compiled = executor.execute_session.await_args.args[1][1]
+    assert compiled == (
+        "DECLARE @p int;\n"
+        "SELECT name FROM sys.objects WHERE object_id = @p\n"
+        "OPTION (OPTIMIZE FOR (@p = 5))"
+    )
+    assert result["query_details"][0]["analysis_status"] == "available"

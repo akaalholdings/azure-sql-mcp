@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -652,7 +653,7 @@ def _typed_contract() -> ParameterExecutionContract:
 
 
 @pytest.mark.asyncio
-async def test_estimated_parameterized_plan_uses_typed_sp_executesql_arguments():
+async def test_estimated_parameterized_plan_sends_typed_constants_only():
     executor = FakeExecutor(row_limit=50)
     service = PlansService(executor=executor, validator=SafeSqlValidator())
     contract = _typed_contract()
@@ -668,7 +669,7 @@ async def test_estimated_parameterized_plan_uses_typed_sp_executesql_arguments()
     # (live, 2026-11-04), so the estimated plan sends constants only.
     assert executor.session_history[0][1] == [
         "SET SHOWPLAN_XML ON",
-        contract.sp_executesql_showplan_sql,
+        contract.estimated_showplan_sql,
         "SET SHOWPLAN_XML OFF",
     ]
     assert "?" not in executor.session_history[0][1][1]
@@ -762,3 +763,254 @@ def test_missing_plan_error_reports_no_result_sets() -> None:
 
     with pytest.raises(RuntimeError, match="result sets: none"):
         service._extract_plan_xml([])
+
+
+# Azure SQL Database, live 2026-11-04: under SET SHOWPLAN_XML ON, the statement
+# inside EXEC sys.sp_executesql is not compiled. SQL Server returns only this
+# EXECUTE PROC stub, with no QueryPlan and no RelOp.
+EXEC_STUB_SHOWPLAN = (
+    '<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan" '
+    'Version="1.613" Build="18.0.319.205"><BatchSequence><Batch><Statements>'
+    '<StmtSimple StatementText="EXEC sys.sp_executesql N&apos;SELECT TOP (50) o.id '
+    'FROM dbo.orders AS o WHERE o.customer_id = @cust AND o.status = @st ORDER BY o.id&apos;, '
+    'N&apos;@cust int, @st tinyint&apos;, 1, 1" StatementId="1" StatementCompId="1" '
+    'StatementType="EXECUTE PROC" RetrievedFromCache="false"></StmtSimple>'
+    "</Statements></Batch></BatchSequence></ShowPlanXML>"
+)
+
+# The same query compiled for the typed values (live shape: Top + Clustered
+# Index Scan, one missing-index hint, compiled values for both parameters).
+COMPILED_TYPED_SHOWPLAN = """\
+<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">
+  <BatchSequence><Batch><Statements>
+    <StmtSimple StatementText="SELECT TOP (50) o.id FROM dbo.orders AS o WHERE o.customer_id = @cust AND o.status = @st ORDER BY o.id"
+                StatementType="SELECT" StatementEstRows="50">
+      <QueryPlan>
+        <MissingIndexes>
+          <MissingIndexGroup Impact="91.2">
+            <MissingIndex Database="[appdb]" Schema="[dbo]" Table="[orders]">
+              <ColumnGroup Usage="EQUALITY">
+                <Column Name="[customer_id]" /><Column Name="[status]" />
+              </ColumnGroup>
+            </MissingIndex>
+          </MissingIndexGroup>
+        </MissingIndexes>
+        <RelOp NodeId="0" PhysicalOp="Top" LogicalOp="Top" EstimateRows="50">
+          <Top><RelOp NodeId="1" PhysicalOp="Clustered Index Scan" LogicalOp="Clustered Index Scan" EstimateRows="50" /></Top>
+        </RelOp>
+        <ParameterList>
+          <ColumnReference Column="@st" ParameterDataType="tinyint" ParameterCompiledValue="(1)" />
+          <ColumnReference Column="@cust" ParameterDataType="int" ParameterCompiledValue="(1)" />
+        </ParameterList>
+      </QueryPlan>
+    </StmtSimple>
+  </Statements></Batch></BatchSequence>
+</ShowPlanXML>
+"""
+
+_SHOWPLAN_COLUMN = "Microsoft SQL Server 2005 XML Showplan"
+
+
+class AzureShapedShowplanExecutor(FakeExecutor):
+    """Answers SHOWPLAN_XML the way Azure SQL Database does for each SQL form."""
+
+    def __init__(self, *, compiled_plan=COMPILED_TYPED_SHOWPLAN, **kwargs):
+        super().__init__(**kwargs)
+        self.compiled_plan = compiled_plan
+
+    async def execute_session(self, database_name, statements, **kwargs):
+        self.session_history.append((database_name, list(statements), kwargs.get("max_rows")))
+        self.session_params.append(kwargs.get("statement_params"))
+        sql = statements[1]
+        if statements[0] == "SET STATISTICS XML ON":
+            # A constant-only SELECT executes, but SQL Server sends no plan.
+            return [[], [QueryResult(columns=("one",), rows=[{"one": 1}])], []]
+        if sql.lstrip().upper().startswith("EXEC SYS.SP_EXECUTESQL"):
+            plan = EXEC_STUB_SHOWPLAN
+        elif sql == "SELECT 1 AS one":
+            plan = (
+                '<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">'
+                "<BatchSequence><Batch><Statements>"
+                '<StmtSimple StatementText="SELECT 1 AS one" StatementType="SELECT WITHOUT QUERY" />'
+                "</Statements></Batch></BatchSequence></ShowPlanXML>"
+            )
+        else:
+            plan = self.compiled_plan
+        return [[], [QueryResult(columns=(_SHOWPLAN_COLUMN,), rows=[{_SHOWPLAN_COLUMN: plan}])], []]
+
+
+def _orders_contract() -> ParameterExecutionContract:
+    return ParameterExecutionContract(
+        sql_text=(
+            "SELECT TOP (50) o.id FROM dbo.orders AS o "
+            "WHERE o.customer_id = @cust AND o.status = @st ORDER BY o.id"
+        ),
+        bucket_id="common",
+        parameters=(
+            TypedParameter(name="@cust", sql_type=SqlParameterType.from_sql("int"), value=1, provenance="synthetic"),
+            TypedParameter(name="@st", sql_type=SqlParameterType.from_sql("tinyint"), value=1, provenance="synthetic"),
+        ),
+        provenance="synthetic",
+    )
+
+
+@pytest.mark.asyncio
+async def test_estimated_parameterized_plan_compiles_the_statement_not_an_exec_stub():
+    # The estimated plan must describe the user's statement for these typed
+    # values, so a missing-index hint and the operators are visible.
+    executor = AzureShapedShowplanExecutor()
+    service = PlansService(executor=executor, validator=SafeSqlValidator())
+
+    artifact = await service.explain_parameterized_query("appdb", _orders_contract(), analyze=False)
+
+    sent = executor.session_history[0][1][1]
+    assert not sent.upper().startswith("EXEC")
+    assert sent.startswith("DECLARE @cust int, @st tinyint;\n")
+    assert sent.endswith("\nOPTION (OPTIMIZE FOR (@cust = 1, @st = 1))")
+    assert artifact.plan_kind == "estimated"
+    assert artifact.summary["operator_count"] == 2
+    assert artifact.summary["missing_indexes"][0]["equality_columns"] == ["customer_id", "status"]
+    assert {p["compiled_value"] for p in artifact.summary["parameters"]} == {"(1)"}
+
+
+@pytest.mark.asyncio
+async def test_estimated_parameterized_plan_states_its_basis():
+    # Local variables plus OPTIMIZE FOR cannot get PSP or optional-parameter
+    # dispatcher variants, so the estimated plan must not read as the plan a
+    # parameterized run compiles.
+    executor = AzureShapedShowplanExecutor()
+    service = PlansService(executor=executor, validator=SafeSqlValidator())
+    contract = _orders_contract()
+
+    estimated = await service.explain_parameterized_query("appdb", contract, analyze=False)
+    actual = await service.explain_parameterized_query("appdb", contract, analyze=True)
+
+    assert estimated.summary["estimated_plan_basis"] == contract.estimated_showplan_basis
+    assert estimated.summary["estimated_plan_basis"]["basis"] == "local_variables_optimize_for"
+    assert "estimated_plan_basis" in estimated.as_dict()["summary"]
+    # The actual plan is the parameterized execution itself.
+    assert "estimated_plan_basis" not in actual.summary
+
+
+@pytest.mark.asyncio
+async def test_estimated_parameterized_plan_refuses_a_plan_with_no_query_plan():
+    # A stub with no operators read as a valid empty plan: 0 operators, no
+    # findings, and "no missing index". It must fail loudly instead.
+    executor = AzureShapedShowplanExecutor(compiled_plan=EXEC_STUB_SHOWPLAN)
+    service = PlansService(executor=executor, validator=SafeSqlValidator())
+
+    with pytest.raises(RuntimeError, match="no compiled query plan") as raised:
+        await service.explain_parameterized_query("appdb", _orders_contract(), analyze=False)
+
+    assert "EXECUTE PROC" in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_actual_plan_of_a_constant_select_names_the_real_cause():
+    # Live: STATISTICS XML returns no plan for SELECT 1; the old error sent the
+    # user to check SHOWPLAN access, which was fine.
+    executor = AzureShapedShowplanExecutor()
+    service = PlansService(executor=executor, validator=SafeSqlValidator())
+
+    with pytest.raises(RuntimeError) as raised:
+        await service.explain_query("appdb", "SELECT 1 AS one", analyze=True)
+
+    message = str(raised.value)
+    assert "SELECT WITHOUT QUERY" in message
+    assert "analyze=false" in message
+    assert "SHOWPLAN access" not in message
+    assert "(" not in message  # incident redaction blanks parenthesized text
+
+
+@pytest.mark.asyncio
+async def test_actual_plan_missing_for_a_real_query_keeps_the_access_hint():
+    class NoActualPlanExecutor(AzureShapedShowplanExecutor):
+        async def execute_session(self, database_name, statements, **kwargs):
+            if statements[0] == "SET STATISTICS XML ON":
+                self.session_history.append((database_name, list(statements), None))
+                return [[], [QueryResult(columns=("id",), rows=[{"id": "customer-secret"}])], []]
+            return await super().execute_session(database_name, statements, **kwargs)
+
+    service = PlansService(executor=NoActualPlanExecutor(), validator=SafeSqlValidator())
+
+    with pytest.raises(RuntimeError, match="No SHOWPLAN XML was returned") as raised:
+        await service.explain_query("appdb", "SELECT id FROM dbo.orders", analyze=True)
+
+    assert "customer-secret" not in str(raised.value)
+
+
+# Live 2026-11-04: a parallel-shaped plan that DOP feedback ran serially. The
+# Gather Streams root has no RunTimeInformation; the scan below it has the rows.
+SERIAL_RUN_PARALLEL_SHOWPLAN = """\
+<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">
+  <BatchSequence><Batch><Statements>
+    <StmtSimple StatementText="SELECT id FROM dbo.orders WHERE status = 3" StatementType="SELECT">
+      <QueryPlan DegreeOfParallelism="0" DOPFeedbackAdjusted="Yes: Adjusting">
+        <QueryTimeStats ElapsedTime="71" CpuTime="71" />
+        <RelOp NodeId="0" PhysicalOp="Parallelism" LogicalOp="Gather Streams" Parallel="1" EstimateRows="6000">
+          <Parallelism>
+            <RelOp NodeId="1" PhysicalOp="Clustered Index Scan" LogicalOp="Clustered Index Scan" Parallel="1" EstimateRows="6000">
+              <RunTimeInformation>
+                <RunTimeCountersPerThread Thread="0" ActualRows="6060" ActualExecutions="1" />
+              </RunTimeInformation>
+            </RelOp>
+          </Parallelism>
+        </RelOp>
+      </QueryPlan>
+    </StmtSimple>
+  </Statements></Batch></BatchSequence>
+</ShowPlanXML>
+"""
+
+
+def test_actual_rows_come_from_the_first_counted_operator_under_a_row_preserving_root():
+    # Benchmarks read actual_rows as "rows returned"; 0 for a 6060-row result
+    # misreports the query.
+    service = PlansService(executor=None, validator=SafeSqlValidator())  # type: ignore[arg-type]
+
+    metrics = service.summarize_showplan_xml(SERIAL_RUN_PARALLEL_SHOWPLAN)["actual_metrics"]
+
+    assert metrics["actual_rows"] == 6060
+    assert metrics["actual_executions"] == 1
+    root = metrics["root_operator_metrics"][0]
+    assert root["node_id"] == "1"
+    assert root["source"] == "showplan_first_counted_descendant"
+
+
+def test_actual_rows_are_unknown_not_zero_when_no_operator_has_counters():
+    service = PlansService(executor=None, validator=SafeSqlValidator())  # type: ignore[arg-type]
+    xml = SERIAL_RUN_PARALLEL_SHOWPLAN.replace(
+        '<RunTimeCountersPerThread Thread="0" ActualRows="6060" ActualExecutions="1" />',
+        "",
+    )
+
+    metrics = service.summarize_showplan_xml(xml)["actual_metrics"]
+
+    assert metrics["actual_rows"] is None
+    assert metrics["actual_executions"] is None
+    assert metrics["root_operator_metrics"][0]["thread_counter_count"] == 0
+
+
+def test_redacted_showplan_parser_is_linear_in_object_nodes() -> None:
+    # Review reads parse every plan that names an unused index (4 MB each);
+    # a parent-map rebuild per Object made a 4000-Object plan take seconds.
+    seeks = "".join(
+        f'<RelOp PhysicalOp="Index Seek" LogicalOp="Index Seek"><IndexScan>'
+        f'<Object Database="[appdb]" Schema="[dbo]" Table="[t{n}]" Index="[ix_{n}]" />'
+        "</IndexScan></RelOp>"
+        for n in range(4000)
+    )
+    plan = (
+        '<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">'
+        "<BatchSequence><Batch><Statements><StmtSimple><QueryPlan>"
+        f'<RelOp PhysicalOp="Concatenation" LogicalOp="Concatenation">{seeks}</RelOp>'
+        "</QueryPlan></StmtSimple></Statements></Batch></BatchSequence></ShowPlanXML>"
+    )
+
+    started = time.monotonic()
+    result = parse_showplan_index_evidence(plan, query_id=1, plan_id=1, max_references=5000)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert len(result["index_references"]) == 4000
+    assert {tuple(ref["operator_kinds"]) for ref in result["index_references"]} == {("Index Seek",)}

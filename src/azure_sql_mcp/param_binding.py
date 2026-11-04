@@ -492,27 +492,99 @@ class ParameterExecutionContract:
         )
 
     @property
-    def sp_executesql_showplan_sql(self) -> str:
-        """The same positional call with constants only, for SET SHOWPLAN_XML.
+    def estimated_showplan_sql(self) -> str:
+        """The user statement compiled for the typed values, for SET SHOWPLAN_XML.
 
-        Under SHOWPLAN_XML, mssql-python returns no result set for any parameter
-        marker, and an unprepared execute is refused (live, Azure SQL Database).
-        Each value is rendered by its declared type; sp_executesql converts the
-        constant to that type, so the plan compiles for the same types and values.
+        SHOWPLAN_XML does not compile the statement inside ``EXEC sp_executesql``
+        (it returns an EXECUTE PROC stub with no plan), and mssql-python returns
+        no result set for parameter markers under it (live, Azure SQL Database).
+        Typed local variables with no initializer plus ``OPTIMIZE FOR`` the typed
+        constants compile the statement itself with the values sniffed. An
+        initialized variable would compile a density estimate instead.
+
+        This is an approximation, not the parameterized plan: a local variable
+        never gets parameter-sensitive (PSP) or optional-parameter dispatcher
+        plan variants, nor parameter embedding under RECOMPILE, so for a
+        catch-all predicate such as ``(@p IS NULL OR col = @p)`` the shape can
+        differ from the parameterized run (live: Index Scan here, Dispatcher
+        plus Index Seek with analyze=true). ``estimated_showplan_basis`` states
+        this. xml parameters stay out of ``OPTIMIZE FOR`` (SQL Server rejects an
+        xml literal there) and compile as unknown.
         """
 
-        def unicode_literal(text: str) -> str:
-            return "N'" + text.replace("'", "''") + "'"
+        if not self.parameters:
+            return self.sql_text
+        sql = self.sql_text
+        code = _mask_parameter_non_code(sql)
+        # Drop a leading or trailing statement terminator; any other one means
+        # a second statement that the hint must not be attached to.
+        for index in (len(code) - len(code.lstrip()), len(code.rstrip()) - 1):
+            if 0 <= index < len(code) and code[index] == ";":
+                sql = sql[:index] + " " + sql[index + 1:]
+                code = code[:index] + " " + code[index + 1:]
+        if ";" in code or _LEADING_VARIABLE_STATEMENT.match(code.lstrip()):
+            raise ValueError(
+                "An estimated plan for typed parameters needs a single SELECT "
+                "statement; sql_text holds more than one statement. Remove the "
+                "DECLARE or SET prefix, or use analyze=true."
+            )
+        hinted = self._optimize_for_parameters()
+        declare = f"DECLARE {self.parameter_definition};\n"
+        if not hinted:
+            # OPTIMIZE FOR () is a syntax error; nothing to hint.
+            return f"{declare}{sql}"
+        hint = "OPTIMIZE FOR ({})".format(
+            ", ".join(
+                f"{parameter.name} = "
+                + format_sql_literal(parameter.sql_type.sql_declaration, parameter.value)
+                for parameter in hinted
+            )
+        )
+        option_open = _top_level_option_open(code)
+        if option_open is None:
+            # A new line, so a trailing line comment cannot swallow the hint.
+            return f"{declare}{sql}\nOPTION ({hint})"
+        if _OPTIMIZE_FOR_PATTERN.search(code, option_open):
+            raise ValueError(
+                "sql_text already has an OPTIMIZE FOR hint; an estimated plan for "
+                "typed parameters adds its own. Remove that hint or use analyze=true."
+            )
+        return f"{declare}{sql[:option_open]}{hint}, {sql[option_open:]}"
 
-        arguments = [
-            unicode_literal(self.sql_text),
-            unicode_literal(self.parameter_definition),
-            *(
-                format_sql_literal(parameter.sql_type.sql_declaration, parameter.value)
-                for parameter in self.parameters
+    def _optimize_for_parameters(self) -> tuple[TypedParameter, ...]:
+        # OPTIMIZE FOR rejects an xml literal ("could not be implicitly
+        # converted", live); an xml value does not drive cardinality anyway.
+        return tuple(
+            parameter
+            for parameter in self.parameters
+            if parameter.sql_type.base_type.strip().lower() != "xml"
+        )
+
+    @property
+    def estimated_showplan_basis(self) -> dict[str, Any]:
+        """What the ``estimated_showplan_sql`` plan models and what it does not."""
+
+        hinted = {parameter.name for parameter in self._optimize_for_parameters()}
+        return {
+            "basis": "local_variables_optimize_for",
+            "optimize_for_parameters": [
+                parameter.name for parameter in self.parameters if parameter.name in hinted
+            ],
+            "unknown_parameters": [
+                parameter.name for parameter in self.parameters if parameter.name not in hinted
+            ],
+            "not_modeled": [
+                "parameter_sensitive_plan",
+                "optional_parameter_plan",
+                "parameter_embedding",
+            ],
+            "note": (
+                "Estimated from typed local variables with OPTIMIZE FOR the values. "
+                "PSP and optional-parameter dispatcher plan variants and parameter "
+                "embedding (RECOMPILE) are not modeled, so the shape can differ from "
+                "the parameterized plan; use analyze=true for the parameterized plan."
             ),
-        ]
-        return "EXEC sys.sp_executesql " + ", ".join(arguments)
+        }
 
     @property
     def sp_executesql_input_sizes(
@@ -544,6 +616,30 @@ class ParameterExecutionContract:
 # contract vocabulary without coupling to the initial class names.
 ParameterBucket = TypedParameterBucket
 TypedParameterExecutionContract = ParameterExecutionContract
+
+
+_LEADING_VARIABLE_STATEMENT = re.compile(r"(?:DECLARE|SET)\b", re.IGNORECASE)
+_OPTION_CLAUSE_PATTERN = re.compile(r"\bOPTION\s*\(", re.IGNORECASE)
+_OPTIMIZE_FOR_PATTERN = re.compile(r"\bOPTIMIZE\s+FOR\b", re.IGNORECASE)
+
+
+def _top_level_option_open(code: str) -> int | None:
+    """Index just after ``OPTION (`` of the statement's own query-hint clause.
+
+    ``code`` is masked SQL, so literals, comments and delimited identifiers
+    cannot match. Clauses inside parentheses (subqueries, CTE bodies) are skipped.
+    """
+
+    depth = 0
+    position = 0
+    for match in _OPTION_CLAUSE_PATTERN.finditer(code):
+        depth += code.count("(", position, match.start()) - code.count(
+            ")", position, match.start()
+        )
+        position = match.start()
+        if depth == 0:
+            return match.end()
+    return None
 
 
 def _replace_parameter_tokens(sql: str, parameter_keys: set[str]) -> str:

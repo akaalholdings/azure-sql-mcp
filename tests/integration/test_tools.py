@@ -112,6 +112,58 @@ async def test_parameterized_execution_pins_only_sp_executesql_controls(
     assert estimated_probe.plan_kind == "estimated"
     assert actual_probe.plan_kind == "actual"
     assert actual_probe.query_executed is True
+    # SHOWPLAN of EXEC sys.sp_executesql is an EXECUTE PROC stub with no
+    # operators: the estimated plan must be the statement compiled for the
+    # typed value. For this simple predicate the shape matches the actual run;
+    # it is not parity in general (no PSP or optional-parameter variants), and
+    # the result says so.
+    assert estimated_probe.summary["estimated_plan_basis"]["basis"] == (
+        "local_variables_optimize_for"
+    )
+    assert estimated_probe.summary["operator_count"] > 0
+    assert "<RelOp " in estimated_probe.raw_xml
+    assert [s["statement_type"] for s in estimated_probe.summary["statements"]] == ["SELECT"]
+    assert [
+        (p["name"], p["data_type"], p["compiled_value"])
+        for p in estimated_probe.summary["parameters"]
+    ] == [("@P1", "int", "(13)")]
+
+    def physical_ops(artifact):
+        return [o["physical_op"] for o in artifact.summary["operators"]]
+
+    assert physical_ops(estimated_probe) == physical_ops(actual_probe)
+
+    # OPTIMIZE FOR rejects an xml literal; an xml parameter must not break the
+    # estimated plan.
+    xml_probe = ParameterExecutionContract(
+        sql_text=(
+            f"SELECT TOP (1) [OrderId] FROM [{prepared_test_schema}].[Orders] "
+            "WHERE [OrderId] > @P1 AND @Doc IS NOT NULL"
+        ),
+        bucket_id="xml-probe",
+        parameters=(
+            TypedParameter(
+                name="@P1",
+                sql_type=SqlParameterType.from_sql("int"),
+                value=13,
+                provenance="integration_test",
+            ),
+            TypedParameter(
+                name="@Doc",
+                sql_type=SqlParameterType.from_sql("xml"),
+                value="<root/>",
+                provenance="integration_test",
+            ),
+        ),
+        provenance="integration_test",
+    )
+    xml_plan = await integration_app.plans.explain_parameterized_query(
+        integration_database_name,
+        xml_probe,
+        analyze=False,
+    )
+    assert xml_plan.summary["operator_count"] > 0
+    assert xml_plan.summary["estimated_plan_basis"]["unknown_parameters"] == ["@Doc"]
 
     index_name = f"IX_{prepared_test_schema}_Orders_ExternalCode"
     varchar_sql = (
