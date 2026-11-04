@@ -31,6 +31,7 @@ from .index_advisor import WorkloadQuery
 from .index_advisor import build_index_advice
 from .index_metadata import ExistingIndex
 from .index_metadata import collect_existing_indexes
+from .index_metadata import collect_readable_replica_status
 from .incident_log import note_exception
 from .observability import sanitize_error_message
 from .query_store import QueryStoreService
@@ -535,6 +536,13 @@ class WorkloadIndexAdvisor:
                 "Query Store plan references could not be checked; unused-index findings stay low confidence"
             )
 
+        readable_replicas = (
+            await collect_readable_replica_status(
+                self.executor, database_name, site="workload_index_advisor"
+            )
+            if include_existing_index_review
+            else None
+        )
         engine_start = next(
             (
                 index.usage_context.get("engine_start_time_utc")
@@ -566,6 +574,7 @@ class WorkloadIndexAdvisor:
             index_hint_references=hint_references,
             forced_plan_coverage=forced_coverage,
             hint_coverage=hint_coverage,
+            readable_replicas=readable_replicas,
         )
         report = build_index_advice(inputs)
         report.update(self._overall_status(report, query_store, query_store_readable, queries))

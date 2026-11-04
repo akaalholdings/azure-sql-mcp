@@ -139,6 +139,21 @@ def test_usage_query_preserves_null_dmv_counters() -> None:
     assert "i.is_auto_created" not in EXISTING_INDEX_METADATA_SQL
 
 
+def test_parser_keeps_statistics_date_as_the_index_age_bound() -> None:
+    # Azure SQL Database has no index create_date; STATS_DATE is the only
+    # catalog fact that bounds a new index's age, so the removal advice can
+    # tell an index created yesterday from one unused for months.
+    assert "STATS_DATE(i.object_id, i.index_id)" in EXISTING_INDEX_METADATA_SQL
+    [dated] = parse_existing_index_rows(
+        [{**row, "statistics_updated_utc": "2026-07-14T09:00:00.123"} for row in _rows()]
+    )
+    [undated] = parse_existing_index_rows(_rows())
+
+    assert dated.statistics_updated_utc == "2026-07-14T09:00:00.123"
+    assert undated.statistics_updated_utc is None
+    assert dated.definition_fingerprint == undated.definition_fingerprint
+
+
 def test_azure_sql_identity_queries_use_physical_database_and_server_epoch() -> None:
     assert "sys.databases" in DATABASE_INCARNATION_SQL
     assert "physical_database_name" in DATABASE_INCARNATION_SQL

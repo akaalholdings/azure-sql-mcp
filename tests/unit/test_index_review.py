@@ -151,6 +151,7 @@ def _index(
             "dependency": "complete",
             "protection": "complete",
             "usage": "covered",
+            "readable_replicas": "none",
             "malformed": [],
         },
         "size_pages": 20,
@@ -1815,3 +1816,100 @@ def test_index_review_remote_surface_is_exactly_the_base_tools(monkeypatch) -> N
         "get_top_queries",
         "get_query_store_trend",
     }
+
+
+def _replica_history(readable_replicas: object) -> list[IndexReviewSnapshotV1]:
+    snapshots = _history(40)
+    for snapshot in snapshots:
+        coverage = snapshot.subjects[0]["coverage"]
+        if readable_replicas is None:
+            coverage.pop("readable_replicas", None)
+        else:
+            coverage["readable_replicas"] = readable_replicas
+    return snapshots
+
+
+@pytest.mark.parametrize("readable_replicas", ["possible", "unknown", None])
+def test_unused_index_is_not_drop_candidate_when_replica_reads_are_unseen(
+    readable_replicas: object,
+) -> None:
+    # Usage counters and Query Store see only the primary. On Premium,
+    # Business Critical, Hyperscale or with a geo secondary, reports that
+    # connect with ApplicationIntent=ReadOnly read on another replica, so 35
+    # days of zero primary reads do not prove the index is unused there.
+    subject = review_index_portfolio(
+        "appdb", _replica_history(readable_replicas)
+    ).subjects[0]
+
+    assert subject["removal_gate"]["passed"] is True
+    assert subject["state"] == "observe"
+    assert subject["reason_codes"] == ["readable_replica_usage_unobserved"]
+    assert subject["removal_gate"]["readable_replica_usage_observed"] is False
+
+
+def test_unused_index_on_tier_without_readable_replicas_stays_drop_candidate() -> None:
+    subject = review_index_portfolio("appdb", _replica_history("none")).subjects[0]
+
+    assert subject["state"] == "drop_candidate"
+    assert subject["removal_gate"]["readable_replica_usage_observed"] is True
+
+
+def test_readable_replica_gap_does_not_block_exact_duplicate_consolidation() -> None:
+    # A replica read served by a duplicate is served equally by the survivor.
+    snapshots = []
+    for day in range(40):
+        subjects = []
+        for name in ("IX_A", "IX_B"):
+            index = _index(name=name)
+            index["coverage"]["readable_replicas"] = "possible"
+            subjects.append(index)
+        snapshots.append(_snapshot(day, subjects=tuple(subjects)))
+
+    states = {
+        item["index_name"]: item["state"]
+        for item in review_index_portfolio("appdb", snapshots).subjects
+    }
+
+    assert states == {"IX_A": "keep", "IX_B": "consolidate_candidate"}
+
+
+@pytest.mark.parametrize(
+    ("edition", "geo_links", "expected"),
+    [
+        ("BusinessCritical", 0, "possible"),
+        ("Premium", 0, "possible"),
+        ("Hyperscale", 0, "possible"),
+        ("GeneralPurpose", 1, "possible"),
+        ("GeneralPurpose", 0, "none"),
+        ("Standard", None, "unknown"),
+        (None, 0, "unknown"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_capture_records_whether_readable_replicas_are_possible(
+    edition: object, geo_links: object, expected: str
+) -> None:
+    from azure_sql_mcp.index_metadata import GEO_REPLICATION_LINK_COUNT_SQL
+    from azure_sql_mcp.index_metadata import READABLE_REPLICA_EDITION_SQL
+    from azure_sql_mcp.index_metadata import collect_readable_replica_status
+
+    class Executor:
+        async def fetch_all(self, database_name, sql, params=None, **kwargs):
+            if sql == READABLE_REPLICA_EDITION_SQL:
+                return [{"edition": edition}]
+            if sql == GEO_REPLICATION_LINK_COUNT_SQL:
+                if geo_links is None:
+                    raise PermissionError("VIEW DATABASE STATE denied")
+                return [{"geo_replication_link_count": geo_links}]
+            raise AssertionError(sql)
+
+    status = await collect_readable_replica_status(Executor(), "appdb", site="test")  # type: ignore[arg-type]
+    subject = _redacted_index(
+        _captured_index(),
+        hint_coverage={"status": "complete"},
+        query_store_coverage={"status": "complete"},
+        readable_replicas=status,
+    )
+
+    assert status == expected
+    assert subject["coverage"]["readable_replicas"] == expected

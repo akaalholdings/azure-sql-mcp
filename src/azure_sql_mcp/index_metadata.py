@@ -12,7 +12,9 @@ from datetime import timedelta
 from datetime import timezone
 from typing import Any, Iterable
 
+from .azure_tier import classify_service_tier
 from .connection import AzureSqlExecutor
+from .incident_log import note_exception
 
 
 EXISTING_INDEX_METADATA_SQL = """
@@ -60,6 +62,7 @@ SELECT
     p.xml_compression_desc,
     st.no_recompute AS statistics_no_recompute,
     st.is_incremental AS statistics_incremental,
+    CONVERT(varchar(33), STATS_DATE(i.object_id, i.index_id), 127) AS statistics_updated_utc,
     us.user_seeks AS user_seeks,
     us.user_scans AS user_scans,
     us.user_lookups AS user_lookups,
@@ -125,6 +128,64 @@ SELECT CONVERT(varchar(128), physical_database_name) AS database_incarnation_ide
 FROM sys.databases
 WHERE name = DB_NAME()
 """
+
+# Usage counters and Query Store record only the replica MCP connects to (the
+# primary). Premium, Business Critical and Hyperscale have readable secondaries
+# (read scale-out, HA and named replicas), and a geo link adds a readable geo
+# secondary. Reads there leave no trace on the primary.
+READABLE_REPLICA_EDITION_SQL = """
+SELECT CAST(DATABASEPROPERTYEX(DB_NAME(), 'Edition') AS nvarchar(128)) AS edition
+"""
+
+# Per-database DMV (VIEW DATABASE STATE). sys.geo_replication_links is in
+# master and shows rows only to admins, so it cannot be read from here.
+GEO_REPLICATION_LINK_COUNT_SQL = """
+SELECT COUNT(*) AS geo_replication_link_count
+FROM sys.dm_geo_replication_link_status
+"""
+
+_READABLE_REPLICA_FAMILIES = frozenset({"premium", "business_critical", "hyperscale"})
+
+
+def readable_replica_status(edition: Any, geo_replication_link_count: Any) -> str:
+    """Return 'possible', 'none' or 'unknown': can another replica serve reads?"""
+
+    family = classify_service_tier(
+        str(edition).strip() if edition is not None else None, None, None
+    ).edition_family
+    if family in _READABLE_REPLICA_FAMILIES:
+        return "possible"
+    links = _as_optional_int(geo_replication_link_count)
+    if links is None:
+        return "unknown"
+    if links > 0:
+        return "possible"
+    return "none" if family != "unknown" else "unknown"
+
+
+async def collect_readable_replica_status(
+    executor: AzureSqlExecutor, database_name: str, *, site: str
+) -> str:
+    """Read the replica signals as plain pooled reads, never inside a transaction.
+
+    Under SET XACT_ABORT ON a failed read rolls back the caller's transaction,
+    so callers that hold one must run this before it starts.
+    """
+
+    try:
+        rows = await executor.fetch_all(database_name, READABLE_REPLICA_EDITION_SQL)
+        edition = rows[0].get("edition") if rows else None
+    except Exception as exc:
+        note_exception(exc, f"{site}.readable_replica_edition")
+        edition = None
+    try:
+        rows = await executor.fetch_all(database_name, GEO_REPLICATION_LINK_COUNT_SQL)
+        links = rows[0].get("geo_replication_link_count") if rows else None
+    except Exception as exc:
+        note_exception(exc, f"{site}.geo_replication_link_status")
+        links = None
+    return readable_replica_status(edition, links)
+
 
 # One row per index; TOP matches parse_protection_evidence(max_rows).
 # child_foreign_key_ids lists the foreign keys on the index's table whose
@@ -292,6 +353,10 @@ class ExistingIndex:
     partition_page_counts: tuple[tuple[int, int | None], ...] = ()
     protection_evidence: dict[str, Any] = field(default_factory=dict)
     has_index_extended_properties: bool | None = None
+    # STATS_DATE: statistics are built when the index is created and only move
+    # later, so it bounds index age from below. Azure SQL Database has no index
+    # create_date. None when unread or never built.
+    statistics_updated_utc: str | None = None
 
     @property
     def definition_fingerprint(self) -> str:
@@ -709,6 +774,11 @@ def parse_existing_index_rows(
                 protection_evidence=protection_payload,
                 has_index_extended_properties=_as_optional_bool(
                     protection_payload.get("has_index_extended_properties")
+                ),
+                statistics_updated_utc=(
+                    str(row["statistics_updated_utc"])
+                    if row.get("statistics_updated_utc") is not None
+                    else None
                 ),
             )
         )

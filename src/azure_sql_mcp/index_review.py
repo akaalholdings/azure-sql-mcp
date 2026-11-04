@@ -34,8 +34,11 @@ from .index_metadata import existing_index_covers_candidate
 from .index_metadata import reversible_index_definition_fingerprint
 from .index_metadata import parse_existing_index_rows
 from .index_metadata import parse_protection_evidence
+from .index_metadata import collect_readable_replica_status
 from .index_recommendations import IndexRecommendationService
 from .plans import parse_showplan_index_evidence
+from .result_status import ResultStatus
+from .result_status import status_payload
 from .index_optimizer import score_index_candidate
 from .query_store import INDEX_EVIDENCE_QUERY
 from .query_store import MODULE_HINTS_SQL
@@ -135,7 +138,7 @@ _SUBJECT_KEYS = frozenset(
         "candidate_fingerprint",
         "survivor_reference", "overlap_relation", "read_count", "request_count", "query_store_executions",
         "runtime_interval_count", "covered_by", "projected_database_storage_percent",
-        "statement_subtree_cost", "estimated_index_size_bytes", "material_score",
+        "statement_subtree_cost", "estimated_index_size_bytes", "estimated_index_size_mb", "material_score",
         "dmv_user_seeks", "dmv_user_scans", "dmv_avg_user_impact", "dmv_avg_total_user_cost",
     }
 )
@@ -186,7 +189,7 @@ _COVERAGE_KEYS = frozenset(
      "capture_mode", "state", "runtime_intervals", "runtime_interval_count", "required",
      "covered", "reason", "error_type", "requested_window_minutes", "required_window_minutes",
      "plan_evidence_empty_allowed", "interval_count", "plan_evidence", "runtime_window",
-     "engine", "database_incarnation"}
+     "engine", "database_incarnation", "missing_index_dmv", "readable_replicas"}
 )
 _PROTECTION_KEYS = frozenset(
     {"object_id", "index_id", "coverage", "blockers", "primary_key", "unique_constraint", "standalone_unique",
@@ -271,6 +274,24 @@ class IndexReviewSchemaError(IndexReviewError):
 
 class IndexReviewSetupError(IndexReviewSchemaError):
     """The optional history tables, or the identity's rights on them, are absent."""
+
+
+def index_history_setup_precondition(
+    exc: IndexReviewSetupError, *, for_write: bool = False
+) -> dict[str, Any]:
+    """Map a missing optional history setup to result_status=precondition.
+
+    Only IndexReviewSetupError maps here; a contract mismatch stays an error.
+    The remediation is text for a DBA to run, never something MCP executes.
+    """
+
+    rights = "SELECT, INSERT" if for_write else "SELECT"
+    remediation = (
+        "A DBA runs sql/Install-IndexReviewHistory-v1.sql in this database, then "
+        f"GRANT {rights} ON dbatools.IndexReviewRun TO [<MCP identity>]; "
+        f"GRANT {rights} ON dbatools.IndexReviewSnapshot TO [<MCP identity>];"
+    )
+    return status_payload(ResultStatus.PRECONDITION, str(exc), remediation=remediation)
 
 
 class IndexReviewIntegrityError(IndexReviewError):
@@ -364,7 +385,7 @@ _SCHEMA_ALLOWED_KEYS: dict[str, frozenset[str]] = {
             "exact_request_recurs_in_two_runtime_intervals", "executed_plan_source",
             "exact_filter_reconstruction_available", "material_positive_existing_mcp_score",
             "no_exact_or_covering_index", "projected_storage_strictly_below_90_percent",
-            "complete_evidence",
+            "complete_evidence", "readable_replica_usage_observed",
         }
     ) | _GATE_KEYS,
     "gate_map": _GATE_KEYS,
@@ -844,6 +865,7 @@ def _redacted_index(
     hint_coverage: Mapping[str, Any] | None = None,
     query_store_coverage: Mapping[str, Any] | None = None,
     hint_evidence: Sequence[Mapping[str, Any]] = (),
+    readable_replicas: str = "unknown",
 ) -> dict[str, Any]:
     protection = _safe_payload(index.protection_evidence, schema="protections")
     hinted = any(
@@ -882,6 +904,7 @@ def _redacted_index(
             if protection.get("partition_switch_dependency") is None
             else "complete"
         ),
+        "readable_replicas": readable_replicas,
         "malformed": [],
     }
     subject: dict[str, Any] = {
@@ -2747,8 +2770,11 @@ def _snapshot_params(run: IndexReviewRunV1, subject: Mapping[str, Any]) -> list[
             raise IndexReviewIntegrityError(f"Capture contains invalid non-negative {name}.")
         return value
 
+    # The row id digests the stored row, so it must use the same observed-time
+    # default (DMV-only candidates carry no last_seen).
+    observed_at = subject.get("observed_at_utc") or run.observed_at_utc
     return [
-        _snapshot_row_id(run.run_id, subject),
+        _snapshot_row_id(run.run_id, {**subject, "observed_at_utc": observed_at}),
         run.run_id,
         subject.get("subject_id"),
         subject.get("subject_kind"),
@@ -2762,7 +2788,7 @@ def _snapshot_params(run: IndexReviewRunV1, subject: Mapping[str, Any]) -> list[
         subject.get("definition_fingerprint"),
         subject.get("counter_epoch_fingerprint"),
         _canonical(subject.get("counters", {})),
-        subject.get("observed_at_utc") or run.observed_at_utc,
+        observed_at,
         subject.get("first_observed_at_utc"),
         subject.get("last_observed_at_utc"),
         nonnegative("size_pages"),
@@ -2841,14 +2867,30 @@ class IndexReviewService:
             observed_at_utc=moment.isoformat().replace("+00:00", "Z"),
             minimum_observation_days=minimum_days,
         )
+        # Read before the capture transaction opens: it runs under XACT_ABORT
+        # ON, so a failed optional read inside it would roll back the
+        # idempotency lock and leave the inserts in a new implicit transaction.
+        readable_replicas = await collect_readable_replica_status(
+            self.executor, database_name, site="index_review"
+        )
+
+        def collector(session: SqlTransactionSession, captured: CaptureContext) -> CaptureResult:
+            return self._collect_capture(session, captured, readable_replicas=readable_replicas)
+
         try:
-            return await self.repository.append_capture(context, self._collect_capture)
+            return await self.repository.append_capture(context, collector)
         except (IndexReviewError, TransactionCommitOutcomeUnknownError):
             raise
         except Exception as exc:
             raise IndexReviewCollectionError("Index review telemetry collection failed.") from exc
 
-    def _collect_capture(self, session: SqlTransactionSession, context: CaptureContext) -> CaptureResult:
+    def _collect_capture(
+        self,
+        session: SqlTransactionSession,
+        context: CaptureContext,
+        *,
+        readable_replicas: str = "unknown",
+    ) -> CaptureResult:
         try:
             index_rows = session.fetch_all(EXISTING_INDEX_METADATA_SQL)
             engine_rows = session.fetch_all(ENGINE_START_TIME_SQL)
@@ -2957,6 +2999,7 @@ class IndexReviewService:
                     hint_coverage=hint_coverage,
                     query_store_coverage=query_store.get("coverage", {}),
                     hint_evidence=hint_evidence,
+                    readable_replicas=readable_replicas,
                 )
             )
         missing = [
@@ -4398,10 +4441,18 @@ def evaluate_removal_gate(
         "no_stored_plan_without_execution": not stored_plan_without_execution,
     }
     blockers = [name for name, passed in gate.items() if not passed]
+    # Kept out of the gate map: only a drop with no survivor needs it, because
+    # a replica read served by a duplicate or covered index is served by the
+    # survivor too.
+    readable_replica_usage_observed = all(
+        _mapping_value(item.get("coverage")).get("readable_replicas") == "none"
+        for item in [*history, subject]
+    )
     return {
         "passed": not blockers,
         "gates": gate,
         "blockers": blockers,
+        "readable_replica_usage_observed": readable_replica_usage_observed,
         "observation": observation,
         "historical_reference": executed_reference,
         "read_count": selected_reads,
@@ -4652,8 +4703,10 @@ def review_index_portfolio(
             )
             if protected or has_valid_read_delta or has_reference:
                 state, reasons = "keep", ["protected_or_used"]
-            elif removal["passed"]:
+            elif removal["passed"] and removal["readable_replica_usage_observed"]:
                 state, reasons = "drop_candidate", []
+            elif removal["passed"]:
+                state, reasons = "observe", ["readable_replica_usage_unobserved"]
             else:
                 state, reasons = "observe", removal["blockers"]
             entry = {**dict(subject), "state": state, "reason_codes": reasons, "removal_gate": removal}
@@ -4835,7 +4888,7 @@ def classify_index_subject(
         )
     ) or executed_reference:
         state = "keep"
-    elif gate["passed"]:
+    elif gate["passed"] and gate["readable_replica_usage_observed"]:
         state = "drop_candidate"
     else:
         state = "observe"

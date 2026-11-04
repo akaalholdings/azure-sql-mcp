@@ -117,6 +117,8 @@ class RoutingExecutor:
             "hint_query_hints": [],
             "hint_plan_guides": [],
             "hint_modules": [],
+            "edition": [{"edition": "GeneralPurpose"}],
+            "geo_links": [{"geo_replication_link_count": 0}],
         }
         self.responses.update(overrides)
         self.delays: dict[str, float] = {}
@@ -153,6 +155,13 @@ class RoutingExecutor:
             key = "hint_plan_guides"
         elif "FROM sys.sql_modules" in query:
             key = "hint_modules"
+        elif "DATABASEPROPERTYEX(DB_NAME(), 'Edition')" in query:
+            key = "edition"
+        elif "FROM sys.dm_geo_replication_link_status" in query:
+            key = "geo_links"
+        elif "sys.geo_replication_links" in query:
+            # A master catalog view: absent from the user database MCP reads.
+            raise RuntimeError("Invalid object name 'sys.geo_replication_links'. (208)")
         else:
             raise AssertionError(f"unexpected query: {query[:80]}")
         self.calls.append((key, query, list(params) if params is not None else None))
@@ -733,3 +742,41 @@ async def test_table_filter_narrows_detail_reads_and_output(existing) -> None:
     assert {t["table"] for t in report["tables"]} == {"OrderLines"}
     column_call = next(call for call in executor.calls if call[0] == "columns")
     assert "IN (2)" in column_call[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "blocker"),
+    [
+        ({"edition": [{"edition": "BusinessCritical"}]}, "readable_replica_usage_unobserved"),
+        ({"edition": [{"edition": "Hyperscale"}]}, "readable_replica_usage_unobserved"),
+        ({"geo_links": [{"geo_replication_link_count": 1}]}, "readable_replica_usage_unobserved"),
+        ({"geo_links": PermissionError("denied")}, "readable_replica_check_unavailable"),
+    ],
+)
+async def test_readable_replica_caps_unused_drop_in_workload_review(
+    existing, overrides: dict[str, Any], blocker: str
+) -> None:
+    # Read scale-out is on by default for Premium and Business Critical, and
+    # Hyperscale and geo links add readable replicas. Their reads never reach
+    # the primary's usage counters or Query Store.
+    executor = RoutingExecutor(references=NO_REFERENCES, **overrides)
+
+    rec = _unused_drop(await WorkloadIndexAdvisor(executor).review("appdb", **LONG))
+
+    assert rec["confidence"] == "medium"
+    assert blocker in rec["blockers"]
+
+
+@pytest.mark.asyncio
+async def test_general_purpose_without_geo_link_keeps_a_high_confidence_drop(existing) -> None:
+    # General Purpose has no readable secondary unless a geo link exists, and
+    # the per-database link DMV says there is none. The replica caveat must
+    # not cap every unused drop on the most common tier.
+    executor = RoutingExecutor(references=NO_REFERENCES)
+
+    rec = _unused_drop(await WorkloadIndexAdvisor(executor).review("appdb", **LONG))
+
+    assert rec["confidence"] == "high"
+    assert not {"readable_replica_usage_unobserved", "readable_replica_check_unavailable"} & set(rec["blockers"])
+    assert "geo_links" in [call[0] for call in executor.calls]
