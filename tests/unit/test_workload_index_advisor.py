@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from datetime import datetime
 from datetime import timezone
 from pathlib import Path
@@ -243,9 +245,233 @@ async def test_full_review_uses_query_store_plans_and_returns_ranked_advice(exis
     assert report["usage_counters"]["engine_start_time_utc"] == "2026-08-01T00:00:00Z"
 
 
+_ORDERS = 'Database="[appdb]" Schema="[Sales]" Table="[Orders]"'
+
+
+def _showplan(relop: str) -> str:
+    return (
+        '<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">'
+        "<BatchSequence><Batch><Statements><StmtSimple><QueryPlan>"
+        f"{relop}</QueryPlan></StmtSimple></Statements></Batch></BatchSequence></ShowPlanXML>"
+    )
+
+
+# Azure narrow INSERT plan: the Clustered Index Insert lists every NC index it
+# maintains in its Object list. IX_Odd]Name is written, never read.
+_INSERT_PLAN = _showplan(
+    '<RelOp NodeId="0" PhysicalOp="Clustered Index Insert" LogicalOp="Insert"><Update>'
+    f'<Object {_ORDERS} Index="[PK_Orders]" IndexKind="Clustered"/>'
+    f'<Object {_ORDERS} Index="[IX_Odd]]Name]" IndexKind="NonClustered"/>'
+    "</Update></RelOp>"
+)
+_SEEK_PLAN = _showplan(
+    '<RelOp NodeId="0" PhysicalOp="Index Seek" LogicalOp="Index Seek"><IndexScan>'
+    f'<Object {_ORDERS} Index="[IX_Odd]]Name]" IndexKind="NonClustered"/>'
+    "</IndexScan></RelOp>"
+)
+
+
+def _plan_match(plan_id: int, plan: str | None, *, forced: bool = False, stats: bool = False) -> dict[str, Any]:
+    return {
+        "ref_id": 0,
+        "plan_id": plan_id,
+        "query_id": plan_id // 10,
+        "is_forced_plan": int(forced),
+        "index_match": 1,
+        "stats_match": int(stats),
+        "query_plan": plan,
+    }
+
+
+@pytest.mark.asyncio
+async def test_write_maintenance_plan_is_not_a_query_store_reference(existing) -> None:
+    # Live Azure: an index only INSERT/UPDATE plans maintain got
+    # "in Query Store plans ... Keep it" here while the portfolio said
+    # observe/drop. Both tools now count only plans that read the index.
+    executor = RoutingExecutor(references=[_plan_match(70, _INSERT_PLAN), _plan_match(80, _INSERT_PLAN)])
+
+    report = await WorkloadIndexAdvisor(executor).review("appdb", **LONG)
+
+    rec = _unused_drop(report)
+    assert "unused_by_dmv_but_in_query_store_plans" not in rec["reason_codes"]
+    assert "no_query_store_plan_reference_in_window" in rec["reason_codes"]
+    assert _odd_name_plan_references(report) == 0
+
+
+@pytest.mark.asyncio
+async def test_read_plan_is_a_query_store_reference(existing) -> None:
+    executor = RoutingExecutor(references=[_plan_match(70, _INSERT_PLAN), _plan_match(80, _SEEK_PLAN)])
+
+    report = await WorkloadIndexAdvisor(executor).review("appdb", **LONG)
+
+    [rec] = [r for r in report["recommendations"] if r["index_name"] == "IX_Odd]Name"]
+    assert rec["reason_codes"] == ["unused_by_dmv_but_in_query_store_plans"]
+    assert _odd_name_plan_references(report) == 1
+
+
+@pytest.mark.asyncio
+async def test_forced_plan_that_only_maintains_the_index_keeps_it(existing) -> None:
+    # A drop silently stops the forcing (no force failure is recorded).
+    executor = RoutingExecutor(references=[_plan_match(70, _INSERT_PLAN, forced=True)])
+
+    report = await WorkloadIndexAdvisor(executor).review("appdb", **LONG)
+
+    [rec] = [r for r in report["recommendations"] if r["index_name"] == "IX_Odd]Name"]
+    assert rec["action"] != "drop_index"
+    assert rec["reason_codes"] == ["unused_by_dmv_but_in_query_store_plans"]
+
+
+@pytest.mark.asyncio
+async def test_unread_plan_counts_as_a_reference_and_is_a_gap(existing) -> None:
+    # Plan XML over the byte budget: its operators are unknown, so it stays use.
+    executor = RoutingExecutor(references=[_plan_match(70, None)])
+
+    report = await WorkloadIndexAdvisor(executor).review("appdb", **LONG)
+
+    assert _odd_name_plan_references(report) == 1
+    assert any("could not be read" in gap and "count as references" in gap for gap in report["gaps"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("plan_bytes", "budget_named"),
+    [(2_000, True), (module.MAX_FORCED_PLAN_XML_BYTES + 2, False)],
+)
+async def test_unread_plan_gap_says_when_the_total_plan_budget_was_reached(
+    existing, plan_bytes: int, budget_named: bool
+) -> None:
+    # A small plan comes back without XML only when the total read budget ran
+    # out: the reader must see that the keep is a budget limit, not plan size.
+    executor = RoutingExecutor(references=[{**_plan_match(70, None), "plan_bytes": plan_bytes}])
+
+    report = await WorkloadIndexAdvisor(executor).review("appdb", **LONG)
+
+    assert _odd_name_plan_references(report) == 1
+    [gap] = [gap for gap in report["gaps"] if "count as references" in gap]
+    assert ("plan read budget" in gap) is budget_named
+
+
+def _seek(object_attributes: str) -> str:
+    return (
+        '<RelOp PhysicalOp="Index Seek" LogicalOp="Index Seek"><IndexScan>'
+        f"<Object {object_attributes}/></IndexScan></RelOp>"
+    )
+
+
+@pytest.mark.asyncio
+async def test_plan_past_the_parser_reference_cap_counts_as_a_reference(existing) -> None:
+    # The parser keeps the first 500 index references; a seek of the unused
+    # index after them is dropped, so the plan was not fully read.
+    others = "".join(
+        _seek(f'Database="[appdb]" Schema="[dbo]" Table="[t{n}]" Index="[ix_{n}]"') for n in range(600)
+    )
+    target = _seek(f'{_ORDERS} Index="[IX_Odd]]Name]"')
+    plan = _showplan(f'<RelOp PhysicalOp="Concatenation" LogicalOp="Concatenation">{others}{target}</RelOp>')
+    executor = RoutingExecutor(references=[_plan_match(70, plan)])
+
+    report = await WorkloadIndexAdvisor(executor).review("appdb", **LONG)
+
+    assert _odd_name_plan_references(report) == 1
+    assert any("could not be read" in gap and "count as references" in gap for gap in report["gaps"])
+
+
+@pytest.mark.asyncio
+async def test_plan_with_an_index_object_of_unknown_table_counts_as_a_reference(existing) -> None:
+    # The parser drops an Object with an Index but no table identity, so the
+    # plan may seek the unused index without the advisor seeing it.
+    plan = _showplan(_seek('Index="[IX_Odd]]Name]"'))
+    executor = RoutingExecutor(references=[_plan_match(70, plan)])
+
+    report = await WorkloadIndexAdvisor(executor).review("appdb", **LONG)
+
+    assert _odd_name_plan_references(report) == 1
+
+
+@pytest.mark.asyncio
+async def test_write_plan_from_an_indexed_table_variable_is_not_a_reference(existing) -> None:
+    # Live Azure: INSERT ... SELECT FROM @t names @t's PK with no Database or
+    # Schema. The unused index is fully identified as written, never read.
+    plan = _showplan(
+        '<RelOp PhysicalOp="Clustered Index Insert" LogicalOp="Insert"><Update>'
+        f'<Object {_ORDERS} Index="[PK_Orders]" IndexKind="Clustered"/>'
+        f'<Object {_ORDERS} Index="[IX_Odd]]Name]" IndexKind="NonClustered"/>'
+        '<RelOp PhysicalOp="Clustered Index Scan" LogicalOp="Clustered Index Scan"><IndexScan>'
+        '<Object Table="[@t]" Index="[PK__#A52DA50__3213E83F]" Alias="[t]"/>'
+        "</IndexScan></RelOp></Update></RelOp>"
+    )
+    executor = RoutingExecutor(references=[_plan_match(70, plan)])
+
+    report = await WorkloadIndexAdvisor(executor).review("appdb", **LONG)
+
+    assert _odd_name_plan_references(report) == 0
+    assert not any("could not be read" in gap for gap in report["gaps"])
+
+
+@pytest.mark.asyncio
+async def test_reference_plans_are_parsed_off_the_event_loop(existing, monkeypatch) -> None:
+    threads: list[int] = []
+    parse = module.parse_showplan_index_evidence
+
+    def recording_parse(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        threads.append(threading.get_ident())
+        return parse(*args, **kwargs)
+
+    monkeypatch.setattr(module, "parse_showplan_index_evidence", recording_parse)
+    executor = RoutingExecutor(references=[_plan_match(80, _SEEK_PLAN)])
+
+    report = await WorkloadIndexAdvisor(executor).review("appdb", **LONG)
+
+    assert threads and threading.get_ident() not in threads
+    assert _odd_name_plan_references(report) == 1
+
+
+@pytest.mark.asyncio
+async def test_slow_reference_plan_parsing_is_bounded_by_the_read_timeout(existing, monkeypatch) -> None:
+    # Large plans parse for seconds; the parse must not hold the event loop
+    # past optional_read_timeout_seconds, and it stops once the read is dropped.
+    parsed: list[int] = []
+    parse = module.parse_showplan_index_evidence
+
+    def slow_parse(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        parsed.append(1)
+        time.sleep(0.05)
+        return parse(*args, **kwargs)
+
+    monkeypatch.setattr(module, "parse_showplan_index_evidence", slow_parse)
+    executor = RoutingExecutor(references=[_plan_match(n * 10, _SEEK_PLAN) for n in range(1, 41)])
+
+    started = time.monotonic()
+    report = await WorkloadIndexAdvisor(executor, optional_read_timeout_seconds=0.1).review("appdb", **LONG)
+    elapsed = time.monotonic() - started
+    await asyncio.sleep(0.2)
+
+    assert elapsed < 1.0
+    assert any("Query Store plan reference read timed out after 0.1 s" in gap for gap in report["gaps"])
+    assert len(parsed) < 20
+
+
+@pytest.mark.asyncio
+async def test_reference_read_skips_internal_queries_and_caps_plan_bytes(existing) -> None:
+    # ALTER INDEX REBUILD and UPDATE STATISTICS are internal queries whose
+    # plans scan the index; they are maintenance, not use (same as portfolio).
+    executor = RoutingExecutor(references=NO_REFERENCES)
+
+    await WorkloadIndexAdvisor(executor).review("appdb", **LONG)
+
+    reference_call = next(call for call in executor.calls if call[0] == "references")
+    assert "q.is_internal_query = 0" in reference_call[1]
+    assert reference_call[2][-3:] == [
+        module.MAX_FORCED_PLAN_XML_BYTES,
+        module.MAX_FORCED_PLAN_XML_BYTES,
+        module.MAX_INDEX_REFERENCE_PLAN_TOTAL_BYTES,
+    ]
+    # This read holds its plan XML while the forced-plan read holds its own.
+    assert module.MAX_INDEX_REFERENCE_PLAN_TOTAL_BYTES < module.MAX_FORCED_PLAN_TOTAL_BYTES
+
+
 @pytest.mark.asyncio
 async def test_reference_check_patterns_escape_closing_brackets(existing) -> None:
-    executor = RoutingExecutor(references=[{"ref_id": 0, "plan_references": 2, "statistics_references": 0}])
+    executor = RoutingExecutor(references=[_plan_match(70, _SEEK_PLAN), _plan_match(80, _SEEK_PLAN)])
 
     report = await WorkloadIndexAdvisor(executor).review("appdb", now=NOW)
 
@@ -264,7 +490,7 @@ def _unused_drop(report: dict[str, Any]) -> dict[str, Any]:
 # Usage counters (61 days) and a 40-day Query Store window both cover the
 # 35-day removal window, so IX_Odd]Name is a high-confidence drop by default.
 LONG = {"lookback_days": 40, "now": NOW}
-NO_REFERENCES = [{"ref_id": 0, "plan_references": 0, "statistics_references": 0}]
+NO_REFERENCES: list[dict[str, Any]] = []
 
 
 @pytest.mark.asyncio
@@ -293,12 +519,13 @@ async def test_a_heap_elsewhere_does_not_make_the_hint_check_incomplete(existing
 
 @pytest.mark.asyncio
 async def test_reference_check_counts_statistics_usage_separately(existing) -> None:
-    executor = RoutingExecutor(references=[{"ref_id": 0, "plan_references": 0, "statistics_references": 2}])
+    stats_only = {**_plan_match(70, None, stats=True), "index_match": 0}
+    executor = RoutingExecutor(references=[stats_only, {**stats_only, "plan_id": 80}])
 
     rec = _unused_drop(await WorkloadIndexAdvisor(executor).review("appdb", **LONG))
 
     reference_call = next(call for call in executor.calls if call[0] == "references")
-    assert "statistics_references" in reference_call[1]
+    assert "stats_match" in reference_call[1]
     assert "index_statistics_used_by_optimizer" in rec["reason_codes"]
     assert rec["ddl"].startswith("CREATE STATISTICS [st_IX_Odd]]Name] ON [Sales].[Orders] ([OrderDate])")
     assert rec["confidence"] == "medium"
@@ -780,3 +1007,145 @@ async def test_general_purpose_without_geo_link_keeps_a_high_confidence_drop(exi
     assert rec["confidence"] == "high"
     assert not {"readable_replica_usage_unobserved", "readable_replica_check_unavailable"} & set(rec["blockers"])
     assert "geo_links" in [call[0] for call in executor.calls]
+
+
+def _add_out_of_scope_unused(existing: list, count: int) -> None:
+    for position in range(count):
+        index = _index("Archive", "Big", f"IX_Archive_{position}", ("OrderID",), index_id=10 + position, reads=0)
+        index.usage_context["engine_start_time_utc"] = "2026-08-01T00:00:00Z"
+        existing.append(index)
+
+
+def _odd_name_plan_references(report: dict[str, Any]) -> Any:
+    [summary] = [
+        index
+        for table in report["tables"]
+        for index in table["existing_indexes"]
+        if index["name"] == "IX_Odd]Name"
+    ]
+    return summary["query_store_plan_references"]
+
+
+def _reference_names(executor: RoutingExecutor) -> list[str]:
+    reference_call = next(call for call in executor.calls if call[0] == "references")
+    return [param for param in reference_call[2] if str(param).startswith('Index="')]
+
+
+@pytest.mark.asyncio
+async def test_schema_scoped_review_checks_query_store_references_for_its_own_indexes_only(existing) -> None:
+    # The reference read costs (index names) x (plan bytes in the window). A
+    # review of one schema must not pay for, or be capped by, every other
+    # schema's unused indexes: 45 of them pushed IX_Odd]Name past the 40-name cap.
+    _add_out_of_scope_unused(existing, 45)
+    executor = RoutingExecutor(references=NO_REFERENCES)
+
+    report = await WorkloadIndexAdvisor(executor).review("appdb", schema_name="Sales", **LONG)
+
+    names = _reference_names(executor)
+    assert 'Index="[IX_Odd]]Name]"' in names
+    assert not any("IX_Archive_" in name for name in names)
+    assert not any("checked for 40 of" in gap for gap in report["gaps"])
+    assert _odd_name_plan_references(report) == 0
+
+
+@pytest.mark.asyncio
+async def test_table_scoped_review_checks_query_store_references_for_that_table_only(existing) -> None:
+    _add_out_of_scope_unused(existing, 3)
+    existing.append(_index("Sales", "OrderLines", "IX_Lines_Unused", ("StockItemID",), index_id=9, reads=0))
+    executor = RoutingExecutor(references=NO_REFERENCES)
+
+    await WorkloadIndexAdvisor(executor).review("appdb", schema_name="Sales", table_names=["Orders"], **LONG)
+
+    names = _reference_names(executor)
+    assert 'Index="[IX_Odd]]Name]"' in names
+    assert not any("IX_Archive_" in name or "IX_Lines_Unused" in name for name in names)
+
+
+class _PerNameCostExecutor(RoutingExecutor):
+    # Live Azure: the reference read grew with the number of names (2 names
+    # 7.6 s, 23 names 81.7 s) and timed out for a one-schema review.
+    async def fetch_all(self, database_name: str, query: str, params=None, **kwargs: Any):
+        if "FROM (VALUES" in query:
+            await asyncio.sleep(0.01 * (len(params) - 1) / 3)
+        return await super().fetch_all(database_name, query, params, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_out_of_scope_indexes_do_not_time_out_the_scoped_reference_read(existing) -> None:
+    _add_out_of_scope_unused(existing, 30)
+    executor = _PerNameCostExecutor(references=NO_REFERENCES)
+
+    report = await WorkloadIndexAdvisor(executor, optional_read_timeout_seconds=0.1).review(
+        "appdb", schema_name="Sales", **LONG
+    )
+
+    assert not any("plan reference read timed out" in gap for gap in report["gaps"])
+    assert _odd_name_plan_references(report) == 0
+
+
+def test_reference_budget_takes_plans_in_turns_per_index() -> None:
+    # One write-heavy index with many plans must not use up the whole plan-XML
+    # budget and leave every other index "unread" (a false keep). Each index
+    # gets its next-smallest plan in turn: the turn number is per index, and
+    # the running budget sum is ordered by that turn first.
+    import sqlglot
+    from sqlglot import exp
+
+    from azure_sql_mcp.workload_index_advisor import _INDEX_REFERENCE_SQL_TEMPLATE
+
+    tree = sqlglot.parse_one(
+        _INDEX_REFERENCE_SQL_TEMPLATE.format(values="(1, N'a', N'b')"), read="tsql"
+    )
+    ctes = {cte.alias: cte for cte in tree.find_all(exp.CTE)}
+    turn_window = next(
+        window
+        for window in ctes["turns"].find_all(exp.Window)
+        if window.parent is not None and window.parent.alias == "plan_turn"
+    )
+    partitions = [column.name for column in turn_window.args["partition_by"]]
+    assert partitions[0] == "ref_id"
+    turn_order = [item.this.name for item in turn_window.args["order"].expressions]
+    assert turn_order[0] == "plan_bytes"
+    budget_window = next(ctes["budgeted"].find_all(exp.Window))
+    budget_order = [item.this.name for item in budget_window.args["order"].expressions]
+    assert budget_order[0] == "plan_turn"
+
+
+@pytest.mark.asyncio
+async def test_scoped_review_ranks_the_scope_before_the_top_query_cap(existing) -> None:
+    # Live (2026-11-04): a schema-scoped review took the database-wide top 100
+    # queries and only then applied the scope. On a busy database the scope's
+    # own queries fell outside the cap, and its index advice silently vanished.
+    executor = RoutingExecutor()
+
+    await WorkloadIndexAdvisor(executor).review(
+        "appdb", lookback_days=7, now=NOW, schema_name="sales", table_names=["Orders", "Order]Lines"]
+    )
+
+    sql, params = next((query, params) for _db, query, params in executor.calls if "WITH plan_stats AS" in query)
+    ranked = sql[sql.index("ranked AS (") : sql.index("dominant AS (")]
+    assert ranked.index("CHARINDEX(?, CAST(sp.query_plan AS nvarchar(max)))") < ranked.rindex("ORDER BY qs.")
+    assert params[3:5] == ['Schema="[sales]" Table="[Orders]"', 'Schema="[sales]" Table="[Order]]Lines]"']
+    assert params[-1] == 1  # plans_per_query stays last
+    # Workload totals stay database-wide: the scope filter is not in totals.
+    totals = sql[sql.index("totals AS (") : sql.index("ranked AS (")]
+    assert "CHARINDEX" not in totals
+
+
+@pytest.mark.asyncio
+async def test_unscoped_review_reads_no_plan_xml_to_rank_queries(existing) -> None:
+    executor = RoutingExecutor()
+
+    await WorkloadIndexAdvisor(executor).review("appdb", lookback_days=7, now=NOW)
+
+    sql, params = next((query, params) for _db, query, params in executor.calls if "WITH plan_stats AS" in query)
+    assert "CHARINDEX" not in sql
+    assert len(params) == 4
+
+
+def test_scope_pattern_escapes_names_the_way_showplan_writes_them() -> None:
+    from azure_sql_mcp.workload_index_advisor import _scope_plan_patterns
+
+    assert _scope_plan_patterns("s&p", None) == ['Schema="[s&amp;p]"']
+    assert _scope_plan_patterns("dbo", ['a"b<c']) == ['Schema="[dbo]" Table="[a&quot;b&lt;c]"']
+    assert _scope_plan_patterns(None, None) == []

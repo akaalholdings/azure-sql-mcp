@@ -29,12 +29,15 @@ from azure_sql_mcp.index_review import MAX_CAPTURE_ROWS
 from azure_sql_mcp.index_review import MIN_OBSERVATION_DAYS
 from azure_sql_mcp.index_review import _column_names
 from azure_sql_mcp.index_review import _redacted_index
+from azure_sql_mcp.index_review import _reference_is_read
+from azure_sql_mcp.index_review import classify_index_subject
 from azure_sql_mcp.index_review import daily_idempotency_key
 from azure_sql_mcp.index_review import idempotency_key_hash
 from azure_sql_mcp.index_review import parse_review_id
 from azure_sql_mcp.index_review import render_index_review_artifacts
 from azure_sql_mcp.index_review import review_index_portfolio
 from azure_sql_mcp.index_review import validate_contract_probe
+from azure_sql_mcp.plans import parse_showplan_index_evidence
 
 
 def _reversible(
@@ -1221,6 +1224,108 @@ def test_executed_query_store_reference_counts_only_inside_the_window() -> None:
 
     before_window = review_index_portfolio("appdb", history(10)).subjects[0]
     assert before_window["state"] == "drop_candidate"
+
+
+def _referenced_history(
+    operator_kinds: list[str], *, is_forced_plan: bool = False
+) -> list[IndexReviewSnapshotV1]:
+    snapshots = []
+    for day in range(40):
+        index = _index(reads=0)
+        index["query_store_references"] = [
+            {
+                "query_id": 7,
+                "plan_id": 70,
+                "execution_count": 30,
+                "operator_kind": operator_kinds[0] if len(operator_kinds) == 1 else "Multiple",
+                "operator_kinds": operator_kinds,
+                "is_forced_plan": is_forced_plan,
+                "last_seen": _utc(_BASE_TIME + timedelta(days=39)),
+            }
+        ]
+        snapshots.append(_snapshot(day, index=index))
+    return snapshots
+
+
+@pytest.mark.parametrize(
+    "operator_kinds",
+    [
+        ["Index Insert", "Insert"],
+        ["Clustered Index Insert", "Insert"],
+        ["Clustered Index Update", "Update"],
+        ["Clustered Index Delete", "Delete"],
+        ["Table Insert", "Insert"],
+    ],
+)
+def test_write_maintenance_reference_does_not_keep_unread_index(
+    operator_kinds: list[str],
+) -> None:
+    # Every INSERT/UPDATE/DELETE plan on the table lists each NC index it
+    # maintains. That is write burden, not use: counting it as use keeps the
+    # write-only, never-read index the review exists to find.
+    snapshots = _referenced_history(operator_kinds)
+
+    subject = review_index_portfolio("appdb", snapshots).subjects[0]
+    assert subject["state"] == "drop_candidate"
+    assert subject["removal_gate"]["historical_reference"] is False
+    assert subject["removal_gate"]["gates"]["no_stored_plan_without_execution"] is True
+    assert classify_index_subject(snapshots[-1].subjects[0], snapshots)["state"] == "drop_candidate"
+
+
+@pytest.mark.parametrize(
+    "operator_kinds", [["Clustered Index Insert", "Insert"], ["Clustered Index Update", "Update"]]
+)
+def test_forced_plan_that_only_maintains_the_index_keeps_it(operator_kinds: list[str]) -> None:
+    # Live Azure: after DROP INDEX, a forced INSERT plan whose Object list held
+    # the index stopped applying with no force failure recorded. The forcing
+    # someone set to fix a regression is lost silently, so it stays use.
+    snapshots = _referenced_history(operator_kinds, is_forced_plan=True)
+
+    subject = review_index_portfolio("appdb", snapshots).subjects[0]
+    assert subject["state"] == "keep"
+    assert subject["removal_gate"]["historical_reference"] is True
+    assert classify_index_subject(snapshots[-1].subjects[0], snapshots)["state"] == "keep"
+
+
+def test_parsed_narrow_update_plan_reads_only_the_seeked_index() -> None:
+    # Azure-shaped narrow UPDATE ... WHERE plan: an Index Seek on IX_Y finds
+    # the rows, and the Clustered Index Update maintains PK and IX_X.
+    obj = 'Database="[appdb]" Schema="[dbo]" Table="[Orders]"'
+    plan = (
+        '<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">'
+        "<BatchSequence><Batch><Statements>"
+        '<StmtSimple StatementType="UPDATE"><QueryPlan>'
+        '<RelOp NodeId="0" PhysicalOp="Clustered Index Update" LogicalOp="Update">'
+        f'<Update><Object {obj} Index="[PK_Orders]" IndexKind="Clustered"/>'
+        f'<Object {obj} Index="[IX_X]" IndexKind="NonClustered"/>'
+        '<RelOp NodeId="1" PhysicalOp="Index Seek" LogicalOp="Index Seek">'
+        f'<IndexScan><Object {obj} Index="[IX_Y]" IndexKind="NonClustered"/>'
+        "</IndexScan></RelOp></Update></RelOp>"
+        "</QueryPlan></StmtSimple></Statements></Batch></BatchSequence></ShowPlanXML>"
+    )
+
+    parsed = parse_showplan_index_evidence(plan, query_id=1, plan_id=1, execution_count=5)
+    reads = {
+        reference["index_name"]: _reference_is_read(reference)
+        for reference in parsed["index_references"]
+    }
+
+    assert reads == {"PK_Orders": False, "IX_X": False, "IX_Y": True}
+
+
+@pytest.mark.parametrize(
+    "operator_kinds",
+    [["Index Seek"], ["Index Scan"], ["Index Seek", "Clustered Index Update", "Update"], ["Unknown"]],
+)
+def test_read_reference_keeps_index(operator_kinds: list[str]) -> None:
+    # A seek or scan of the index is use, also inside a write plan; an
+    # unknown operator stays conservative.
+    snapshots = _referenced_history(operator_kinds)
+
+    subject = review_index_portfolio("appdb", snapshots).subjects[0]
+    assert subject["state"] == "keep"
+    assert subject["removal_gate"]["historical_reference"] is True
+    assert classify_index_subject(snapshots[-1].subjects[0], snapshots)["state"] == "keep"
 
 
 def test_epoch_counter_definition_protection_and_special_type_gates() -> None:

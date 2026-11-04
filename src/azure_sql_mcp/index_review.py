@@ -3991,6 +3991,38 @@ def _missing_history_review(
     )
 
 
+# Showplan operators that only maintain an index for an INSERT, UPDATE, DELETE
+# or MERGE (every write plan lists each NC index it keeps current). They are
+# write burden, not use.
+_WRITE_MAINTENANCE_OPERATORS = frozenset(
+    {
+        "Insert", "Update", "Delete", "Merge",
+        "Index Insert", "Index Update", "Index Delete",
+        "Clustered Index Insert", "Clustered Index Update",
+        "Clustered Index Delete", "Clustered Index Merge",
+        "Table Insert", "Table Update", "Table Delete", "Table Merge",
+        "Columnstore Index Insert", "Columnstore Index Update",
+        "Columnstore Index Delete", "Columnstore Index Merge",
+        "Online Index Insert",
+    }
+)
+
+
+def _reference_is_read(reference: Mapping[str, Any]) -> bool:
+    kinds = {str(kind) for kind in reference.get("operator_kinds") or () if kind}
+    operator_kind = reference.get("operator_kind")
+    if operator_kind and operator_kind != "Multiple":
+        kinds.add(str(operator_kind))
+    # No operator recorded (older captures): stay conservative, count as use.
+    return not kinds or bool(kinds - _WRITE_MAINTENANCE_OPERATORS)
+
+
+def _reference_is_use(reference: Mapping[str, Any]) -> bool:
+    # A forced plan that only maintains the index still depends on it: after a
+    # drop the forcing stops applying with no force failure recorded.
+    return _reference_is_read(reference) or _as_bool(reference.get("is_forced_plan"))
+
+
 def _reference_has_execution(reference: Mapping[str, Any]) -> bool:
     if reference.get("executed") is True:
         return True
@@ -4426,7 +4458,9 @@ def evaluate_removal_gate(
         reference
         for item in history
         for reference in item.get("query_store_references", [])
-        if isinstance(reference, Mapping) and _reference_in_window(reference, window_start)
+        if isinstance(reference, Mapping)
+        and _reference_in_window(reference, window_start)
+        and _reference_is_use(reference)
     ]
     executed_reference = any(_reference_has_execution(reference) for reference in references)
     stored_plan_without_execution = bool(references) and not executed_reference
@@ -4948,7 +4982,7 @@ def classify_index_subject(
         any(
             _reference_has_execution(reference)
             for reference in references
-            if isinstance(reference, Mapping)
+            if isinstance(reference, Mapping) and _reference_is_use(reference)
         )
         if isinstance(references, (list, tuple))
         else False
