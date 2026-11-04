@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
+import time
 import warnings
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -18,8 +20,10 @@ from azure_sql_mcp.connection import BatchExecutionMode
 from azure_sql_mcp.connection import ProfiledExecution
 from azure_sql_mcp.connection import QueryResult
 from azure_sql_mcp.connection import StatementDispatchPrevented
+from azure_sql_mcp.connection import StatementDispatchStopped
 from azure_sql_mcp.connection import TransactionCommitOutcomeUnknownError
 from azure_sql_mcp.connection import TransactionRollbackError
+from azure_sql_mcp.connection import statement_deadline
 
 
 class RowCountCursor:
@@ -121,7 +125,9 @@ async def test_execute_batches_admin_mode_does_not_replay_transient_failure(
 
     execute_mock.assert_called_once()
     assert execute_mock.call_args.args[4] is None
-    assert execute_mock.call_args.kwargs == {
+    kwargs = dict(execute_mock.call_args.kwargs)
+    assert isinstance(kwargs.pop("cancel_event"), threading.Event)
+    assert kwargs == {
         "drain_all_result_sets": True,
         "outcome_unknown_after_dispatch": True,
     }
@@ -1141,3 +1147,237 @@ def test_consume_batches_retains_duplicate_columns_positionally(sample_server_co
     assert result.rows == [{"value": 7}]
     assert result.positional_rows == (("left", 7),)
     assert result.typed_rows == (("left", 7),)
+
+
+class DriverLikeConnection:
+    """Behaves like mssql-python 1.10: no cancel call, and each new cursor
+    copies ``connection.timeout`` as its statement timeout."""
+
+    def __init__(self, *, block_on: str | None = None, on_execute=None) -> None:
+        self.timeout = 30
+        self.dispatched: list[str] = []
+        self.cursor_timeouts: list[int] = []
+        self.block_on = block_on
+        self.on_execute = on_execute
+        self.blocked = threading.Event()
+        self.unblock = threading.Event()
+
+    def cursor(self):
+        self.cursor_timeouts.append(self.timeout)
+        connection = self
+
+        class Cursor:
+            description = None
+            rowcount = -1
+            messages: list[object] = []
+
+            def execute(self, statement, params=None):
+                connection.dispatched.append(statement)
+                if connection.on_execute is not None:
+                    connection.on_execute(statement)
+                if statement == connection.block_on:
+                    connection.blocked.set()
+                    connection.unblock.wait(timeout=2)
+
+            def nextset(self):
+                return False
+
+            def close(self):
+                pass
+
+        return Cursor()
+
+
+def _recording_pool(connection) -> tuple[SimpleNamespace, asyncio.Event]:
+    discarded = asyncio.Event()
+    pool = SimpleNamespace(
+        acquire=AsyncMock(return_value=connection),
+        release=AsyncMock(),
+        discard=AsyncMock(side_effect=lambda *_args: discarded.set()),
+    )
+    return pool, discarded
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entrypoint", ["execute_session", "execute_session_exactly_once"])
+async def test_cancelled_session_dispatches_no_later_statements(
+    sample_server_config,
+    entrypoint: str,
+) -> None:
+    # mssql-python cannot cancel the statement in flight. After a tool timeout
+    # the executor must at least stop the rest of the session; otherwise every
+    # remaining benchmark run still loads the server and holds the pool slot.
+    connection = DriverLikeConnection(block_on="SELECT 2")
+    pool, discarded = _recording_pool(connection)
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), pool)
+    statements = [f"SELECT {index}" for index in range(1, 6)]
+
+    task = asyncio.create_task(getattr(executor, entrypoint)("appdb", statements))
+    assert await asyncio.to_thread(connection.blocked.wait, 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    connection.unblock.set()
+    await asyncio.wait_for(discarded.wait(), timeout=2)
+
+    user_statements = [s for s in connection.dispatched if s.startswith("SELECT")]
+    assert user_statements == ["SELECT 1", "SELECT 2"]
+    pool.release.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_profiled_sample_does_not_dispatch_user_query(
+    sample_server_config,
+) -> None:
+    # A measured sample cancelled during its SET setup must not start the
+    # user query afterwards: nobody will read the measurement.
+    connection = DriverLikeConnection(block_on="SET STATISTICS XML ON")
+    pool, discarded = _recording_pool(connection)
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), pool)
+
+    task = asyncio.create_task(
+        executor.execute_profiled_read_only("appdb", "SELECT heavy FROM dbo.t")
+    )
+    assert await asyncio.to_thread(connection.blocked.wait, 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    connection.unblock.set()
+    await asyncio.wait_for(discarded.wait(), timeout=2)
+
+    assert "SELECT heavy FROM dbo.t" not in connection.dispatched
+    pool.release.assert_not_awaited()
+
+
+def test_session_statement_timeouts_shrink_to_the_remaining_deadline(
+    sample_server_config,
+) -> None:
+    # Each later statement gets min(query_timeout, time left). The driver then
+    # sends the attention itself, so no statement outlives the tool budget by
+    # a full query timeout. A statement past the deadline is never sent.
+    clock = [1000.0]
+    advance_after = {"SELECT 1": 12.0, "SELECT 2": 9.0}
+
+    def advance(statement: str) -> None:
+        clock[0] += advance_after.get(statement, 0.0)
+
+    connection = DriverLikeConnection(on_execute=advance)
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), MagicMock())
+    fake_time = SimpleNamespace(
+        monotonic=lambda: clock[0],
+        perf_counter=time.perf_counter,
+    )
+
+    with patch("azure_sql_mcp.connection.time", fake_time):
+        with statement_deadline(20):
+            with pytest.raises(StatementDispatchStopped):
+                executor._execute_session_with_connection(
+                    connection,
+                    "appdb",
+                    ("SELECT 1", "SELECT 2", "SELECT 3"),
+                    max_rows=10,
+                )
+
+    # 20 s left -> 21, then 8 s left -> 9, then -1 s left -> not dispatched.
+    # The driver timeout lands just after the deadline, never before it, so
+    # the caller's wait_for still owns the 'timeout' outcome.
+    assert connection.cursor_timeouts == [21, 9]
+    assert "SELECT 3" not in connection.dispatched
+    # The pooled connection keeps its configured timeout for the next lease.
+    assert connection.timeout == 30
+
+
+@pytest.mark.asyncio
+async def test_statement_deadline_reaches_the_worker_thread(sample_server_config) -> None:
+    connection = DriverLikeConnection()
+    pool, _discarded = _recording_pool(connection)
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), pool)
+
+    with statement_deadline(5.5):
+        await executor.execute_session("appdb", ["SET SHOWPLAN_XML ON", "SELECT 1"])
+        await executor.fetch_all("appdb", "SELECT 2")
+
+    assert connection.cursor_timeouts == [7, 7, 7]
+    assert connection.timeout == 30
+
+    await executor.fetch_all("appdb", "SELECT 3")
+    assert connection.cursor_timeouts[-1] == sample_server_config.query_timeout_seconds
+
+
+def test_request_cancel_reports_once_that_the_driver_cannot_cancel(
+    sample_server_config,
+    caplog,
+) -> None:
+    # mssql-python has no cancel call. Say so once instead of pretending.
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), MagicMock())
+    connection = SimpleNamespace()
+
+    with caplog.at_level(logging.WARNING, logger="azure_sql_mcp.connection"):
+        executor._request_cancel(connection)
+        executor._request_cancel(connection)
+
+    reports = [r for r in caplog.records if "cancel" in r.getMessage().lower()]
+    assert len(reports) == 1
+
+
+class _DriverQueryTimeout(Exception):
+    """Stands in for the HYT00 error the driver raises at its own timeout."""
+
+
+@pytest.mark.asyncio
+async def test_statement_in_flight_at_the_tool_deadline_surfaces_as_timeout(
+    sample_server_config,
+) -> None:
+    # _run_tool maps asyncio.TimeoutError to 'timeout' and anything else to
+    # 'tool_error'; benchmark receipts record failure_code='timeout' only on
+    # the timeout path. The shrunk driver timeout must therefore fire just
+    # after the tool deadline, so a statement still running at the deadline
+    # ends in asyncio.TimeoutError and not in a driver error.
+    release = threading.Event()
+    cursor_timeouts: list[int] = []
+
+    class Connection:
+        timeout = 30
+
+        def cursor(self):
+            limit = self.timeout
+            cursor_timeouts.append(limit)
+
+            class Cursor:
+                description = None
+                rowcount = -1
+                messages: list[object] = []
+
+                def execute(self, statement, params=None):
+                    if statement == "SELECT 1":
+                        time.sleep(0.1)
+                    if statement != "SELECT heavy":
+                        return
+                    if not release.wait(timeout=limit):
+                        raise _DriverQueryTimeout(f"HYT00 timeout after {limit}s")
+
+                def nextset(self):
+                    return False
+
+                def close(self):
+                    pass
+
+            return Cursor()
+
+    pool, discarded = _recording_pool(Connection())
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), pool)
+
+    try:
+        with statement_deadline(2.0):
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    executor.execute_session("appdb", ["SELECT 1", "SELECT heavy"]),
+                    timeout=2.0,
+                )
+    finally:
+        release.set()
+    await asyncio.wait_for(discarded.wait(), timeout=2)
+
+    # About 1.9 s were left for the heavy statement: its driver timeout must
+    # pass the deadline but stay close to it, so orphaned work stays bounded.
+    assert cursor_timeouts[-1] == 3
