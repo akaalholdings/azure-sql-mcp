@@ -1400,3 +1400,190 @@ async def test_intent_ttl_is_configurable(server_config_factory) -> None:
     expires_at = datetime.fromisoformat(intent["metadata"]["expires_at_utc"])
     created_at = datetime.fromisoformat(intent["created_at_utc"])
     assert expires_at - created_at == timedelta(hours=2)
+
+
+@pytest.mark.asyncio
+async def test_verify_rollback_reports_regressed_metrics(server_config_factory) -> None:
+    # Duration improves 30% but reads double: the operator must learn the
+    # rollback came from reads, not time, or they will re-force the same plan.
+    service, store, _admin, intent_id = await _applied_force_plan(
+        server_config_factory,
+        runtime_rows=[
+            _qs_row("baseline", 7, 40, 100.0, cpu=40.0, reads=1000.0),
+            _qs_row("post", 7, 40, 70.0, cpu=30.0, reads=2000.0),
+        ],
+        extra_states=[_state(7, None, force_failures=0), _state(None, None)],
+    )
+
+    result = await service.verify(
+        "appdb", intent_id, authorization_reference="approved-rollback"
+    )
+
+    assert result["decision"] == "rollback"
+    assert result["confirmed"] is True
+    assert result["regressed_metrics"] == ["avg_logical_io_reads"]
+    intent = store.get_plan_action_intent(intent_id)
+    assert intent.status == "rolled_back"
+    verification = intent.metadata["verification"]
+    assert verification["action"] == "rollback"
+    assert verification["regressed_metrics"] == ["avg_logical_io_reads"]
+    assert verification["evidence"]["post"]["count_executions"] == 40
+
+
+@pytest.mark.asyncio
+async def test_verify_rollback_hold_keeps_regressed_metrics(server_config_factory) -> None:
+    # Automatic tuning took the query after verify chose rollback: the intent
+    # holds, and the reason for the attempted rollback must survive the hold.
+    service, store, _admin, intent_id = await _applied_force_plan(
+        server_config_factory,
+        runtime_rows=[
+            _qs_row("baseline", 7, 40, 100.0, cpu=40.0, reads=1000.0),
+            _qs_row("post", 7, 40, 70.0, cpu=30.0, reads=2000.0),
+        ],
+        extra_states=[_state(7, None, ownership="automatic")],
+    )
+
+    result = await service.verify(
+        "appdb", intent_id, authorization_reference="approved-rollback"
+    )
+
+    assert result["decision"] == "rollback"
+    assert result["confirmed"] is False
+    intent = store.get_plan_action_intent(intent_id)
+    assert intent.status == "hold"
+    assert intent.metadata["rollback_confirmation"] == "ownership_changed"
+    assert intent.metadata["verification"]["regressed_metrics"] == [
+        "avg_logical_io_reads"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_state_errors_keep_the_status_word_after_redaction(
+    server_config_factory,
+) -> None:
+    # The MCP error sanitizer masks single-quoted text, so a quoted status
+    # reaches the caller as '[REDACTED]' and the operator cannot see why.
+    from azure_sql_mcp.observability import sanitize_error_message
+
+    service, _store, _admin, session_id = _service(
+        server_config_factory, [_state(None, None)]
+    )
+    intent_id = (await _prepare_only(service, session_id))["intent"]["intent_id"]
+
+    with pytest.raises(ValueError) as rollback_error:
+        await service.rollback(
+            "appdb", intent_id, authorization_reference="approved-rollback"
+        )
+    with pytest.raises(ValueError) as verify_error:
+        await service.verify(
+            "appdb", intent_id, authorization_reference="approved-rollback"
+        )
+
+    for error in (rollback_error.value, verify_error.value):
+        message = sanitize_error_message(str(error))
+        assert "prepared" in message
+        assert "[REDACTED]" not in message
+
+
+class ConcurrentWriterAdminPolicy(RecordingAdminPolicy):
+    """Another writer bumps the intent row while the force call runs."""
+
+    def __init__(self, store: PerformanceStore, intent_id: str, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.store = store
+        self.intent_id = intent_id
+
+    async def execute(self, action, _executor, *, dry_run: bool, max_rows=None):
+        latest = self.store.get_plan_action_intent(self.intent_id)
+        self.store.save_plan_action_intent(
+            replace(latest, status="hold", version=latest.version + 1),
+            expected_version=latest.version,
+        )
+        return await super().execute(action, _executor, dry_run=dry_run, max_rows=max_rows)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch_fails", [False, True])
+async def test_apply_reports_outcome_unknown_when_dispatched_result_cannot_be_recorded(
+    server_config_factory,
+    dispatch_fails: bool,
+) -> None:
+    # The force call was sent. A lost status write must not read as a plain
+    # state-store error (safe to retry): the plan may be forced already.
+    from azure_sql_mcp.incident_log import describe_exception, tool_failure_code
+    from azure_sql_mcp.plan_action_service import PlanActionOutcomeUnknownError
+
+    service, store, _admin, session_id = _service(
+        server_config_factory,
+        [_state(None, None), _state(None, None), _state(7, None)],
+    )
+    intent_id = (await _prepare_only(service, session_id))["intent"]["intent_id"]
+    writer = ConcurrentWriterAdminPolicy(
+        store, intent_id, fail_on_call=1 if dispatch_fails else None
+    )
+    service.admin_policy = writer  # type: ignore[assignment]
+
+    with pytest.raises(PlanActionOutcomeUnknownError) as raised:
+        await service.apply("appdb", intent_id, authorization_reference="approved-change")
+
+    assert len(writer.actions) == 1
+    assert tool_failure_code(raised.value) == "verification_failed"
+    described = describe_exception(raised.value)
+    assert (described["category"], described["priority"]) == ("outcome_unknown", "P1")
+    assert store.get_plan_action_intent(intent_id).status == "hold"
+
+
+@pytest.mark.asyncio
+async def test_apply_records_unknown_when_the_confirm_read_fails(server_config_factory) -> None:
+    # The force call was sent and the store works; only the confirm read failed.
+    # The intent must say so (unknown, confirm_read_failed), not stay "applying".
+    service, store, _admin, session_id = _service(
+        server_config_factory,
+        [_state(None, None), _state(None, None)],  # no state left for the confirm read
+    )
+    intent_id = (await _prepare_only(service, session_id))["intent"]["intent_id"]
+
+    result = await service.apply("appdb", intent_id, authorization_reference="approved-change")
+
+    assert result["confirmed"] is False
+    intent = store.get_plan_action_intent(intent_id)
+    assert intent.status == "unknown"
+    assert intent.metadata["apply_confirmation"] == "confirm_read_failed"
+    assert intent.metadata["apply_error_type"] == "IndexError"
+
+
+@pytest.mark.asyncio
+async def test_rollback_records_unknown_when_the_confirm_read_fails(server_config_factory) -> None:
+    service, store, admin, intent_id = await _applied_force_plan(server_config_factory)
+
+    result = await service.rollback(
+        "appdb", intent_id, authorization_reference="approved-change", reason="operator"
+    )
+
+    assert len(admin.actions) == 2  # force, then the restore was sent
+    assert result["confirmed"] is False
+    intent = store.get_plan_action_intent(intent_id)
+    assert intent.status == "unknown"
+    assert intent.metadata["rollback_confirmation"] == "confirm_read_failed"
+
+
+@pytest.mark.asyncio
+async def test_rollback_reports_outcome_unknown_when_the_result_cannot_be_recorded(
+    server_config_factory,
+) -> None:
+    # The restore was sent, then another writer changed the intent row, so the
+    # rolled_back status cannot be saved. That must not read as a refusal.
+    from azure_sql_mcp.incident_log import tool_failure_code
+    from azure_sql_mcp.plan_action_service import PlanActionOutcomeUnknownError
+
+    service, store, _admin, intent_id = await _applied_force_plan(
+        server_config_factory, extra_states=[_state(None, None)]
+    )
+    service.admin_policy = ConcurrentWriterAdminPolicy(store, intent_id)  # type: ignore[assignment]
+
+    with pytest.raises(PlanActionOutcomeUnknownError) as raised:
+        await service.rollback(
+            "appdb", intent_id, authorization_reference="approved-change", reason="operator"
+        )
+
+    assert tool_failure_code(raised.value) == "verification_failed"

@@ -67,6 +67,16 @@ ORDER BY window_name, rs.plan_id
 """
 
 
+class PlanActionOutcomeUnknownError(RuntimeError):
+    """A plan action was dispatched, then its outcome could not be recorded."""
+
+
+_OUTCOME_UNKNOWN = (
+    "plan action was dispatched, then its outcome could not be recorded; "
+    "read the intent and the Query Store force state before any retry"
+)
+
+
 def _hash_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -335,39 +345,51 @@ class PlanActionService:
             )
             raise
         except Exception as exc:
-            updated = self._save_status(
+            return self._unknown_after_dispatch(
                 intent,
-                "unknown",
                 {
                     "apply_confirmation": "uncertain_after_error",
                     "apply_error_type": type(exc).__name__,
                     "authorization_fingerprint": _hash_text(authorization_reference),
                 },
             )
-            return {"intent": updated.to_dict(), "confirmed": False}
-        expected_state = self._expected_applied_state(intent, current_state)
-        confirmed_state = await self._capture_control_state(database_name, query_id)
-        if not self._control_state_matches(confirmed_state, expected_state):
-            return {
-                "intent": self._save_status(
-                    intent,
-                    "unknown",
-                    {
-                        "apply_confirmation": "state_mismatch",
-                        "authorization_fingerprint": _hash_text(authorization_reference),
-                    },
-                ).to_dict(),
-                "confirmed": False,
-            }
-        updated = self._save_status(
-            intent,
-            "applied",
-            {
-                "applied_at_utc": utc_now(),
-                "authorization_fingerprint": _hash_text(authorization_reference),
-                "applied_state": confirmed_state,
-            },
-        )
+        try:
+            expected_state = self._expected_applied_state(intent, current_state)
+            confirmed_state = await self._capture_control_state(database_name, query_id)
+        except Exception as exc:
+            return self._unknown_after_dispatch(
+                intent,
+                {
+                    "apply_confirmation": "confirm_read_failed",
+                    "apply_error_type": type(exc).__name__,
+                    "authorization_fingerprint": _hash_text(authorization_reference),
+                },
+            )
+        try:
+            if not self._control_state_matches(confirmed_state, expected_state):
+                return {
+                    "intent": self._save_status(
+                        intent,
+                        "unknown",
+                        {
+                            "apply_confirmation": "state_mismatch",
+                            "authorization_fingerprint": _hash_text(authorization_reference),
+                        },
+                    ).to_dict(),
+                    "confirmed": False,
+                }
+            updated = self._save_status(
+                intent,
+                "applied",
+                {
+                    "applied_at_utc": utc_now(),
+                    "authorization_fingerprint": _hash_text(authorization_reference),
+                    "applied_state": confirmed_state,
+                },
+            )
+        except Exception as exc:
+            # The action was sent: a retry could force twice or undo someone else.
+            raise PlanActionOutcomeUnknownError(_OUTCOME_UNKNOWN) from exc
         return {"intent": updated.to_dict(), "confirmed": True, "idempotent": False}
 
     async def verify(
@@ -385,7 +407,7 @@ class PlanActionService:
         """
         intent = self._validated_intent(database_name, intent_id)
         if intent.status not in {"applied", "observing", "hold"}:
-            raise ValueError(f"Intent status {intent.status!r} cannot be verified.")
+            raise ValueError(f"Intent status={intent.status} cannot be verified.")
         metadata = dict(intent.metadata)
         baseline = metadata.get("baseline_evidence")
         if not isinstance(baseline, Mapping):
@@ -548,9 +570,17 @@ class PlanActionService:
             intent_id,
             authorization_reference=authorization_reference,
             reason=decision.reason,
+            verification={
+                "action": "rollback",
+                "reason": decision.reason,
+                "improvement_pct": decision.improvement_pct,
+                "regressed_metrics": list(decision.regressed_metrics),
+                "evidence": evidence,
+            },
         )
         rollback["decision"] = "rollback"
         rollback["evidence"] = evidence
+        rollback["regressed_metrics"] = list(decision.regressed_metrics)
         return rollback
 
     def _verification_hold(
@@ -731,6 +761,7 @@ class PlanActionService:
         *,
         authorization_reference: str,
         reason: str = "explicit rollback requested",
+        verification: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         self._require_apply_gates(database_name, authorization_reference)
         intent = self._validated_intent(database_name, intent_id)
@@ -744,7 +775,7 @@ class PlanActionService:
                 "reconciliation_required": True,
             }
         if intent.status not in {"applied", "observing", "hold", "kept"}:
-            raise ValueError(f"Intent status {intent.status!r} cannot be rolled back.")
+            raise ValueError(f"Intent status={intent.status} cannot be rolled back.")
         if not intent.metadata.get("applied_at_utc"):
             # Held before apply (expired or precondition changed): this intent
             # changed nothing, so restoring its prior state would undo someone
@@ -758,6 +789,13 @@ class PlanActionService:
                     "rollback_started_at_utc": utc_now(),
                     "rollback_authorization_fingerprint": _hash_text(
                         authorization_reference
+                    ),
+                    # Kept on every later outcome, so a held or unknown
+                    # rollback still says which metrics regressed.
+                    **(
+                        {"verification": dict(verification)}
+                        if verification is not None
+                        else {}
                     ),
                 },
             )
@@ -838,9 +876,8 @@ class PlanActionService:
             )
             raise
         except Exception as exc:
-            updated = self._save_status(
+            return self._unknown_after_dispatch(
                 intent,
-                "unknown",
                 {
                     "rollback_confirmation": "uncertain_after_error",
                     "rollback_error_type": type(exc).__name__,
@@ -849,28 +886,54 @@ class PlanActionService:
                     ),
                 },
             )
-            return {"intent": updated.to_dict(), "confirmed": False}
-        confirmed = await self._capture_control_state(database_name, query_id)
-        if not self._control_state_matches(confirmed, prior_state):
-            updated = self._save_status(
+        try:
+            confirmed = await self._capture_control_state(database_name, query_id)
+        except Exception as exc:
+            return self._unknown_after_dispatch(
                 intent,
-                "unknown",
+                {
+                    "rollback_confirmation": "confirm_read_failed",
+                    "rollback_error_type": type(exc).__name__,
+                    "rollback_authorization_fingerprint": _hash_text(
+                        authorization_reference
+                    ),
+                },
+            )
+        if not self._control_state_matches(confirmed, prior_state):
+            return self._unknown_after_dispatch(
+                intent,
                 {"rollback_confirmation": "state_mismatch"},
             )
-            return {"intent": updated.to_dict(), "confirmed": False}
-        updated = self._save_status(
-            intent,
-            "rolled_back",
-            {
-                "rolled_back_at_utc": utc_now(),
-                "rollback_reason": reason,
-                "rollback_authorization_fingerprint": _hash_text(
-                    authorization_reference
-                ),
-                "restored_state": confirmed,
-            },
-        )
+        try:
+            updated = self._save_status(
+                intent,
+                "rolled_back",
+                {
+                    "rolled_back_at_utc": utc_now(),
+                    "rollback_reason": reason,
+                    "rollback_authorization_fingerprint": _hash_text(
+                        authorization_reference
+                    ),
+                    "restored_state": confirmed,
+                },
+            )
+        except Exception as exc:
+            # The restore was sent: a retry could undo someone else's change.
+            raise PlanActionOutcomeUnknownError(_OUTCOME_UNKNOWN) from exc
         return {"intent": updated.to_dict(), "confirmed": True, "idempotent": False}
+
+    def _unknown_after_dispatch(
+        self,
+        intent: Any,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        """The action was sent: record "unknown", or raise if even that fails."""
+
+        try:
+            updated = self._save_status(intent, "unknown", metadata)
+        except Exception as save_exc:
+            raise PlanActionOutcomeUnknownError(_OUTCOME_UNKNOWN) from save_exc
+        return {"intent": updated.to_dict(), "confirmed": False}
 
     async def _capture_control_state(
         self,

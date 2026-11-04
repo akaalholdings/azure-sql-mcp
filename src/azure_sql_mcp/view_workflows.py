@@ -26,7 +26,15 @@ SELECT
     m.definition,
     m.is_schema_bound,
     m.uses_ansi_nulls,
-    m.uses_quoted_identifier
+    m.uses_quoted_identifier,
+    -- The column collation wins over the literal, so SQL decides whether
+    -- this catalog folds every ASCII letter. Turkish and Azeri CI do not
+    -- fold I and i, so they read 0, as CS and BIN collations do.
+    CASE
+        WHEN s.name + N'ABCDEFGHIJKLMNOPQRSTUVWXYZ' = s.name + N'abcdefghijklmnopqrstuvwxyz'
+         AND v.name + N'ABCDEFGHIJKLMNOPQRSTUVWXYZ' = v.name + N'abcdefghijklmnopqrstuvwxyz'
+        THEN 1 ELSE 0
+    END AS catalog_names_ignore_case
 FROM sys.views AS v
 INNER JOIN sys.schemas AS s
     ON s.schema_id = v.schema_id
@@ -163,6 +171,11 @@ class ViewHeader:
 class _ParsedViewDefinition:
     header: ViewHeader
     body: str
+    # Offsets into the module text, so a restore can reuse it as written.
+    keyword_end: int = 0
+    name_start: int = 0
+    name_end: int = 0
+    name_parts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -185,6 +198,11 @@ class ViewSnapshot:
     marker_value: str | None = None
     reserved_marker_names: tuple[str, ...] = ()
     dispatch_proof: dict[str, str] | None = None
+    # Names as sys.schemas/sys.views store them; the request may use other
+    # case on a case-insensitive collation.
+    catalog_schema_name: str | None = None
+    catalog_view_name: str | None = None
+    catalog_names_ignore_case: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -819,6 +837,22 @@ def _build_fenced_view_execution_batch(
         1 if marker_action == "add" else -1
     )
     locked_marker_value_literal = _sql_string_literal(locked_marker_value or "")
+    # The fence reads the request-named view; the DDL resolves the name the
+    # statement writes. They must be the same object.
+    target_guard: list[str] = []
+    parsed_statement = _parse_view_module(statement) if expected_exists else None
+    if parsed_statement is not None:
+        # The written identifier tokens without the trivia between them:
+        # CREATE VIEW accepts "s . v", OBJECT_ID returns NULL for it.
+        written_literal = _sql_string_literal(".".join(parsed_statement.name_parts))
+        target_guard = [
+            f"IF OBJECT_ID(N'{written_literal}', N'V') IS NULL",
+            f"   OR OBJECT_ID(N'{written_literal}', N'V') <> @actual_object_id",
+            "BEGIN",
+            "    ROLLBACK TRANSACTION;",
+            "    THROW 51003, N'view mutation statement does not target the fenced view', 1;",
+            "END;",
+        ]
     escaped = statement.replace("'", "''")
     fence_comment = (
         "-- AzureSqlMcp view fence "
@@ -988,6 +1022,7 @@ def _build_fenced_view_execution_batch(
             "    ROLLBACK TRANSACTION;",
             "    THROW 51001, N'view mutation precondition no longer matches', 1;",
             "END;",
+            *target_guard,
             f"EXEC sys.sp_executesql N'{escaped}';",
             *(
                 [
@@ -1273,6 +1308,9 @@ def prepared_view_change_state(prepared: PreparedViewChange) -> dict[str, Any]:
             "marker_present": prior.marker_present,
             "marker_value": prior.marker_value,
             "reserved_marker_names": list(prior.reserved_marker_names),
+            "catalog_schema_name": prior.catalog_schema_name,
+            "catalog_view_name": prior.catalog_view_name,
+            "catalog_names_ignore_case": prior.catalog_names_ignore_case,
         },
         "marker_name": prepared.marker_name,
         "marker_value": prepared.marker_value,
@@ -1621,7 +1659,9 @@ class ViewWorkflowService:
         definition = row.get("definition")
         if definition is None:
             raise ViewWorkflowError(
-                f"view {schema_name}.{view_name} exists but its definition is unavailable"
+                f"view {schema_name}.{view_name} exists but its definition is "
+                "unavailable (a WITH ENCRYPTION view, or no VIEW DEFINITION "
+                "permission), so no exact rollback can be captured"
             )
         definition_text = str(definition)
         parsed = _parse_view_module(definition_text)
@@ -1716,6 +1756,13 @@ class ViewWorkflowService:
             marker_present=marker_present,
             marker_value=marker_value,
             reserved_marker_names=reserved_marker_names,
+            catalog_schema_name=(
+                str(row["schema_name"]) if row.get("schema_name") is not None else None
+            ),
+            catalog_view_name=(
+                str(row["view_name"]) if row.get("view_name") is not None else None
+            ),
+            catalog_names_ignore_case=bool(_as_bool(row.get("catalog_names_ignore_case"))),
         )
 
     async def prepare(self, request: ViewChangeRequest) -> PreparedViewChange:
@@ -1725,12 +1772,17 @@ class ViewWorkflowService:
             schema_bound=bool(request.schema_bound),
         )
         marker_name = _new_marker_name()
-        prior = await self.capture_view(
-            request.database_name,
-            request.schema_name,
-            request.view_name,
-            marker_name=marker_name,
-        )
+        try:
+            prior = await self.capture_view(
+                request.database_name,
+                request.schema_name,
+                request.view_name,
+                marker_name=marker_name,
+            )
+        except ViewWorkflowError as exc:
+            # Prepare only reads, so here (unlike after apply or rollback DDL)
+            # the refusal can promise that nothing changed.
+            raise type(exc)(f"{exc}; nothing was changed") from exc
         _require_azure_sql_module_options(prior)
         request = resolve_view_request_schema_bound(request, prior)
         legality = require_valid_view_definition(
@@ -1874,7 +1926,8 @@ class ViewWorkflowService:
                 )
             verification = await self.verify(prepared)
             if not verification.verified:
-                raise ViewVerificationError(
+                # No DDL ran here, so this is not a post-write verification error.
+                raise ViewWorkflowError(
                     "no-op view verification failed; prepare a new reviewed change"
                 )
             return {
@@ -1951,13 +2004,18 @@ class ViewWorkflowService:
             verification_required=True,
         )
         execution = await self._execute_once(action)
-        verification = await self.verify(prepared)
-        dispatch_proof = _build_dispatch_proof(
-            execution,
-            action.sql,
-            prepared,
-            object_id=verification.actual.object_id,
-        )
+        try:
+            verification = await self.verify(prepared)
+            dispatch_proof = _build_dispatch_proof(
+                execution,
+                action.sql,
+                prepared,
+                object_id=verification.actual.object_id,
+            )
+        except ViewVerificationError:
+            raise
+        except ViewWorkflowError as exc:
+            raise _dispatched_outcome_unknown("view DDL", exc) from exc
         confirmed = replace(verification.actual, dispatch_proof=dispatch_proof)
         self._applied_receipts[self._receipt_key(prepared)] = confirmed
         if not verification.verified:
@@ -2139,17 +2197,47 @@ class ViewWorkflowService:
             verification_required=True,
         )
         await self._execute_once(action)
-        after = await self.capture_view(
-            request.database_name,
-            request.schema_name,
-            request.view_name,
-            marker_name=prepared.marker_name,
-        )
-        restored = _snapshot_matches_prior(after, prepared.prior)
-        if not restored:
-            raise ViewVerificationError("exact prior view state was not restored")
+        try:
+            after = await self.capture_view(
+                request.database_name,
+                request.schema_name,
+                request.view_name,
+                marker_name=prepared.marker_name,
+            )
+            if not _snapshot_matches_prior(after, prepared.prior):
+                raise ViewVerificationError("exact prior view state was not restored")
+            exactness = self.restore_exactness(prepared, after)
+        except ViewVerificationError:
+            raise
+        except ViewWorkflowError as exc:
+            raise _dispatched_outcome_unknown("view restore", exc) from exc
         self._applied_receipts.pop(receipt_key, None)
-        return {"status": "rolled_back", "snapshot": after.as_dict()}
+        # The restore has committed: text drift is reported, not raised, so a
+        # retry cannot turn it into an unqualified "already rolled back".
+        return {
+            "status": "rolled_back",
+            "snapshot": after.as_dict(),
+            **exactness,
+        }
+
+    def restore_exactness(
+        self,
+        prepared: PreparedViewChange,
+        current: ViewSnapshot,
+    ) -> dict[str, bool]:
+        """Byte-level outcome of a restore; the fingerprint normalises text.
+
+        ``text_drift`` is true when the catalog holds neither the prior text
+        nor the text the restore writes (only a qualified name may differ).
+        """
+        prior = prepared.prior
+        definition_exact = current.definition == prior.definition
+        text_drift = (
+            prior.exists
+            and not definition_exact
+            and current.definition != _restored_catalog_definition(prior)
+        )
+        return {"definition_exact": definition_exact, "text_drift": text_drift}
 
     async def rollback_view_change(self, prepared: PreparedViewChange) -> dict[str, Any]:
         return await self.rollback(prepared)
@@ -2300,6 +2388,15 @@ def _target_quoted_identifier(
     return True if request.indexed_view or not prior.exists else prior.uses_quoted_identifier
 
 
+def _dispatched_outcome_unknown(
+    what: str, exc: ViewWorkflowError
+) -> ViewVerificationError:
+    return ViewVerificationError(
+        f"{what} was dispatched, then its outcome could not be confirmed: {exc}; "
+        "read the view with verify_view_change before any retry"
+    )
+
+
 def _build_dispatch_proof(
     execution: dict[str, Any],
     sql: str,
@@ -2349,13 +2446,17 @@ def _parse_view_module(definition: str) -> _ParsedViewDefinition | None:
     if _matches_keyword(text, position, "OR"):
         position = _consume_keyword(text, position, "OR")
         position = _consume_keyword(text, position, "ALTER")
+    keyword_end = position
     position = _consume_keyword(text, position, "VIEW")
 
-    _, position = _consume_sql_identifier(text, position, "view name")
+    name_start = _skip_space(text, position)
+    name_part, position = _consume_sql_identifier(text, position, "view name")
+    name_parts = [name_part]
     view_name_end = position
     position = _skip_space(text, position)
     if position < len(text) and text[position] == ".":
-        _, position = _consume_sql_identifier(text, position + 1, "view name")
+        name_part, position = _consume_sql_identifier(text, position + 1, "view name")
+        name_parts.append(name_part)
         view_name_end = position
         position = _skip_space(text, position)
     if position < len(text) and text[position] == ".":
@@ -2399,7 +2500,14 @@ def _parse_view_module(definition: str) -> _ParsedViewDefinition | None:
         attributes=tuple(attributes),
         raw_suffix=text[option_start:position],
     )
-    return _ParsedViewDefinition(header=header, body=text[as_position:])
+    return _ParsedViewDefinition(
+        header=header,
+        body=text[as_position:],
+        keyword_end=keyword_end,
+        name_start=name_start,
+        name_end=view_name_end,
+        name_parts=tuple(name_parts),
+    )
 
 
 def _view_snapshot_from_state(payload: dict[str, Any]) -> ViewSnapshot:
@@ -2441,6 +2549,18 @@ def _view_snapshot_from_state(payload: dict[str, Any]) -> ViewSnapshot:
         _validate_reserved_marker_inventory(reserved_marker_names)
         marker_name = marker_name_value
         definition_value = payload.get("definition")
+        # Optional: state from an earlier version has no catalog names.
+        catalog_schema_name = payload.get("catalog_schema_name")
+        catalog_view_name = payload.get("catalog_view_name")
+        if not all(
+            value is None or isinstance(value, str)
+            for value in (catalog_schema_name, catalog_view_name)
+        ):
+            raise ViewWorkflowError("durable prior view catalog names are invalid")
+        catalog_names_ignore_case = _state_bool(
+            payload.get("catalog_names_ignore_case", False),
+            "prior catalog_names_ignore_case",
+        )
     except (KeyError, TypeError, ValueError) as exc:
         raise ViewWorkflowError("durable prior view state is invalid") from exc
     if not exists:
@@ -2484,6 +2604,9 @@ def _view_snapshot_from_state(payload: dict[str, Any]) -> ViewSnapshot:
         marker_present=marker_present,
         marker_value=marker_value,
         reserved_marker_names=reserved_marker_names,
+        catalog_schema_name=catalog_schema_name,
+        catalog_view_name=catalog_view_name,
+        catalog_names_ignore_case=catalog_names_ignore_case,
     )
     _require_azure_sql_module_options(snapshot)
     return snapshot
@@ -2659,14 +2782,58 @@ def _build_snapshot_restore_module(snapshot: ViewSnapshot) -> str:
     if not snapshot.exists or snapshot.definition is None or snapshot.header is None:
         raise ViewWorkflowError("exact prior view header capture is required")
     _require_azure_sql_module_options(snapshot)
-    parsed = _parse_view_module(snapshot.definition)
+    text = snapshot.definition
+    parsed = _parse_view_module(text)
     if parsed is None:
         raise ViewWorkflowError("exact prior view header capture is required")
+    # Reuse the module text as written: the catalog then holds the prior bytes
+    # again (Azure SQL shows only the ALTER keyword as CREATE). A name that is
+    # unqualified, or stale after sp_rename, would not resolve to this view.
+    name = text[parsed.name_start : parsed.name_end]
+    if not _written_name_is_view(parsed.name_parts, snapshot):
+        name = (
+            f"{_quote_identifier(snapshot.catalog_schema_name or snapshot.schema_name)}."
+            f"{_quote_identifier(snapshot.catalog_view_name or snapshot.view_name)}"
+        )
     return (
-        f"{snapshot.header.leading_comments}ALTER VIEW "
-        f"{_quote_identifier(snapshot.schema_name)}.{_quote_identifier(snapshot.view_name)}"
-        f"{snapshot.header.raw_suffix}AS{_strip_statement_terminator(parsed.body)};"
+        f"{parsed.header.leading_comments}ALTER"
+        f"{text[parsed.keyword_end : parsed.name_start]}{name}"
+        f"{text[parsed.name_end :]}"
     )
+
+
+def _written_name_is_view(name_parts: tuple[str, ...], snapshot: ViewSnapshot) -> bool:
+    if len(name_parts) != 2:
+        return False
+    try:
+        schema_name = _canonical_identifier(name_parts[0], "schema name")
+        view_name = _canonical_identifier(name_parts[1], "view name")
+    except ViewDefinitionError:
+        return False
+    return _same_catalog_name(
+        schema_name, snapshot.catalog_schema_name or snapshot.schema_name, snapshot
+    ) and _same_catalog_name(
+        view_name, snapshot.catalog_view_name or snapshot.view_name, snapshot
+    )
+
+
+def _same_catalog_name(written: str, catalog: str, snapshot: ViewSnapshot) -> bool:
+    if written == catalog:
+        return True
+    # Case-only match on a CI catalog. ASCII only: every CI collation folds
+    # ASCII case, while non-ASCII folding differs between Python and SQL.
+    return (
+        snapshot.catalog_names_ignore_case
+        and written.isascii()
+        and catalog.isascii()
+        and written.lower() == catalog.lower()
+    )
+
+
+def _restored_catalog_definition(snapshot: ViewSnapshot) -> str:
+    module = _build_snapshot_restore_module(snapshot)
+    keyword = _consume_leading_trivia(module)
+    return f"{module[:keyword]}CREATE{module[keyword + len('ALTER') :]}"
 
 
 def _build_target_catalog_definition(prepared: PreparedViewChange) -> str:

@@ -358,6 +358,19 @@ _CALLER_STATE_ERRORS = frozenset(
     """.split()
 )
 _POLICY_ERRORS = frozenset({"DatabasePolicyError", "IndexReviewPolicyError"})
+# A write was dispatched, then the MCP could not verify or record its outcome.
+# This wins over any driver error in the chain: that error answered a later
+# read or record step, not the write itself.
+_VERIFICATION_ERRORS = frozenset({"ViewVerificationError", "PlanActionOutcomeUnknownError"})
+# failure_diagnostic.diagnostic_code for a tool error no SQL error caused.
+_FAILURE_CODES = {
+    "caller_error": "request_refused",
+    "policy": "policy_refused",
+    # A dispatched write whose outcome the MCP could not verify or record.
+    "outcome_unknown": "verification_failed",
+    "product_bug": "internal_error",
+    "product_gap": "internal_error",
+}
 # An optional setup step a DBA has not done: not a code defect.
 _SETUP_ERRORS = frozenset({"IndexReviewSetupError"})
 _STATE_ERRORS = frozenset({"PerformanceStoreError", "LearningStoreError"})
@@ -461,6 +474,21 @@ def describe_exception(
     }
 
 
+def tool_failure_code(exc: BaseException) -> str | None:
+    """The failure_diagnostic code for a tool exception, from the category
+    describe_exception files it under; None keeps the SQL diagnostic."""
+
+    chain = _exception_chain(_leaf_exception(exc))
+    names = {cls.__name__ for cls in type(chain[0]).__mro__}
+    if names & _VERIFICATION_ERRORS:
+        return "verification_failed"
+    if any(type(item).__module__.startswith(("mssql_python", "pyodbc")) for item in chain):
+        return None
+    if "LeaseConflictError" in names:
+        return "lease_conflict"
+    return _FAILURE_CODES.get(describe_exception(exc)["category"])
+
+
 def _classify_root(
     root: BaseException,
     chain: list[BaseException],
@@ -476,6 +504,8 @@ def _classify_root(
         if error["parse"].get("keyword"):
             return "product_gap", "P2"
         return "caller_error", "P4"
+    if names & _VERIFICATION_ERRORS:
+        return "outcome_unknown", "P1"
     if any(name.endswith("OutcomeUnknownError") for name in names):
         cause = root.__cause__
         if cause is not None and type(cause).__module__.startswith("mssql_python"):

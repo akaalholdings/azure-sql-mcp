@@ -17,7 +17,9 @@ from azure_sql_mcp.database_policy import DatabasePolicySet
 from azure_sql_mcp.server import AzureSqlMcpApplication
 from azure_sql_mcp.view_workflows import ViewChangeRequest
 from azure_sql_mcp.view_workflows import ViewDefinitionError
+from azure_sql_mcp.view_workflows import VIEW_DEFINITION_SQL
 from azure_sql_mcp.view_workflows import ViewPolicyError
+from azure_sql_mcp.view_workflows import ViewVerificationError
 from azure_sql_mcp.view_workflows import ViewWorkflowError
 from azure_sql_mcp.view_workflows import ViewWorkflowService
 from azure_sql_mcp.view_workflows import build_view_execution_batch
@@ -51,6 +53,10 @@ class FakeViewExecutor:
         self.batch_history: list[tuple[str, str]] = []
         self.before_execute: Callable[[], None] | None = None
         self.at_lock_boundary: Callable[[], None] | None = None
+
+    def _resolve(self, schema_name: str, view_name: str) -> tuple[str, str] | None:
+        key = (schema_name, view_name)
+        return key if key in self.views else None
 
     async def fetch_all(self, database_name, query, params=None):
         if "sys.extended_properties" in query:
@@ -309,6 +315,33 @@ class FakeViewExecutor:
                     raise ViewWorkflowError(
                         "view mutation precondition no longer matches"
                     )
+                # OBJECT_ID resolves the statement's written name the way the
+                # DDL will; it must be the fenced object.
+                target_guard = re.search(
+                    r"OBJECT_ID\(N'((?:''|[^'])*)', N'V'\) IS NULL",
+                    sql,
+                )
+                if target_guard is not None:
+                    raw_parts = target_guard.group(1).replace("''", "'").split(".")
+                    parts = [part.strip("[]") for part in raw_parts]
+                    # Like OBJECT_ID: whitespace or a comment between name parts
+                    # does not resolve, although CREATE VIEW accepts it.
+                    resolved = (
+                        self._resolve(*parts)
+                        if len(parts) == 2 and all(part == part.strip() for part in raw_parts)
+                        else None
+                    )
+                    if (
+                        resolved is None
+                        or self.object_ids.get(resolved) != expected_object_id
+                    ):
+                        if marker_was_present:
+                            self.extended_properties[marker_key] = marker_before
+                        else:
+                            self.extended_properties.pop(marker_key, None)
+                        raise ViewWorkflowError(
+                            "view mutation statement does not target the fenced view"
+                        )
             else:
                 if self._fence_state(key, marker_name) != expected_state:
                     raise ViewWorkflowError(
@@ -331,21 +364,26 @@ class FakeViewExecutor:
                 module_sql = decoded
                 break
         match = re.search(
-            r"(CREATE|ALTER) VIEW \[([^]]+)\]\.\[([^]]+)\]",
+            r"(CREATE|ALTER)\s+VIEW\s+"
+            r"(?:\[([^]]+)\]|([A-Za-z_]\w*))\s*\.\s*(?:\[([^]]+)\]|([A-Za-z_]\w*))",
             module_sql,
             flags=re.IGNORECASE,
         )
         if match:
-            operation, schema_name, view_name = match.groups()
+            operation = match.group(1)
+            schema_name = match.group(2) or match.group(3)
+            view_name = match.group(4) or match.group(5)
             key = (schema_name, view_name)
             if operation.casefold() == "create" and key in self.views:
                 raise ViewWorkflowError("CREATE VIEW target was created concurrently")
             if operation.casefold() == "create" or key not in self.object_ids:
                 self.object_ids[key] = self._next_object_id
                 self._next_object_id += 1
+            # Azure SQL Database stores ALTER text as written, with only the
+            # ALTER keyword shown as CREATE (spacing and case kept).
             self.views[key] = re.sub(
-                r"\bALTER VIEW",
-                "CREATE VIEW",
+                r"\bALTER(?=\s+VIEW\b)",
+                "CREATE",
                 module_sql,
                 count=1,
                 flags=re.IGNORECASE,
@@ -906,6 +944,60 @@ async def test_noop_apply_rejects_view_changed_after_prepare(
     with pytest.raises(ViewWorkflowError, match="changed after preview"):
         await service.apply(prepared)
 
+    assert executor.batch_history == []
+
+
+class _ChangesOnSecondDefinitionReadExecutor(FakeViewExecutor):
+    """A concurrent ALTER lands between the no-op identity read and verify."""
+
+    def __init__(self, definition: str) -> None:
+        super().__init__(definition)
+        self.definition_reads = 0
+        self.armed = False
+
+    async def fetch_all(self, database_name, query, params=None):
+        if "m.definition" in query and self.armed:
+            self.definition_reads += 1
+            if self.definition_reads == 2:
+                self.views[("dbo", "SalesView")] = (
+                    "CREATE VIEW [dbo].[SalesView] AS SELECT [Id] FROM [dbo].[Other];"
+                )
+        return await super().fetch_all(database_name, query, params)
+
+
+@pytest.mark.asyncio
+async def test_noop_verification_failure_is_not_a_post_write_verification_error(
+    server_config_factory,
+    tmp_path: Path,
+) -> None:
+    # No DDL runs on the no-op path, so its failure must not carry the
+    # "write was sent, outcome unknown" class (a P1 incident, "do not resubmit").
+    executor = _ChangesOnSecondDefinitionReadExecutor(
+        "CREATE VIEW [dbo].[SalesView] AS SELECT [Id] FROM [dbo].[Sales];"
+    )
+    service = ViewWorkflowService(
+        executor,
+        _policy(),
+        _admin(server_config_factory, tmp_path, WritePolicy.APPLY),
+    )
+    prepared = await service.prepare(
+        ViewChangeRequest(
+            database_name="testdb",
+            schema_name="dbo",
+            view_name="SalesView",
+            definition="SELECT [Id] FROM [dbo].[Sales]",
+            operation="alter",
+            reviewed_intent=True,
+            idempotency_key="noop-verify",
+        )
+    )
+    assert prepared.operation == "noop"
+    executor.armed = True
+
+    with pytest.raises(ViewWorkflowError, match="no-op view verification") as raised:
+        await service.apply(prepared)
+
+    assert type(raised.value) is ViewWorkflowError
     assert executor.batch_history == []
 
 
@@ -2213,3 +2305,568 @@ async def test_function_dependencies_are_included_in_view_verification(
 
     assert verification.verified is True
     assert verification.dependencies_verified is True
+
+
+async def _alter_then_rollback(
+    executor: FakeViewExecutor,
+    server_config_factory,
+    tmp_path: Path,
+) -> tuple[dict, str]:
+    service = ViewWorkflowService(
+        executor,
+        _policy(),
+        _admin(server_config_factory, tmp_path, WritePolicy.APPLY),
+    )
+    prepared = await service.prepare(
+        ViewChangeRequest(
+            database_name="testdb",
+            schema_name="dbo",
+            view_name="SalesView",
+            definition="SELECT Id, Amount FROM dbo.NewSales",
+            operation="alter",
+            reviewed_intent=True,
+            idempotency_key="exact-text-rollback",
+        )
+    )
+    await service.apply(prepared)
+    return await service.rollback(prepared), prepared.rollback_sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prior_definition",
+    [
+        # Name as written, no terminator: the shape seen live on Azure SQL.
+        "CREATE VIEW dbo.SalesView (cust, amt)\n"
+        "WITH SCHEMABINDING, VIEW_METADATA\n"
+        "AS SELECT Id, Amount FROM dbo.Sales WHERE Id < 100",
+        # Mixed quoting, extra spaces (what CREATE OR ALTER leaves), lower "as".
+        "-- owner note\nCREATE   VIEW [dbo].SalesView\nas\nSELECT Id FROM dbo.Sales",
+    ],
+)
+async def test_rollback_restores_the_prior_module_text_byte_for_byte(
+    server_config_factory,
+    tmp_path: Path,
+    prior_definition: str,
+) -> None:
+    # Text or checksum drift checks on sys.sql_modules must see no change
+    # after a rollback, so the restore keeps the name as written and adds no
+    # terminator.
+    executor = FakeViewExecutor(prior_definition)
+
+    result, rollback_sql = await _alter_then_rollback(
+        executor, server_config_factory, tmp_path
+    )
+
+    assert result["status"] == "rolled_back"
+    assert result["definition_exact"] is True
+    assert executor.views[("dbo", "SalesView")] == prior_definition
+    assert "[dbo].[SalesView]" not in rollback_sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prior_definition",
+    [
+        # Unqualified: resolves against the creator's default schema, which
+        # the MCP login may not share, so the name must be qualified.
+        "CREATE VIEW SalesView AS SELECT Id FROM dbo.Sales",
+        # sp_rename leaves the old name in the module text.
+        "CREATE VIEW dbo.OldSalesView AS SELECT Id FROM dbo.Sales",
+    ],
+)
+async def test_rollback_qualifies_a_name_that_does_not_name_the_view(
+    server_config_factory,
+    tmp_path: Path,
+    prior_definition: str,
+) -> None:
+    executor = FakeViewExecutor(prior_definition)
+
+    result, _rollback_sql = await _alter_then_rollback(
+        executor, server_config_factory, tmp_path
+    )
+
+    assert result["status"] == "rolled_back"
+    assert result["definition_exact"] is False
+    assert executor.views[("dbo", "SalesView")] == (
+        "CREATE VIEW [dbo].[SalesView] AS SELECT Id FROM dbo.Sales"
+    )
+
+
+class _TerminatorDriftExecutor(FakeViewExecutor):
+    """Catalog text gains a newline after the restore: same meaning, other bytes."""
+
+    drift = False
+
+    async def execute_batches(self, database_name, sql, params=(), **kwargs):
+        result = await super().execute_batches(database_name, sql, params, **kwargs)
+        if self.drift:
+            self.views[("dbo", "SalesView")] += "\n"
+        return result
+
+
+@pytest.mark.asyncio
+async def test_rollback_text_drift_is_not_hidden_by_normalisation(
+    server_config_factory,
+    tmp_path: Path,
+) -> None:
+    executor = _TerminatorDriftExecutor(
+        "CREATE VIEW [dbo].[SalesView] AS SELECT Id FROM dbo.Sales"
+    )
+    service = ViewWorkflowService(
+        executor,
+        _policy(),
+        _admin(server_config_factory, tmp_path, WritePolicy.APPLY),
+    )
+    prepared = await service.prepare(
+        ViewChangeRequest(
+            database_name="testdb",
+            schema_name="dbo",
+            view_name="SalesView",
+            definition="SELECT Id FROM dbo.NewSales",
+            operation="alter",
+            reviewed_intent=True,
+            idempotency_key="drift-rollback",
+        )
+    )
+    await service.apply(prepared)
+    executor.drift = True
+
+    # The restore has committed, so the drift is a result field, not an error
+    # an agent would retry into an "already rolled back" success.
+    result = await service.rollback(prepared)
+
+    assert result["status"] == "rolled_back"
+    assert result["definition_exact"] is False
+    assert result["text_drift"] is True
+    # A retry re-reads the catalog; the same rule must still see the drift.
+    restored, current = await service.prior_state_restored(prepared)
+    assert restored is True
+    assert service.restore_exactness(prepared, current) == {
+        "definition_exact": False,
+        "text_drift": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_restore_exactness_accepts_the_known_qualified_name_restore(
+    server_config_factory,
+    tmp_path: Path,
+) -> None:
+    # An unqualified name must be restored qualified: not exact, but it is the
+    # text the restore wrote, so it is not drift.
+    executor = FakeViewExecutor("CREATE VIEW SalesView AS SELECT Id FROM dbo.Sales")
+    service = ViewWorkflowService(
+        executor,
+        _policy(),
+        _admin(server_config_factory, tmp_path, WritePolicy.APPLY),
+    )
+    prepared = await service.prepare(
+        ViewChangeRequest(
+            database_name="testdb",
+            schema_name="dbo",
+            view_name="SalesView",
+            definition="SELECT Id FROM dbo.NewSales",
+            operation="alter",
+            reviewed_intent=True,
+            idempotency_key="qualified-rollback",
+        )
+    )
+    await service.apply(prepared)
+    result = await service.rollback(prepared)
+
+    assert (result["definition_exact"], result["text_drift"]) == (False, False)
+    _restored, current = await service.prior_state_restored(prepared)
+    assert service.restore_exactness(prepared, current) == {
+        "definition_exact": False,
+        "text_drift": False,
+    }
+
+
+class _CaseInsensitiveCatalogExecutor(FakeViewExecutor):
+    """Azure SQL's default CI collation: any name case finds the view."""
+
+    async def fetch_all(self, database_name, query, params=None):
+        if params:
+            params = list(params)
+            for schema_name, view_name in self.views:
+                if (schema_name.casefold(), view_name.casefold()) == (
+                    str(params[0]).casefold(),
+                    str(params[1]).casefold(),
+                ):
+                    params[0], params[1] = schema_name, view_name
+        rows = await super().fetch_all(database_name, query, params)
+        return [
+            {**row, "catalog_names_ignore_case": 1} if "definition" in row else row
+            for row in rows
+        ]
+
+
+@pytest.mark.asyncio
+async def test_rollback_keeps_the_written_name_when_the_caller_uses_other_case(
+    server_config_factory,
+    tmp_path: Path,
+) -> None:
+    executor = _CaseInsensitiveCatalogExecutor(
+        "CREATE VIEW dbo.SalesView AS SELECT Id FROM dbo.Sales"
+    )
+    service = ViewWorkflowService(
+        executor,
+        _policy(),
+        _admin(server_config_factory, tmp_path, WritePolicy.APPLY),
+    )
+    prepared = await service.prepare(
+        ViewChangeRequest(
+            database_name="testdb",
+            schema_name="DBO",
+            view_name="salesview",
+            definition="SELECT Id FROM dbo.NewSales",
+            operation="alter",
+            reviewed_intent=True,
+            idempotency_key="case-rollback",
+        )
+    )
+
+    assert "ALTER VIEW dbo.SalesView AS SELECT Id FROM dbo.Sales" in (
+        prepared.rollback_sql
+    )
+    # A restart rebuilds the restore from durable state: same written name.
+    restarted = prepared_view_change_from_state(prepared_view_change_state(prepared))
+    assert restarted.rollback_sql == prepared.rollback_sql
+
+
+def _alter_request(schema_name: str, view_name: str, key: str) -> ViewChangeRequest:
+    return ViewChangeRequest(
+        database_name="testdb",
+        schema_name=schema_name,
+        view_name=view_name,
+        definition="SELECT Id FROM dbo.NewSales",
+        operation="alter",
+        reviewed_intent=True,
+        idempotency_key=key,
+    )
+
+
+@pytest.mark.asyncio
+async def test_rollback_keeps_a_case_only_different_written_name_on_ci_catalog(
+    server_config_factory,
+    tmp_path: Path,
+) -> None:
+    # On a CI catalog collation DBO.SalesView resolves to dbo.SalesView, so the
+    # written text can be reused and the restore stays byte exact.
+    executor = _CaseInsensitiveCatalogExecutor(
+        "CREATE VIEW DBO.SalesView AS SELECT Id FROM dbo.Sales"
+    )
+    service = ViewWorkflowService(
+        executor,
+        _policy(),
+        _admin(server_config_factory, tmp_path, WritePolicy.APPLY),
+    )
+    prepared = await service.prepare(_alter_request("dbo", "SalesView", "ci-name"))
+
+    assert "ALTER VIEW DBO.SalesView AS SELECT Id FROM dbo.Sales" in (
+        prepared.rollback_sql
+    )
+    restarted = prepared_view_change_from_state(prepared_view_change_state(prepared))
+    assert restarted.rollback_sql == prepared.rollback_sql
+
+
+@pytest.mark.asyncio
+async def test_rollback_rewrites_a_case_only_different_name_on_cs_catalog(
+    server_config_factory,
+    tmp_path: Path,
+) -> None:
+    # A case-sensitive catalog does not resolve DBO to dbo: use the catalog name.
+    executor = FakeViewExecutor("CREATE VIEW DBO.SalesView AS SELECT Id FROM dbo.Sales")
+    service = ViewWorkflowService(
+        executor,
+        _policy(),
+        _admin(server_config_factory, tmp_path, WritePolicy.APPLY),
+    )
+    prepared = await service.prepare(_alter_request("dbo", "SalesView", "cs-name"))
+
+    assert "ALTER VIEW [dbo].[SalesView] AS SELECT Id FROM dbo.Sales" in (
+        prepared.rollback_sql
+    )
+
+
+@pytest.mark.asyncio
+async def test_rollback_fallback_name_uses_catalog_case_not_request_case(
+    server_config_factory,
+    tmp_path: Path,
+) -> None:
+    executor = _CaseInsensitiveCatalogExecutor(
+        "CREATE VIEW SalesView AS SELECT Id FROM dbo.Sales"
+    )
+    service = ViewWorkflowService(
+        executor,
+        _policy(),
+        _admin(server_config_factory, tmp_path, WritePolicy.APPLY),
+    )
+    prepared = await service.prepare(_alter_request("DBO", "salesview", "fallback"))
+
+    assert "ALTER VIEW [dbo].[SalesView] AS SELECT Id FROM dbo.Sales" in (
+        prepared.rollback_sql
+    )
+    restarted = prepared_view_change_from_state(prepared_view_change_state(prepared))
+    assert restarted.rollback_sql == prepared.rollback_sql
+
+
+class _EncryptedViewExecutor(FakeViewExecutor):
+    async def fetch_all(self, database_name, query, params=None):
+        rows = await super().fetch_all(database_name, query, params)
+        return [
+            {**row, "definition": None} if "definition" in row else row
+            for row in rows
+        ]
+
+
+@pytest.mark.asyncio
+async def test_prepare_refuses_an_encrypted_view_and_says_nothing_changed(
+    server_config_factory,
+    tmp_path: Path,
+) -> None:
+    # sys.sql_modules.definition is NULL for a WITH ENCRYPTION view, so no
+    # exact rollback can be captured; prepare only reads, so it can say so.
+    executor = _EncryptedViewExecutor("CREATE VIEW [dbo].[SalesView] AS SELECT 1 AS Id")
+    service = ViewWorkflowService(
+        executor,
+        _policy(),
+        _admin(server_config_factory, tmp_path, WritePolicy.APPLY),
+    )
+
+    with pytest.raises(
+        ViewWorkflowError, match="WITH ENCRYPTION.*; nothing was changed$"
+    ):
+        await service.prepare(
+            ViewChangeRequest(
+                database_name="testdb",
+                schema_name="dbo",
+                view_name="SalesView",
+                definition="SELECT 2 AS Id",
+                operation="alter",
+                reviewed_intent=True,
+                idempotency_key="encrypted-view",
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_capture_after_committed_ddl_does_not_claim_nothing_changed(
+    server_config_factory,
+    tmp_path: Path,
+) -> None:
+    # capture_view also runs after apply and rollback DDL has committed, so
+    # its own refusal must stay neutral.
+    executor = _EncryptedViewExecutor("CREATE VIEW [dbo].[SalesView] AS SELECT 1 AS Id")
+    service = ViewWorkflowService(
+        executor,
+        _policy(),
+        _admin(server_config_factory, tmp_path, WritePolicy.APPLY),
+    )
+
+    with pytest.raises(ViewWorkflowError, match="WITH ENCRYPTION") as raised:
+        await service.capture_view("testdb", "dbo", "SalesView")
+    assert "nothing was changed" not in str(raised.value)
+
+
+class _DropsViewAfterDdlExecutor(FakeViewExecutor):
+    """Another session drops the view as soon as the workflow DDL commits."""
+
+    async def execute_batches(self, database_name, sql, params=(), **kwargs):
+        result = await super().execute_batches(database_name, sql, params, **kwargs)
+        self.views.pop(("dbo", "SalesView"), None)
+        self.object_ids.pop(("dbo", "SalesView"), None)
+        return result
+
+
+@pytest.mark.asyncio
+async def test_apply_error_after_ddl_dispatch_is_outcome_unknown(
+    server_config_factory,
+    tmp_path: Path,
+) -> None:
+    # The ALTER ran; a refusal after it must not read as "nothing changed".
+    executor = _DropsViewAfterDdlExecutor(
+        "CREATE VIEW [dbo].[SalesView] AS SELECT [Id] FROM [dbo].[OldSales];"
+    )
+    service = ViewWorkflowService(
+        executor,
+        _policy(),
+        _admin(server_config_factory, tmp_path, WritePolicy.APPLY),
+    )
+    prepared = await service.prepare(
+        _alter_request("dbo", "SalesView", "drop-after-ddl")
+    )
+
+    with pytest.raises(ViewVerificationError, match="no confirmed object identity"):
+        await service.apply(prepared)
+
+    assert len(executor.batch_history) == 1
+
+
+@pytest.mark.asyncio
+async def test_apply_refusal_before_ddl_dispatch_stays_a_plain_refusal(
+    server_config_factory,
+    tmp_path: Path,
+) -> None:
+    executor = FakeViewExecutor(
+        "CREATE VIEW [dbo].[SalesView] AS SELECT [Id] FROM [dbo].[OldSales];"
+    )
+    service = ViewWorkflowService(
+        executor,
+        _policy(),
+        _admin(server_config_factory, tmp_path, WritePolicy.APPLY),
+    )
+    prepared = await service.prepare(_alter_request("dbo", "SalesView", "pre-ddl"))
+    executor.object_ids[("dbo", "SalesView")] = 99
+
+    with pytest.raises(ViewWorkflowError, match="changed after preview") as raised:
+        await service.apply(prepared)
+
+    assert type(raised.value) is ViewWorkflowError
+    assert executor.batch_history == []
+
+
+class _HidesDefinitionAfterNextBatchExecutor(FakeViewExecutor):
+    """The module text becomes unreadable once the next batch has run."""
+
+    armed = False
+    hidden = False
+
+    async def execute_batches(self, database_name, sql, params=(), **kwargs):
+        result = await super().execute_batches(database_name, sql, params, **kwargs)
+        self.hidden = self.armed
+        return result
+
+    async def fetch_all(self, database_name, query, params=None):
+        rows = await super().fetch_all(database_name, query, params)
+        if not self.hidden:
+            return rows
+        return [
+            {**row, "definition": None} if "definition" in row else row
+            for row in rows
+        ]
+
+
+@pytest.mark.asyncio
+async def test_rollback_error_after_restore_dispatch_is_outcome_unknown(
+    server_config_factory,
+    tmp_path: Path,
+) -> None:
+    executor = _HidesDefinitionAfterNextBatchExecutor(
+        "CREATE VIEW [dbo].[SalesView] AS SELECT [Id] FROM [dbo].[OldSales];"
+    )
+    service = ViewWorkflowService(
+        executor,
+        _policy(),
+        _admin(server_config_factory, tmp_path, WritePolicy.APPLY),
+    )
+    prepared = await service.prepare(
+        _alter_request("dbo", "SalesView", "hidden-after-restore")
+    )
+    await service.apply(prepared)
+    executor.armed = True
+
+    with pytest.raises(ViewVerificationError, match="definition is unavailable"):
+        await service.rollback(prepared)
+
+    assert len(executor.batch_history) == 2
+
+
+def test_catalog_case_flag_requires_sql_to_fold_every_ascii_letter() -> None:
+    # Turkish_CI_AS and Azeri_Latin_100_CI_AS are CI but do not fold I and i
+    # (live: N'VIEW_I' = N'view_i' COLLATE Turkish_CI_AS is false), and
+    # x = UPPER(x) AND x = LOWER(x) was 1 there. Comparing each name with the
+    # whole ASCII alphabet appended in both cases lets the column collation
+    # decide for every letter Python folds.
+    flag_sql = VIEW_DEFINITION_SQL.split("AS catalog_names_ignore_case")[0]
+    upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    lower = upper.lower()
+    for column in ("s.name", "v.name"):
+        assert f"{column} + N'{upper}' = {column} + N'{lower}'" in flag_sql
+    assert "UPPER(" not in flag_sql and "LOWER(" not in flag_sql
+
+
+def _turkish_fold(name: str) -> str:
+    # Turkish CI: I pairs with dotless i, i with dotted I, so I and i differ.
+    return "".join(
+        "\u0131" if char == "I" else char.lower() if char.isascii() else char
+        for char in name
+    )
+
+
+class _TurkishCatalogWithWrongCaseFlagExecutor(FakeViewExecutor):
+    """A Turkish_CI_AS catalog that still reports catalog_names_ignore_case=1.
+
+    The flag is wrong on purpose: the batch itself must refuse a restore text
+    whose written name resolves to another object.
+    """
+
+    def _resolve(self, schema_name: str, view_name: str) -> tuple[str, str] | None:
+        wanted = (_turkish_fold(schema_name), _turkish_fold(view_name))
+        return next(
+            (key for key in self.views if tuple(map(_turkish_fold, key)) == wanted),
+            None,
+        )
+
+    async def fetch_all(self, database_name, query, params=None):
+        rows = await super().fetch_all(database_name, query, params)
+        return [
+            {**row, "catalog_names_ignore_case": 1} if "definition" in row else row
+            for row in rows
+        ]
+
+
+@pytest.mark.asyncio
+async def test_restore_text_cannot_alter_an_object_other_than_the_fenced_view(
+    server_config_factory,
+    tmp_path: Path,
+) -> None:
+    # sp_rename dbo.VIEW_I -> view_i (a different name under Turkish), then a
+    # new dbo.VIEW_I. The restore of view_i keeps the written "dbo.VIEW_I".
+    executor = _TurkishCatalogWithWrongCaseFlagExecutor()
+    executor.views[("dbo", "view_i")] = "CREATE VIEW dbo.VIEW_I AS SELECT 1 AS a"
+    executor.object_ids[("dbo", "view_i")] = 17
+    other = "CREATE VIEW dbo.VIEW_I AS SELECT 2 AS a"
+    executor.views[("dbo", "VIEW_I")] = other
+    executor.object_ids[("dbo", "VIEW_I")] = 30
+    service = ViewWorkflowService(
+        executor,
+        _policy(),
+        _admin(server_config_factory, tmp_path, WritePolicy.APPLY),
+    )
+    prepared = await service.prepare(_alter_request("dbo", "view_i", "turkish-i"))
+    await service.apply(prepared)
+    applied = executor.views[("dbo", "view_i")]
+
+    with pytest.raises(ViewWorkflowError, match="does not target the fenced view"):
+        await service.rollback(prepared)
+
+    assert executor.views[("dbo", "VIEW_I")] == other
+    assert executor.views[("dbo", "view_i")] == applied
+    assert ("dbo", "view_i", prepared.marker_name) in executor.extended_properties
+
+
+@pytest.mark.asyncio
+async def test_rollback_of_a_view_written_with_spaces_between_name_parts(
+    server_config_factory,
+    tmp_path: Path,
+) -> None:
+    # CREATE VIEW accepts "dbo . SpacedView", OBJECT_ID does not. The restore
+    # guard must resolve the same object the DDL resolves, or every rollback
+    # of such a view fails with 51003 and the change can never be undone.
+    executor = FakeViewExecutor()
+    original = "CREATE VIEW dbo . SpacedView AS SELECT 1 AS a"
+    executor.views[("dbo", "SpacedView")] = original
+    executor.object_ids[("dbo", "SpacedView")] = 41
+    service = ViewWorkflowService(
+        executor,
+        _policy(),
+        _admin(server_config_factory, tmp_path, WritePolicy.APPLY),
+    )
+    prepared = await service.prepare(_alter_request("dbo", "SpacedView", "spaced"))
+    await service.apply(prepared)
+
+    await service.rollback(prepared)
+
+    assert executor.views[("dbo", "SpacedView")] == original
