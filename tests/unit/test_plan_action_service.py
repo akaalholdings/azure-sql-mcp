@@ -316,6 +316,7 @@ async def test_prepared_apply_verifies_and_restores_exact_prior_state(
         authorization_reference="approved-change",
     )
     assert applied_result["confirmed"] is True
+    _age_applied_intent(store, intent_id)
 
     verified = await service.verify(
         "appdb",
@@ -917,6 +918,26 @@ async def test_concurrent_apply_uses_one_durable_mutation_claim(
     assert len(blocker.actions) == 1
 
 
+def _age_applied_intent(store: PerformanceStore, intent_id: str) -> None:
+    """Verify runs after the post-apply window has elapsed, as it does in use.
+
+    Without this a verify microseconds after apply gets a zero-length window on a
+    coarse clock (Windows before Python 3.13 ticks about every 15 ms), and holds
+    with "windows must have positive duration", whatever the evidence says.
+    """
+
+    latest = store.get_plan_action_intent(intent_id)
+    applied = datetime.fromisoformat(str(latest.metadata["applied_at_utc"]))
+    store.save_plan_action_intent(
+        replace(
+            latest,
+            metadata={**latest.metadata, "applied_at_utc": (applied - timedelta(hours=1)).isoformat()},
+            version=latest.version + 1,
+        ),
+        expected_version=latest.version,
+    )
+
+
 async def _applied_force_plan(
     server_config_factory,
     *,
@@ -952,6 +973,7 @@ async def _applied_force_plan(
         authorization_reference="approved-change",
     )
     assert applied_result["confirmed"] is True
+    _age_applied_intent(store, intent_id)
     return service, store, admin, intent_id
 
 
