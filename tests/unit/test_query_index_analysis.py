@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
-from types import SimpleNamespace
 
 import pytest
 
@@ -109,12 +108,10 @@ async def test_analyze_queries_uses_typed_contract_for_estimated_plan() -> None:
 
     assert result["queries_analyzed"] == 1
     plan_call = executor.execute_session.await_args
-    assert plan_call.args[1][1] == contract.sp_executesql_sql
-    assert plan_call.kwargs["statement_params"] == [
-        None,
-        contract.sp_executesql_values,
-        None,
-    ]
+    # SHOWPLAN_XML returns nothing for parameter markers through mssql-python
+    # (live, 2026-11-04): the estimated plan sends constants only.
+    assert plan_call.args[1][1] == contract.sp_executesql_showplan_sql
+    assert "statement_params" not in plan_call.kwargs
     assert result["missing_index_provenance"]["source"] == "SHOWPLAN_XML"
     assert result["missing_index_provenance"][
         "zero_hint_is_not_proof_no_index_can_help"
@@ -125,52 +122,6 @@ async def test_analyze_queries_uses_typed_contract_for_estimated_plan() -> None:
     )
     assert result["raw_missing_index_hint_count"] == 0
     assert result["recommendation_count_after_filtering"] == 0
-
-
-@pytest.mark.asyncio
-async def test_analyze_queries_propagates_contract_input_sizes_to_plan_statement() -> None:
-    executor = MagicMock()
-    executor.config.row_limit = 200
-    executor.fetch_all = AsyncMock(return_value=[])
-    executor.execute_session = AsyncMock(
-        return_value=[
-            [],
-            [QueryResult(columns=("plan_xml",), rows=[{"plan_xml": "<ShowPlanXML/>"}])],
-            [],
-        ]
-    )
-    service = QueryIndexAnalysisService(executor, SafeSqlValidator())
-    service._extract_missing_indexes = MagicMock(return_value=[])
-    sql = "SELECT name FROM dbo.Widgets WHERE WidgetId = @WidgetId"
-    base_contract = ParameterExecutionContract(
-        sql_text=sql,
-        bucket_id="common",
-        parameters=(
-            TypedParameter(
-                name="@WidgetId",
-                sql_type=SqlParameterType.from_sql("bigint"),
-                value=42,
-                provenance="synthetic",
-            ),
-        ),
-        provenance="synthetic",
-    )
-    contract = SimpleNamespace(
-        sql_text=base_contract.sql_text,
-        parameters=base_contract.parameters,
-        sp_executesql_sql=base_contract.sp_executesql_sql,
-        sp_executesql_values=base_contract.sp_executesql_values,
-        sp_executesql_input_sizes=("stmt-size", "params-size", "value-size"),
-    )
-
-    await service.analyze_queries("appdb", [sql], execution_contracts=[contract])
-
-    plan_call = executor.execute_session.await_args
-    assert plan_call.kwargs["statement_input_sizes"] == [
-        None,
-        contract.sp_executesql_input_sizes,
-        None,
-    ]
 
 
 @pytest.mark.asyncio

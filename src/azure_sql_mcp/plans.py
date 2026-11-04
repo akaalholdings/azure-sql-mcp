@@ -486,10 +486,8 @@ class PlansService:
             return profiled.plan
         raw_xml = await self._get_plan_xml(
             database_name=database_name,
-            sql=contract.sp_executesql_sql,
+            sql=contract.sp_executesql_showplan_sql,
             analyze=False,
-            params=contract.sp_executesql_values,
-            input_sizes=contract.sp_executesql_input_sizes,
         )
         return ExplainPlanArtifact(
             database_name=database_name,

@@ -664,17 +664,15 @@ async def test_estimated_parameterized_plan_uses_typed_sp_executesql_arguments()
     )
 
     assert artifact.raw_xml == SAMPLE_SHOWPLAN
-    assert executor.session_history[0][1][1] == contract.sp_executesql_sql
-    assert executor.session_params[0] == [
-        None,
-        contract.sp_executesql_values,
-        None,
+    # SHOWPLAN_XML returns nothing for parameter markers through mssql-python
+    # (live, 2026-11-04), so the estimated plan sends constants only.
+    assert executor.session_history[0][1] == [
+        "SET SHOWPLAN_XML ON",
+        contract.sp_executesql_showplan_sql,
+        "SET SHOWPLAN_XML OFF",
     ]
-    assert executor.session_input_sizes[0] == [
-        None,
-        contract.sp_executesql_input_sizes,
-        None,
-    ]
+    assert "?" not in executor.session_history[0][1][1]
+    assert not executor.session_params or executor.session_params[0] is None
 
 
 @pytest.mark.asyncio

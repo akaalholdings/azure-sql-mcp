@@ -84,9 +84,7 @@ class QueryIndexAnalysisService:
             if contract is not None and contract.parameters:
                 plan_xml = await self._get_estimated_plan(
                     database_name,
-                    contract.sp_executesql_sql,
-                    params=contract.sp_executesql_values,
-                    input_sizes=contract.sp_executesql_input_sizes,
+                    contract.sp_executesql_showplan_sql,
                 )
             else:
                 plan_xml = await self._get_estimated_plan(

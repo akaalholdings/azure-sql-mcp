@@ -661,6 +661,85 @@ def test_sp_executesql_supports_query_parameters_named_stmt_and_params() -> None
     assert contract.parameter_definition == "@stmt int, @params int"
 
 
+def test_showplan_form_sends_every_argument_as_a_constant() -> None:
+    # Live (2026-11-04, Azure SQL Database, mssql-python 1.10): under
+    # SET SHOWPLAN_XML ON any parameter marker returns no result set, and
+    # use_prepare=False is refused, so an estimated plan needs constants only.
+    bucket = TypedParameterBucket(
+        bucket_id="showplan",
+        parameters=(
+            TypedParameter(
+                name="@Name",
+                sql_type=SqlParameterType.from_sql("nvarchar(40)"),
+                value="O'Reilly",
+                provenance="synthetic",
+            ),
+            TypedParameter(
+                name="@Code",
+                sql_type=SqlParameterType.from_sql("varchar(10)"),
+                value=None,
+                provenance="synthetic",
+            ),
+            TypedParameter(
+                name="@At",
+                sql_type=SqlParameterType.from_sql("datetime"),
+                value=datetime(2026, 11, 4, 14, 23, 44, 748708),
+                provenance="synthetic",
+            ),
+            TypedParameter(
+                name="@Amount",
+                sql_type=SqlParameterType.from_sql("decimal(18,2)"),
+                value=Decimal("12.50"),
+                provenance="synthetic",
+            ),
+        ),
+    )
+    contract = bucket.for_sql(
+        "SELECT 1 WHERE N'it''s' <> @Name AND @Code IS NULL AND @At > 0 AND @Amount > 0"
+    )
+
+    assert contract.sp_executesql_showplan_sql == (
+        "EXEC sys.sp_executesql "
+        "N'SELECT 1 WHERE N''it''''s'' <> @Name AND @Code IS NULL AND @At > 0 AND @Amount > 0', "
+        "N'@Name nvarchar(40), @Code varchar(10), @At datetime, @Amount decimal(18,2)', "
+        "N'O''Reilly', NULL, '2026-11-04T14:23:44.748', 12.50"
+    )
+    assert "?" not in contract.sp_executesql_showplan_sql
+
+
+def test_showplan_form_keeps_reserved_parameter_names_positional() -> None:
+    bucket = TypedParameterBucket(
+        bucket_id="reserved-names",
+        parameters=(
+            TypedParameter(name="@stmt", sql_type=SqlParameterType.from_sql("int"), value=1, provenance="synthetic"),
+            TypedParameter(name="@params", sql_type=SqlParameterType.from_sql("int"), value=2, provenance="synthetic"),
+        ),
+    )
+    contract = bucket.for_sql("SELECT @stmt + @params")
+
+    assert contract.sp_executesql_showplan_sql == (
+        "EXEC sys.sp_executesql N'SELECT @stmt + @params', N'@stmt int, @params int', 1, 2"
+    )
+
+
+def test_showplan_form_refuses_a_value_that_is_not_its_type() -> None:
+    bucket = TypedParameterBucket(
+        bucket_id="bad",
+        parameters=(
+            TypedParameter(
+                name="@Id",
+                sql_type=SqlParameterType.from_sql("int"),
+                value="1; DROP TABLE dbo.t",
+                provenance="synthetic",
+            ),
+        ),
+    )
+    contract = bucket.for_sql("SELECT @Id")
+
+    with pytest.raises(ValueError):
+        contract.sp_executesql_showplan_sql
+
+
 def test_driver_binding_ignores_escaped_bracketed_identifier_parameters() -> None:
     bucket = TypedParameterBucket(
         bucket_id="escaped-identifier",

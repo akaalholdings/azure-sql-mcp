@@ -366,6 +366,60 @@ class TypedParameterBucket:
         }
 
 
+def format_sql_literal(data_type: str, value: Any) -> str:
+    """Format a raw value as a T-SQL literal."""
+    base_type = data_type.lower().split("(")[0].strip()
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, datetime) and base_type in {"datetime", "smalldatetime"}:
+        # datetime accepts at most 3 fractional digits from a string.
+        str_value = value.replace(tzinfo=None).isoformat(timespec="milliseconds")
+    elif isinstance(value, (date, time)):
+        str_value = value.isoformat()
+    else:
+        str_value = str(value)
+
+    if base_type == "bit":
+        if str_value not in {"0", "1"}:
+            raise ValueError(f"explicit value is not valid for {data_type}")
+        return str_value
+    if base_type in {"int", "bigint", "smallint", "tinyint"}:
+        if not re.fullmatch(r"-?\d+", str_value):
+            raise ValueError(f"explicit value is not valid for {data_type}")
+        return str_value
+    if base_type in {"decimal", "numeric", "float", "real", "money", "smallmoney"}:
+        if not re.fullmatch(r"-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", str_value):
+            raise ValueError(f"explicit value is not valid for {data_type}")
+        return str_value
+    if base_type in {"nvarchar", "nchar", "ntext"}:
+        escaped = str_value.replace("'", "''")
+        return f"N'{escaped}'"
+    if base_type in {"varchar", "char", "text"}:
+        escaped = str_value.replace("'", "''")
+        return f"'{escaped}'"
+    if base_type in {
+        "date", "datetime", "datetime2", "smalldatetime",
+        "datetimeoffset", "time",
+    }:
+        escaped = str_value.replace("'", "''")
+        return f"'{escaped}'"
+    if base_type == "uniqueidentifier":
+        escaped = str_value.replace("'", "''")
+        return f"'{escaped}'"
+    if base_type in {"binary", "varbinary"}:
+        if isinstance(value, bytes):
+            return "0x" + value.hex()
+        hex_value = str_value[2:] if str_value.lower().startswith("0x") else str_value
+        if not re.fullmatch(r"[0-9a-fA-F]*", hex_value):
+            raise ValueError(f"explicit value is not valid for {data_type}")
+        return f"0x{hex_value}"
+
+    escaped = str_value.replace("'", "''")
+    return f"N'{escaped}'"
+
+
 @dataclass(frozen=True, slots=True)
 class ParameterExecutionContract:
     """Driver and ``sp_executesql`` forms for one typed parameter bucket."""
@@ -436,6 +490,29 @@ class ParameterExecutionContract:
             self.parameter_definition,
             *(parameter.value for parameter in self.parameters),
         )
+
+    @property
+    def sp_executesql_showplan_sql(self) -> str:
+        """The same positional call with constants only, for SET SHOWPLAN_XML.
+
+        Under SHOWPLAN_XML, mssql-python returns no result set for any parameter
+        marker, and an unprepared execute is refused (live, Azure SQL Database).
+        Each value is rendered by its declared type; sp_executesql converts the
+        constant to that type, so the plan compiles for the same types and values.
+        """
+
+        def unicode_literal(text: str) -> str:
+            return "N'" + text.replace("'", "''") + "'"
+
+        arguments = [
+            unicode_literal(self.sql_text),
+            unicode_literal(self.parameter_definition),
+            *(
+                format_sql_literal(parameter.sql_type.sql_declaration, parameter.value)
+                for parameter in self.parameters
+            ),
+        ]
+        return "EXEC sys.sp_executesql " + ", ".join(arguments)
 
     @property
     def sp_executesql_input_sizes(
@@ -1272,47 +1349,4 @@ class ParameterBindingService:
 
     def _format_literal(self, data_type: str, value: Any) -> str:
         """Format a raw value as a T-SQL literal."""
-        base_type = data_type.lower().split("(")[0].strip()
-        if value is None:
-            return "NULL"
-        if isinstance(value, bool):
-            return "1" if value else "0"
-        str_value = str(value)
-
-        if base_type == "bit":
-            if str_value not in {"0", "1"}:
-                raise ValueError(f"explicit value is not valid for {data_type}")
-            return str_value
-        if base_type in {"int", "bigint", "smallint", "tinyint"}:
-            if not re.fullmatch(r"-?\d+", str_value):
-                raise ValueError(f"explicit value is not valid for {data_type}")
-            return str_value
-        if base_type in {"decimal", "numeric", "float", "real", "money", "smallmoney"}:
-            if not re.fullmatch(r"-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", str_value):
-                raise ValueError(f"explicit value is not valid for {data_type}")
-            return str_value
-        if base_type in {"nvarchar", "nchar", "ntext"}:
-            escaped = str_value.replace("'", "''")
-            return f"N'{escaped}'"
-        if base_type in {"varchar", "char", "text"}:
-            escaped = str_value.replace("'", "''")
-            return f"'{escaped}'"
-        if base_type in {
-            "date", "datetime", "datetime2", "smalldatetime",
-            "datetimeoffset", "time",
-        }:
-            escaped = str_value.replace("'", "''")
-            return f"'{escaped}'"
-        if base_type == "uniqueidentifier":
-            escaped = str_value.replace("'", "''")
-            return f"'{escaped}'"
-        if base_type in {"binary", "varbinary"}:
-            if isinstance(value, bytes):
-                return "0x" + value.hex()
-            hex_value = str_value[2:] if str_value.lower().startswith("0x") else str_value
-            if not re.fullmatch(r"[0-9a-fA-F]*", hex_value):
-                raise ValueError(f"explicit value is not valid for {data_type}")
-            return f"0x{hex_value}"
-
-        escaped = str_value.replace("'", "''")
-        return f"N'{escaped}'"
+        return format_sql_literal(data_type, value)
