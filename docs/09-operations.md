@@ -508,12 +508,13 @@ Apply sequence:
 2. Call `apply_prepared_plan_action` once with the intent id and authorization reference.
 3. Confirm the applied state matches the expected force/hint state.
 4. Wait for a non-overlapping post-change Query Store window.
-5. Collect the same parameter buckets used in the pre-change window.
-6. Call `verify_plan_action`.
-7. Accept `keep`, `hold`, or automatic exact rollback on regression.
-8. Re-engage the kill switch by setting `AZURE_SQL_PLAN_APPLY_KILL_SWITCH=true` and restart/stop the apply process.
+5. Call `verify_plan_action`. The MCP reads the Query Store evidence itself; `candidate_evidence` is optional context and never produces a keep. Parameter buckets are reported as `unavailable`. When the result is `hold` because the baseline ran more than one plan or the forced plan did not run in the baseline, check each bucket with `get_query_parameter_buckets` or a benchmark with representative parameters.
+6. Accept `keep`, `hold`, or automatic exact rollback on regression.
+7. Re-engage the kill switch by setting `AZURE_SQL_PLAN_APPLY_KILL_SWITCH=true` and restart/stop the apply process.
 
-If verification evidence is insufficient, the decision is `hold`; it is not silently treated as success. `rollback_plan_action` is available for an explicitly authorized exact restore.
+A prepared intent expires 24 hours after prepare (`expires_at_utc`). Apply holds an expired intent; prepare it again with a new idempotency key.
+
+If verification evidence is insufficient, the decision is `hold`; it is not silently treated as success. `rollback_plan_action` is available for an explicitly authorized exact restore. It changes nothing for an intent that was never applied, and it holds when the current state is no longer the state the intent applied.
 
 ## Usage contexts
 
