@@ -15,6 +15,7 @@ import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import CallToolRequest
 from mcp.types import CallToolRequestParams
+from mssql_python.exceptions import sqlstate_to_exception
 
 from azure_sql_mcp.artifacts import ExplainPlanArtifact
 from azure_sql_mcp.config import AccessMode
@@ -32,11 +33,17 @@ from azure_sql_mcp.index_review import CONTRACT_SCHEMA_FINGERPRINT
 from azure_sql_mcp.performance_contracts import EvidenceEnvelopeV1
 from azure_sql_mcp.performance_store import ContractNotFoundError
 from azure_sql_mcp.performance_store import IdempotencyConflictError
+from azure_sql_mcp.performance_store import PerformanceStore
+from azure_sql_mcp.performance_store import ReservationError
+from azure_sql_mcp.index_optimizer import IndexCandidate
+from azure_sql_mcp.index_optimizer import build_index_candidate_statement
 from azure_sql_mcp.query_identity import legacy_database_fingerprint
 from azure_sql_mcp.performance_workflows import database_fingerprint
 from azure_sql_mcp.performance_workflows import fingerprint_json
 from azure_sql_mcp.server import async_main
 from azure_sql_mcp.server import AzureSqlMcpApplication
+from azure_sql_mcp.learning_store import LearningStore
+from azure_sql_mcp.plan_tree import parse_showplan
 from azure_sql_mcp.tuning_sessions import InvalidTransitionError
 from azure_sql_mcp.view_workflows import ViewChangeRequest
 from azure_sql_mcp.view_workflows import ViewSnapshot
@@ -45,6 +52,8 @@ from azure_sql_mcp.view_workflows import prepared_view_change_state
 from tests.unit.test_view_workflows import FakeViewExecutor
 from tests.unit.test_view_workflows import _admin
 from tests.unit.test_view_workflows import _policy
+from tests.unit.test_index_benchmark_workflow import _app as _index_app
+from tests.unit.test_index_benchmark_workflow import _candidate as _index_candidate
 
 
 def make_config(
@@ -1264,7 +1273,7 @@ async def test_run_tool_formats_errors_from_callback(app: AzureSqlMcpApplication
         "code": "tool_error",
         "details": {
             "failure_diagnostic": {
-                "diagnostic_code": "sql_execution_failed",
+                "diagnostic_code": "internal_error",
             }
         },
         "message": "boom",
@@ -1300,6 +1309,512 @@ async def test_run_tool_returns_allowlisted_structured_sql_diagnostic(
     serialized = json.dumps(payload)
     assert "SecretValue" not in serialized
     assert "PrivateTable" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_run_tool_marks_mcp_input_refusal_as_request_refused(
+    app: AzureSqlMcpApplication,
+) -> None:
+    """The index builder refuses a CAST filter before any SQL runs. Reporting
+    sql_execution_failed sends the agent to debug the database instead of
+    fixing its input, and the guidance must reach it without redaction."""
+
+    async def refuse(_: str) -> dict[str, str]:
+        build_index_candidate_statement(
+            IndexCandidate(
+                schema="dbo",
+                table="Orders",
+                key_columns=("Status",),
+                include_columns=(),
+                filter_definition="[Status] = CAST(1 AS tinyint)",
+            )
+        )
+        return {}
+
+    with pytest.raises(ToolError) as error:
+        await app._run_tool("benchmark_index_candidate", None, refuse)
+
+    payload = json.loads(str(error.value))
+    assert payload["code"] == "tool_error"
+    assert payload["details"]["failure_diagnostic"] == {
+        "diagnostic_code": "request_refused",
+    }
+    assert "[REDACTED]" not in payload["message"]
+    assert "[Amount] > 1000.0" in payload["message"]
+
+
+@pytest.mark.asyncio
+async def test_run_tool_marks_view_verification_failure_after_ddl_as_not_refused(
+    server_config_factory,
+    tmp_path: Path,
+    app: AzureSqlMcpApplication,
+) -> None:
+    """The CREATE VIEW ran before verification failed, so the change may have
+    left state behind: request_refused ("no SQL ran") would make the agent
+    resubmit instead of checking the view."""
+
+    executor = FakeViewExecutor()
+    service = ViewWorkflowService(
+        executor,
+        _policy(),
+        _admin(server_config_factory, tmp_path, WritePolicy.APPLY),
+    )
+    prepared = await service.prepare(
+        ViewChangeRequest(
+            database_name="testdb",
+            schema_name="dbo",
+            view_name="SalesView",
+            definition="SELECT [Id] FROM [dbo].[Sales]",
+            reviewed_intent=True,
+            idempotency_key="view-verify-drift",
+        )
+    )
+    original_execute = executor.execute_batches
+
+    async def drifting_execute(database_name, sql, params=(), **kwargs):
+        result = await original_execute(database_name, sql, params, **kwargs)
+        if ("dbo", "SalesView") in executor.views:
+            # Catalog drift after the DDL: verification sees another state.
+            executor.catalog_quoted_identifier[("dbo", "SalesView")] = False
+        return result
+
+    executor.execute_batches = drifting_execute  # type: ignore[method-assign]
+
+    async def apply(_: str) -> dict[str, Any]:
+        return await service.apply(prepared)
+
+    with pytest.raises(ToolError) as error:
+        await app._run_tool("apply_prepared_view_change", None, apply)
+
+    payload = json.loads(str(error.value))
+    assert "view verification failed" in payload["message"]
+    assert executor.batch_history, "the DDL must have been dispatched"
+    assert payload["details"]["failure_diagnostic"] == {
+        "diagnostic_code": "verification_failed",
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_tool_marks_plan_apply_gate_as_policy_refused(
+    app: AzureSqlMcpApplication,
+) -> None:
+    """A plan apply gate (profile, kill switch, write policy) refuses before
+    any SQL; sql_execution_failed sends the agent to debug the database."""
+
+    async def apply(database_name: str) -> dict[str, Any]:
+        return await app.plan_actions.apply(
+            database_name,
+            "intent-gated",
+            authorization_reference="change-1",
+        )
+
+    with pytest.raises(ToolError) as error:
+        await app._run_tool("apply_prepared_plan_action", None, apply)
+
+    payload = json.loads(str(error.value))
+    assert "enforcer-apply profile" in payload["message"]
+    assert payload["details"]["failure_diagnostic"] == {
+        "diagnostic_code": "policy_refused",
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_tool_marks_mcp_defects_as_internal_error_not_refusal(
+    app: AzureSqlMcpApplication,
+) -> None:
+    """A package TypeError and an unparsable plan are MCP defects or gaps (the
+    incident log files them as product_bug / product_gap), not the caller's
+    input to fix."""
+
+    store = LearningStore(db_path=":memory:")
+
+    async def type_error(_: str) -> dict[str, str]:
+        store._save_locked("lesson", object(), expected_version=None, actor="mcp")  # type: ignore[arg-type]
+        return {}
+
+    async def plan_parse_error(_: str) -> dict[str, str]:
+        parse_showplan("<not xml")
+        return {}
+
+    diagnostics = []
+    for callback in (type_error, plan_parse_error):
+        with pytest.raises(ToolError) as error:
+            await app._run_tool("sample_tool", None, callback)
+        diagnostics.append(json.loads(str(error.value))["details"]["failure_diagnostic"])
+
+    assert diagnostics == [
+        {"diagnostic_code": "internal_error"},
+        {"diagnostic_code": "internal_error"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_refused_index_filter_does_not_bind_candidate_to_refused_request(
+    server_config_factory,
+) -> None:
+    """Seen live: a CAST filter is refused before CREATE, and the corrected
+    request with a new idempotency key was then refused as a replay of a
+    different request, so the candidate could never be benchmarked."""
+
+    app = _index_app(server_config_factory)
+    sql = "SELECT id FROM dbo.Items WHERE id > 0"
+    session_id, candidate_id = _index_candidate(app, sql)
+
+    async def benchmark(filter_definition: str, key: str) -> dict[str, Any]:
+        return await app._benchmark_index_candidate(
+            "appdb",
+            session_id,
+            candidate_id,
+            sql,
+            "dbo",
+            "Items",
+            ["id"],
+            None,
+            filter_definition,
+            False,
+            "screening",
+            False,
+            None,
+            30,
+            key,
+        )
+
+    with pytest.raises(ValueError, match="plain literal"):
+        await benchmark("[id] > CAST(0 AS int)", "refused-cast")
+    app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("measurement reached")
+    )
+
+    result = await benchmark("[id] > 0", "corrected-filter")
+
+    # The corrected request took its lease and started measuring instead of
+    # being refused as a replay of the refused CAST request.
+    app.plans.profile_query.assert_awaited()
+    assert result["lease"]["metadata"]["filter_definition"] == "[id] > 0"
+    assert result["index_ddl"].endswith("WHERE [id] > 0;")
+
+
+@pytest.mark.asyncio
+async def test_unresolved_index_table_does_not_bind_candidate_to_refused_request(
+    server_config_factory,
+) -> None:
+    """Seen live: table_name='Ordrs' is refused by the catalog lookup before
+    any DDL, and the corrected table with a new idempotency key was then refused
+    as 'a different request' with guidance to read results that never existed."""
+
+    app = _index_app(server_config_factory)
+    catalog_rows = app.executor.fetch_all.side_effect
+
+    async def fetch_rows(database_name: str, sql: str, **kwargs: Any) -> Any:
+        if "FROM sys.tables AS t" in sql and "Ordrs" in kwargs.get("params", ()):
+            return []
+        return await catalog_rows(database_name, sql, **kwargs)
+
+    app.executor.fetch_all.side_effect = fetch_rows
+    sql = "SELECT id FROM dbo.Items WHERE id > 0"
+    session_id, candidate_id = _index_candidate(app, sql)
+
+    async def benchmark(table_name: str, key: str) -> dict[str, Any]:
+        return await app._benchmark_index_candidate(
+            "appdb",
+            session_id,
+            candidate_id,
+            sql,
+            "dbo",
+            table_name,
+            ["id"],
+            None,
+            None,
+            False,
+            "screening",
+            False,
+            None,
+            30,
+            key,
+        )
+
+    with pytest.raises(ValueError, match="could not be resolved"):
+        await benchmark("Ordrs", "typo-table")
+    app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("measurement reached")
+    )
+
+    result = await benchmark("Items", "corrected-table")
+
+    app.plans.profile_query.assert_awaited()
+    assert result["lease"]["metadata"]["target_table"] == "Items"
+
+
+@pytest.mark.asyncio
+async def test_budget_refused_index_request_does_not_bind_candidate(
+    server_config_factory,
+) -> None:
+    """The execution budget refuses a two-case screening request before any
+    DDL; the smaller one-case request with a new key must reach measurement,
+    not be refused as a replay of 'a different request'."""
+
+    app = _index_app(server_config_factory)
+    sql = "SELECT id FROM dbo.Items WHERE id > @p"
+    cases: list[dict[str, Any]] = [
+        {"name": "low", "values": {"p": 0}, "types": {"p": "int"}, "weight": 1.0},
+        {"name": "high", "values": {"p": 9}, "types": {"p": "int"}, "weight": 1.0},
+    ]
+    case = app.performance_workflows.start_case("appdb", sql, parameter_cases=cases)
+    probe = app.performance_workflows.start_session(case.case_id, "appdb")
+    runs = app.tuning_sessions.get_session(probe["session_id"]).screen_runs_per_candidate
+    # Budget fits one case (runs * 3 executions) but not two.
+    session_id = app.performance_workflows.start_session(
+        case.case_id, "appdb", execution_limit=runs * 3
+    )["session_id"]
+    candidate_id = app.performance_workflows.add_candidate(
+        session_id, sql, strategy="index"
+    )["candidate_id"]
+
+    async def benchmark(
+        parameter_cases: list[dict[str, Any]], key: str
+    ) -> dict[str, Any]:
+        return await app._benchmark_index_candidate(
+            "appdb",
+            session_id,
+            candidate_id,
+            sql,
+            "dbo",
+            "Items",
+            ["id"],
+            None,
+            None,
+            False,
+            "screening",
+            False,
+            None,
+            30,
+            key,
+            parameter_cases,
+        )
+
+    with pytest.raises(ReservationError, match="budget"):
+        await benchmark(cases, "two-cases")
+    app.plans.profile_parameterized_query = AsyncMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("measurement reached")
+    )
+
+    result = await benchmark(cases[:1], "one-case")
+
+    app.plans.profile_parameterized_query.assert_awaited()
+    assert result["lease"]["metadata"]["target_table"] == "Items"
+
+
+@pytest.mark.asyncio
+async def test_budget_refusal_on_a_replayed_binding_still_frees_the_candidate(
+    server_config_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first attempt binds the request, then fails on a transient read; the
+    exact replay is then refused by the budget. A smaller request with a new
+    key must still reach measurement: nothing was reserved or dispatched."""
+
+    import azure_sql_mcp.server as server_module
+
+    app = _index_app(server_config_factory)
+    sql = "SELECT id FROM dbo.Items WHERE id > @p"
+    cases: list[dict[str, Any]] = [
+        {"name": "low", "values": {"p": 0}, "types": {"p": "int"}, "weight": 1.0},
+        {"name": "high", "values": {"p": 9}, "types": {"p": "int"}, "weight": 1.0},
+    ]
+    case = app.performance_workflows.start_case("appdb", sql, parameter_cases=cases)
+    probe = app.performance_workflows.start_session(case.case_id, "appdb")
+    runs = app.tuning_sessions.get_session(probe["session_id"]).screen_runs_per_candidate
+    session_id = app.performance_workflows.start_session(
+        case.case_id, "appdb", execution_limit=runs * 3
+    )["session_id"]
+    candidate_id = app.performance_workflows.add_candidate(
+        session_id, sql, strategy="index"
+    )["candidate_id"]
+
+    async def benchmark(parameter_cases: list[dict[str, Any]], key: str) -> dict[str, Any]:
+        return await app._benchmark_index_candidate(
+            "appdb", session_id, candidate_id, sql, "dbo", "Items", ["id"], None, None,
+            False, "screening", False, None, 30, key, parameter_cases,
+        )
+
+    real_collect = server_module.collect_existing_indexes
+    calls = {"n": 0}
+
+    async def flaky_collect(*args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient catalog read")
+        return await real_collect(*args, **kwargs)
+
+    monkeypatch.setattr(server_module, "collect_existing_indexes", flaky_collect)
+    with pytest.raises(RuntimeError, match="transient"):
+        await benchmark(cases, "two-cases")
+    with pytest.raises(ReservationError, match="budget"):
+        await benchmark(cases, "two-cases")
+    app.plans.profile_parameterized_query = AsyncMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("measurement reached")
+    )
+
+    result = await benchmark(cases[:1], "one-case")
+
+    app.plans.profile_parameterized_query.assert_awaited()
+    assert result["lease"]["metadata"]["target_table"] == "Items"
+
+
+@pytest.mark.asyncio
+async def test_code_owned_tokens_in_refusals_survive_redaction(
+    app: AzureSqlMcpApplication,
+) -> None:
+    """The tool error handler redacts quoted text, so a quoted status or test
+    prefix reached the agent as '[REDACTED]' and the guidance was lost."""
+
+    app.config = replace(app.config, profile=McpProfile.SANDBOX)
+    app._require_durable_view_change = Mock(  # type: ignore[method-assign]
+        return_value=(Mock(), {"status": "unknown", "version": 1})
+    )
+
+    async def apply_view(database_name: str) -> dict[str, Any]:
+        return await app._apply_prepared_view_change(
+            database_name, "view-change-1", True, "view-key"
+        )
+
+    async def drop_index(_: str) -> dict[str, Any]:
+        app._validate_test_index_name("IX_Orders_Status")
+        return {}
+
+    messages = []
+    for tool_name, callback in (
+        ("apply_prepared_view_change", apply_view),
+        ("drop_test_index", drop_index),
+    ):
+        with pytest.raises(ToolError) as error:
+            await app._run_tool(tool_name, None, callback)
+        messages.append(json.loads(str(error.value))["message"])
+
+    assert all("[REDACTED]" not in message for message in messages)
+    assert "status=unknown" in messages[0]
+    assert "test prefix IX_Testing_" in messages[1]
+
+
+@pytest.mark.asyncio
+async def test_run_tool_marks_active_index_lease_as_lease_conflict(
+    app: AzureSqlMcpApplication,
+    tmp_path: Path,
+) -> None:
+    """A second benchmark on a database that already holds a cleanup lease is
+    refused by the state store; no SQL ran, and the agent should wait for or
+    clean up the lease, not treat it as a query failure."""
+
+    store = PerformanceStore(tmp_path / "lease-state")
+    lease = {
+        "database_fingerprint": "database-fingerprint",
+        "object_fingerprint": "object-fingerprint",
+        "expires_at_utc": "2026-07-15T12:00:00+00:00",
+    }
+    store.create_index_lease(
+        lease_id="lease-1",
+        session_id="session-1",
+        candidate_id="candidate-1",
+        index_name="IX_Testing_one",
+        **lease,
+    )
+
+    async def second_lease(_: str) -> dict[str, str]:
+        store.create_index_lease(
+            lease_id="lease-2",
+            session_id="session-2",
+            candidate_id="candidate-2",
+            index_name="IX_Testing_two",
+            **lease,
+        )
+        return {}
+
+    with pytest.raises(ToolError) as error:
+        await app._run_tool("benchmark_index_candidate", None, second_lease)
+
+    payload = json.loads(str(error.value))
+    assert payload["details"]["failure_diagnostic"] == {
+        "diagnostic_code": "lease_conflict",
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_tool_marks_idempotency_replay_conflict_as_request_refused(
+    app: AzureSqlMcpApplication,
+    tmp_path: Path,
+) -> None:
+    """Replaying an idempotency key with a different request is refused by
+    the state store before any SQL runs (seen live on a second benchmark)."""
+
+    store = PerformanceStore(tmp_path / "replay-state")
+    lease = {
+        "lease_id": "lease-1",
+        "database_fingerprint": "database-fingerprint",
+        "session_id": "session-1",
+        "candidate_id": "candidate-1",
+        "index_name": "IX_Testing_one",
+        "object_fingerprint": "object-fingerprint",
+        "expires_at_utc": "2026-07-15T12:00:00+00:00",
+    }
+    store.create_index_lease(**lease, request_fingerprint="request-a")
+
+    async def replay(_: str) -> dict[str, str]:
+        store.create_index_lease(**lease, request_fingerprint="request-b")
+        return {}
+
+    with pytest.raises(ToolError) as error:
+        await app._run_tool("benchmark_index_candidate", None, replay)
+
+    payload = json.loads(str(error.value))
+    assert payload["details"]["failure_diagnostic"] == {
+        "diagnostic_code": "request_refused",
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_tool_keeps_sql_failure_code_for_wrapped_driver_error(
+    app: AzureSqlMcpApplication,
+) -> None:
+    """A package ValueError raised from a real mssql-python error is a SQL
+    failure, not a refusal; the driver SQLSTATE stays in the diagnostic even
+    though mssql-python text carries no bracketed SQLSTATE."""
+
+    async def failing_query(_: str) -> dict[str, str]:
+        driver_error = sqlstate_to_exception(
+            "42S02",
+            "[Microsoft][SQL Server]Invalid object name 'dbo.Missing'.",
+        )
+        try:
+            raise driver_error
+        except Exception as exc:
+            raise ValueError("Catalog query failed.") from exc
+
+    with pytest.raises(ToolError) as error:
+        await app._run_tool("sample_tool", None, failing_query)
+
+    payload = json.loads(str(error.value))
+    assert payload["details"]["failure_diagnostic"] == {
+        "diagnostic_code": "sql_execution_failed",
+        "sqlstate": "42S02",
+    }
+
+
+@pytest.mark.asyncio
+async def test_pair_tool_marks_unallowlisted_database_as_request_refused(
+    app: AzureSqlMcpApplication,
+) -> None:
+    async def never_called(_source: str, _target: str) -> dict[str, str]:
+        raise AssertionError("callback must not run")
+
+    with pytest.raises(ToolError) as error:
+        await app._run_database_pair_tool(
+            "compare_schemas", "appdb", "otherdb", never_called
+        )
+
+    payload = json.loads(str(error.value))
+    assert payload["details"]["failure_diagnostic"] == {
+        "diagnostic_code": "request_refused",
+    }
 
 
 @pytest.mark.asyncio
@@ -1795,6 +2310,47 @@ async def test_explain_query_uses_typed_parameter_execution_and_redacts_values(
             "provenance_detail": {},
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_estimated_typed_plan_digest_does_not_call_xml_parameter_local(
+    app: AzureSqlMcpApplication,
+    showplan,
+) -> None:
+    """Seen live: the estimate leaves the xml parameter out of OPTIMIZE FOR, so
+    the plan's ParameterList omits it and the digest called the caller's real
+    @doc parameter a local variable, against estimated_plan_basis."""
+
+    predicate = (
+        '<Predicate><ScalarOperator><Compare CompareOp="GT">'
+        f"<ScalarOperator><Identifier>{showplan.column('T', 'object_id')}</Identifier></ScalarOperator>"
+        '<ScalarOperator><Identifier><ColumnReference Column="@p" /></Identifier></ScalarOperator>'
+        '</Compare><Identifier><ColumnReference Column="@doc" /></Identifier>'
+        "</ScalarOperator></Predicate>"
+    )
+    plan_xml = showplan.plan(
+        showplan.scan(0, body=predicate),
+        plan_children=(
+            '<ParameterList><ColumnReference Column="@p" ParameterCompiledValue="(5)" />'
+            "</ParameterList>"
+        ),
+    )
+    app.plans._get_plan_xml = AsyncMock(return_value=plan_xml)  # type: ignore[method-assign]
+
+    payload = await app._explain_query(
+        "appdb",
+        "SELECT TOP (1) o.object_id FROM sys.objects AS o "
+        "WHERE o.object_id > @p AND @doc.exist('/root') = 1",
+        analyze=False,
+        parameter_values={"p": 5, "doc": "<root/>"},
+        parameter_types={"p": "int", "doc": "xml"},
+    )
+
+    assert payload["summary"]["estimated_plan_basis"]["unknown_parameters"] == ["@doc"]
+    statement = payload["plan_digest"]["statements"][0]
+    assert "@doc" not in statement.get("local_variables", [])
+    assert "local_variables_note" not in statement
+    assert statement["unknown_parameters"] == ["@doc"]
 
 
 @pytest.mark.asyncio
@@ -2634,6 +3190,129 @@ async def test_durable_view_prepare_explicit_unbind_conflicts_with_kept_binding(
 
     with pytest.raises(IdempotencyConflictError):
         await app._prepare_view_change(*_DURABLE_VIEW_ARGS, False, False, "replay-key")
+    app.performance_store.close()
+
+
+@pytest.mark.asyncio
+async def test_view_apply_state_conflict_after_ddl_is_not_request_refused(
+    server_config_factory,
+    tmp_path: Path,
+) -> None:
+    """The ALTER VIEW ran, then a concurrent writer moved the durable intent:
+    the ConcurrencyError must not read as request_refused ("nothing changed")."""
+
+    app = _durable_view_app(server_config_factory, tmp_path, prior_bound=False)
+    prepared = await app._prepare_view_change(
+        *_DURABLE_VIEW_ARGS, None, False, "conflict-key"
+    )
+    change_id = prepared["change_id"]
+    executor = app.view_workflows.executor
+
+    def concurrent_writer() -> None:
+        intent = app.performance_store.get_view_change_intent(change_id)
+        app.performance_store.update_view_change_intent(
+            change_id,
+            status="applying",
+            expected_version=int(intent["version"]),
+            raw_sql_persistence_authorized=True,
+        )
+
+    executor.before_execute = concurrent_writer
+
+    async def apply(database_name: str) -> dict[str, Any]:
+        return await app._apply_prepared_view_change(
+            "testdb", change_id, True, "conflict-key"
+        )
+
+    with pytest.raises(ToolError) as error:
+        await app._run_tool("apply_prepared_view_change", None, apply)
+
+    payload = json.loads(str(error.value))
+    assert executor.batch_history, "the DDL must have been dispatched"
+    assert payload["details"]["failure_diagnostic"] == {
+        "diagnostic_code": "verification_failed",
+    }
+    app.performance_store.close()
+
+
+@pytest.mark.asyncio
+async def test_view_rollback_state_conflict_after_ddl_is_not_request_refused(
+    server_config_factory,
+    tmp_path: Path,
+) -> None:
+    """The restore DDL ran, then a concurrent writer moved the durable intent:
+    the ConcurrencyError must not read as request_refused ("nothing changed")."""
+
+    app = _durable_view_app(server_config_factory, tmp_path, prior_bound=False)
+    prepared = await app._prepare_view_change(
+        *_DURABLE_VIEW_ARGS, None, False, "rollback-conflict-key"
+    )
+    change_id = prepared["change_id"]
+    await app._apply_prepared_view_change(
+        "testdb", change_id, True, "rollback-conflict-key"
+    )
+    executor = app.view_workflows.executor
+    batches_before_rollback = len(executor.batch_history)
+
+    def concurrent_writer() -> None:
+        intent = app.performance_store.get_view_change_intent(change_id)
+        app.performance_store.update_view_change_intent(
+            change_id,
+            status="hold",
+            expected_version=int(intent["version"]),
+            raw_sql_persistence_authorized=True,
+        )
+
+    executor.before_execute = concurrent_writer
+
+    async def rollback(database_name: str) -> dict[str, Any]:
+        return await app._rollback_view_change("testdb", change_id)
+
+    with pytest.raises(ToolError) as error:
+        await app._run_tool("rollback_view_change", None, rollback)
+
+    payload = json.loads(str(error.value))
+    assert len(executor.batch_history) > batches_before_rollback, (
+        "the restore DDL must have been dispatched"
+    )
+    assert payload["details"]["failure_diagnostic"] == {
+        "diagnostic_code": "verification_failed",
+    }
+    app.performance_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("intent_recorded", (True, False))
+async def test_rollback_retry_still_reports_restore_text_drift(
+    server_config_factory,
+    tmp_path: Path,
+    intent_recorded: bool,
+) -> None:
+    """Seen live: the first rollback reported text_drift, but a retry (lost
+    response, or a crash before the intent was recorded) returned an
+    unqualified already_rolled_back with no exactness fields."""
+
+    app = _durable_view_app(server_config_factory, tmp_path, prior_bound=False)
+    prepared = await app._prepare_view_change(
+        *_DURABLE_VIEW_ARGS, None, False, "drift-key"
+    )
+    change_id = prepared["change_id"]
+    await app._apply_prepared_view_change("testdb", change_id, True, "drift-key")
+    if intent_recorded:
+        first = await app._rollback_view_change("testdb", change_id)
+        assert (first["definition_exact"], first["text_drift"]) == (True, False)
+    else:
+        # The restore committed, then the process stopped before the intent
+        # was marked rolled_back.
+        durable, _intent = app._durable_view_change("testdb", change_id)
+        await app.view_workflows.rollback_view_change(durable)
+    executor = app.view_workflows.executor
+    executor.views[("dbo", "SalesView")] += "\n"
+
+    retry = await app._rollback_view_change("testdb", change_id)
+
+    assert retry["status"] == "already_rolled_back"
+    assert (retry["definition_exact"], retry["text_drift"]) == (False, True)
     app.performance_store.close()
 
 
@@ -3620,3 +4299,16 @@ async def test_last_actual_plan_keeps_the_requested_statement_of_a_large_batch(
         assert finding["is_requested_statement"] is (
             finding.get("statement_index") == 6
         )
+
+
+def test_compare_query_plans_documents_plan_pair_and_ratio_direction(
+    app: AzureSqlMcpApplication,
+) -> None:
+    # One plan id is refused, and ratios are compared / baseline: the agent
+    # reads the direction from the schema before it calls the tool.
+    tool = app.mcp._tool_manager._tools["compare_query_plans"]
+    properties = tool.fn_metadata.arg_model.model_json_schema()["properties"]
+
+    assert "both plan ids or neither" in properties["plan_id_a"]["description"]
+    assert "plan_id_b / plan_id_a" in properties["plan_id_a"]["description"]
+    assert "both plan ids or neither" in properties["plan_id_b"]["description"]

@@ -22,6 +22,7 @@ from azure_sql_mcp.index_optimizer import (
 )
 from azure_sql_mcp.index_metadata import ExistingIndex
 from azure_sql_mcp.index_metadata import IndexKeyColumn
+from azure_sql_mcp.observability import sanitize_error_message
 
 SAMPLE_SHOWPLAN = """\
 <ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">
@@ -330,6 +331,28 @@ def test_filtered_predicate_validation_rejects_unverifiable_constants(
 
     with pytest.raises(ValueError, match="plain literal"):
         build_index_candidate_statement(candidate)
+
+
+def test_unverifiable_filter_refusal_guidance_survives_error_redaction() -> None:
+    """The tool error handler redacts every quoted token in an exception
+    message. The refusal's own example must not hold one, or the agent reads
+    '[REDACTED]' instead of the form it should send."""
+
+    candidate = IndexCandidate(
+        schema="dbo",
+        table="Orders",
+        key_columns=("Status",),
+        include_columns=(),
+        filter_definition="[Status] = CAST(1 AS tinyint)",
+    )
+
+    with pytest.raises(ValueError) as error:
+        build_index_candidate_statement(candidate)
+
+    message = str(error.value)
+    assert sanitize_error_message(message) == message
+    assert "[Amount] > 1000.0" in message
+    assert "date" in message
 
 
 @pytest.mark.parametrize(

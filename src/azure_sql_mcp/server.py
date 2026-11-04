@@ -56,9 +56,11 @@ from .equivalence_contract import effective_compare_order
 from .equivalence_preflight import EquivalencePreflightService
 from .health import HealthService
 from .incident_log import IncidentLog
+from .incident_log import native_codes
 from .incident_log import note_exception
 from .incident_log import record_startup_failure
 from .incident_log import summarize_backlog
+from .incident_log import tool_failure_code
 from .index_optimizer import IndexCandidate
 from .index_optimizer import IndexOptimizer
 from .index_optimizer import build_index_candidate_statement
@@ -93,6 +95,8 @@ from .performance_contracts import STOPPING_REASON_MAX_LENGTH
 from .performance_store import ContractNotFoundError
 from .performance_store import IdempotencyConflictError
 from .performance_store import PerformanceStore
+from .performance_store import PerformanceStoreError
+from .performance_store import ReservationError
 from .performance_workflows import COMPARISON_DECISION_BASIS
 from .performance_workflows import PerformanceWorkflowService
 from .performance_workflows import aba_result_status
@@ -161,6 +165,7 @@ from .wait_stats import WaitStatsService
 from .workload_index_advisor import WorkloadIndexAdvisor
 from .view_workflows import PreparedViewChange
 from .view_workflows import ViewChangeRequest
+from .view_workflows import ViewVerificationError
 from .view_workflows import ViewWorkflowService
 from .view_workflows import prepared_view_change_from_state
 from .view_workflows import prepared_view_change_state
@@ -268,8 +273,56 @@ _CATALOG_PAIR_TOOLS = frozenset(
 )
 
 
+def _driver_exception(exc: BaseException) -> BaseException | None:
+    current: BaseException | None = exc
+    while current is not None:
+        if type(current).__module__.startswith(("mssql_python", "pyodbc")):
+            return current
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _label_unknown_parameters(digest: dict[str, Any], unknown: list[str]) -> None:
+    """The typed estimate leaves some contract parameters out of OPTIMIZE FOR
+    (xml), so its plan lists them as local variables; they are parameters."""
+
+    names = {name.casefold() for name in unknown}
+    for entry in digest.get("statements") or ():
+        local = entry.get("local_variables") or []
+        found = [name for name in local if name.casefold() in names]
+        if not found:
+            continue
+        entry["unknown_parameters"] = found
+        entry["unknown_parameters_note"] = (
+            "Caller parameters this estimate compiled as unknown (not in OPTIMIZE FOR); "
+            "see summary.estimated_plan_basis. Use analyze=true for their compiled values."
+        )
+        remaining = [name for name in local if name.casefold() not in names]
+        if remaining:
+            entry["local_variables"] = remaining
+        else:
+            entry.pop("local_variables", None)
+            entry.pop("local_variables_note", None)
+
+
 def _tool_failure_diagnostic(exc: Exception) -> dict[str, Any]:
+    driver_exc = _driver_exception(exc)
     failure_diagnostic = extract_failure_diagnostic(exc)
+    # The incident log's classification names failures no SQL error caused;
+    # a recognised engine diagnostic (214) in the text still wins.
+    code = tool_failure_code(exc)
+    if code is not None and (
+        code == "verification_failed"
+        or failure_diagnostic["diagnostic_code"] == "sql_execution_failed"
+    ):
+        return {"diagnostic_code": code}
+    if driver_exc is not None:
+        # mssql-python text has no bracketed SQLSTATE; map its driver class.
+        native, sqlstate = native_codes(driver_exc)
+        if sqlstate is not None:
+            failure_diagnostic.setdefault("sqlstate", sqlstate)
+        if native is not None:
+            failure_diagnostic.setdefault("native_error_code", native)
     if _is_transient(exc):
         # Skills retry these before they report a blocker.
         failure_diagnostic["transient"] = True
@@ -3315,10 +3368,19 @@ class AzureSqlMcpApplication:
         async def compare_query_plans(
             query_id: int = Field(description="Query Store query_id."),
             plan_id_a: int | None = Field(
-                default=None, description="First plan_id to compare (optional, uses best by default)."
+                default=None,
+                description=(
+                    "Baseline plan_id. Give both plan ids or neither (then best vs "
+                    "worst by duration). Ratios are plan_id_b / plan_id_a "
+                    "(comparison.compared_plan_id / baseline_plan_id)."
+                ),
             ),
             plan_id_b: int | None = Field(
-                default=None, description="Second plan_id to compare (optional, uses worst by default)."
+                default=None,
+                description=(
+                    "Compared plan_id. Give both plan ids or neither (then worst "
+                    "by duration)."
+                ),
             ),
             database_name: str | None = Field(
                 default=None,
@@ -6204,7 +6266,7 @@ class AzureSqlMcpApplication:
         if intent["status"] == "rolled_back":
             raise ValueError("Rolled-back view intent cannot be applied again.")
         if intent["status"] != "prepared":
-            raise ValueError(f"View intent is not applyable from {intent['status']!r}.")
+            raise ValueError(f"View intent is not applyable from status={intent['status']}.")
         normalized_idempotency_key = _view_idempotency_identity(idempotency_key)
         existing_key = prepared.request.idempotency_key
         if existing_key and existing_key != normalized_idempotency_key:
@@ -6227,27 +6289,37 @@ class AzureSqlMcpApplication:
             raw_sql_persistence_authorized=True,
         )
         result = await self.view_workflows.apply_prepared_view_change(prepared)
-        verification = await self.view_workflows.verify_view_change(prepared)
         workflow_applied = result.get("workflow_applied") is True
-        if workflow_applied:
-            receipt_payload = result.get("apply_receipt")
-            receipt_snapshot = view_snapshot_from_receipt(receipt_payload)
-            self.view_workflows.register_apply_receipt(
-                prepared,
-                receipt_snapshot,
+        try:
+            verification = await self.view_workflows.verify_view_change(prepared)
+            if workflow_applied:
+                receipt_payload = result.get("apply_receipt")
+                receipt_snapshot = view_snapshot_from_receipt(receipt_payload)
+                self.view_workflows.register_apply_receipt(
+                    prepared,
+                    receipt_snapshot,
+                )
+                receipt = view_apply_receipt(receipt_snapshot)
+                status = "applied" if verification.verified else "hold"
+            else:
+                receipt = None
+                status = "already_applied" if verification.verified else "hold"
+            intent = self.performance_store.update_view_change_intent(
+                change_id,
+                status=status,
+                expected_version=int(intent["version"]),
+                raw_sql_persistence_authorized=True,
+                receipt=receipt,
             )
-            receipt = view_apply_receipt(receipt_snapshot)
-            status = "applied" if verification.verified else "hold"
-        else:
-            receipt = None
-            status = "already_applied" if verification.verified else "hold"
-        intent = self.performance_store.update_view_change_intent(
-            change_id,
-            status=status,
-            expected_version=int(intent["version"]),
-            raw_sql_persistence_authorized=True,
-            receipt=receipt,
-        )
+        except (ValueError, LookupError, PerformanceStoreError) as exc:
+            if not workflow_applied:
+                raise
+            # The workflow-owned DDL was dispatched: a refusal here does not
+            # mean nothing changed, so it is not request_refused.
+            raise ViewVerificationError(
+                "the view change was dispatched, then its outcome could not be "
+                "recorded; read the view with verify_view_change before any retry"
+            ) from exc
         response = {
             "change_id": change_id,
             "intent_status": intent["status"],
@@ -6323,6 +6395,7 @@ class AzureSqlMcpApplication:
                 "status": "already_rolled_back",
                 "intent_status": "rolled_back",
                 "snapshot": current.as_dict(),
+                **self.view_workflows.restore_exactness(prepared, current),
             }
         if intent["status"] == "applying" or (
             intent["status"] == "hold" and intent.get("receipt") is None
@@ -6361,14 +6434,22 @@ class AzureSqlMcpApplication:
                 "status": "already_rolled_back",
                 "intent_status": updated["status"],
                 "snapshot": current.as_dict(),
+                **self.view_workflows.restore_exactness(prepared, current),
             }
         result = await self.view_workflows.rollback_view_change(prepared)
-        updated = self.performance_store.update_view_change_intent(
-            change_id,
-            status="rolled_back",
-            expected_version=int(intent["version"]),
-            raw_sql_persistence_authorized=True,
-        )
+        try:
+            updated = self.performance_store.update_view_change_intent(
+                change_id,
+                status="rolled_back",
+                expected_version=int(intent["version"]),
+                raw_sql_persistence_authorized=True,
+            )
+        except (ValueError, LookupError, PerformanceStoreError) as exc:
+            # The restore DDL was dispatched: not request_refused.
+            raise ViewVerificationError(
+                "the view rollback was dispatched, then its outcome could not be "
+                "recorded; read the view with verify_view_change before any retry"
+            ) from exc
         return {
             "change_id": change_id,
             "intent_status": updated["status"],
@@ -6787,54 +6868,10 @@ class AzureSqlMcpApplication:
                 "lineage": lineage,
             }
         )
-        self._require_tuning_session_time(session_id)
-        self.performance_store.bind_index_benchmark_request(
-            session_id,
-            candidate_id,
-            phase,
-            request_fingerprint,
-            idempotency_key=idempotency_key,
-        )
-        existing_reservation = (
-            self.performance_store.get_idempotent_execution_reservation(
-                session_id,
-                candidate_id,
-                request_fingerprint,
-                idempotency_key=idempotency_key,
-                owner_reference=execution_owner,
-            )
-        )
-        if existing_reservation is None and candidate.is_terminal:
-            if candidate.executions == 0:
-                return {
-                    "session_id": session_id,
-                    "candidate_id": candidate_id,
-                    "classification": candidate.state,
-                    "durable_state": candidate.state,
-                    "reason": (
-                        "Replayed the durable zero-execution candidate result; "
-                        "no catalog lookup, DDL, or benchmark query was dispatched."
-                    ),
-                    "executions": 0,
-                    "session_continues": candidate.state != "cleanup_required",
-                    "replayed_zero_execution_result": True,
-                }
-            raise ValueError("Index candidate already has a terminal benchmark result.")
-        if (
-            existing_reservation is None
-            and not candidate.is_terminal
-            and phase == "screening"
-            and candidate.screen_runs
-        ):
-            raise ValueError("Index candidate screening has already been measured.")
-        if (
-            existing_reservation is None
-            and not candidate.is_terminal
-            and phase == "finalist"
-            and candidate.finalist_runs
-        ):
-            raise ValueError("Index candidate finalist validation has already been measured.")
-
+        # Request-validation reads and refusals run before the request binds
+        # the candidate; else the corrected request is refused as a replay.
+        # The budget reservation runs after the bind, so its refusal releases
+        # a fresh binding.
         self._require_tuning_session_time(session_id)
         bound_cases = [
             {
@@ -6870,6 +6907,54 @@ class AzureSqlMcpApplication:
         object_fingerprint = index_candidate.definition_fingerprint
         index_ddl = build_index_candidate_statement(index_candidate, online=online)
         rollback_ddl = f"DROP INDEX [{index_name}] ON [{schema}].[{table}];"
+        self._require_tuning_session_time(session_id)
+        self.performance_store.bind_index_benchmark_request(
+            session_id,
+            candidate_id,
+            phase,
+            request_fingerprint,
+            idempotency_key=idempotency_key,
+        )
+        existing_reservation = (
+            self.performance_store.get_idempotent_execution_reservation(
+                session_id,
+                candidate_id,
+                request_fingerprint,
+                idempotency_key=idempotency_key,
+                owner_reference=execution_owner,
+            )
+        )
+        if existing_reservation is None and candidate.is_terminal:
+            if candidate.executions == 0:
+                return {
+                    "session_id": session_id,
+                    "candidate_id": candidate_id,
+                    "classification": candidate.state,
+                    "durable_state": candidate.state,
+                    "reason": (
+                        "Replayed the durable zero-execution candidate result; "
+                        "no DDL or benchmark query was dispatched."
+                    ),
+                    "executions": 0,
+                    "session_continues": candidate.state != "cleanup_required",
+                    "replayed_zero_execution_result": True,
+                }
+            raise ValueError("Index candidate already has a terminal benchmark result.")
+        if (
+            existing_reservation is None
+            and not candidate.is_terminal
+            and phase == "screening"
+            and candidate.screen_runs
+        ):
+            raise ValueError("Index candidate screening has already been measured.")
+        if (
+            existing_reservation is None
+            and not candidate.is_terminal
+            and phase == "finalist"
+            and candidate.finalist_runs
+        ):
+            raise ValueError("Index candidate finalist validation has already been measured.")
+
         if existing_reservation is not None:
             return self._recover_index_benchmark_result(
                 session_id=session_id,
@@ -6966,14 +7051,27 @@ class AzureSqlMcpApplication:
             }
 
         self._require_tuning_session_time(session_id)
-        execution_reservation = self.performance_store.reserve_execution_attempts(
-            session_id,
-            candidate_id,
-            requested_executions,
-            request_fingerprint,
-            idempotency_key=idempotency_key,
-            owner_reference=execution_owner,
-        )
+        try:
+            execution_reservation = self.performance_store.reserve_execution_attempts(
+                session_id,
+                candidate_id,
+                requested_executions,
+                request_fingerprint,
+                idempotency_key=idempotency_key,
+                owner_reference=execution_owner,
+            )
+        except ReservationError:
+            # Also for a replayed binding: an earlier attempt may have bound the
+            # request and failed before reserving. The store keeps any binding
+            # that holds a reservation, so only an unreserved one is freed.
+            self.performance_store.release_index_benchmark_request(
+                session_id,
+                candidate_id,
+                phase,
+                request_fingerprint,
+                idempotency_key=idempotency_key,
+            )
+            raise
         if (
             execution_reservation["status"] != "reserved"
             or execution_reservation.get("replayed") is True
@@ -8840,7 +8938,7 @@ class AzureSqlMcpApplication:
         value = cls._validate_plain_identifier(index_name, "index_name")
         if not value.upper().startswith(TEST_INDEX_PREFIX.upper()):
             raise ValueError(
-                f"index_name must start with the test prefix {TEST_INDEX_PREFIX!r} — "
+                f"index_name must start with the test prefix {TEST_INDEX_PREFIX} — "
                 "these tools only manage disposable test indexes."
             )
         return value
@@ -9393,6 +9491,9 @@ class AzureSqlMcpApplication:
         if artifact.raw_xml:
             result["plan_findings"] = _compact_plan_findings(analyze_plan(artifact.raw_xml))
             result["plan_digest"] = build_plan_digest(artifact.raw_xml, top_n=5, tree_budget=40)
+            basis = artifact.summary.get("estimated_plan_basis")
+            if basis:
+                _label_unknown_parameters(result["plan_digest"], basis["unknown_parameters"])
         return result
 
     @staticmethod

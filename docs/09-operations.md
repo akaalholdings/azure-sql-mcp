@@ -579,6 +579,18 @@ For `execute_tsql_unrestricted`, leave `AZURE_SQL_PROFILE` unset, select unrestr
 
 Do not repeat the batch. Locate the audit id, inspect database state with a separate read-only query, and decide whether the intended change completed, partially completed, or rolled back. The server deliberately does not retry DBA batches after a timeout, cancellation, or post-submission connection failure.
 
+### Reading a tool error's `failure_diagnostic`
+
+A `tool_error` carries `details.failure_diagnostic.diagnostic_code`. The code comes from the same classification the incident log uses, so the two agree:
+
+- `request_refused`: the MCP refused the request (input validation, replay or state conflict) before it sent any change; it can have read catalog state first. Fix the request. The incident category is `caller_error`.
+- `policy_refused`: a profile, access mode, write policy, kill switch or database policy gate refused the request before it sent any change. Do not retry the same call; change the request or ask the owner to change the gate. The incident category is `policy`.
+- `lease_conflict`: another benchmark holds the cleanup lease for this database. Wait for it or reconcile it.
+- `verification_failed`: the write was sent, then the MCP could not verify it or record its outcome. The change can have left state behind. Read the object's state before you do anything else, and do not resubmit. The incident category is `outcome_unknown`.
+- `internal_error`: an MCP defect or gap, not your input (incident category `product_bug` or `product_gap`). This code does not tell you whether SQL ran. Call `report_stuck`.
+- `sp_executesql_unicode_control_argument`: the engine refused an `sp_executesql` control argument that was not Unicode.
+- `sql_execution_failed`: every other failure. It holds `sqlstate` and `native_error_code` when the driver gave them. Without them, it can also be a state store, environment or unknown-outcome failure. `transient: true` means retry after a delay.
+
 ### Authentication succeeds but a DMV fails
 
 Run `check_capabilities`. Azure SQL tier and database permissions can make individual evidence sections unavailable. Preserve that section as an evidence gap.

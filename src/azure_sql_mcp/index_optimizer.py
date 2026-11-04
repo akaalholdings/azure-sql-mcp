@@ -1380,11 +1380,12 @@ def _validate_filtered_index_predicate(text: str) -> None:
             and not node.is_string
             and "e" in str(node.this).casefold()
         ):
+            # No quoted example: the tool error handler redacts quoted text.
             raise ValueError(
                 "filtered index predicate must compare columns with a plain literal, "
-                "for example [CreatedAt] >= '2026-01-01' or [Amount] > 1000.0; "
-                "CAST, CONVERT and scientific-notation constants cannot be verified "
-                "after CREATE"
+                "for example [Status] = 1 or [Amount] > 1000.0 (compare a date column "
+                "with a plain quoted date string); CAST, CONVERT and "
+                "scientific-notation constants cannot be verified after CREATE"
             )
 
 
