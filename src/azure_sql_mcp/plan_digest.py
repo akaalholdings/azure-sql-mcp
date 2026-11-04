@@ -225,6 +225,11 @@ def _statement_digest(
             ),
         }
     )
+    if timed and not entry["top_operators"]:
+        entry["top_operators_note"] = (
+            "Every operator ran in under 1 ms of self time on this run, so none is "
+            "ranked. For a frequent statement, judge it by its Query Store totals."
+        )
     if entry.get("local_variables"):
         entry["local_variables_note"] = LOCAL_VARIABLE_NOTE
     repeated = _repeated_objects(nodes, timed)

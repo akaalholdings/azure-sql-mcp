@@ -39,6 +39,27 @@ def _spool_plan(showplan, *, waits: str = "", query_time: str = "") -> str:
     )
 
 
+def test_actual_plan_under_one_millisecond_says_why_no_operator_is_ranked(showplan) -> None:
+    # Live (2026-11-04): a selective seek ran in 0 ms everywhere; top_operators was
+    # empty with no reason, which reads like a broken digest.
+    rt = showplan.runtime
+    plan = showplan.plan(
+        showplan.relop(
+            0,
+            "Nested Loops",
+            "Inner Join",
+            showplan.scan(1, "Posts", est_rows=1, runtime=rt((0, 3, 1, 0, 0))),
+            showplan.scan(2, "Votes", est_rows=1, runtime=rt((0, 3, 3, 0, 0))),
+            runtime=rt((0, 3, 1, 0, 0)),
+        ),
+    )
+
+    statement = _statement(build_plan_digest(plan))
+
+    assert not statement.get("top_operators")
+    assert "under 1 ms" in statement["top_operators_note"]
+
+
 def test_estimated_plan_says_what_it_cannot_show(showplan) -> None:
     plan = showplan.plan(
         showplan.relop(
