@@ -1798,6 +1798,169 @@ async def test_exact_rollback_preserves_column_list_and_multiple_view_attributes
     assert executor.views[("dbo", "SalesView")] == prior_definition
 
 
+_SALES_VIEW_WITH_HEADER = (
+    "CREATE VIEW [dbo].[SalesView] ([CustomerKey], [Total]) "
+    "WITH VIEW_METADATA, SCHEMABINDING AS "
+    "SELECT [Id], [Amount] FROM [dbo].[Sales];"
+)
+
+
+def _body_only_alter(definition: str, **kwargs) -> ViewChangeRequest:
+    return ViewChangeRequest(
+        database_name="testdb",
+        schema_name="dbo",
+        view_name="SalesView",
+        definition=definition,
+        operation="alter",
+        reviewed_intent=True,
+        idempotency_key="keep-header",
+        **kwargs,
+    )
+
+
+@pytest.mark.asyncio
+async def test_body_only_alter_keeps_prior_column_list_and_view_attributes(
+    server_config_factory,
+    tmp_path: Path,
+) -> None:
+    # Callers select [CustomerKey]/[Total]; browse-mode clients need
+    # VIEW_METADATA; SCHEMABINDING protects the base table. A body-only ALTER
+    # must not silently remove any of them and still report verified.
+    executor = FakeViewExecutor(_SALES_VIEW_WITH_HEADER)
+    service = ViewWorkflowService(
+        executor,
+        _policy(),
+        _admin(server_config_factory, tmp_path, WritePolicy.APPLY),
+    )
+
+    prepared = await service.prepare(
+        _body_only_alter(
+            "SELECT [Id], [Amount] FROM [dbo].[Sales] WHERE [Amount] > 0"
+        )
+    )
+
+    assert prepared.request.schema_bound is True
+    assert prepared.apply_sql is not None
+    assert (
+        "ALTER VIEW [dbo].[SalesView] ([CustomerKey], [Total]) "
+        "WITH VIEW_METADATA, SCHEMABINDING AS "
+        "SELECT [Id], [Amount] FROM [dbo].[Sales] WHERE [Amount] > 0;"
+    ) in prepared.apply_sql
+
+    result = await service.apply(prepared)
+
+    stored = executor.views[("dbo", "SalesView")]
+    assert "([CustomerKey], [Total]) WITH VIEW_METADATA, SCHEMABINDING AS" in stored
+    assert "WHERE [Amount] > 0" in stored
+    assert result["status"] == "completed"
+    assert result["verification"]["verified"] is True
+
+
+@pytest.mark.asyncio
+async def test_body_only_resubmit_of_view_with_header_is_noop(
+    server_config_factory,
+    tmp_path: Path,
+) -> None:
+    executor = FakeViewExecutor(_SALES_VIEW_WITH_HEADER)
+    service = ViewWorkflowService(
+        executor,
+        _policy(),
+        _admin(server_config_factory, tmp_path, WritePolicy.APPLY),
+    )
+
+    prepared = await service.prepare(
+        _body_only_alter("SELECT [Id], [Amount] FROM [dbo].[Sales]")
+    )
+
+    assert prepared.operation == "noop"
+    assert prepared.apply_sql is None
+
+
+@pytest.mark.asyncio
+async def test_alter_refuses_body_that_does_not_fit_prior_column_list(
+    server_config_factory,
+    tmp_path: Path,
+) -> None:
+    # The kept column list names two columns; a three-column body would fail
+    # inside the ALTER at apply time, so prepare must refuse it up front. The
+    # error must say the header cannot change through this tool, so an agent
+    # does not drop a column it needs just to fit the old width.
+    executor = FakeViewExecutor(_SALES_VIEW_WITH_HEADER)
+    service = ViewWorkflowService(
+        executor,
+        _policy(),
+        _admin(server_config_factory, tmp_path, WritePolicy.APPLY),
+    )
+
+    with pytest.raises(ViewDefinitionError, match="column list") as error:
+        await service.prepare(
+            _body_only_alter(
+                "SELECT [Id], [Amount], [Region] FROM [dbo].[Sales]"
+            )
+        )
+    message = str(error.value)
+    assert "WITH options" in message
+    assert "cannot be changed through prepare_view_change" in message
+    assert "outside this tool" in message
+    assert executor.batch_history == []
+
+
+@pytest.mark.asyncio
+async def test_alter_inherits_schemabinding_unless_request_unbinds_explicitly(
+    server_config_factory,
+    tmp_path: Path,
+) -> None:
+    executor = FakeViewExecutor(
+        "CREATE VIEW [dbo].[SalesView] WITH SCHEMABINDING AS "
+        "SELECT [Id] FROM [dbo].[Sales];"
+    )
+    service = ViewWorkflowService(
+        executor,
+        _policy(),
+        _admin(server_config_factory, tmp_path, WritePolicy.APPLY),
+    )
+
+    inherited = await service.prepare(
+        _body_only_alter("SELECT [Id] FROM [dbo].[Sales] WHERE [Id] > 0")
+    )
+    unbound = await service.prepare(
+        _body_only_alter(
+            "SELECT [Id] FROM [dbo].[Sales] WHERE [Id] > 0",
+            schema_bound=False,
+        )
+    )
+
+    assert inherited.request.schema_bound is True
+    assert inherited.apply_sql is not None
+    assert "[SalesView] WITH SCHEMABINDING AS SELECT" in inherited.apply_sql
+    assert unbound.request.schema_bound is False
+    assert unbound.apply_sql is not None
+    assert "SCHEMABINDING" not in unbound.apply_sql.split("sp_executesql", 1)[1]
+
+
+@pytest.mark.asyncio
+async def test_durable_state_rebuilds_alter_with_prior_header(
+    server_config_factory,
+    tmp_path: Path,
+) -> None:
+    executor = FakeViewExecutor(_SALES_VIEW_WITH_HEADER)
+    service = ViewWorkflowService(
+        executor,
+        _policy(),
+        _admin(server_config_factory, tmp_path, WritePolicy.APPLY),
+    )
+    prepared = await service.prepare(
+        _body_only_alter(
+            "SELECT [Id], [Amount] FROM [dbo].[Sales] WHERE [Amount] > 0"
+        )
+    )
+
+    restored = prepared_view_change_from_state(prepared_view_change_state(prepared))
+
+    assert restored.apply_sql == prepared.apply_sql
+    assert restored.target_fingerprint == prepared.target_fingerprint
+
+
 @pytest.mark.asyncio
 async def test_exact_rollback_preserves_leading_comments(
     server_config_factory,
