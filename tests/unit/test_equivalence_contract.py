@@ -724,3 +724,56 @@ def test_kept_or_absent_order_contract_has_no_risk(
     candidate: str,
 ) -> None:
     assert order_contract_risk(baseline, candidate) is None
+
+
+# Found by the live acceptance critic (2026-11-04): the same order key written
+# another way was treated as a changed order contract, so a correct rewrite that
+# only renamed an alias or used an ordinal could never be proven.
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        # Unqualified column with one source.
+        "SELECT o.OrderID, o.CustomerID FROM Sales.Orders AS o "
+        "WHERE o.CustomerID = 5 ORDER BY OrderID",
+        # Renamed table alias.
+        "SELECT ord.OrderID, ord.CustomerID FROM Sales.Orders AS ord "
+        "WHERE ord.CustomerID = 5 ORDER BY ord.OrderID",
+        # Ordinal of the same select-list column.
+        "SELECT o.OrderID, o.CustomerID FROM Sales.Orders AS o "
+        "WHERE o.CustomerID = 5 ORDER BY 1",
+        # Select-list alias of the same column.
+        "SELECT o.OrderID AS id, o.CustomerID FROM Sales.Orders AS o "
+        "WHERE o.CustomerID = 5 ORDER BY id",
+        # No alias at all.
+        "SELECT Sales.Orders.OrderID, CustomerID FROM Sales.Orders "
+        "WHERE CustomerID = 5 ORDER BY Sales.Orders.OrderID",
+    ],
+)
+def test_same_order_key_written_another_way_keeps_the_contract(candidate: str) -> None:
+    assert order_contract_risk(BASELINE_ORDERED, candidate) is None
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        # Ordinal of a different column.
+        "SELECT o.OrderID, o.CustomerID FROM Sales.Orders AS o "
+        "WHERE o.CustomerID = 5 ORDER BY 2",
+        # Select alias that names a different column than the baseline key.
+        "SELECT o.CustomerID AS OrderID, o.OrderID AS real_id FROM Sales.Orders AS o "
+        "WHERE o.CustomerID = 5 ORDER BY OrderID",
+        # Same column name from another table after a join.
+        "SELECT o.OrderID, o.CustomerID FROM Sales.Orders AS o "
+        "JOIN Sales.OrderLines AS l ON l.OrderID = o.OrderID "
+        "WHERE o.CustomerID = 5 ORDER BY l.OrderLineID",
+        # Unqualified name with two sources stays unresolved, so it stays a risk.
+        "SELECT o.OrderID, o.CustomerID FROM Sales.Orders AS o "
+        "JOIN Sales.OrderLines AS l ON l.OrderID = o.OrderID "
+        "WHERE o.CustomerID = 5 ORDER BY OrderLineID",
+    ],
+)
+def test_a_different_order_key_written_like_the_baseline_is_still_a_risk(candidate: str) -> None:
+    risk = order_contract_risk(BASELINE_ORDERED, candidate)
+
+    assert risk is not None
+    assert risk["risk"] == "order_contract_changed"

@@ -273,8 +273,9 @@ def outer_order_by_keys(sql: str) -> tuple[OrderKeys | None, ...]:
         if not isinstance(order, exp.Order) or not order.expressions:
             orders.append(None)
             continue
+        scope = last_member if isinstance(last_member, exp.Select) and last_member is statement else None
         orders.append(
-            tuple(_order_key(ordered) for ordered in order.expressions)
+            tuple(_order_key(ordered, scope) for ordered in order.expressions)
         )
     return tuple(orders)
 
@@ -340,8 +341,78 @@ def order_contract_risk(
     return None
 
 
-def _order_key(ordered: exp.Expr) -> tuple[str, bool]:
-    expression = ordered.this.copy() if isinstance(ordered, exp.Ordered) else ordered
+def _order_sources(select: exp.Select) -> dict[str, str] | None:
+    """Map each FROM/JOIN source name or alias to the table it names."""
+
+    sources: dict[str, str] = {}
+    from_clause = select.args.get("from") or select.args.get("from_")
+    items = [from_clause.this] if from_clause is not None else []
+    items += [join.this for join in select.args.get("joins") or []]
+    for item in items:
+        if isinstance(item, exp.Table):
+            target = ".".join(
+                part.casefold() for part in (item.catalog, item.db, item.name) if part
+            )
+            sources[(item.alias_or_name or item.name).casefold()] = target
+            sources.setdefault(target, target)
+        elif item is not None and item.alias_or_name:
+            # Derived table or other source: its alias is its identity.
+            sources[item.alias_or_name.casefold()] = item.alias_or_name.casefold()
+        else:
+            return None
+    return sources
+
+
+def _resolve_order_expression(expression: exp.Expr, select: exp.Select) -> exp.Expr:
+    """Rewrite an ORDER BY key to the column it binds to, when that is certain.
+
+    T-SQL binds an ORDER BY ordinal to the select list, an unqualified name to a
+    select-list alias first, and a qualifier to its FROM source. Anything that
+    cannot be resolved for certain is returned unchanged, so the comparison
+    stays at least as strict as plain text.
+    """
+
+    projections = list(select.expressions)
+    if any(isinstance(item, exp.Star) or isinstance(item.this, exp.Star) for item in projections):
+        return expression
+    if isinstance(expression, exp.Literal) and expression.is_int:
+        position = int(expression.name)
+        if 1 <= position <= len(projections):
+            expression = projections[position - 1].unalias().copy()
+        else:
+            return expression
+    elif isinstance(expression, exp.Column) and not expression.table:
+        for item in projections:
+            if isinstance(item, exp.Alias) and item.alias.casefold() == expression.name.casefold():
+                expression = item.this.copy()
+                break
+    sources = _order_sources(select)
+    if not sources:
+        return expression
+    targets = set(sources.values())
+
+    def qualify(node: exp.Expr) -> exp.Expr:
+        if not isinstance(node, exp.Column) or isinstance(node.this, exp.Star):
+            return node
+        qualifier = ".".join(
+            part.casefold() for part in (node.catalog, node.db, node.table) if part
+        )
+        if qualifier:
+            target = sources.get(qualifier) or sources.get(node.table.casefold())
+        else:
+            target = next(iter(targets)) if len(targets) == 1 else None
+        if target is None:
+            return node
+        # One opaque identifier: the resolved source is compared, not re-parsed.
+        return exp.Column(this=exp.to_identifier(node.name), table=exp.to_identifier(target))
+
+    return expression.transform(qualify)
+
+
+def _order_key(ordered: exp.Expr, select: exp.Select | None = None) -> tuple[str, bool]:
+    expression = ordered.this.copy() if isinstance(ordered, exp.Ordered) else ordered.copy()
+    if select is not None:
+        expression = _resolve_order_expression(expression, select)
     # Identifier case and quoting do not change T-SQL name resolution.
     for identifier in expression.find_all(exp.Identifier):
         identifier.set("this", identifier.name.casefold())
