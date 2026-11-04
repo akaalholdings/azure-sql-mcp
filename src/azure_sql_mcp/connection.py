@@ -508,7 +508,9 @@ class AzureSqlExecutor:
                 setup_cursor.execute(
                     "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
                 )
-                setup_cursor.execute("BEGIN TRANSACTION")
+                # No BEGIN TRANSACTION: with autocommit off the driver already
+                # opens one. A second level makes commit() end only the inner
+                # one, and the discarded connection then rolls everything back.
             finally:
                 with contextlib.suppress(Exception):
                     setup_cursor.close()

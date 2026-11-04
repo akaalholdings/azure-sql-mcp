@@ -1778,6 +1778,62 @@ CONTRACT_CHECKS: tuple[tuple[str, str, str], ...] = (
     ("IndexReviewSnapshot", "CK_IndexReviewSnapshot_CoverageJson", "ISJSON(CoverageJson) = 1 AND JSON_QUERY(CoverageJson) IS NOT NULL"),
     ("IndexReviewSnapshot", "CK_IndexReviewSnapshot_SubjectActionInvariants", "SubjectKind IN ('existing_index', 'missing_index') AND (SubjectKind = 'existing_index' OR MissingSignatureJson IS NOT NULL)"),
 )
+# SQL Server stores a CHECK in its own rewritten form (sys.check_constraints.definition):
+# `x NOT LIKE p` becomes `NOT [x] like p`, an IN list becomes a reversed OR chain, and
+# parentheses that AND precedence makes redundant are dropped. Token canonicalization
+# cannot undo that, so the exact form a fresh install stores is accepted as well (read
+# live from Azure SQL Database, compat 170). CONTRACT_CHECKS stays the fingerprinted source.
+_FINGERPRINT_CHECK_ENGINE_FORM = "(NOT [{0}] like '%[^0-9a-fA-F]%' AND len([{0}])=(64))"
+_NULLABLE_FINGERPRINT_CHECK_ENGINE_FORM = (
+    "([{0}] IS NULL OR NOT [{0}] like '%[^0-9a-fA-F]%' AND len([{0}])=(64))"
+)
+_SUBJECT_KIND_ENGINE_FORM = "([SubjectKind]='missing_index' OR [SubjectKind]='existing_index')"
+CONTRACT_CHECK_ENGINE_FORMS: dict[tuple[str, str], str] = {
+    **{
+        ("IndexReviewRun", f"CK_IndexReviewRun_{column}"): _FINGERPRINT_CHECK_ENGINE_FORM.format(column)
+        for column in (
+            "DatabaseFingerprint",
+            "IdempotencyKeyHash",
+            "RequestFingerprint",
+            "InventoryFingerprint",
+            "QueryStoreFingerprint",
+            "SnapshotSetFingerprint",
+        )
+    },
+    **{
+        ("IndexReviewRun", f"CK_IndexReviewRun_{column}"): _NULLABLE_FINGERPRINT_CHECK_ENGINE_FORM.format(column)
+        for column in (
+            "DatabaseIncarnationFingerprint",
+            "EngineFingerprint",
+            "CounterEpochFingerprint",
+        )
+    },
+    ("IndexReviewRun", "CK_IndexReviewRun_DatabaseIncarnationIdentity"): (
+        "([DatabaseIncarnationFingerprint] IS NULL AND [DatabaseIncarnationIdentity] IS NULL "
+        "OR [DatabaseIncarnationFingerprint] IS NOT NULL AND [DatabaseIncarnationIdentity] IS NOT NULL)"
+    ),
+    ("IndexReviewRun", "CK_IndexReviewRun_EngineEpochIdentity"): (
+        "([EngineFingerprint] IS NULL AND [EngineIdentity] IS NULL AND [EngineStartTimeUtc] IS NULL "
+        "OR [EngineFingerprint] IS NOT NULL AND [EngineIdentity] IS NOT NULL AND [EngineStartTimeUtc] IS NOT NULL)"
+    ),
+    ("IndexReviewSnapshot", "CK_IndexReviewSnapshot_SubjectKind"): _SUBJECT_KIND_ENGINE_FORM,
+    ("IndexReviewSnapshot", "CK_IndexReviewSnapshot_SubjectFingerprint"): _FINGERPRINT_CHECK_ENGINE_FORM.format(
+        "SubjectFingerprint"
+    ),
+    ("IndexReviewSnapshot", "CK_IndexReviewSnapshot_DefinitionFingerprint"): _FINGERPRINT_CHECK_ENGINE_FORM.format(
+        "DefinitionFingerprint"
+    ),
+    ("IndexReviewSnapshot", "CK_IndexReviewSnapshot_CounterEpochFingerprint"): (
+        _NULLABLE_FINGERPRINT_CHECK_ENGINE_FORM.format("CounterEpochFingerprint")
+    ),
+    ("IndexReviewSnapshot", "CK_IndexReviewSnapshot_MissingSignatureJson"): (
+        "([MissingSignatureJson] IS NULL OR isjson([MissingSignatureJson])=(1) "
+        "AND json_query([MissingSignatureJson]) IS NOT NULL)"
+    ),
+    ("IndexReviewSnapshot", "CK_IndexReviewSnapshot_SubjectActionInvariants"): (
+        f"({_SUBJECT_KIND_ENGINE_FORM} AND ([SubjectKind]='existing_index' OR [MissingSignatureJson] IS NOT NULL))"
+    ),
+}
 
 
 def _schema_material() -> dict[str, Any]:
@@ -2120,8 +2176,14 @@ def validate_contract_probe(result_sets: Sequence[Any]) -> ContractProbeResult:
             raise IndexReviewSchemaError(f"History contract default {table}.{name} is missing or drifted.")
     for table, name, definition in CONTRACT_CHECKS:
         actual_constraint = actual_constraints.get((table, name))
-        if actual_constraint != ("CHECK", _canonical_sql_tokens(definition)):
+        accepted = {("CHECK", _canonical_sql_tokens(definition))}
+        engine_form = CONTRACT_CHECK_ENGINE_FORMS.get((table, name))
+        if engine_form is not None:
+            accepted.add(("CHECK", _canonical_sql_tokens(engine_form)))
+        if actual_constraint not in accepted:
             raise IndexReviewSchemaError(f"History contract check {table}.{name} is missing or drifted.")
+        # Fingerprint the matched contract source, not the engine's spelling of it.
+        actual_constraints[(table, name)] = ("CHECK", _canonical_sql_tokens(definition))
 
     permissions = sets[4]
     if len(permissions) != 2 or {str(row.get("TableName")) for row in permissions} != {"IndexReviewRun", "IndexReviewSnapshot"}:
@@ -2770,11 +2832,24 @@ def _snapshot_params(run: IndexReviewRunV1, subject: Mapping[str, Any]) -> list[
             raise IndexReviewIntegrityError(f"Capture contains invalid non-negative {name}.")
         return value
 
+    def timestamp(value: Any, name: str) -> str | None:
+        return None if value in (None, "") else _timestamp(value, name)
+
     # The row id digests the stored row, so it must use the same observed-time
-    # default (DMV-only candidates carry no last_seen).
-    observed_at = subject.get("observed_at_utc") or run.observed_at_utc
+    # default (DMV-only candidates carry no last_seen) and the same text the
+    # datetime2 column reads back as: collectors carry SYSUTCDATETIME() text
+    # with 100 ns precision and no offset; read-back yields microseconds + Z.
+    observed_at = timestamp(subject.get("observed_at_utc") or run.observed_at_utc, "observed_at_utc")
+    first_observed_at = timestamp(subject.get("first_observed_at_utc"), "first_observed_at_utc")
+    last_observed_at = timestamp(subject.get("last_observed_at_utc"), "last_observed_at_utc")
+    stored_subject = {
+        **subject,
+        "observed_at_utc": observed_at,
+        "first_observed_at_utc": first_observed_at,
+        "last_observed_at_utc": last_observed_at,
+    }
     return [
-        _snapshot_row_id(run.run_id, {**subject, "observed_at_utc": observed_at}),
+        _snapshot_row_id(run.run_id, stored_subject),
         run.run_id,
         subject.get("subject_id"),
         subject.get("subject_kind"),
@@ -2789,8 +2864,8 @@ def _snapshot_params(run: IndexReviewRunV1, subject: Mapping[str, Any]) -> list[
         subject.get("counter_epoch_fingerprint"),
         _canonical(subject.get("counters", {})),
         observed_at,
-        subject.get("first_observed_at_utc"),
-        subject.get("last_observed_at_utc"),
+        first_observed_at,
+        last_observed_at,
         nonnegative("size_pages"),
         nonnegative("size_bytes"),
         nonnegative("write_burden"),

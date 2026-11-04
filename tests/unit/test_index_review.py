@@ -533,6 +533,92 @@ def test_contract_probe_preserves_logical_grouping() -> None:
         validate_contract_probe(probe)
 
 
+# sys.check_constraints.definition / sys.default_constraints.definition as Azure SQL
+# Database (compat 170) stores them after a fresh run of
+# sql/Install-IndexReviewHistory-v1.sql, read live on 2026-11-04. The engine rewrites
+# `x NOT LIKE` to `NOT [x] like`, an IN list to a reversed OR chain, drops the
+# parentheses that AND precedence makes redundant, and lowercases built-ins.
+ENGINE_STORED_DEFINITIONS = {
+    "DF_IndexReviewRun_CreatedAtUtc": "(sysutcdatetime())",
+    "CK_IndexReviewRun_ContractVersion": "([ContractVersion]='2.3.0')",
+    "CK_IndexReviewRun_SchemaVersion": "([SchemaVersion]='index-history-v1')",
+    "CK_IndexReviewRun_DatabaseFingerprint": "(NOT [DatabaseFingerprint] like '%[^0-9a-fA-F]%' AND len([DatabaseFingerprint])=(64))",
+    "CK_IndexReviewRun_DatabaseIncarnationFingerprint": "([DatabaseIncarnationFingerprint] IS NULL OR NOT [DatabaseIncarnationFingerprint] like '%[^0-9a-fA-F]%' AND len([DatabaseIncarnationFingerprint])=(64))",
+    "CK_IndexReviewRun_EngineFingerprint": "([EngineFingerprint] IS NULL OR NOT [EngineFingerprint] like '%[^0-9a-fA-F]%' AND len([EngineFingerprint])=(64))",
+    "CK_IndexReviewRun_IdempotencyKeyHash": "(NOT [IdempotencyKeyHash] like '%[^0-9a-fA-F]%' AND len([IdempotencyKeyHash])=(64))",
+    "CK_IndexReviewRun_RequestFingerprint": "(NOT [RequestFingerprint] like '%[^0-9a-fA-F]%' AND len([RequestFingerprint])=(64))",
+    "CK_IndexReviewRun_CounterEpochFingerprint": "([CounterEpochFingerprint] IS NULL OR NOT [CounterEpochFingerprint] like '%[^0-9a-fA-F]%' AND len([CounterEpochFingerprint])=(64))",
+    "CK_IndexReviewRun_InventoryFingerprint": "(NOT [InventoryFingerprint] like '%[^0-9a-fA-F]%' AND len([InventoryFingerprint])=(64))",
+    "CK_IndexReviewRun_QueryStoreFingerprint": "(NOT [QueryStoreFingerprint] like '%[^0-9a-fA-F]%' AND len([QueryStoreFingerprint])=(64))",
+    "CK_IndexReviewRun_CoverageJson": "(isjson([CoverageJson])=(1) AND json_query([CoverageJson]) IS NOT NULL)",
+    "CK_IndexReviewRun_SubjectCount": "([SubjectCount]>=(0))",
+    "CK_IndexReviewRun_SnapshotSetFingerprint": "(NOT [SnapshotSetFingerprint] like '%[^0-9a-fA-F]%' AND len([SnapshotSetFingerprint])=(64))",
+    "CK_IndexReviewRun_QueryStoreJson": "(isjson([QueryStoreJson])=(1) AND json_query([QueryStoreJson]) IS NOT NULL)",
+    "CK_IndexReviewRun_DatabaseIncarnationIdentity": "([DatabaseIncarnationFingerprint] IS NULL AND [DatabaseIncarnationIdentity] IS NULL OR [DatabaseIncarnationFingerprint] IS NOT NULL AND [DatabaseIncarnationIdentity] IS NOT NULL)",
+    "CK_IndexReviewRun_EngineEpochIdentity": "([EngineFingerprint] IS NULL AND [EngineIdentity] IS NULL AND [EngineStartTimeUtc] IS NULL OR [EngineFingerprint] IS NOT NULL AND [EngineIdentity] IS NOT NULL AND [EngineStartTimeUtc] IS NOT NULL)",
+    "CK_IndexReviewSnapshot_SubjectKind": "([SubjectKind]='missing_index' OR [SubjectKind]='existing_index')",
+    "CK_IndexReviewSnapshot_SubjectFingerprint": "(NOT [SubjectFingerprint] like '%[^0-9a-fA-F]%' AND len([SubjectFingerprint])=(64))",
+    "CK_IndexReviewSnapshot_DefinitionJson": "(isjson([DefinitionJson])=(1) AND json_query([DefinitionJson]) IS NOT NULL)",
+    "CK_IndexReviewSnapshot_DefinitionFingerprint": "(NOT [DefinitionFingerprint] like '%[^0-9a-fA-F]%' AND len([DefinitionFingerprint])=(64))",
+    "CK_IndexReviewSnapshot_CounterEpochFingerprint": "([CounterEpochFingerprint] IS NULL OR NOT [CounterEpochFingerprint] like '%[^0-9a-fA-F]%' AND len([CounterEpochFingerprint])=(64))",
+    "CK_IndexReviewSnapshot_CountersJson": "(isjson([CountersJson])=(1) AND json_query([CountersJson]) IS NOT NULL)",
+    "CK_IndexReviewSnapshot_SizePages": "([SizePages] IS NULL OR [SizePages]>=(0))",
+    "CK_IndexReviewSnapshot_SizeBytes": "([SizeBytes] IS NULL OR [SizeBytes]>=(0))",
+    "CK_IndexReviewSnapshot_WriteBurden": "([WriteBurden] IS NULL OR [WriteBurden]>=(0))",
+    "CK_IndexReviewSnapshot_QueryStoreReferencesJson": "(isjson([QueryStoreReferencesJson])=(1) AND left(ltrim([QueryStoreReferencesJson]),(1))='[')",
+    "CK_IndexReviewSnapshot_ProtectionsJson": "(isjson([ProtectionsJson])=(1) AND json_query([ProtectionsJson]) IS NOT NULL)",
+    "CK_IndexReviewSnapshot_MissingSignatureJson": "([MissingSignatureJson] IS NULL OR isjson([MissingSignatureJson])=(1) AND json_query([MissingSignatureJson]) IS NOT NULL)",
+    "CK_IndexReviewSnapshot_AggregatesJson": "(isjson([AggregatesJson])=(1) AND json_query([AggregatesJson]) IS NOT NULL)",
+    "CK_IndexReviewSnapshot_CoverageJson": "(isjson([CoverageJson])=(1) AND json_query([CoverageJson]) IS NOT NULL)",
+    "CK_IndexReviewSnapshot_SubjectActionInvariants": "(([SubjectKind]='missing_index' OR [SubjectKind]='existing_index') AND ([SubjectKind]='existing_index' OR [MissingSignatureJson] IS NOT NULL))",
+}
+
+
+def _engine_stored_probe_rows() -> list[list[dict[str, object]]]:
+    probe = _probe_rows()
+    for row in probe[3]:
+        row["Definition"] = ENGINE_STORED_DEFINITIONS[str(row["ConstraintName"])]
+    return probe
+
+
+def test_contract_probe_accepts_a_fresh_install_as_azure_sql_stores_it() -> None:
+    # Before: a correct install with the repo script failed as "missing or drifted",
+    # so capture could never store a run on Azure SQL Database.
+    assert {row["ConstraintName"] for row in _probe_rows()[3]} == set(ENGINE_STORED_DEFINITIONS)
+
+    result = validate_contract_probe(_engine_stored_probe_rows())
+
+    assert result.schema_fingerprint == CONTRACT_SCHEMA_FINGERPRINT
+    assert result.allow_write is True
+
+
+@pytest.mark.parametrize(
+    ("constraint_name", "definition"),
+    [
+        (
+            "CK_IndexReviewRun_DatabaseFingerprint",
+            "(NOT [DatabaseFingerprint] like '%[^0-9a-fA-F]%' AND len([DatabaseFingerprint])=(63))",
+        ),
+        (
+            "CK_IndexReviewSnapshot_SubjectKind",
+            "([SubjectKind]='missing_index' OR [SubjectKind]='other_index')",
+        ),
+        (
+            "CK_IndexReviewRun_EngineEpochIdentity",
+            "([EngineFingerprint] IS NULL AND ([EngineIdentity] IS NULL AND [EngineStartTimeUtc] IS NULL OR [EngineFingerprint] IS NOT NULL) AND [EngineIdentity] IS NOT NULL AND [EngineStartTimeUtc] IS NOT NULL)",
+        ),
+    ],
+)
+def test_contract_probe_still_rejects_drift_in_the_engine_stored_form(
+    constraint_name: str, definition: str
+) -> None:
+    probe = _engine_stored_probe_rows()
+    row = next(row for row in probe[3] if row["ConstraintName"] == constraint_name)
+    row["Definition"] = definition
+    with pytest.raises(Exception):
+        validate_contract_probe(probe)
+
+
 def test_redaction_rejects_query_material_but_allows_exact_reversible_filter() -> None:
     subject = _index()
     subject["definition"]["reversible_definition"]["filter"] = {

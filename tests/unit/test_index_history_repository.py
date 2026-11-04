@@ -399,6 +399,67 @@ async def test_repository_round_trip_preserves_dmv_only_source_marker() -> None:
     assert restored_subject["aggregates"]["dmv_only"] is True
 
 
+def _as_driver_datetime2(value: object) -> object:
+    """datetime2(7) column read back through mssql-python: naive, microseconds."""
+    if value is None:
+        return None
+    text = str(value).replace("Z", "+00:00")
+    return datetime.fromisoformat(text).replace(tzinfo=None)
+
+
+@pytest.mark.asyncio
+async def test_capture_with_engine_precision_timestamps_reads_back_after_commit() -> None:
+    # Live repro (2026-11-04, Azure SQL Database): the collector carries
+    # CONVERT(varchar(33), SYSUTCDATETIME(), 127) text with 100 ns precision and no
+    # offset. The row id digested that text, the datetime2 column read back as
+    # microseconds, and read-back failed with "non-canonical snapshot id".
+    executor = _Executor()
+    repository = SqlIndexHistoryRepository(executor, _policy(allow_write=True))
+    original = _capture()
+    subject = dict(original.snapshot.subjects[0])
+    subject["observed_at_utc"] = "2026-11-04T14:23:44.7487081"
+    subject["first_observed_at_utc"] = "2026-11-01T08:00:00.1234567"
+    subject["last_observed_at_utc"] = "2026-11-04T14:23:44.7487081"
+    subject["subject_fingerprint"] = _subject_fingerprint(str(subject["subject_kind"]), subject)
+    snapshot = replace(original.snapshot, subjects=(subject,), inventory_fingerprint="", snapshot_fingerprint="")
+    run = replace(
+        original.run,
+        inventory_fingerprint=snapshot.inventory_fingerprint,
+        snapshot_set_fingerprint=snapshot.snapshot_fingerprint,
+    )
+    capture = CaptureResult(run, snapshot)
+    context = CaptureContext(
+        "appdb",
+        run.database_fingerprint,
+        run.run_id,
+        run.idempotency_key_hash,
+        run.request_fingerprint,
+        run.observed_at_utc,
+        90,
+    )
+
+    def collector(session, _context):
+        session.capture = capture
+        return capture
+
+    original_transaction = executor.execute_transaction_exactly_once
+
+    async def transaction_with_driver_types(database_name, callback):
+        result = await original_transaction(database_name, callback)
+        for row in executor.snapshot_rows:
+            for column in ("ObservedAtUtc", "FirstObservedAtUtc", "LastObservedAtUtc"):
+                row[column] = _as_driver_datetime2(row[column])
+        return result
+
+    executor.execute_transaction_exactly_once = transaction_with_driver_types
+
+    result = await repository.append_capture(context, collector)
+
+    restored_subject = result.snapshot.subjects[0]
+    assert restored_subject["observed_at_utc"] == "2026-11-04T14:23:44.748708Z"
+    assert restored_subject["first_observed_at_utc"] == "2026-11-01T08:00:00.123456Z"
+
+
 def _policy(*, allow_write: bool) -> DatabasePolicySet:
     return DatabasePolicySet.from_mapping(
         {
@@ -543,10 +604,9 @@ async def test_capture_isolation_change_never_reaches_a_pooled_connection(
 
     assert result.already_captured is False
     statements = [call.args[0] for call in cursor.execute.call_args_list]
-    assert statements[:6] == [
+    assert statements[:5] == [
         "SET XACT_ABORT ON",
         "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
-        "BEGIN TRANSACTION",
         IDEMPOTENCY_LOCK_SQL,
         READ_COMMITTED_SQL,
         EXISTING_INDEX_METADATA_SQL,

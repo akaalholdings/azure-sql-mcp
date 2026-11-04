@@ -6,6 +6,7 @@ import threading
 import time
 import warnings
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 from unittest.mock import call
@@ -316,13 +317,98 @@ async def test_transaction_exactly_once_uses_one_connection_and_discards_it(
     pool.release.assert_not_awaited()
     pool.discard.assert_awaited_once_with("appdb", connection)
     assert connection.cursor.call_count == 3
-    assert [call.args[0] for call in cursor.execute.call_args_list[:3]] == [
+    assert [call.args[0] for call in cursor.execute.call_args_list[:2]] == [
         "SET XACT_ABORT ON",
         "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
-        "BEGIN TRANSACTION",
     ]
+    assert connection.autocommit is False
     connection.commit.assert_called_once_with()
     connection.rollback.assert_not_called()
+
+
+class _SqlServerTransactionConnection:
+    """ODBC transaction semantics of SQL Server, as seen live on Azure SQL Database.
+
+    With autocommit off the driver opens an implicit transaction (@@TRANCOUNT 1).
+    A further BEGIN TRANSACTION nests it (@@TRANCOUNT 2). commit() ends one
+    level only; rows are durable when @@TRANCOUNT reaches 0. A connection that
+    is discarded with an open transaction rolls back.
+    """
+
+    def __init__(self) -> None:
+        self.autocommit = True
+        self.trancount = 0
+        self.pending: list[Any] = []
+        self.durable: list[Any] = []
+
+    def cursor(self) -> Any:
+        connection = self
+
+        class _Cursor:
+            description = None
+            rowcount = 1
+
+            def execute(self, sql: str, params: Any = None) -> None:
+                if not connection.autocommit and connection.trancount == 0:
+                    connection.trancount = 1
+                if sql.strip().upper().startswith("BEGIN TRAN"):
+                    connection.trancount += 1
+                elif sql.strip().upper().startswith("INSERT"):
+                    connection.pending.append(params)
+
+            def fetchall(self) -> list[Any]:
+                return []
+
+            def nextset(self) -> bool:
+                return False
+
+            def close(self) -> None:
+                pass
+
+        return _Cursor()
+
+    def commit(self) -> None:
+        if self.trancount > 0:
+            self.trancount -= 1
+        if self.trancount == 0:
+            self.durable.extend(self.pending)
+            self.pending = []
+
+    def rollback(self) -> None:
+        self.trancount = 0
+        self.pending = []
+
+    def close(self) -> None:
+        self.rollback()
+
+
+@pytest.mark.asyncio
+async def test_transaction_exactly_once_commit_is_durable_with_sql_server_semantics(
+    sample_server_config,
+) -> None:
+    # Live repro (2026-11-04, Azure SQL Database): @@TRANCOUNT was 2 inside the
+    # callback and the inserted row was gone after the call, so index history
+    # capture could never store a run.
+    connection = _SqlServerTransactionConnection()
+
+    async def discard(_database: str, conn: Any) -> None:
+        conn.close()
+
+    pool = SimpleNamespace(
+        acquire=AsyncMock(return_value=connection),
+        release=AsyncMock(),
+        discard=AsyncMock(side_effect=discard),
+    )
+    executor = AzureSqlExecutor(sample_server_config, MagicMock(), pool)
+
+    def callback(session):
+        session.execute("INSERT INTO dbatools.IndexReviewRun VALUES (?)", ("run",))
+        return connection.trancount
+
+    trancount_inside = await executor.execute_transaction_exactly_once("appdb", callback)
+
+    assert trancount_inside == 1
+    assert connection.durable == [("run",)]
 
 
 def test_transaction_precommit_failure_rolls_back_and_does_not_commit(
