@@ -429,3 +429,335 @@ async def test_get_query_parameter_buckets_rejects_bad_query_id():
     service = QueryRegressionService(FakeExecutor([[]]))
     with pytest.raises(ValueError, match="query_id"):
         await service.get_query_parameter_buckets("testdb", 0)
+
+
+# --- Query Store SQL run on SQLite -------------------------------------------
+# The service's own SQL text runs here; only the T-SQL dialect is translated
+# (TOP, NVARCHAR(MAX), DATEADD on the UTC clock). Joins, GROUP BY, windowing and
+# aggregates are the exact text, so a grain or ranking bug shows as a wrong row.
+
+_QS_SCHEMA = """
+CREATE TABLE sys.query_store_query_text (query_text_id INT, query_sql_text TEXT);
+CREATE TABLE sys.query_store_query (query_id INT, query_text_id INT);
+CREATE TABLE sys.query_store_plan (plan_id INT, query_id INT, query_plan TEXT,
+    is_forced_plan INT, force_failure_count INT);
+CREATE TABLE sys.query_store_runtime_stats_interval (runtime_stats_interval_id INT,
+    start_time TEXT, end_time TEXT);
+CREATE TABLE sys.query_store_runtime_stats (plan_id INT, runtime_stats_interval_id INT,
+    execution_type INT, count_executions INT, avg_duration REAL, avg_cpu_time REAL,
+    avg_logical_io_reads REAL, avg_physical_io_reads REAL,
+    first_execution_time TEXT, last_execution_time TEXT);
+CREATE TABLE sys.query_store_wait_stats (plan_id INT, runtime_stats_interval_id INT,
+    execution_type INT, wait_category_desc TEXT, total_query_wait_time_ms REAL,
+    avg_query_wait_time_ms REAL, max_query_wait_time_ms REAL);
+"""
+
+_SHOWPLAN = (
+    "<ShowPlanXML xmlns='http://schemas.microsoft.com/sqlserver/2004/07/showplan'>"
+    "<BatchSequence><Batch><Statements><StmtSimple><QueryPlan>"
+    "<RelOp PhysicalOp='{op}'/></QueryPlan></StmtSimple></Statements></Batch>"
+    "</BatchSequence></ShowPlanXML>"
+)
+
+
+def _qs_ts(value) -> str:
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _translate_tsql(query: str, params: list) -> tuple[str, list]:
+    import re
+
+    params = list(params)
+    q = re.sub(r"(?i)nvarchar\s*\(\s*max\s*\)", "TEXT", query)
+    q = re.sub(
+        r"(?i)DATEADD\(MINUTE,\s*-\?,\s*(SYSUTCDATETIME|GETUTCDATE)\(\)\)",
+        "datetime('now', '-' || ? || ' minutes')",
+        q,
+    )
+    q = re.sub(
+        r"(?i)DATEADD\(MINUTE,\s*-(\d+),\s*(SYSUTCDATETIME|GETUTCDATE)\(\)\)",
+        r"datetime('now', '-\1 minutes')",
+        q,
+    )
+    match = re.search(r"(?i)SELECT\s+TOP\s*\((\?|\d+)\)", q)
+    if match:
+        if match.group(1) == "?":
+            limit = params.pop(q[: match.start()].count("?"))
+        else:
+            limit = int(match.group(1))
+        q = q[: match.start()] + "SELECT " + q[match.end() :]
+        q = q.rstrip().rstrip(";") + f"\nLIMIT {int(limit)}"
+    return q, params
+
+
+class QueryStoreSqlite:
+    def __init__(self) -> None:
+        import sqlite3
+
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.execute("ATTACH DATABASE ':memory:' AS sys")
+        self.conn.executescript(_QS_SCHEMA)
+        self.conn.row_factory = sqlite3.Row
+        self.calls: list[tuple[str, list]] = []
+
+    def insert(self, table: str, **values) -> None:
+        columns = ", ".join(values)
+        marks = ", ".join("?" for _ in values)
+        self.conn.execute(
+            f"INSERT INTO sys.{table} ({columns}) VALUES ({marks})", list(values.values())
+        )
+
+    def add_interval(self, interval_id: int, start, minutes: int = 60) -> None:
+        from datetime import timedelta
+
+        self.insert(
+            "query_store_runtime_stats_interval",
+            runtime_stats_interval_id=interval_id,
+            start_time=_qs_ts(start),
+            end_time=_qs_ts(start + timedelta(minutes=minutes)),
+        )
+
+    def add_query(self, query_id: int, plans: dict[int, str]) -> None:
+        self.insert("query_store_query_text", query_text_id=query_id, query_sql_text=f"q{query_id}")
+        self.insert("query_store_query", query_id=query_id, query_text_id=query_id)
+        for plan_id, op in plans.items():
+            self.insert(
+                "query_store_plan",
+                plan_id=plan_id,
+                query_id=query_id,
+                query_plan=_SHOWPLAN.format(op=op),
+                is_forced_plan=0,
+                force_failure_count=0,
+            )
+
+    def add_runtime(
+        self, plan_id: int, interval_id: int, count: int, avg_duration_us: float, execution_type: int = 0
+    ) -> None:
+        self.insert(
+            "query_store_runtime_stats",
+            plan_id=plan_id,
+            runtime_stats_interval_id=interval_id,
+            execution_type=execution_type,
+            count_executions=count,
+            avg_duration=avg_duration_us,
+            avg_cpu_time=avg_duration_us,
+            avg_logical_io_reads=10.0,
+            avg_physical_io_reads=0.0,
+            first_execution_time="2026-11-01 00:00:00",
+            last_execution_time="2026-11-03 00:00:00",
+        )
+
+    async def fetch_all(self, database_name: str, query: str, params: list | None = None) -> list[dict]:
+        sql, bound = _translate_tsql(query, params or [])
+        self.calls.append((query, list(params or [])))
+        return [dict(row) for row in self.conn.execute(sql, bound).fetchall()]
+
+
+def _hourly_intervals(store: QueryStoreSqlite, hours: int):
+    from datetime import UTC, datetime, timedelta
+
+    top = datetime.now(UTC).replace(tzinfo=None, minute=0, second=0, microsecond=0)
+    for index in range(hours):
+        store.add_interval(index + 1, top - timedelta(hours=hours - 1 - index))
+    return top
+
+
+@pytest.mark.asyncio
+async def test_parameter_sniffing_names_the_fast_plan_as_best() -> None:
+    # An agent forces best_plan_id. Plan 10 is the slow plan (500 ms) and has the
+    # lower id; naming it "best" would force the slow plan in production.
+    store = QueryStoreSqlite()
+    _hourly_intervals(store, 3)
+    store.add_query(1, {10: "Clustered Index Scan", 20: "Index Seek"})
+    for interval_id in (1, 2, 3):
+        store.add_runtime(10, interval_id, 50, 500_000)
+        store.add_runtime(20, interval_id, 400, 2_000)
+
+    result = await QueryRegressionService(store).detect_parameter_sniffing("db", 10.0, 1440, 20)
+
+    [row] = result["queries"]
+    assert (row["best_plan_id"], row["worst_plan_id"]) == (20, 10)
+    assert row["best_avg_duration_ms"] == pytest.approx(2.0)
+    assert row["worst_avg_duration_ms"] == pytest.approx(500.0)
+    assert row["duration_variance_ratio"] == pytest.approx(250.0)
+    assert row["plan_count"] == 2
+    assert row["total_executions"] == 1350
+    assert row["query_sql_text"] == "q1"
+
+
+@pytest.mark.asyncio
+async def test_parameter_sniffing_ignores_timeouts_and_single_bad_intervals() -> None:
+    # Two plans of equal speed are not a sniffing case. One Aborted (timeout) row
+    # or one slow hour of one plan must not create a 6000x "variance".
+    store = QueryStoreSqlite()
+    _hourly_intervals(store, 3)
+    store.add_query(2, {30: "Index Seek", 31: "Index Seek"})
+    for interval_id in (1, 2, 3):
+        store.add_runtime(30, interval_id, 1000, 5_000)
+        store.add_runtime(31, interval_id, 1000, 5_000)
+    store.add_runtime(31, 2, 1, 30_000_000, execution_type=3)  # Aborted
+    store.add_runtime(30, 3, 1, 600_000)  # one slow execution among 3001
+
+    result = await QueryRegressionService(store).detect_parameter_sniffing("db", 10.0, 1440, 20)
+
+    assert result["queries"] == []
+
+
+@pytest.mark.asyncio
+async def test_parameter_sniffing_binds_its_inputs() -> None:
+    store = QueryStoreSqlite()
+
+    await QueryRegressionService(store).detect_parameter_sniffing("db", 10.0, 90, 5)
+
+    query, params = store.calls[0]
+    assert "rsi.end_time >= DATEADD(MINUTE, -?, SYSUTCDATETIME())" in query
+    assert sorted(params, key=float) == [5, 10.0, 90]
+
+
+def _two_plans_over_48_hours() -> QueryStoreSqlite:
+    # Plan 5: 3 ms over 48 hourly intervals plus one Aborted 4 s row.
+    # Plan 6: about 400 ms over the same intervals.
+    store = QueryStoreSqlite()
+    _hourly_intervals(store, 48)
+    store.add_query(1, {5: "Index Seek", 6: "Clustered Index Scan"})
+    for interval_id in range(1, 49):
+        store.add_runtime(5, interval_id, 200, 3_000)
+        store.add_runtime(6, interval_id, 50, 400_000)
+    store.add_runtime(5, 10, 1, 4_000_000, execution_type=3)
+    return store
+
+
+@pytest.mark.asyncio
+async def test_compare_query_plans_with_explicit_ids_compares_plans_not_intervals() -> None:
+    # Each plan ran in 48 intervals. The answer is one row per plan with a ratio,
+    # not 97 interval rows (each with its plan XML) and an empty comparison.
+    store = _two_plans_over_48_hours()
+
+    result = await QueryRegressionService(store).compare_query_plans("db", 1, 5, 6)
+
+    assert [plan["plan_id"] for plan in result["plans"]] == [5, 6]
+    fast, slow = result["plans"]
+    assert fast["avg_duration_ms"] == pytest.approx(3.0)
+    assert fast["count_executions"] == 9600
+    assert fast["aborted_executions"] == 1
+    assert slow["avg_duration_ms"] == pytest.approx(400.0)
+    assert fast["top_operators"] == ["Index Seek"]
+    assert result["comparison"]["duration_ratio"] == pytest.approx(133.33)
+
+
+@pytest.mark.asyncio
+async def test_compare_query_plans_default_picks_two_different_plans() -> None:
+    # best and worst must be plans. Ranking interval rows compared plan 5 with its
+    # own timeout row (a false 1333x regression) and hid the slow plan 6.
+    store = _two_plans_over_48_hours()
+
+    result = await QueryRegressionService(store).compare_query_plans("db", 1)
+
+    assert [plan["plan_id"] for plan in result["plans"]] == [5, 6]
+    assert result["comparison"]["duration_ratio"] == pytest.approx(133.33)
+
+
+@pytest.mark.asyncio
+async def test_compare_query_plans_never_names_a_plan_that_only_timed_out_as_best() -> None:
+    # Plan 7 has only Aborted runs, so it has no Regular average. It must not be
+    # the "best" plan; asked for by id, it still shows its aborted count.
+    store = _two_plans_over_48_hours()
+    store.insert("query_store_plan", plan_id=7, query_id=1, query_plan="", is_forced_plan=0, force_failure_count=0)
+    store.add_runtime(7, 5, 3, 30_000_000, execution_type=3)
+    service = QueryRegressionService(store)
+
+    default = await service.compare_query_plans("db", 1)
+    explicit = await service.compare_query_plans("db", 1, 5, 7)
+
+    # Plan 7 is never "best"; it is the worst plan, because it always times out.
+    assert [plan["plan_id"] for plan in default["plans"]] == [5, 7]
+    timed_out = next(plan for plan in explicit["plans"] if plan["plan_id"] == 7)
+    assert timed_out["avg_duration_ms"] is None
+    assert timed_out["aborted_executions"] == 3
+    # No Regular average means no ratio. Substituting 1 ms reported the plan
+    # that always times out as about 3x faster than plan 5.
+    comparison = explicit["comparison"]
+    assert (comparison["duration_ratio"], comparison["cpu_ratio"], comparison["io_ratio"]) == (None, None, None)
+    assert comparison["plans_without_regular_runs"] == [7]
+
+
+@pytest.mark.asyncio
+async def test_compare_query_plans_default_never_names_a_plan_that_mostly_times_out_as_best() -> None:
+    # Plan 8 timed out 1000 times and finished twice at 1 ms. Its Regular-only
+    # average is the lowest, but the default comparison must show it as the
+    # worst plan, not the best: the documented default is "best vs worst".
+    store = _two_plans_over_48_hours()
+    store.insert("query_store_plan", plan_id=8, query_id=1, query_plan="", is_forced_plan=0, force_failure_count=0)
+    store.add_runtime(8, 3, 1000, 30_000_000, execution_type=3)
+    store.add_runtime(8, 4, 2, 1_000)
+
+    result = await QueryRegressionService(store).compare_query_plans("db", 1)
+
+    best, worst = result["plans"]
+    assert (best["plan_id"], worst["plan_id"]) == (5, 8)
+    assert (bool(best["material_failures"]), bool(worst["material_failures"])) == (False, True)
+    # A Regular-only average of a failing plan omits its timeouts: no ratio.
+    assert result["comparison"]["duration_ratio"] is None
+
+
+@pytest.mark.asyncio
+async def test_parameter_sniffing_never_names_a_plan_that_mostly_times_out_as_best() -> None:
+    # Plan 10 timed out 1000 times (30 s) and finished twice at 1 ms; plan 20
+    # runs at 50 ms. Averaging Regular runs only made plan 10 "best", and an
+    # agent that forces best_plan_id would force the plan that times out.
+    store = QueryStoreSqlite()
+    _hourly_intervals(store, 3)
+    store.add_query(1, {10: "Nested Loops", 20: "Hash Match"})
+    store.add_runtime(10, 1, 1000, 30_000_000, execution_type=3)  # Aborted
+    store.add_runtime(10, 2, 2, 1_000)
+    store.add_runtime(20, 2, 1000, 50_000)
+
+    result = await QueryRegressionService(store).detect_parameter_sniffing("db", 10.0, 1440, 20)
+
+    [row] = result["queries"]
+    assert (row["best_plan_id"], row["worst_plan_id"]) == (20, 10)
+    assert row["best_avg_duration_ms"] == pytest.approx(50.0)
+    # Its 1 ms Regular average omits 1000 timeouts, so it gives no ratio.
+    assert row["duration_variance_ratio"] is None
+    assert row["worst_plan_aborted_executions"] == 1000
+    assert row["worst_plan_material_failures"] is True
+    assert row["best_plan_aborted_executions"] == 0
+    assert row["best_plan_material_failures"] is False
+
+
+@pytest.mark.asyncio
+async def test_parameter_sniffing_flags_a_plan_that_only_times_out() -> None:
+    # Plan 11 has only Aborted runs, so it has no Regular average. It is the
+    # worst plan of the query; dropping it hid the sniffing case completely.
+    store = QueryStoreSqlite()
+    _hourly_intervals(store, 3)
+    store.add_query(2, {11: "Nested Loops", 21: "Hash Match"})
+    store.add_runtime(11, 1, 500, 30_000_000, execution_type=3)
+    store.add_runtime(11, 2, 4, 30_000_000, execution_type=4)  # Exception
+    store.add_runtime(21, 2, 1000, 5_000)
+
+    result = await QueryRegressionService(store).detect_parameter_sniffing("db", 10.0, 1440, 20)
+
+    [row] = result["queries"]
+    assert (row["best_plan_id"], row["worst_plan_id"]) == (21, 11)
+    assert row["best_avg_duration_ms"] == pytest.approx(5.0)
+    assert row["worst_avg_duration_ms"] is None
+    assert row["duration_variance_ratio"] is None
+    assert row["worst_plan_aborted_executions"] == 500
+    assert row["worst_plan_exception_executions"] == 4
+    assert row["worst_plan_material_failures"] is True
+
+
+@pytest.mark.asyncio
+async def test_parameter_sniffing_does_not_report_a_query_whose_plans_all_time_out() -> None:
+    # No plan is safe to force, so there is no best plan to name.
+    store = QueryStoreSqlite()
+    _hourly_intervals(store, 3)
+    store.add_query(3, {12: "Nested Loops", 22: "Hash Match"})
+    store.add_runtime(12, 1, 500, 30_000_000, execution_type=3)
+    store.add_runtime(22, 1, 100, 1_000)
+    store.add_runtime(22, 2, 400, 30_000_000, execution_type=3)
+
+    result = await QueryRegressionService(store).detect_parameter_sniffing("db", 10.0, 1440, 20)
+
+    assert result["queries"] == []
