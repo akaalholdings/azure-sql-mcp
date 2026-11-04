@@ -20,6 +20,7 @@ from .plan_tree import child_relops
 from .plan_tree import describe_result_shape
 from .plan_tree import is_true
 from .plan_tree import showplan_from_results
+from .plan_tree import statements
 from .safe_sql import SafeSqlValidator
 
 SHOWPLAN_NAMESPACE = {"sp": "http://schemas.microsoft.com/sqlserver/2004/07/showplan"}
@@ -36,13 +37,11 @@ _ROW_PRESERVING_OPERATORS = frozenset({"Parallelism", "Compute Scalar"})
 def _no_query_statement_types(raw_xml: str) -> list[str] | None:
     """Statement types when no statement has a query plan, else ``None``."""
 
-    statements = ET.fromstring(raw_xml).findall(".//sp:StmtSimple", SHOWPLAN_NAMESPACE)
-    if any(
-        statement.find("sp:QueryPlan", SHOWPLAN_NAMESPACE) is not None
-        for statement in statements
-    ):
+    # The shared statement list: a cursor's plans sit under CursorPlan/Operation.
+    found = statements(ET.fromstring(raw_xml))
+    if any(query_plan is not None for _, query_plan in found):
         return None
-    return [statement.attrib.get("StatementType", "") for statement in statements]
+    return [statement.attrib.get("StatementType", "") for statement, _ in found]
 
 
 def _only_no_query_statements(statement_types: list[str]) -> bool:

@@ -906,6 +906,20 @@ async def test_estimated_parameterized_plan_refuses_a_plan_with_no_query_plan():
 
 
 @pytest.mark.asyncio
+async def test_estimated_parameterized_plan_accepts_a_cursor_plan(showplan):
+    # A cursor's compiled plans sit under StmtCursor/CursorPlan/Operation, not
+    # StmtSimple. The digest and plan rules read them, so they are not a stub.
+    cursor_plan = showplan.batch(showplan.cursor(("FetchQuery", showplan.scan(0, "Orders", index="PK_Orders"))))
+    executor = AzureShapedShowplanExecutor(compiled_plan=cursor_plan)
+    service = PlansService(executor=executor, validator=SafeSqlValidator())
+
+    artifact = await service.explain_parameterized_query("appdb", _orders_contract(), analyze=False)
+
+    assert artifact.plan_kind == "estimated"
+    assert artifact.raw_xml == cursor_plan
+
+
+@pytest.mark.asyncio
 async def test_actual_plan_of_a_constant_select_names_the_real_cause():
     # Live: STATISTICS XML returns no plan for SELECT 1; the old error sent the
     # user to check SHOWPLAN access, which was fine.
