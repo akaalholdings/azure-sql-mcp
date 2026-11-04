@@ -286,22 +286,87 @@ def test_filtered_predicate_validation_preserves_legal_boolean_predicates() -> N
     assert "WHERE [Status] = 'SELECT; DROP' AND [DeletedAt] IS NOT NULL" in sql
 
 
-def test_filtered_predicate_validation_accepts_in_and_rhs_conversion() -> None:
+def test_filtered_predicate_validation_accepts_in_and_plain_date_literal() -> None:
     candidate = IndexCandidate(
         schema="dbo",
         table="Orders",
         key_columns=("Status",),
         include_columns=(),
-        filter_definition=(
-            "[Status] IN (1, 2, 3) "
-            "AND [CreatedAt] >= CONVERT(datetime2, '2026-01-01')"
-        ),
+        filter_definition="[Status] IN (1, 2, 3) AND [CreatedAt] >= '2026-01-01'",
     )
 
     sql = build_index_candidate_statement(candidate)
 
-    assert "[Status] IN (1, 2, 3)" in sql
-    assert "CONVERT(datetime2, '2026-01-01')" in sql
+    assert "WHERE [Status] IN (1, 2, 3) AND [CreatedAt] >= '2026-01-01'" in sql
+
+
+@pytest.mark.parametrize(
+    "filter_definition",
+    [
+        "[x] > CAST('2024-01-01' AS date)",
+        "[x] > TRY_CAST('2024-01-01' AS date)",
+        "[CreatedAt] >= CONVERT(datetime2, '2026-01-01')",
+        "[CreatedAt] >= CONVERT(datetime, '2026-01-01', 120)",
+        "[Amount] > 1e3",
+        "[Amount] > -1.5E-2",
+        "[Amount] IN (1, 2e1)",
+    ],
+)
+def test_filtered_predicate_validation_rejects_unverifiable_constants(
+    filter_definition: str,
+) -> None:
+    """SQL Server stores CAST as CONVERT([type],...) and float constants as
+    1.000000000000000e+003 in sys.indexes.filter_definition, so a created test
+    index with these constants can never be verified as ours and the benchmark
+    always rejects it after a real CREATE and DROP. Fail before any CREATE."""
+
+    candidate = IndexCandidate(
+        schema="dbo",
+        table="Orders",
+        key_columns=("Status",),
+        include_columns=(),
+        filter_definition=filter_definition,
+    )
+
+    with pytest.raises(ValueError, match="plain literal"):
+        build_index_candidate_statement(candidate)
+
+
+@pytest.mark.parametrize(
+    ("user_filter", "catalog_filter"),
+    [
+        ("x > '2024-01-01'", "([x]>'2024-01-01')"),
+        ("Amount > 1000.0", "([Amount]>(1000.0))"),
+    ],
+)
+def test_plain_literal_filters_verify_against_catalog_spelling(
+    user_filter: str,
+    catalog_filter: str,
+) -> None:
+    """The plain-literal spelling that the validator asks for must still verify."""
+
+    candidate = make_temporary_index_candidate(
+        IndexCandidate(
+            schema="dbo",
+            table="Orders",
+            key_columns=("Status",),
+            include_columns=(),
+            filter_definition=user_filter,
+        ),
+        "case-plain-literal",
+    )
+    build_index_candidate_statement(candidate)
+    actual = ExistingIndex(
+        schema="dbo",
+        table="Orders",
+        index_id=14,
+        name=candidate.index_name or "",
+        index_type="NONCLUSTERED",
+        key_columns=(IndexKeyColumn("Status", "ASC"),),
+        filter_definition=catalog_filter,
+    )
+
+    assert IndexOptimizer.verify_expected_index_definition(actual, candidate)
 
 
 @pytest.mark.parametrize(
@@ -459,6 +524,93 @@ def test_expected_definition_requires_full_observed_ownership_metadata() -> None
         replace(actual, partition_compression=((1, "ROW"),)),
     ):
         assert not IndexOptimizer.verify_expected_index_definition(changed, candidate)
+
+
+def _filtered_candidate_and_catalog_index(
+    user_filter: str,
+    catalog_filter: str,
+) -> tuple[IndexCandidate, ExistingIndex]:
+    candidate = make_temporary_index_candidate(
+        IndexCandidate(
+            schema="dbo",
+            table="Orders",
+            key_columns=("Status",),
+            include_columns=(),
+            filter_definition=user_filter,
+        ),
+        "filtered-catalog-spelling",
+    )
+    actual = ExistingIndex(
+        schema="dbo",
+        table="Orders",
+        index_id=14,
+        name=candidate.index_name or "",
+        index_type="NONCLUSTERED",
+        key_columns=(IndexKeyColumn("Status", "ASC"),),
+        filter_definition=catalog_filter,
+    )
+    return candidate, actual
+
+
+# sys.indexes.filter_definition is SQL Server's regenerated text: every column
+# is bracketed, every constant is parenthesized, <> replaces !=, and IN lists
+# are stored as OR chains. Post-create verification compares the caller's text
+# with this spelling; a false mismatch leaves an unowned index on the database.
+@pytest.mark.parametrize(
+    ("user_filter", "catalog_filter"),
+    [
+        ("status = 1", "([status]=(1))"),
+        ("Status IN (1, 2)", "([Status]=(1) OR [Status]=(2))"),
+        ("Status IN (1, 2)", "([Status]=(2) OR [Status]=(1))"),
+        ("Status IN (1)", "([Status]=(1))"),
+        ("Region IS NOT NULL", "([Region] IS NOT NULL)"),
+        ("Qty != 0", "([Qty]<>(0))"),
+        ("Amount > -1.5", "([Amount]>(-1.5))"),
+        ("ShipDate >= '20240101'", "([ShipDate]>='20240101')"),
+        ("Code = N'A'", "([Code]=N'A')"),
+        ("[Order Status] = 1", "([Order Status]=(1))"),
+        (
+            "Deleted = 0 AND Region IS NOT NULL",
+            "([Deleted]=(0) AND [Region] IS NOT NULL)",
+        ),
+        (
+            "Deleted = 0 AND Status IN (1, 2)",
+            "([Deleted]=(0) AND ([Status]=(1) OR [Status]=(2)))",
+        ),
+    ],
+)
+def test_expected_definition_matches_sql_server_filter_spelling(
+    user_filter: str,
+    catalog_filter: str,
+) -> None:
+    candidate, actual = _filtered_candidate_and_catalog_index(user_filter, catalog_filter)
+
+    build_index_candidate_statement(candidate)
+    assert IndexOptimizer.verify_expected_index_definition(actual, candidate)
+
+
+# Canonical text must stay a faithful predicate: a different value set, a
+# different AND/OR grouping, or a different literal is a different index.
+@pytest.mark.parametrize(
+    ("user_filter", "catalog_filter"),
+    [
+        ("Status IN (1, 2)", "([Status]=(1) OR [Status]=(3))"),
+        ("Status IN (1, 2)", "([Status]=(1))"),
+        (
+            "Deleted = 0 AND Status IN (1, 2)",
+            "([Deleted]=(0) AND [Status]=(1) OR [Status]=(2))",
+        ),
+        ("Code = N'A'", "([Code]=N'a')"),
+        ("Qty != 0", "([Qty]=(0))"),
+    ],
+)
+def test_expected_definition_rejects_different_filter_predicate(
+    user_filter: str,
+    catalog_filter: str,
+) -> None:
+    candidate, actual = _filtered_candidate_and_catalog_index(user_filter, catalog_filter)
+
+    assert not IndexOptimizer.verify_expected_index_definition(actual, candidate)
 
 
 @pytest.mark.parametrize(

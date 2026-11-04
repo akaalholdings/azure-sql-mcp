@@ -1310,7 +1310,8 @@ def _is_filter_column(node: Any) -> bool:
 
 
 def _is_filter_constant(node: Any) -> bool:
-    if isinstance(node, (exp.Literal, exp.Boolean)):
+    # exp.National is an N'...' Unicode string literal.
+    if isinstance(node, (exp.Literal, exp.Boolean, exp.National)):
         return True
     if isinstance(node, exp.Neg):
         return isinstance(node.this, exp.Literal) and not node.this.is_string
@@ -1370,6 +1371,21 @@ def _validate_filtered_index_predicate(text: str) -> None:
         raise ValueError("filtered index predicate must be one Boolean expression")
     if any(isinstance(node, _FILTERED_PREDICATE_UNSAFE_NODES) for node in predicate.walk()):
         raise ValueError("filtered index predicate contains a disallowed SQL construct")
+    # SQL Server stores CAST as CONVERT([type],...) and float constants as
+    # 1.000000000000000e+003, so a created index with either cannot be
+    # verified against sys.indexes.filter_definition.
+    for node in predicate.walk():
+        if isinstance(node, (exp.Cast, exp.Convert)) or (
+            isinstance(node, exp.Literal)
+            and not node.is_string
+            and "e" in str(node.this).casefold()
+        ):
+            raise ValueError(
+                "filtered index predicate must compare columns with a plain literal, "
+                "for example [CreatedAt] >= '2026-01-01' or [Amount] > 1000.0; "
+                "CAST, CONVERT and scientific-notation constants cannot be verified "
+                "after CREATE"
+            )
 
 
 def build_index_candidate_statement(
@@ -1569,13 +1585,64 @@ def _canonical_catalog_identifier(value: str) -> str:
     return _identifier_spelling(value).casefold()
 
 
+def _is_constant_in_list(node: Any) -> bool:
+    return (
+        isinstance(node, exp.In)
+        and node.args.get("query") is None
+        and bool(node.expressions)
+        and all(_is_filter_constant(value) for value in node.expressions)
+    )
+
+
+def _filter_disjuncts(node: Any) -> list[Any]:
+    if isinstance(node, exp.Or):
+        return [*_filter_disjuncts(node.this), *_filter_disjuncts(node.expression)]
+    if _is_constant_in_list(node):
+        return [
+            exp.EQ(this=node.this.copy(), expression=value.copy())
+            for value in node.expressions
+        ]
+    return [_canonical_filter_boolean(node)]
+
+
+def _canonical_filter_boolean(node: Any) -> Any:
+    """Give IN lists and OR chains one order-independent spelling.
+
+    SQL Server stores ``x IN (1, 2)`` as ``[x]=(1) OR [x]=(2)``. Each rebuilt
+    OR group is parenthesized so that removed parentheses cannot make two
+    different AND/OR groupings render the same text.
+    """
+
+    if isinstance(node, exp.And):
+        return exp.And(
+            this=_canonical_filter_boolean(node.this),
+            expression=_canonical_filter_boolean(node.expression),
+        )
+    if isinstance(node, exp.Not):
+        return exp.Not(this=_canonical_filter_boolean(node.this))
+    if isinstance(node, exp.Or) or _is_constant_in_list(node):
+        disjuncts = sorted(
+            _filter_disjuncts(node),
+            key=lambda disjunct: disjunct.sql(dialect="tsql"),
+        )
+        if len(disjuncts) == 1:
+            return disjuncts[0]
+        combined = disjuncts[0]
+        for disjunct in disjuncts[1:]:
+            combined = exp.Or(this=combined, expression=disjunct)
+        return exp.Paren(this=combined)
+    return node
+
+
 def _canonical_filter_definition(value: str | None) -> str | None:
     """Normalize catalog filter text without changing literal values.
 
-    SQL Server commonly returns generated filter text with redundant
-    parentheses. Parse the restricted predicate grammar already admitted by
-    this module, remove only ``Paren`` nodes, and casefold identifiers while
-    preserving string and numeric literal values.
+    SQL Server stores sys.indexes.filter_definition as regenerated text, for
+    example ``([status]=(1))`` for ``status = 1``. Parse the restricted
+    predicate grammar already admitted by this module, remove ``Paren``
+    nodes, quote and casefold every identifier, and give IN lists
+    and OR chains one spelling, while preserving string and numeric literal
+    values.
     """
 
     normalized = normalize_index_definition(value)
@@ -1592,6 +1659,10 @@ def _canonical_filter_definition(value: str | None) -> str | None:
             )
         for identifier in expression.find_all(exp.Identifier):
             identifier.set("this", str(identifier.this).casefold())
+            # Quote every identifier: SQL Server brackets all columns, and
+            # uniform delimiters keep names with spaces unambiguous.
+            identifier.set("quoted", True)
+        expression = _canonical_filter_boolean(expression)
         return expression.sql(dialect="tsql", normalize=True)
     except (ParseError, ValueError):
         # Verification must fail closed for text that cannot be normalized.
