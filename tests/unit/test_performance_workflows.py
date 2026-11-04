@@ -26,6 +26,7 @@ from azure_sql_mcp.performance_contracts import PerformanceCaseV1
 from azure_sql_mcp.performance_store import IdempotencyConflictError
 from azure_sql_mcp.performance_store import PerformanceStore
 from azure_sql_mcp.performance_workflows import PerformanceWorkflowService
+from azure_sql_mcp.performance_workflows import aba_result_status
 from azure_sql_mcp.performance_workflows import aggregate_samples
 from azure_sql_mcp.performance_workflows import classify_benchmark
 from azure_sql_mcp.performance_workflows import compare_result_collections
@@ -1859,7 +1860,9 @@ async def test_duplicate_and_order_sensitive_comparison_fails_closed() -> None:
         "SELECT id FROM dbo.Items",
         compare_order=False,
     )
-    assert ordered["status"] == "mismatch"
+    # Same rows in another order: not proven, but not a result difference.
+    assert ordered["status"] == "order_only_mismatch"
+    assert ordered["proven_for_parameter_case"] is False
     assert unordered["status"] == "match"
     assert unordered["snapshot_isolation_verified"] is True
     statements = executor.sessions[-1]
@@ -3515,3 +3518,214 @@ def test_classification_rejects_missing_or_mixed_metric_provenance() -> None:
 
     assert state == "inconclusive"
     assert "provenance" in reason
+
+
+def _rows_result(ids: list[int]) -> QueryResult:
+    return QueryResult(
+        columns=("id",),
+        rows=[{"id": value} for value in ids],
+        column_type_signatures=("synthetic-int",),
+    )
+
+
+def test_reordered_rows_are_order_only_mismatch_not_a_result_difference() -> None:
+    reordered = compare_result_sets(
+        _rows_result([3, 1, 2]),
+        _rows_result([1, 2, 3]),
+        row_limit=10,
+        compare_order=True,
+        same_snapshot=True,
+    )
+    different = compare_result_sets(
+        _rows_result([3, 1, 2]),
+        _rows_result([1, 2, 4]),
+        row_limit=10,
+        compare_order=True,
+        same_snapshot=True,
+    )
+    collection = compare_result_collections(
+        [_rows_result([3, 1, 2])],
+        [_rows_result([1, 2, 3])],
+        row_limit=10,
+        compare_order=True,
+        same_snapshot=True,
+    )
+
+    assert reordered["status"] == "order_only_mismatch"
+    assert reordered["proven_for_parameter_case"] is False
+    assert different["status"] == "mismatch"
+    assert collection["status"] == "order_only_mismatch"
+    assert collection["proven_for_parameter_case"] is False
+
+
+def test_order_only_mismatch_is_inconclusive_not_equivalence_failed() -> None:
+    state, reason = classify_benchmark(
+        [],
+        [{"status": "order_only_mismatch", "same_snapshot": True}],
+        require_equivalence=True,
+    )
+
+    assert state == "inconclusive"
+    assert "order" in reason
+
+
+def _ordered_profile(ids: list[int]) -> ProfiledPlanResult:
+    profile = _profile(10, marker="same")
+    profile.result_sets[0] = replace(
+        _rows_result(ids),
+        positional_rows_exact=True,
+    )
+    return profile
+
+
+def test_aba_stability_separates_reordered_rows_from_changed_rows() -> None:
+    heap_order = profile_result_fingerprint(
+        _ordered_profile([3, 1, 2]),
+        compare_order=True,
+    )
+    index_order = profile_result_fingerprint(
+        _ordered_profile([1, 2, 3]),
+        compare_order=True,
+    )
+    changed = profile_result_fingerprint(
+        _ordered_profile([1, 2, 4]),
+        compare_order=True,
+    )
+
+    assert heap_order["fingerprint"] != index_order["fingerprint"]
+    assert heap_order["multiset_fingerprint"] == index_order["multiset_fingerprint"]
+    assert aba_result_status([heap_order, heap_order], complete=True) == "match"
+    assert (
+        aba_result_status([heap_order, index_order, heap_order], complete=True)
+        == "order_only_mismatch"
+    )
+    assert (
+        aba_result_status([heap_order, changed, heap_order], complete=True)
+        == "mismatch"
+    )
+    assert aba_result_status([heap_order], complete=False) == "inconclusive"
+
+
+@pytest.mark.asyncio
+async def test_unordered_comparison_defaults_to_a_multiset() -> None:
+    executor = SnapshotExecutor(
+        baseline_rows=[{"id": 2}, {"id": 1}],
+        candidate_rows=[{"id": 1}, {"id": 2}],
+    )
+    service, _store, _plans, _executor = _service(executor=executor)
+
+    result = await service.compare_query_results(
+        "appdb",
+        "SELECT id FROM dbo.Items",
+        "SELECT id FROM dbo.Items AS candidate",
+    )
+
+    assert result["status"] == "match"
+    assert result["order_compared"] is False
+
+
+@pytest.mark.asyncio
+async def test_outer_order_by_cannot_be_waived_by_compare_order_false() -> None:
+    executor = SnapshotExecutor(
+        baseline_rows=[{"id": 1}, {"id": 2}],
+        candidate_rows=[{"id": 2}, {"id": 1}],
+    )
+    service, _store, _plans, _executor = _service(executor=executor)
+
+    result = await service.compare_query_results(
+        "appdb",
+        "SELECT id FROM dbo.Items ORDER BY id",
+        "SELECT id FROM dbo.Items AS candidate ORDER BY id",
+        compare_order=False,
+    )
+
+    assert result["order_compared"] is True
+    assert result["status"] == "order_only_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_comparison_that_drops_outer_order_by_needs_a_proof_contract() -> None:
+    service, _store, _plans, executor = _service()
+
+    result = await service.compare_query_results(
+        "appdb",
+        "SELECT id FROM dbo.Items ORDER BY id",
+        "SELECT id FROM dbo.Items AS candidate",
+    )
+
+    assert result["status"] == "proof_contract_required"
+    assert "order_contract_changed" in (
+        result["equivalence_preflight"]["candidate"]["risk_codes"]
+    )
+    assert executor.sessions == []
+
+
+@pytest.mark.asyncio
+async def test_new_access_order_for_unordered_query_is_not_equivalence_failed() -> None:
+    # A faster plan for a query with no ORDER BY returns the same rows in a
+    # different order. That is not a semantic change.
+    executor = SnapshotExecutor(
+        baseline_rows=[{"id": 3}, {"id": 1}, {"id": 2}],
+        candidate_rows=[{"id": 1}, {"id": 2}, {"id": 3}],
+    )
+    service, store, _plans, _executor = _service(executor=executor)
+    baseline = "SELECT id FROM dbo.Items"
+    candidate_sql = "SELECT id FROM dbo.Items AS candidate"
+    session_id, candidate_id = _start(
+        service,
+        baseline=baseline,
+        candidate=candidate_sql,
+    )
+
+    await service.benchmark_candidate(
+        session_id, candidate_id, "appdb", baseline, candidate_sql,
+        phase="screening",
+    )
+    result = await service.benchmark_candidate(
+        session_id, candidate_id, "appdb", baseline, candidate_sql,
+        phase="finalist",
+    )
+
+    assert result["classification"] == "improved"
+    assert result["equivalence"][0]["order_compared"] is False
+    assert store.get_candidate(candidate_id).state == "improved"
+
+
+@pytest.mark.asyncio
+async def test_rewrite_that_drops_outer_order_by_is_never_deployment_ready() -> None:
+    baseline = "SELECT id FROM dbo.Items ORDER BY id"
+    candidate_sql = "SELECT id FROM dbo.Items AS candidate"
+    service, _store, _plans, _executor = _service()
+    session_id, candidate_id = _start(
+        service,
+        baseline=baseline,
+        candidate=candidate_sql,
+    )
+
+    await service.benchmark_candidate(
+        session_id, candidate_id, "appdb", baseline, candidate_sql,
+        phase="screening",
+    )
+    result = await service.benchmark_candidate(
+        session_id, candidate_id, "appdb", baseline, candidate_sql,
+        phase="finalist",
+    )
+
+    assert result["classification"] == "performance_only"
+    assert result["proof_scope"] == "performance_only"
+    candidate_preflight = result["equivalence_preflight"]["candidate"]
+    assert candidate_preflight["direct_snapshot_supported"] is False
+    assert "order_contract_changed" in candidate_preflight["risk_codes"]
+    with pytest.raises(ValueError, match="Selection scope proven"):
+        service.finalize_session(
+            session_id,
+            selected_candidate_id=candidate_id,
+            stopping_reason="choose the measured winner",
+        )
+    final = service.finalize_session(
+        session_id,
+        selected_candidate_id=candidate_id,
+        stopping_reason="choose the measured winner",
+        selection_scope="performance_only",
+    )
+    assert final["deployment_ready"] is False

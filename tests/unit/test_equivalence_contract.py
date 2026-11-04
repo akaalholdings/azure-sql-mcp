@@ -5,7 +5,10 @@ import json
 import pytest
 
 from azure_sql_mcp.equivalence_contract import analyze_equivalence_preflight
+from azure_sql_mcp.equivalence_contract import effective_compare_order
 from azure_sql_mcp.equivalence_contract import has_outer_literal_top_zero
+from azure_sql_mcp.equivalence_contract import order_contract_risk
+from azure_sql_mcp.equivalence_contract import resolve_compare_order
 from azure_sql_mcp.equivalence_preflight import EquivalencePreflightService
 
 
@@ -613,3 +616,111 @@ async def test_database_preflight_accepts_executor_compatible_fetcher() -> None:
     assert result.as_dict()["resolved_view_dependencies"][0]["object_name"] == (
         "v_orders"
     )
+
+
+# Result order is part of a query's contract only when the outermost statement
+# has ORDER BY. Any other order is an accident of the plan, and an index or a
+# rewrite is expected to change it.
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        ("SELECT id FROM dbo.Orders WHERE customer_id = 5", False),
+        ("SELECT id FROM dbo.Orders ORDER BY id", True),
+        ("SELECT TOP (5) id FROM dbo.Orders ORDER BY id DESC", True),
+        (
+            "SELECT id FROM dbo.Orders ORDER BY id "
+            "OFFSET 10 ROWS FETCH NEXT 10 ROWS ONLY",
+            True,
+        ),
+        (
+            "SELECT d.id FROM (SELECT TOP (5) id FROM dbo.Orders ORDER BY id) AS d",
+            False,
+        ),
+        (
+            "SELECT id FROM dbo.Orders UNION ALL SELECT id FROM dbo.Archive "
+            "ORDER BY id",
+            True,
+        ),
+        (
+            "WITH recent AS (SELECT id FROM dbo.Orders) "
+            "SELECT id FROM recent ORDER BY id",
+            True,
+        ),
+        ("DECLARE @c int = 5; SELECT id FROM dbo.Orders ORDER BY id", True),
+        ("SELECT id INTO #ids FROM dbo.Orders ORDER BY id", False),
+    ],
+)
+def test_compare_order_resolves_from_outer_order_by_only(
+    sql: str,
+    expected: bool,
+) -> None:
+    assert resolve_compare_order(sql) is expected
+
+
+def test_effective_compare_order_keeps_a_contractual_order() -> None:
+    unordered = "SELECT id FROM dbo.Orders"
+    ordered = "SELECT id FROM dbo.Orders ORDER BY id"
+
+    assert effective_compare_order(unordered, None) is False
+    assert effective_compare_order(unordered, True) is True
+    assert effective_compare_order(ordered, None) is True
+    # A caller cannot waive an order that the baseline promises its callers.
+    assert effective_compare_order(ordered, False) is True
+
+
+BASELINE_ORDERED = (
+    "SELECT o.OrderID, o.CustomerID FROM Sales.Orders AS o "
+    "WHERE o.CustomerID = 5 ORDER BY o.OrderID"
+)
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        # Drops the order: a sandbox serial seek can still return key order.
+        "SELECT o.OrderID, o.CustomerID FROM Sales.Orders AS o "
+        "WHERE o.CustomerID = 5",
+        # Changes the keys.
+        "SELECT o.OrderID, o.CustomerID FROM Sales.Orders AS o "
+        "WHERE o.CustomerID = 5 ORDER BY o.CustomerID",
+        # Changes the direction.
+        "SELECT o.OrderID, o.CustomerID FROM Sales.Orders AS o "
+        "WHERE o.CustomerID = 5 ORDER BY o.OrderID DESC",
+        # Moves the order into a derived table, where it promises nothing.
+        "SELECT d.OrderID, d.CustomerID FROM (SELECT TOP (100) o.OrderID, "
+        "o.CustomerID FROM Sales.Orders AS o WHERE o.CustomerID = 5 "
+        "ORDER BY o.OrderID) AS d",
+    ],
+)
+def test_order_contract_change_is_a_blocking_risk(candidate: str) -> None:
+    risk = order_contract_risk(BASELINE_ORDERED, candidate)
+
+    assert risk is not None
+    assert risk["risk"] == "order_contract_changed"
+    assert risk["result_set_ordinal"] == 1
+
+
+@pytest.mark.parametrize(
+    ("baseline", "candidate"),
+    [
+        (BASELINE_ORDERED, BASELINE_ORDERED),
+        (
+            BASELINE_ORDERED,
+            "SELECT o.OrderID, o.CustomerID FROM Sales.Orders AS o "
+            "WHERE o.CustomerID = 5 ORDER BY [o].[orderid] ASC, o.CustomerID",
+        ),
+        (
+            "SELECT id FROM dbo.Orders",
+            "SELECT id FROM dbo.Orders AS candidate",
+        ),
+        (
+            "SELECT id FROM dbo.Orders",
+            "SELECT id FROM dbo.Orders ORDER BY id",
+        ),
+    ],
+)
+def test_kept_or_absent_order_contract_has_no_risk(
+    baseline: str,
+    candidate: str,
+) -> None:
+    assert order_contract_risk(baseline, candidate) is None
