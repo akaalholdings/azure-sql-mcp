@@ -95,7 +95,8 @@ Plan actions, views and plans:
   `rollback_confirmation=state_changed`, when the current force or hint state is
   no longer the state the intent applied.
 - ALTER of a view keeps the existing column list and WITH options
-  (VIEW_METADATA, SCHEMABINDING, ENCRYPTION). Before, a body-only change
+  (VIEW_METADATA, SCHEMABINDING). An encrypted view has no readable
+  definition, so prepare refuses it and changes nothing. Before, a body-only change
   removed them and verify still reported success. An unset `schema_bound` keeps
   the existing SCHEMABINDING, and a durable retry with the same key no longer
   fails with an idempotency conflict.
@@ -117,6 +118,65 @@ Runtime:
   durable settlement: the executions already run are counted and the execution
   reservation is settled before the cancel is raised again.
 
+Found by live acceptance on Azure SQL Database (most were also in 2.6.2):
+
+- Index history capture stored no run at all. The exactly-once transaction
+  nested `BEGIN TRANSACTION` inside the driver's own transaction, so commit
+  ended only the inner level and the run rolled back. The contract check also
+  compared CHECK constraints with the installer text, not the form SQL Server
+  stores, and snapshot row ids digested 100 ns timestamp text that reads back
+  as microseconds. A fresh install now captures, reads back and replays.
+- `sys.objects.type` is `char(2)` (`'U '`): user-table indexes got the blocker
+  `parent_is_not_user_table`, so widen, extend and consolidate advice had no
+  rollback DDL, and indexed views were missed.
+- Estimated plans for typed parameters (`explain_query`, `analyze_query_indexes`)
+  never compiled the statement: SHOWPLAN_XML returns nothing for parameter
+  markers and only an EXECUTE PROC stub for `sp_executesql`. They now compile
+  the statement with typed local variables and `OPTIMIZE FOR` the values, and
+  `estimated_plan_basis` says what that does not model (PSP and
+  optional-parameter dispatcher plans, parameter embedding). A plan with no
+  compiled query plan is refused, never read as zero hints.
+- A plan that only maintains an index (INSERT, UPDATE, DELETE, or an internal
+  REBUILD or UPDATE STATISTICS) no longer counts as use in
+  `review_index_portfolio` and `review_workload_indexes`, so an index on a
+  table that takes inserts can become a removal candidate. A forced plan that
+  touches the index still protects it.
+- A schema- or table-scoped `review_workload_indexes` ranks only the scope's
+  queries before the `top_queries` cap and checks only the scope's indexes for
+  plan references. Before, a busy database pushed the scope's own queries out
+  of the cap and the reference read timed out.
+- `get_top_queries`, `get_query_store_trend`, the query history tools and
+  `get_query_store_regressions` add `aborted_executions`,
+  `exception_executions` and a Regular-only average beside the existing
+  averages, which still include failed runs.
+- `compare_query_plans` keeps the caller's a/b order, names
+  `baseline_plan_id` and `compared_plan_id`, and refuses a single plan id.
+- `order_contract_changed` no longer fires when the same ORDER BY key is
+  written another way (unqualified, another alias, an ordinal or a select-list
+  alias).
+- Benchmark `actual_rows` was 0 when a parallel-shaped plan ran serially; an
+  actual plan of a constant-only SELECT now gets an accurate error; a digest
+  of an actual plan that ran in under 1 ms says why no operator is ranked.
+- View rollback restores the original module text, not a rebuilt one, and
+  reports `definition_exact` and `text_drift` on every path, including a retry.
+- An index benchmark refused before dispatch (filter, table name, parameter
+  binding, execution budget) no longer binds the candidate, so the corrected
+  request with a new key runs.
+- A failure after a plan or view write was sent records `unknown` or raises
+  an outcome-unknown error, so a retry cannot force twice or undo another
+  change. A verify that decides rollback returns the regressed metrics.
+- MCP refusal messages no longer quote examples or statuses, which the error
+  sanitizer redacted.
+
+### Changed
+
+- `failure_diagnostic.diagnostic_code` now says what happened when no SQL error
+  caused the failure: `request_refused`, `policy_refused`,
+  `verification_failed` (a write was sent, then its outcome could not be
+  verified or recorded: read state first, do not resubmit), `lease_conflict`
+  or `internal_error`. Before, all of these were `sql_execution_failed`, which
+  now means a SQL or driver error only. See docs/09-operations.md.
+
 ### Known issues
 
 - A durable view change prepared by 2.6.2 (`persist_view_sql_state`) for a view
@@ -124,6 +184,16 @@ Runtime:
   rollback of that change id fail with "durable view marker identity is
   invalid". Restore the stored prior definition by hand. This applies only to
   sandbox profiles with persisted view state.
+- An unscoped `review_workload_indexes` on a database with many unused indexes
+  and large plans can still time out on the plan reference read (the unused
+  indexes then stay low confidence). Scoped reviews are fixed; the general fix
+  is planned for 2.6.3b.
+- Query Store plan references match an index by name. After a table is dropped
+  and recreated with the same index names, old plans can still count as
+  references until they age out.
+- Not verified live: readable-replica holds (the test tier has no replicas)
+  and the index-age gate alone (a serverless resume resets usage counters, so
+  the counters-recent gate fires first). Both are covered by unit tests.
 
 ## [2.6.2] - 2026-10-06
 
