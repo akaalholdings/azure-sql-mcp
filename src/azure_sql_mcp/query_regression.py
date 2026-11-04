@@ -330,8 +330,12 @@ class QueryRegressionService:
 
         Runtime stats are aggregated per plan first (execution-weighted, Regular
         runs only; aborted and exception counts are separate fields), so each
-        plan is one row and its XML is read once.
+        plan is one row and its XML is read once. Plans come back in the
+        caller's a/b order (best, worst by default) and each ratio is
+        compared_plan_id / baseline_plan_id.
         """
+        if (plan_id_a is None) != (plan_id_b is None):
+            raise ValueError("Give both plan_id_a and plan_id_b, or neither (best vs worst).")
         if plan_id_a is not None and plan_id_b is not None:
             plans_query = _COMPARE_PLANS_SQL.format(
                 plan_filter="AND p.plan_id IN (?, ?)",
@@ -358,6 +362,10 @@ class QueryRegressionService:
             # Extract top operators from plan XML (lightweight parse)
             row["top_operators"] = self._extract_top_operators(plan_xml)
             plans.append(row)
+        if plan_id_a is not None and plan_id_b is not None:
+            # The SQL sorts by plan_id; put the rows in the caller's a/b order.
+            by_id = {int(plan["plan_id"]): plan for plan in plans}
+            plans = [by_id[i] for i in dict.fromkeys((int(plan_id_a), int(plan_id_b))) if i in by_id]
 
         comparison: dict[str, Any] = {}
         if len(plans) == 2:
@@ -373,6 +381,9 @@ class QueryRegressionService:
             comparison = {
                 name: None if failing else _plan_ratio(a, b, column) for name, column in metrics
             }
+            # Each ratio is compared / baseline.
+            comparison["baseline_plan_id"] = a["plan_id"]
+            comparison["compared_plan_id"] = b["plan_id"]
             # A plan with only aborted/exception runs has no Regular average,
             # so its ratios are None; it is not 1 ms (it may always time out).
             without_regular = [p["plan_id"] for p in plans if p.get("avg_duration_ms") is None]

@@ -51,6 +51,10 @@ def _bucket(hour: int, executions: float, duration_ms: float, plans: int = 1) ->
         "total_duration_ms": duration_ms,
         "total_logical_reads": executions * 100,
         "total_physical_reads": 0,
+        "regular_executions": executions,
+        "regular_total_duration_ms": duration_ms,
+        "aborted_executions": 0,
+        "exception_executions": 0,
     }
 
 
@@ -76,6 +80,9 @@ async def test_workload_trend_buckets_carry_averages_and_a_peak() -> None:
         "avg_cpu_ms": 40.0,
         "avg_duration_ms": 80.0,
         "avg_logical_reads": 100.0,
+        "aborted_executions": 0,
+        "exception_executions": 0,
+        "regular_avg_duration_ms": 80.0,
     }
     assert result["totals"]["peak_bucket_utc"] == "2026-10-01T10:00:00Z"
     assert "plans" not in result
@@ -238,3 +245,96 @@ async def test_top_queries_default_window_is_unchanged() -> None:
 
     assert "DATEADD(MINUTE, -?, SYSUTCDATETIME())" in executor.query
     assert executor.params == [10, 60]
+
+
+@pytest.mark.asyncio
+async def test_trend_shows_timeouts_and_a_regular_only_average() -> None:
+    # Plan 399: 53 Regular runs at 0.1 ms and 7 timeouts at 2 s. The mixed
+    # average (233 ms) hides the timeouts; the reader needs the aborted count and
+    # the Regular-only average that compare_query_plans reports.
+    row = {
+        **_bucket(9, 60, 14_005.3),
+        "regular_executions": 53,
+        "regular_total_duration_ms": 5.3,
+        "aborted_executions": 7,
+        "exception_executions": 0,
+    }
+    plan = {
+        "plan_id": 399, "is_forced_plan": 0, "executions": 60, "total_cpu_ms": 10,
+        "total_duration_ms": 14_005.3, "total_logical_reads": 600,
+        "regular_executions": 53, "regular_total_duration_ms": 5.3,
+        "aborted_executions": 7, "exception_executions": 0,
+        "first_seen_utc": "2026-10-01T09:00:00", "last_seen_utc": "2026-10-01T10:00:00",
+    }
+    executor = RoutingExecutor(trend=[row], plans=[plan])
+
+    result = await QueryStoreTrendService(executor).trend("appdb", query_id=372, now=NOW)
+
+    for key in ("trend", "plans"):
+        sql = next(call for call in executor.calls if call[0] == key)[1]
+        assert "rs.execution_type = 0" in sql
+        assert "rs.execution_type = 3" in sql
+        assert "rs.execution_type = 4" in sql
+    bucket, totals, plan_row = result["buckets"][0], result["totals"], result["plans"][0]
+    for item in (bucket, totals, plan_row):
+        assert item["executions"] == 60
+        assert item["avg_duration_ms"] == pytest.approx(233.422)  # unchanged meaning: all runs
+        assert item["aborted_executions"] == 7
+        assert item["exception_executions"] == 0
+        assert item["regular_avg_duration_ms"] == pytest.approx(0.1)
+
+
+@pytest.mark.asyncio
+async def test_trend_regular_average_is_none_when_every_run_timed_out() -> None:
+    row = {**_bucket(9, 5, 10_000), "regular_executions": 0, "regular_total_duration_ms": None, "aborted_executions": 5, "exception_executions": 0}
+    executor = RoutingExecutor(trend=[row])
+
+    result = await QueryStoreTrendService(executor).trend("appdb", now=NOW)
+
+    assert result["buckets"][0]["regular_avg_duration_ms"] is None
+    assert result["totals"]["regular_avg_duration_ms"] is None
+    assert result["totals"]["aborted_executions"] == 5
+
+
+@pytest.mark.asyncio
+async def test_regressions_show_timeouts_and_regular_only_averages() -> None:
+    # Query 1 ran at 10 ms in both periods; in the recent hour 10 of its runs
+    # timed out at 30 s. The mixed recent average (about 9.4 s) stays as it is,
+    # and the row also shows the failed runs and the Regular-only averages, so the
+    # reader can tell a timeout storm from a slower plan.
+    from datetime import timedelta
+
+    from tests.unit.test_query_regression import QueryStoreSqlite
+    from tests.unit.test_query_regression import _hourly_intervals
+
+    store = QueryStoreSqlite()
+    top = _hourly_intervals(store, 30)
+    store.add_query(1, {7: "Index Seek"})
+    store.add_runtime(7, 20, 100, 10_000)  # baseline
+    store.add_runtime(7, 30, 20, 10_000)  # recent hour
+    store.add_runtime(7, 30, 10, 30_000_000, execution_type=3)  # Aborted
+    store.add_runtime(7, 30, 2, 5_000, execution_type=4)  # Exception
+
+    class SqliteRegressions(RoutingExecutor):
+        async def fetch_all(self, database_name: str, query: str, params=None, **kwargs: Any):
+            if "plan_period" in query:
+                return await store.fetch_all(database_name, query, params)
+            return await super().fetch_all(database_name, query, params, **kwargs)
+
+    result = await QueryStoreTrendService(SqliteRegressions()).regressions(
+        "appdb",
+        recent_minutes=60,
+        baseline_minutes=1440,
+        now=(top + timedelta(hours=1)).replace(tzinfo=timezone.utc),
+    )
+
+    [item] = result["regressions"]
+    assert item["recent_executions"] == 32
+    assert item["recent_avg_duration_ms"] == pytest.approx((200_000 + 300_000_000 + 10_000) / 32 / 1000, abs=0.001)
+    assert item["baseline_avg_duration_ms"] == pytest.approx(10.0)
+    assert item["recent_aborted_executions"] == 10
+    assert item["recent_exception_executions"] == 2
+    assert item["baseline_aborted_executions"] == 0
+    assert item["baseline_exception_executions"] == 0
+    assert item["recent_regular_avg_duration_ms"] == pytest.approx(10.0)
+    assert item["baseline_regular_avg_duration_ms"] == pytest.approx(10.0)

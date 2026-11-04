@@ -438,14 +438,18 @@ async def test_get_query_parameter_buckets_rejects_bad_query_id():
 
 _QS_SCHEMA = """
 CREATE TABLE sys.query_store_query_text (query_text_id INT, query_sql_text TEXT);
-CREATE TABLE sys.query_store_query (query_id INT, query_text_id INT);
+CREATE TABLE sys.query_store_query (query_id INT, query_text_id INT,
+    is_internal_query INT DEFAULT 0, query_hash TEXT, object_id INT,
+    query_parameterization_type_desc TEXT);
 CREATE TABLE sys.query_store_plan (plan_id INT, query_id INT, query_plan TEXT,
-    is_forced_plan INT, force_failure_count INT);
+    is_forced_plan INT, force_failure_count INT, query_plan_hash TEXT,
+    plan_type_desc TEXT, last_force_failure_reason_desc TEXT);
 CREATE TABLE sys.query_store_runtime_stats_interval (runtime_stats_interval_id INT,
     start_time TEXT, end_time TEXT);
 CREATE TABLE sys.query_store_runtime_stats (plan_id INT, runtime_stats_interval_id INT,
     execution_type INT, count_executions INT, avg_duration REAL, avg_cpu_time REAL,
     avg_logical_io_reads REAL, avg_physical_io_reads REAL,
+    avg_query_max_used_memory REAL, avg_rowcount REAL,
     first_execution_time TEXT, last_execution_time TEXT);
 CREATE TABLE sys.query_store_wait_stats (plan_id INT, runtime_stats_interval_id INT,
     execution_type INT, wait_category_desc TEXT, total_query_wait_time_ms REAL,
@@ -469,6 +473,9 @@ def _translate_tsql(query: str, params: list) -> tuple[str, list]:
 
     params = list(params)
     q = re.sub(r"(?i)nvarchar\s*\(\s*max\s*\)", "TEXT", query)
+    q = q.replace("TODATETIMEOFFSET(CAST(? AS datetime2), 0)", "replace(?, 'T', ' ')")
+    q = q.replace("CONVERT(BINARY(8), ?, 1)", "?")
+    q = re.sub(r"'%' \+ (.+?) \+ '%'", r"'%' || \1 || '%'", q)
     q = re.sub(
         r"(?i)DATEADD\(MINUTE,\s*-\?,\s*(SYSUTCDATETIME|GETUTCDATE)\(\)\)",
         "datetime('now', '-' || ? || ' minutes')",
@@ -498,6 +505,9 @@ class QueryStoreSqlite:
         self.conn.execute("ATTACH DATABASE ':memory:' AS sys")
         self.conn.executescript(_QS_SCHEMA)
         self.conn.row_factory = sqlite3.Row
+        self.conn.create_function("LEFT", 2, lambda text, n: None if text is None else text[:n])
+        self.conn.create_function("OBJECT_NAME", 1, lambda object_id: None)
+        self.conn.create_function("OBJECT_SCHEMA_NAME", 1, lambda object_id: None)
         self.calls: list[tuple[str, list]] = []
 
     def insert(self, table: str, **values) -> None:
@@ -517,9 +527,15 @@ class QueryStoreSqlite:
             end_time=_qs_ts(start + timedelta(minutes=minutes)),
         )
 
-    def add_query(self, query_id: int, plans: dict[int, str]) -> None:
+    def add_query(self, query_id: int, plans: dict[int, str], *, is_internal: bool = False) -> None:
         self.insert("query_store_query_text", query_text_id=query_id, query_sql_text=f"q{query_id}")
-        self.insert("query_store_query", query_id=query_id, query_text_id=query_id)
+        self.insert(
+            "query_store_query",
+            query_id=query_id,
+            query_text_id=query_id,
+            is_internal_query=int(is_internal),
+            query_hash=f"0x{query_id:016X}",
+        )
         for plan_id, op in plans.items():
             self.insert(
                 "query_store_plan",
@@ -761,3 +777,43 @@ async def test_parameter_sniffing_does_not_report_a_query_whose_plans_all_time_o
     result = await QueryRegressionService(store).detect_parameter_sniffing("db", 10.0, 1440, 20)
 
     assert result["queries"] == []
+
+
+@pytest.mark.asyncio
+async def test_compare_query_plans_keeps_the_callers_plan_order() -> None:
+    # A caller who asks for plan 5 relative to plan 6 must get 5/6, not the
+    # higher plan id over the lower one. The ratio direction must also be named.
+    store = _two_plans_over_48_hours()
+    service = QueryRegressionService(store)
+
+    fast_vs_slow = await service.compare_query_plans("db", 1, plan_id_a=6, plan_id_b=5)
+    slow_vs_fast = await service.compare_query_plans("db", 1, plan_id_a=5, plan_id_b=6)
+
+    assert [plan["plan_id"] for plan in fast_vs_slow["plans"]] == [6, 5]
+    assert fast_vs_slow["comparison"]["duration_ratio"] == pytest.approx(0.01)  # 3 ms / 400 ms
+    assert fast_vs_slow["comparison"]["baseline_plan_id"] == 6
+    assert fast_vs_slow["comparison"]["compared_plan_id"] == 5
+    assert [plan["plan_id"] for plan in slow_vs_fast["plans"]] == [5, 6]
+    assert slow_vs_fast["comparison"]["duration_ratio"] == pytest.approx(133.33)
+    assert slow_vs_fast["comparison"]["baseline_plan_id"] == 5
+
+
+@pytest.mark.asyncio
+async def test_compare_query_plans_default_names_best_plan_as_baseline() -> None:
+    store = _two_plans_over_48_hours()
+
+    result = await QueryRegressionService(store).compare_query_plans("db", 1)
+
+    assert result["comparison"]["baseline_plan_id"] == 5
+    assert result["comparison"]["compared_plan_id"] == 6
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("plan_ids", [(5, None), (None, 6)])
+async def test_compare_query_plans_refuses_only_one_plan_id(plan_ids) -> None:
+    # Silently answering best vs worst drops the plan the caller asked about.
+    store = _two_plans_over_48_hours()
+
+    with pytest.raises(ValueError, match="both plan_id_a and plan_id_b"):
+        await QueryRegressionService(store).compare_query_plans("db", 1, *plan_ids)
+    assert store.calls == []
