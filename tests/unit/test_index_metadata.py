@@ -595,6 +595,27 @@ def test_protection_evidence_preserves_fk_roles_and_composite_order() -> None:
     assert index.protection_evidence["has_index_extended_properties"] is True
 
 
+def test_char2_object_type_padding_from_the_driver_is_ignored() -> None:
+    # sys.objects.type is char(2): Azure SQL returns 'U ' and 'V '. Live
+    # (2026-11-04) every user-table index got the blocker parent_is_not_user_table,
+    # so widen/extend/consolidate advice had no rollback DDL.
+    from azure_sql_mcp.index_ddl import render_reverse_index_ddl
+
+    [table_index] = parse_existing_index_rows(
+        [{**_complete_rows()[0], "parent_object_type_code": "U "}]
+    )
+    assert table_index.parent_object_type_code == "U"
+    assert "parent_is_not_user_table" not in render_reverse_index_ddl(table_index).get(
+        "blockers", []
+    )
+
+    view_row = {**_complete_rows()[0], "parent_object_type_code": "V "}
+    view_row.pop("is_indexed_view", None)
+    [view_index] = parse_existing_index_rows([view_row])
+    assert view_index.parent_object_type_code == "V"
+    assert view_index.protection_evidence["indexed_view"] is True
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [("is_indexed_view", True), ("auto_created", True), ("index_type_code", 5)],

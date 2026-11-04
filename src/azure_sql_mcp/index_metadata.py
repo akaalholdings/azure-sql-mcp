@@ -741,8 +741,9 @@ def parse_existing_index_rows(
                     if row.get("parent_object_type") is not None
                     else None
                 ),
+                # sys.objects.type is char(2): 'U ' and 'V ' arrive padded.
                 parent_object_type_code=(
-                    str(row["parent_object_type_code"])
+                    str(row["parent_object_type_code"]).strip().upper() or None
                     if row.get("parent_object_type_code") is not None
                     else None
                 ),
@@ -1576,10 +1577,9 @@ def _index_protection_payload(
     is_primary_key = _as_bool(row.get("is_primary_key"))
     is_unique_constraint = _as_bool(row.get("is_unique_constraint"))
     index_type_code = _as_optional_int(row.get("index_type_code"))
-    parent_type = str(
-        row.get("parent_object_type_code")
-        or row.get("parent_object_type")
-        or ""
+    parent_type = (
+        str(row.get("parent_object_type_code") or "").strip()
+        or str(row.get("parent_object_type") or "").strip()
     ).upper()
     payload.setdefault("primary_key", is_primary_key)
     payload.setdefault("unique_constraint", is_unique_constraint)
