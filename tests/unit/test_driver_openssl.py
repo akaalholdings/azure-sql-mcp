@@ -9,6 +9,7 @@ Codex.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -64,7 +65,7 @@ def test_an_existing_dyld_path_with_openssl_3_is_left_alone(tmp_path: Path) -> N
     _brew(tmp_path, "openssl", "4")
     good = _brew(tmp_path, "openssl@3", "3")
 
-    assert _decide(tmp_path, DYLD_LIBRARY_PATH=f"/somewhere:{good}").action == "none"
+    assert _decide(tmp_path, DYLD_LIBRARY_PATH=os.pathsep.join(["/somewhere", str(good)])).action == "none"
 
 
 def test_no_reexec_loop_when_the_marker_is_set(tmp_path: Path) -> None:
@@ -120,7 +121,7 @@ def test_ensure_reexecs_the_same_command_with_the_library_path(
     [(path, args, env)] = calls
     assert path == "/venv/bin/python"
     assert args == ["/venv/bin/python", "/venv/bin/azure-sql-mcp", "--transport", "stdio"]
-    assert env["DYLD_LIBRARY_PATH"] == f"{good}:/existing"
+    assert env["DYLD_LIBRARY_PATH"] == os.pathsep.join([str(good), "/existing"])
     assert env[REEXEC_MARKER] == "1"
     assert env["AZURE_SQL_SERVER"] == "s"
 
@@ -185,7 +186,7 @@ def test_dyld_entries_count_in_order_and_an_earlier_openssl_4_still_wins(tmp_pat
     (shadow / "libssl.4.dylib").write_bytes(b"")
     (shadow / "libssl.dylib").symlink_to("libssl.4.dylib")
 
-    decision = _decide(tmp_path, DYLD_LIBRARY_PATH=f"{shadow}:{good}")
+    decision = _decide(tmp_path, DYLD_LIBRARY_PATH=os.pathsep.join([str(shadow), str(good)]))
 
     assert decision.action == "reexec"
 
@@ -203,8 +204,6 @@ def test_the_reexec_marker_is_not_inherited_by_child_processes(
     decision = ensure_driver_openssl(platform="darwin", machine="arm64", brew_prefixes={"arm64": tmp_path})
 
     assert decision.action == "none"
-    import os
-
     assert REEXEC_MARKER not in os.environ
 
 

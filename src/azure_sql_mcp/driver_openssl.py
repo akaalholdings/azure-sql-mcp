@@ -58,7 +58,8 @@ def decide(
     if _libssl_major(prefix / "opt" / "openssl" / "lib") in _SUPPORTED_MAJORS:
         return OpenSSLDecision("none")
     # dyld takes the first DYLD_LIBRARY_PATH entry that holds libssl.dylib.
-    for entry in environ.get("DYLD_LIBRARY_PATH", "").split(":"):
+    # os.pathsep is ":" on macOS; it keeps the logic testable on Windows paths.
+    for entry in environ.get("DYLD_LIBRARY_PATH", "").split(os.pathsep):
         major = _libssl_major(Path(entry)) if entry else None
         if major is not None:
             if major in _SUPPORTED_MAJORS:
@@ -147,7 +148,7 @@ def ensure_driver_openssl(
         env = dict(environ)
         existing = env.get("DYLD_LIBRARY_PATH")
         env["DYLD_LIBRARY_PATH"] = (
-            f"{decision.library_dir}:{existing}" if existing else decision.library_dir
+            f"{decision.library_dir}{os.pathsep}{existing}" if existing else decision.library_dir
         )
         env[REEXEC_MARKER] = "1"
         os.execve(sys.executable, [sys.executable, *sys.orig_argv[1:]], env)
