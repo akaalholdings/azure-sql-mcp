@@ -63,8 +63,9 @@ def _tool_payload(result: Any) -> Any:
 
 
 def _rows(payload: Any) -> Any:
-    """List-returning tools are wrapped by _format_response as {'result': [...]}."""
-    if isinstance(payload, dict) and set(payload) == {"result"}:
+    """List-returning tools arrive as {'result': [...], 'result_status': ...}."""
+    if isinstance(payload, dict) and isinstance(payload.get("result"), list):
+        assert payload.get("result_status") in {"ok", "empty"}
         return payload["result"]
     return payload
 
@@ -289,7 +290,9 @@ async def test_mcp_stdio_end_to_end(
                 )
             )
             assert "checks" in health
-            assert "index" in health["checks"]
+            # Index health moved to review_workload_indexes; the check is retired.
+            assert "statistics" in health["checks"]
+            assert "index" not in health["checks"]
 
             recommendations = _tool_payload(
                 await session.call_tool(
@@ -450,12 +453,10 @@ async def test_mcp_stdio_end_to_end(
                         ],
                     },
                 )
-                if hypothetical.isError:
-                    pytest.fail(
-                        "explain_query returned an MCP error for hypothetical indexes."
-                    )
-                hypothetical_payload = json.loads(hypothetical.content[0].text)
-                assert hypothetical_payload["summary"]["statement_count"] >= 1
+                # Hypothetical indexes are refused on explain_query by design;
+                # analyze_query_indexes above is the supported read-only path.
+                assert hypothetical.isError is True
+                assert "Hypothetical index analysis is disabled" in hypothetical.content[0].text
 
             if capability_checks["actual_plan"]["available"]:
                 actual_plan = _tool_payload(

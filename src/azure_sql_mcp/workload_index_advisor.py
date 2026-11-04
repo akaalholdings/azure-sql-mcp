@@ -12,6 +12,7 @@ checks) degrades to a reported gap instead of failing the review.
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Awaitable
 from datetime import datetime
 from datetime import timezone
@@ -31,8 +32,11 @@ from .index_advisor import WorkloadQuery
 from .index_advisor import build_index_advice
 from .index_metadata import ExistingIndex
 from .index_metadata import collect_existing_indexes
+from .index_metadata import collect_readable_replica_status
 from .incident_log import note_exception
+from .index_review import _reference_is_read
 from .observability import sanitize_error_message
+from .plans import parse_showplan_index_evidence
 from .query_store import QueryStoreService
 from .result_status import ResultStatus
 from .result_status import status_payload
@@ -50,6 +54,10 @@ QUERY_TEXT_PREVIEW_CHARS = 300
 MAX_FORCED_PLANS = 500
 MAX_FORCED_PLAN_XML_BYTES = 4_000_000
 MAX_FORCED_PLAN_TOTAL_BYTES = 64_000_000
+# Plan XML the unused-index reference read returns in total. It runs beside the
+# forced-plan read, so it gets a smaller share; plans past it stay use. Plans
+# take turns per index, smallest first, so one index cannot use all of it.
+MAX_INDEX_REFERENCE_PLAN_TOTAL_BYTES = 16_000_000
 # Rows read per hint source (query text, Query Store hints, plan guides, modules).
 MAX_HINT_SOURCE_ROWS = 2_000
 # Each optional dependency read runs concurrently and gives up after the
@@ -164,7 +172,7 @@ ranked AS (
     SELECT TOP (?)
         qs.*,
         ROW_NUMBER() OVER (ORDER BY qs.{objective} DESC, qs.query_id) AS workload_rank
-    FROM query_stats AS qs
+    FROM query_stats AS qs{scope_filter}
     ORDER BY qs.{objective} DESC, qs.query_id
 ),
 dominant AS (
@@ -314,28 +322,122 @@ INNER JOIN sys.columns AS c
 ORDER BY fk.object_id, fkc.constraint_column_id
 """
 
-# plan_references: plans that access the index (Index="[name]").
-# statistics_references: plans whose OptimizerStatsUsage read its statistics.
+# One row per (index, plan) match in the window: index_match when the plan
+# names the index (Index="[name]"), stats_match when its OptimizerStatsUsage
+# read the index statistics. Each index_match plan's XML comes back once (on
+# its first row) within the byte budget, so Python can tell a read of the index
+# from a write plan that only maintains it. The budget is spent round-robin:
+# each index's smallest plan, then each index's next smallest, and so on. Internal queries (ALTER INDEX
+# REBUILD, UPDATE STATISTICS) are maintenance, not use.
 _INDEX_REFERENCE_SQL_TEMPLATE = """
+WITH matches AS (
+    SELECT
+        v.ref_id,
+        x.plan_id,
+        x.query_id,
+        x.is_forced_plan,
+        x.plan_bytes,
+        CASE WHEN CHARINDEX(v.index_pattern, x.plan_xml) > 0 THEN 1 ELSE 0 END AS index_match,
+        CASE WHEN CHARINDEX(v.stats_pattern, x.plan_xml) > 0 THEN 1 ELSE 0 END AS stats_match
+    FROM (VALUES {values}) AS v(ref_id, index_pattern, stats_pattern)
+    INNER JOIN (
+        SELECT
+            p.plan_id,
+            p.query_id,
+            CAST(p.is_forced_plan AS int) AS is_forced_plan,
+            DATALENGTH(p.query_plan) AS plan_bytes,
+            CAST(p.query_plan AS nvarchar(max)) AS plan_xml
+        FROM sys.query_store_plan AS p
+        INNER JOIN sys.query_store_query AS q
+            ON q.query_id = p.query_id
+        WHERE p.last_execution_time > TODATETIMEOFFSET(CAST(? AS datetime2), 0)
+          AND q.is_internal_query = 0
+    ) AS x
+        ON CHARINDEX(v.index_pattern, x.plan_xml) > 0
+        OR CHARINDEX(v.stats_pattern, x.plan_xml) > 0
+),
+ranked AS (
+    SELECT
+        m.*,
+        ROW_NUMBER() OVER (PARTITION BY m.plan_id ORDER BY m.index_match DESC, m.ref_id) AS plan_row
+    FROM matches AS m
+),
+turns AS (
+    SELECT
+        r.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY r.ref_id, r.plan_row, r.index_match ORDER BY r.plan_bytes, r.plan_id
+        ) AS plan_turn
+    FROM ranked AS r
+),
+budgeted AS (
+    SELECT
+        t.*,
+        SUM(CASE WHEN t.plan_row = 1 AND t.index_match = 1 AND t.plan_bytes <= ? THEN t.plan_bytes ELSE 0 END)
+            OVER (ORDER BY t.plan_turn, t.plan_bytes, t.plan_id, t.plan_row ROWS UNBOUNDED PRECEDING)
+            AS running_bytes
+    FROM turns AS t
+)
 SELECT
-    v.ref_id,
-    COUNT(CASE WHEN CHARINDEX(v.index_pattern, x.plan_xml) > 0 THEN 1 END) AS plan_references,
-    COUNT(CASE WHEN CHARINDEX(v.stats_pattern, x.plan_xml) > 0 THEN 1 END) AS statistics_references
-FROM (VALUES {values}) AS v(ref_id, index_pattern, stats_pattern)
-LEFT JOIN (
-    SELECT CAST(p.query_plan AS nvarchar(max)) AS plan_xml
-    FROM sys.query_store_plan AS p
-    WHERE p.last_execution_time > TODATETIMEOFFSET(CAST(? AS datetime2), 0)
-) AS x
-    ON CHARINDEX(v.index_pattern, x.plan_xml) > 0
-    OR CHARINDEX(v.stats_pattern, x.plan_xml) > 0
-GROUP BY v.ref_id
+    b.ref_id,
+    b.plan_id,
+    b.query_id,
+    b.is_forced_plan,
+    b.index_match,
+    b.stats_match,
+    b.plan_bytes,
+    CASE
+        WHEN b.plan_bytes <= ? AND b.running_bytes <= ?
+        THEN CAST(p.query_plan AS nvarchar(max))
+    END AS query_plan
+FROM budgeted AS b
+LEFT JOIN sys.query_store_plan AS p
+    ON p.plan_id = b.plan_id
+   AND b.plan_row = 1
+   AND b.index_match = 1
+ORDER BY b.plan_id, b.plan_row
 """
 
 
-def workload_sql(objective: str) -> str:
+def workload_sql(objective: str, scope_pattern_count: int = 0) -> str:
     column = _OBJECTIVE_SORT_COLUMNS[objective]
-    return _WORKLOAD_SQL_TEMPLATE.format(objective=column, preview=QUERY_TEXT_PREVIEW_CHARS)
+    scope_filter = ""
+    if scope_pattern_count:
+        # A scoped review ranks only queries whose plans touch the scope, before
+        # the TOP cap; else a busy database pushes the scope's queries out of it.
+        # Totals stay database-wide.
+        matches = " OR ".join(
+            ["CHARINDEX(?, CAST(sp.query_plan AS nvarchar(max))) > 0"] * scope_pattern_count
+        )
+        scope_filter = (
+            "\n    WHERE EXISTS (\n"
+            "        SELECT 1 FROM plan_stats AS sps\n"
+            "        INNER JOIN sys.query_store_plan AS sp ON sp.plan_id = sps.plan_id\n"
+            f"        WHERE sps.query_id = qs.query_id AND ({matches})\n"
+            "    )"
+        )
+    return _WORKLOAD_SQL_TEMPLATE.format(
+        objective=column, preview=QUERY_TEXT_PREVIEW_CHARS, scope_filter=scope_filter
+    )
+
+
+def _showplan_name(name: str) -> str:
+    # Showplan writes object names bracket-quoted inside XML attribute values.
+    quoted = "[" + name.replace("]", "]]") + "]"
+    return (
+        quoted.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    )
+
+
+def _scope_plan_patterns(schema_name: str | None, table_names: list[str] | None) -> list[str]:
+    """Plan XML Object attributes that mark a plan as touching the review scope."""
+
+    if schema_name is None:
+        return []
+    schema = f'Schema="{_showplan_name(schema_name)}"'
+    if not table_names:
+        return [schema]
+    return [f'{schema} Table="{_showplan_name(table)}"' for table in table_names]
 
 
 def resolve_window(lookback_days: int, as_of_utc: str | None, *, now: datetime | None = None) -> tuple[datetime, datetime]:
@@ -397,7 +499,13 @@ class WorkloadIndexAdvisor:
         if query_store_readable:
             try:
                 queries, totals = await self._workload(
-                    database_name, objective, start, end, top_queries, plans_per_query
+                    database_name,
+                    objective,
+                    start,
+                    end,
+                    top_queries,
+                    plans_per_query,
+                    _scope_plan_patterns(schema_name, table_names),
                 )
             except Exception as exc:
                 note_exception(exc, "workload_index_advisor.workload")
@@ -482,6 +590,15 @@ class WorkloadIndexAdvisor:
         hint_gaps: list[str] = []
         coverage_gaps: list[str] = []
         pin_reads = include_existing_index_review and query_store_readable
+        # The reference read costs (index names) x (plan bytes), so check only
+        # the indexes this review can report. The hint read keeps every index:
+        # a hint that names an out-of-scope index must still resolve.
+        scoped_existing = [
+            index
+            for index in existing
+            if (schema_name is None or _norm(index.schema) == _norm(schema_name))
+            and (focus_tables is None or (_norm(index.schema), _norm(index.table)) in focus_tables)
+        ]
         (
             (references, statistics_references),
             (forced_accesses, forced_coverage),
@@ -489,7 +606,7 @@ class WorkloadIndexAdvisor:
             coverage,
         ) = await asyncio.gather(
             self._bounded(
-                self._index_references(database_name, existing, start, reference_gaps)
+                self._index_references(database_name, scoped_existing, start, reference_gaps)
                 if pin_reads
                 else _value(({}, {})),
                 fallback=({}, {}),
@@ -535,6 +652,13 @@ class WorkloadIndexAdvisor:
                 "Query Store plan references could not be checked; unused-index findings stay low confidence"
             )
 
+        readable_replicas = (
+            await collect_readable_replica_status(
+                self.executor, database_name, site="workload_index_advisor"
+            )
+            if include_existing_index_review
+            else None
+        )
         engine_start = next(
             (
                 index.usage_context.get("engine_start_time_utc")
@@ -566,6 +690,7 @@ class WorkloadIndexAdvisor:
             index_hint_references=hint_references,
             forced_plan_coverage=forced_coverage,
             hint_coverage=hint_coverage,
+            readable_replicas=readable_replicas,
         )
         report = build_index_advice(inputs)
         report.update(self._overall_status(report, query_store, query_store_readable, queries))
@@ -614,11 +739,13 @@ class WorkloadIndexAdvisor:
         end: datetime,
         top_queries: int,
         plans_per_query: int,
+        scope_patterns: list[str] | None = None,
     ) -> tuple[list[WorkloadQuery], dict[str, float]]:
+        patterns = list(scope_patterns or ())
         rows = await self.executor.fetch_all(
             database_name,
-            workload_sql(objective),
-            params=[_iso(end), _iso(start), top_queries, plans_per_query],
+            workload_sql(objective, len(patterns)),
+            params=[_iso(end), _iso(start), top_queries, *patterns, plans_per_query],
         )
         totals: dict[str, float] = {}
         queries: list[WorkloadQuery] = []
@@ -875,7 +1002,7 @@ class WorkloadIndexAdvisor:
         start: datetime,
         gaps: list[str],
     ) -> tuple[dict[tuple[str, str, str], int | None], dict[tuple[str, str, str], int | None]]:
-        """Query Store plans in the window that access, or read the statistics of, each unused index."""
+        """Query Store plans in the window that read (or force a plan on), or read the statistics of, each unused index."""
 
         unused = [
             index
@@ -897,7 +1024,9 @@ class WorkloadIndexAdvisor:
         for position, index in enumerate(checked):
             quoted = "[" + index.name.replace("]", "]]") + ']"'
             params.extend([position, 'Index="' + quoted, 'Statistics="' + quoted])
-        params.append(_iso(start))
+        params.extend(
+            [_iso(start), MAX_FORCED_PLAN_XML_BYTES, MAX_FORCED_PLAN_XML_BYTES, MAX_INDEX_REFERENCE_PLAN_TOTAL_BYTES]
+        )
         keys = [(_norm(i.schema), _norm(i.table), _norm(i.name)) for i in checked]
         try:
             rows = await self.executor.fetch_all(
@@ -909,15 +1038,65 @@ class WorkloadIndexAdvisor:
                 "Query Store index references could not be checked: " + sanitize_error_message(str(exc))
             )
             return dict.fromkeys(keys), dict.fromkeys(keys)
-        plans: dict[int, int] = {}
+        index_plans: dict[int, set[int]] = {}
         statistics: dict[int, int] = {}
+        plan_xml: dict[int, str] = {}
+        query_ids: dict[int, int] = {}
+        forced: set[int] = set()
+        within_plan_cap: set[int] = set()
         for row in rows:
             position = int(_float(row.get("ref_id")))
-            plans[position] = int(_float(row.get("plan_references")))
-            statistics[position] = int(_float(row.get("statistics_references")))
+            plan_id = int(_float(row.get("plan_id")))
+            query_ids[plan_id] = int(_float(row.get("query_id")))
+            if row.get("query_plan"):
+                plan_xml[plan_id] = str(row["query_plan"])
+            if row.get("plan_bytes") is not None and _float(row["plan_bytes"]) <= MAX_FORCED_PLAN_XML_BYTES:
+                within_plan_cap.add(plan_id)
+            if _float(row.get("is_forced_plan")):
+                forced.add(plan_id)
+            if _float(row.get("index_match")):
+                index_plans.setdefault(position, set()).add(plan_id)
+            if _float(row.get("stats_match")):
+                statistics[position] = statistics.get(position, 0) + 1
+        # Same rule as review_index_portfolio: a plan is use when it reads the
+        # index, or is forced (a drop silently stops the forcing). A plan whose
+        # XML was not returned or not fully parsed stays use for every index it
+        # does not name in full. Parsing runs off the event loop and stops when
+        # the bounded read is cancelled.
+        stop = threading.Event()
+        try:
+            plan_reads = await asyncio.to_thread(
+                _plan_reads, sorted(set().union(*index_plans.values())), plan_xml, query_ids, stop
+            )
+        finally:
+            stop.set()
+        unread: set[int] = set()
+        plans: dict[int, int] = {}
+        for position, plan_ids in index_plans.items():
+            if position >= len(keys):
+                continue
+            for plan_id in plan_ids:
+                entry = plan_reads[plan_id]
+                unknown = entry is None or (entry[1] is not None and keys[position] not in entry[1])
+                if unknown and plan_id not in forced:
+                    unread.add(plan_id)
+                if plan_id in forced or unknown or (entry is not None and keys[position] in entry[0]):
+                    plans[position] = plans.get(position, 0) + 1
+        if unread:
+            gap = (
+                f"{len(unread)} Query Store plan(s) that name an unused index could not be read "
+                "(too large or not fully parsed); they count as references, so those indexes stay kept"
+            )
+            # A plan under the per-plan cap with no XML was cut by the total budget.
+            if any(plan_id in within_plan_cap and plan_id not in plan_xml for plan_id in unread):
+                gap += (
+                    f"; the {MAX_INDEX_REFERENCE_PLAN_TOTAL_BYTES // 1_000_000} MB plan read budget "
+                    "was reached, so later plans were not read"
+                )
+            gaps.append(gap)
         return (
-            {key: plans.get(position) for position, key in enumerate(keys)},
-            {key: statistics.get(position) for position, key in enumerate(keys)},
+            {key: plans.get(position, 0) for position, key in enumerate(keys)},
+            {key: statistics.get(position, 0) for position, key in enumerate(keys)},
         )
 
     async def _forced_plans(
@@ -1097,6 +1276,44 @@ class WorkloadIndexAdvisor:
             ResultStatus.OK,
             f"Analysed {len(queries)} Query Store plan(s); {len(recommendations)} recommendation(s).",
         )
+
+
+_IndexKey = tuple[str, str, str]
+
+
+def _plan_reads(
+    plan_ids: list[int], plan_xml: dict[int, str], query_ids: dict[int, int], stop: threading.Event
+) -> dict[int, tuple[set[_IndexKey], set[_IndexKey] | None] | None]:
+    """Per plan: the indexes it reads, and the indexes it names in full when an
+    Object had no table identity (a table variable); None when not parsed or
+    past the parser's reference cap."""
+
+    plan_reads: dict[int, tuple[set[_IndexKey], set[_IndexKey] | None] | None] = {}
+    for plan_id in plan_ids:
+        if stop.is_set():
+            break
+        xml = plan_xml.get(plan_id)
+        evidence = (
+            parse_showplan_index_evidence(xml, query_id=max(query_ids[plan_id], 1), plan_id=max(plan_id, 1))
+            if xml
+            else None
+        )
+        if (
+            evidence is None
+            or not evidence["coverage"]["scanned"]
+            or "index_reference_cap_reached" in evidence["coverage"]["blockers"]
+        ):
+            plan_reads[plan_id] = None
+            continue
+        keyed = [
+            ((_norm(ref["schema_name"]), _norm(ref["object_name"]), _norm(ref["index_name"])), ref)
+            for ref in evidence["index_references"]
+        ]
+        plan_reads[plan_id] = (
+            {key for key, ref in keyed if _reference_is_read(ref)},
+            {key for key, _ in keyed} if "index_reference_identity_incomplete" in evidence["coverage"]["blockers"] else None,
+        )
+    return plan_reads
 
 
 async def _value(value: _T) -> _T:

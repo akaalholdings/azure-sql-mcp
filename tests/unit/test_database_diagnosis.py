@@ -195,3 +195,28 @@ async def test_every_source_failing_is_unavailable() -> None:
 
     assert result["result_status"] == "unavailable"
     assert len(result["gaps"]) == 7
+
+
+def test_resource_peak_comes_from_the_sample_maximum_on_long_windows() -> None:
+    # Long windows summarize hourly buckets. The highest hourly AVERAGE (47%) hides
+    # a 20-minute saturation; the bucket MAXIMUM (100%) is the peak to judge.
+    findings = _codes(
+        diagnose_findings(
+            {
+                "resource_history": {
+                    "source": "long_term",
+                    "summary": {
+                        "avg_cpu_percent": {"avg": 28.89, "max": 46.67},
+                        "max_cpu_percent": {"avg": 46.67, "max": 100.0},
+                        "avg_log_write_percent": {"avg": 10.0, "max": 20.0},
+                        "max_log_write_percent": {"avg": 30.0, "max": 88.0},
+                    },
+                }
+            }
+        )
+    )
+
+    assert findings["cpu_pressure"]["severity"] == "high"
+    assert findings["cpu_pressure"]["evidence"]["max_pct"] == 100.0
+    assert findings["cpu_pressure"]["evidence"]["avg_pct"] == 28.89
+    assert findings["log_write_pressure"]["severity"] == "medium"

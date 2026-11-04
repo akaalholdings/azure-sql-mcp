@@ -329,3 +329,81 @@ async def test_resource_history_rejects_unknown_sources_and_clamps_windows():
 
     result = await service.get_resource_stats_history("appdb", 10**9, master_available=True)
     assert result["window_minutes"] == 20160
+
+
+def _hourly_cpu_buckets(samples_by_hour: dict[int, list[float]]) -> list[dict]:
+    """What LONG_TERM_RESOURCE_SQL returns for these 5-minute sys.resource_stats samples."""
+    rows = []
+    for hour, values in samples_by_hour.items():
+        rows.append(
+            {
+                "hour_start_utc": f"2026-11-03T0{hour}:00:00",
+                "samples": len(values),
+                "avg_cpu_percent": round(sum(values) / len(values), 2),
+                "max_cpu_percent": max(values),
+                "cpu_samples_above_80": sum(1 for v in values if v > 80),
+                "cpu_samples_above_95": sum(1 for v in values if v > 95),
+                "avg_data_io_percent": 5.0,
+                "max_data_io_percent": 5.0,
+                "data_io_samples_above_80": 0,
+                "data_io_samples_above_95": 0,
+                "avg_log_write_percent": 5.0,
+                "max_log_write_percent": 5.0,
+                "log_write_samples_above_80": 0,
+                "log_write_samples_above_95": 0,
+                "max_worker_percent": 3.0,
+                "max_session_percent": 2.0,
+            }
+        )
+    return rows
+
+
+@pytest.mark.asyncio
+async def test_long_window_keeps_a_cpu_saturation_shorter_than_an_hour():
+    # 20 minutes at 100% CPU (4 of 12 samples) average to 46.7% for the hour.
+    # The summary must keep the 5-minute peak and the real time above the
+    # thresholds, or a 3-hour diagnosis reports no CPU pressure.
+    from azure_sql_mcp.database_diagnosis import diagnose_findings
+
+    rows = _hourly_cpu_buckets({0: [20] * 12, 1: [20] * 8 + [100] * 4, 2: [20] * 12})
+    executor = RecordingExecutor({"sys.resource_stats": rows})
+
+    result = await ResourceGovernanceService(executor).get_resource_stats_history(
+        "appdb", 180, master_available=True
+    )
+
+    assert result["summary"]["max_cpu_percent"]["max"] == 100.0
+    cpu = result["summary"]["avg_cpu_percent"]
+    assert cpu["minutes_above_95"] == 20
+    assert cpu["minutes_above_80"] == 20
+    assert cpu["samples_above_80_pct"] == 4
+    assert cpu["total_samples"] == 36
+    [finding] = [f for f in diagnose_findings({"resource_history": result}) if f["code"] == "cpu_pressure"]
+    assert finding["severity"] == "high"
+    assert finding["evidence"]["max_pct"] == 100.0
+
+
+@pytest.mark.asyncio
+async def test_long_window_sustained_warning_counts_samples_not_hours():
+    # CPU above 80% for 30 of 36 five-minute samples is sustained pressure.
+    rows = _hourly_cpu_buckets({0: [90] * 12, 1: [90] * 12, 2: [20] * 6 + [90] * 6})
+    executor = RecordingExecutor({"sys.resource_stats": rows})
+
+    result = await ResourceGovernanceService(executor).get_resource_stats_history(
+        "appdb", 180, master_available=True
+    )
+
+    [warning] = [w for w in result["warnings"] if w["type"] == "sustained_avg_cpu_percent"]
+    assert "30 of 36 samples" in warning["message"]
+    assert not any(w["type"].startswith("sustained_max_") for w in result["warnings"])
+
+
+def test_long_term_sql_counts_samples_above_the_thresholds():
+    from azure_sql_mcp.resource_governance import LONG_TERM_RESOURCE_SQL
+
+    for metric in ("cpu", "data_io", "log_write"):
+        for threshold in (80, 95):
+            assert (
+                f"SUM(CASE WHEN avg_{metric}_percent > {threshold} THEN 1 ELSE 0 END) "
+                f"AS {metric}_samples_above_{threshold}"
+            ) in LONG_TERM_RESOURCE_SQL

@@ -27,8 +27,11 @@ def test_blocked_agents_report_once_and_stop_retrying_that_call() -> None:
     # A delayed retry of a failure the server marks transient is correct.
     assert "failure_diagnostic.transient" in blocked
     # Without these the report cannot be matched to a skill release or a tool.
-    for argument in ("skill", "skill_version", "last_tool"):
+    # blocker_kind is a required enum argument; omitting it fails the one report.
+    for argument in ("skill", "skill_version", "last_tool", "blocker_kind"):
         assert argument in " ".join(blocked.split())
+    # The owner traces the report by this id, so the user must receive it.
+    assert "incident_id" in blocked
 
 
 @pytest.mark.asyncio

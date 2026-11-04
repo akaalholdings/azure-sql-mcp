@@ -583,13 +583,13 @@ The only mutation path is:
 4. Start a local `enforcer-apply` process that points at the same state directory.
 5. Set `AZURE_SQL_PLAN_APPLY_KILL_SWITCH=false` only for the authorized action.
 6. Call `apply_prepared_plan_action` with the intent id and an explicit authorization reference.
-7. Collect a non-overlapping post-change window for the same parameter buckets.
-8. Call `verify_plan_action`.
-9. Keep on improvement, return `hold` on insufficient evidence, or restore the exact prior force/hint state on regression.
+7. Wait for a non-overlapping post-change Query Store window.
+8. Call `verify_plan_action`. The MCP reads the Query Store evidence itself. `candidate_evidence` is optional context: it can turn a keep into a hold, but it never produces a keep. Query Store has no per-parameter runtime stats, so parameter buckets are reported as `unavailable`.
+9. Keep on improvement, return `hold` on insufficient evidence, or restore the exact prior force/hint state on regression. Without parameter buckets, the result is `hold` when the baseline ran more than one plan or the forced plan did not run in the baseline: check each bucket with `get_query_parameter_buckets` or a benchmark with representative parameters.
 
-Apply gates include the named profile, unrestricted local server, write policy, database policy, kill switch, prepared intent, evidence hash, exact current-vs-prior state, manual ownership, authorization reference, and idempotency key. Automatic Tuning ownership is detected and cannot be silently overridden.
+Apply gates include the named profile, unrestricted local server, write policy, database policy, kill switch, prepared intent, evidence hash, exact current-vs-prior state, manual ownership, authorization reference, and idempotency key. Automatic Tuning ownership is detected and cannot be silently overridden. A prepared intent expires 24 hours after prepare (`expires_at_utc`); apply holds an expired intent, so prepare it again with a new idempotency key.
 
-`rollback_plan_action` restores the exact force-plan and Query Store hint state captured during preparation, then confirms the resulting state.
+`rollback_plan_action` restores the exact force-plan and Query Store hint state captured during preparation, then confirms the resulting state. It changes nothing for an intent that was never applied, and it holds when the current state is no longer the state the intent applied.
 
 ## Authentication
 

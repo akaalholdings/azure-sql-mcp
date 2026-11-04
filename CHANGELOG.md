@@ -6,6 +6,195 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+Correctness fixes from the 2026-11-03 review (2.6.3a).
+
+### Fixed
+
+Index advice and removal:
+
+- `capture_index_review_snapshot` now stores runs. Before, every capture
+  failed: the coverage field `missing_index_dmv` and the subject field
+  `estimated_index_size_mb` were not allowed, and a DMV-only candidate got a
+  snapshot id that failed the read-back check. So `review_index_portfolio`
+  always returned `history_status=missing`.
+- The index history tools return `result_status=precondition`, with the DBA
+  install and GRANT steps, when the `dbatools` history tables or rights are
+  missing. A history contract mismatch is still a tool error.
+- `review_workload_indexes` no longer gives a high-confidence drop for a new
+  index. Index age (from `STATS_DATE`, a lower bound) limits the evidence
+  window: younger than 7 days gives `review_index`, younger than 35 days or
+  unknown age caps the drop at medium. An index with no usage-stats row is no
+  longer counted as zero reads.
+- `review_workload_indexes` keeps every range predicate column in the designed
+  index. A range column that is not the key goes to INCLUDE.
+- Index removal now accounts for readable replicas. On Premium, Business
+  Critical, Hyperscale or with a geo link (`sys.dm_geo_replication_link_status`),
+  `review_index_portfolio` keeps an unused index at observe and
+  `review_workload_indexes` caps the drop at medium, because replica reads are
+  not visible on the primary. Capture reads these signals before its
+  transaction opens.
+
+Query Store and diagnosis:
+
+- `detect_parameter_sniffing` names the fastest plan as `best_plan_id` and the
+  slowest as `worst_plan_id`. Before, it used the lowest and highest plan id.
+  It compares execution-weighted averages per plan over Regular runs. A plan
+  with 10% or more aborted or exception runs never ranks best and ranks first
+  as worst; a plan with only failed runs is reported as the worst plan. New
+  fields: `*_aborted_executions`, `*_exception_executions`,
+  `*_material_failures`.
+- `compare_query_plans` returns one row per plan with execution-weighted
+  averages and aborted and exception counts. Before, it returned one row per
+  interval, each with its plan XML, and the comparison was empty. With no plan
+  ids it compares the best and the worst plan by the same failure rule. A plan
+  with no Regular average or with material failures gets no ratio.
+- `get_query_wait_stats` includes each interval that ends inside the window.
+  Before, it filtered on the interval start, so the default 60-minute window
+  could drop the closed interval that held most of the last hour.
+- `get_resource_stats_history` keeps the hourly peaks and counts the 5-minute
+  samples above 80% and 95% on windows over 60 minutes. `diagnose_database`
+  finds CPU, data I/O and log write pressure from these peaks, so a short
+  saturation is no longer hidden by the hourly average.
+
+Proof and benchmarks:
+
+- Rewrite and index benchmarks resolve `compare_order` from the SQL when it is
+  not set: row order is compared only when the query has an outer ORDER BY.
+  Before, the default was true, so most index candidates for unordered queries
+  failed with `equivalence_failed`.
+- Same rows in a different order now give `order_only_mismatch`
+  (inconclusive), not `equivalence_failed`.
+- A rewrite that removes or changes the baseline outer ORDER BY gets the risk
+  `order_contract_changed` and cannot be proven or marked `deployment_ready`.
+- Equivalence preflight no longer reports `STRING_SPLIT`, a user table-valued
+  function or XML `nodes()` shredding as a cross-database dependency. It reads
+  the body of inline and multi-statement table-valued functions, also under
+  CROSS and OUTER APPLY.
+- Filtered index benchmarks match the filter text that SQL Server stores, for
+  example `([status]=(1))` for `status = 1`. Before, the check failed after a
+  real CREATE, the test index stayed, and the lease blocked every later index
+  benchmark. Filters can use `N'...'` literals; CAST, CONVERT and
+  scientific-notation constants are refused before CREATE.
+- The index benchmark drops a temporary index when its ownership marker proves
+  that the MCP created it, also after a lost CREATE reply or a failed
+  post-create check. Expired-lease cleanup uses the same marker.
+
+Plan actions, views and plans:
+
+- `verify_plan_action` reads the post-apply Query Store evidence itself;
+  `candidate_evidence` is optional and can never produce a keep. It holds when
+  the forced plan ran half or fewer of the executions, when plan forcing failed
+  after apply, or when max duration or spread gets worse against the forced
+  plan's own baseline. Without parameter buckets it holds when the baseline ran
+  more than one plan or when the forced plan did not run in the baseline.
+- Prepared plan-action intents expire after 24 hours. Apply holds an expired
+  intent.
+- `rollback_plan_action` changes nothing for an intent that was never applied
+  (held as expired or after a changed precondition). Before, it restored the
+  prior state and so undid a later DBA change. It also holds, with
+  `rollback_confirmation=state_changed`, when the current force or hint state is
+  no longer the state the intent applied.
+- ALTER of a view keeps the existing column list and WITH options
+  (VIEW_METADATA, SCHEMABINDING). An encrypted view has no readable
+  definition, so prepare refuses it and changes nothing. Before, a body-only change
+  removed them and verify still reported success. An unset `schema_bound` keeps
+  the existing SCHEMABINDING, and a durable retry with the same key no longer
+  fails with an idempotency conflict.
+- `analyze_query_plan` with `last_actual=true` keeps the requested statement
+  when it cuts a cached batch to five statements, and marks its findings with
+  `is_requested_statement`.
+
+Runtime:
+
+- A tool timeout or cancel stops the remaining statements of a multi-statement
+  session. Each statement gets the smaller of the query timeout and the time
+  left for the tool. The statement that is already running still runs until
+  its own timeout, because the mssql-python driver has no cancel call.
+  `benchmark_index_candidate` keeps the full query timeout, so it can drop its
+  index after a timeout.
+- The server instructions name the required `report_stuck` argument
+  `blocker_kind`.
+- A cancel during the index benchmark's ownership check no longer skips the
+  durable settlement: the executions already run are counted and the execution
+  reservation is settled before the cancel is raised again.
+
+Found by live acceptance on Azure SQL Database (most were also in 2.6.2):
+
+- Index history capture stored no run at all. The exactly-once transaction
+  nested `BEGIN TRANSACTION` inside the driver's own transaction, so commit
+  ended only the inner level and the run rolled back. The contract check also
+  compared CHECK constraints with the installer text, not the form SQL Server
+  stores, and snapshot row ids digested 100 ns timestamp text that reads back
+  as microseconds. A fresh install now captures, reads back and replays.
+- `sys.objects.type` is `char(2)` (`'U '`): user-table indexes got the blocker
+  `parent_is_not_user_table`, so widen, extend and consolidate advice had no
+  rollback DDL, and indexed views were missed.
+- Estimated plans for typed parameters (`explain_query`, `analyze_query_indexes`)
+  never compiled the statement: SHOWPLAN_XML returns nothing for parameter
+  markers and only an EXECUTE PROC stub for `sp_executesql`. They now compile
+  the statement with typed local variables and `OPTIMIZE FOR` the values, and
+  `estimated_plan_basis` says what that does not model (PSP and
+  optional-parameter dispatcher plans, parameter embedding). A plan with no
+  compiled query plan is refused, never read as zero hints.
+- A plan that only maintains an index (INSERT, UPDATE, DELETE, or an internal
+  REBUILD or UPDATE STATISTICS) no longer counts as use in
+  `review_index_portfolio` and `review_workload_indexes`, so an index on a
+  table that takes inserts can become a removal candidate. A forced plan that
+  touches the index still protects it.
+- A schema- or table-scoped `review_workload_indexes` ranks only the scope's
+  queries before the `top_queries` cap and checks only the scope's indexes for
+  plan references. Before, a busy database pushed the scope's own queries out
+  of the cap and the reference read timed out.
+- `get_top_queries`, `get_query_store_trend`, the query history tools and
+  `get_query_store_regressions` add `aborted_executions`,
+  `exception_executions` and a Regular-only average beside the existing
+  averages, which still include failed runs.
+- `compare_query_plans` keeps the caller's a/b order, names
+  `baseline_plan_id` and `compared_plan_id`, and refuses a single plan id.
+- `order_contract_changed` no longer fires when the same ORDER BY key is
+  written another way (unqualified, another alias, an ordinal or a select-list
+  alias).
+- Benchmark `actual_rows` was 0 when a parallel-shaped plan ran serially; an
+  actual plan of a constant-only SELECT now gets an accurate error; a digest
+  of an actual plan that ran in under 1 ms says why no operator is ranked.
+- View rollback restores the original module text, not a rebuilt one, and
+  reports `definition_exact` and `text_drift` on every path, including a retry.
+- An index benchmark refused before dispatch (filter, table name, parameter
+  binding, execution budget) no longer binds the candidate, so the corrected
+  request with a new key runs.
+- A failure after a plan or view write was sent records `unknown` or raises
+  an outcome-unknown error, so a retry cannot force twice or undo another
+  change. A verify that decides rollback returns the regressed metrics.
+- MCP refusal messages no longer quote examples or statuses, which the error
+  sanitizer redacted.
+
+### Changed
+
+- `failure_diagnostic.diagnostic_code` now says what happened when no SQL error
+  caused the failure: `request_refused`, `policy_refused`,
+  `verification_failed` (a write was sent, then its outcome could not be
+  verified or recorded: read state first, do not resubmit), `lease_conflict`
+  or `internal_error`. Before, all of these were `sql_execution_failed`, which
+  now means a SQL or driver error only. See docs/09-operations.md.
+
+### Known issues
+
+- A durable view change prepared by 2.6.2 (`persist_view_sql_state`) for a view
+  with a column list or WITH options does not load in this version: verify and
+  rollback of that change id fail with "durable view marker identity is
+  invalid". Restore the stored prior definition by hand. This applies only to
+  sandbox profiles with persisted view state.
+- An unscoped `review_workload_indexes` on a database with many unused indexes
+  and large plans can still time out on the plan reference read (the unused
+  indexes then stay low confidence). Scoped reviews are fixed; the general fix
+  is planned for 2.6.3b.
+- Query Store plan references match an index by name. After a table is dropped
+  and recreated with the same index names, old plans can still count as
+  references until they age out.
+- Not verified live: readable-replica holds (the test tier has no replicas)
+  and the index-age gate alone (a serverless resume resets usage counters, so
+  the counters-recent gate fires first). Both are covered by unit tests.
+
 ## [2.6.2] - 2026-10-06
 
 Fixes from the first live incident log (Windows, Python 3.14, Copilot CLI).

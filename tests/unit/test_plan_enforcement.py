@@ -5,6 +5,7 @@ import json
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
+from azure_sql_mcp.observability import sanitize_error_message
 from azure_sql_mcp.plan_enforcement import PlanEnforcementService
 
 
@@ -556,3 +557,14 @@ async def test_plan_enforcer_tick_apply_request_is_an_mcp_error(tmp_path) -> Non
 
     payload = json.loads(str(error.value).split(": ", 1)[1])
     assert payload["code"] == "preview_only"
+
+
+def test_unknown_action_guidance_survives_tool_error_redaction():
+    # The tool error handler redacts quoted text, so quoted choices would
+    # reach the agent as '[REDACTED]' or '[REDACTED]'.
+    with pytest.raises(ValueError) as error:
+        PlanEnforcementService._normalize_action("pin")
+
+    message = sanitize_error_message(str(error.value))
+    assert "[REDACTED]" not in message
+    assert "force or unforce" in message

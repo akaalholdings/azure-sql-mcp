@@ -244,7 +244,7 @@ class PlanEnforcementService:
             return "force"
         if normalized in {"unforce", "unforced"}:
             return "unforce"
-        raise ValueError("action must be 'force' or 'unforce'.")
+        raise ValueError("action must be force or unforce.")
 
     @staticmethod
     def _recommend_force_action(

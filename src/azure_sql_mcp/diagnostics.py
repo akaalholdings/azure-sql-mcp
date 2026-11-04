@@ -607,13 +607,17 @@ class DiagnosticQueryService:
                 t.name AS table_name,
                 i.name AS index_name,
                 i.type_desc,
-                COALESCE(ius.user_seeks, 0) AS user_seeks,
-                COALESCE(ius.user_scans, 0) AS user_scans,
-                COALESCE(ius.user_lookups, 0) AS user_lookups,
-                COALESCE(ius.user_updates, 0) AS user_updates,
-                COALESCE(ius.user_seeks, 0)
-                    + COALESCE(ius.user_scans, 0)
-                    + COALESCE(ius.user_lookups, 0) AS user_reads
+                -- No usage row: no use recorded since the counters last
+                -- reset, so the counters stay NULL, not 0.
+                CAST(CASE WHEN ius.index_id IS NULL THEN 0 ELSE 1 END AS bit) AS has_usage_row,
+                ius.user_seeks,
+                ius.user_scans,
+                ius.user_lookups,
+                ius.user_updates,
+                CASE
+                    WHEN ius.index_id IS NULL THEN NULL
+                    ELSE ius.user_seeks + ius.user_scans + ius.user_lookups
+                END AS user_reads
             FROM sys.tables AS t
             INNER JOIN sys.indexes AS i
                 ON t.object_id = i.object_id
@@ -635,10 +639,11 @@ class DiagnosticQueryService:
                 t.name AS table_name,
                 i.name AS index_name,
                 i.type_desc,
-                COALESCE(ius.user_updates, 0) AS user_updates,
-                COALESCE(ius.user_seeks, 0) AS user_seeks,
-                COALESCE(ius.user_scans, 0) AS user_scans,
-                COALESCE(ius.user_lookups, 0) AS user_lookups
+                CAST(CASE WHEN ius.index_id IS NULL THEN 0 ELSE 1 END AS bit) AS has_usage_row,
+                ius.user_updates,
+                ius.user_seeks,
+                ius.user_scans,
+                ius.user_lookups
             FROM sys.tables AS t
             INNER JOIN sys.indexes AS i
                 ON t.object_id = i.object_id

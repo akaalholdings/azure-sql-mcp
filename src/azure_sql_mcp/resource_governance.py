@@ -45,6 +45,12 @@ SELECT
     CAST(MAX(avg_data_io_percent) AS DECIMAL(5, 2)) AS max_data_io_percent,
     CAST(AVG(avg_log_write_percent) AS DECIMAL(5, 2)) AS avg_log_write_percent,
     CAST(MAX(avg_log_write_percent) AS DECIMAL(5, 2)) AS max_log_write_percent,
+    SUM(CASE WHEN avg_cpu_percent > 80 THEN 1 ELSE 0 END) AS cpu_samples_above_80,
+    SUM(CASE WHEN avg_cpu_percent > 95 THEN 1 ELSE 0 END) AS cpu_samples_above_95,
+    SUM(CASE WHEN avg_data_io_percent > 80 THEN 1 ELSE 0 END) AS data_io_samples_above_80,
+    SUM(CASE WHEN avg_data_io_percent > 95 THEN 1 ELSE 0 END) AS data_io_samples_above_95,
+    SUM(CASE WHEN avg_log_write_percent > 80 THEN 1 ELSE 0 END) AS log_write_samples_above_80,
+    SUM(CASE WHEN avg_log_write_percent > 95 THEN 1 ELSE 0 END) AS log_write_samples_above_95,
     CAST(MAX(max_worker_percent) AS DECIMAL(5, 2)) AS max_worker_percent,
     CAST(MAX(max_session_percent) AS DECIMAL(5, 2)) AS max_session_percent,
     MAX(storage_in_megabytes) AS storage_in_megabytes,
@@ -64,10 +70,21 @@ WHERE database_id = DB_ID()
 """
 
 RECENT_SAMPLE_SECONDS = 15
+LONG_TERM_SAMPLE_MINUTES = 5
+# Hourly bucket peaks (long_term only): the highest 5-minute sample in the hour.
+# They are peaks, not time, so they never raise a "sustained" warning.
+LONG_TERM_PEAK_METRICS = ("max_cpu_percent", "max_data_io_percent", "max_log_write_percent")
+# long_term: the per-hour counts of 5-minute samples above 80% and 95%.
+LONG_TERM_SAMPLE_COUNTS = {
+    "avg_cpu_percent": "cpu",
+    "avg_data_io_percent": "data_io",
+    "avg_log_write_percent": "log_write",
+}
 SUMMARY_METRICS = (
     "avg_cpu_percent",
     "avg_data_io_percent",
     "avg_log_write_percent",
+    *LONG_TERM_PEAK_METRICS,
     "avg_memory_usage_percent",
     "avg_instance_memory_percent",
     "max_worker_percent",
@@ -127,6 +144,25 @@ def summarize_resource_metric(values: list[float], *, sample_seconds: int | None
         "total_samples": len(values),
         "minutes_above_80": minutes(above_80),
         "minutes_above_95": minutes(above_95),
+    }
+
+
+def _long_term_sample_time(rows: list[dict[str, Any]], prefix: str) -> dict[str, Any]:
+    """Time above 80% and 95% from the 5-minute samples behind the hourly buckets.
+
+    Bucket counts would say how many hours had a high average, not how long the
+    database was near its limit. Rows without the counts keep the bucket view.
+    """
+    above_80, above_95 = f"{prefix}_samples_above_80", f"{prefix}_samples_above_95"
+    if not all("samples" in r and above_80 in r and above_95 in r for r in rows):
+        return {}
+    count_80 = sum(int(r.get(above_80) or 0) for r in rows)
+    count_95 = sum(int(r.get(above_95) or 0) for r in rows)
+    return {
+        "samples_above_80_pct": count_80,
+        "total_samples": sum(int(r.get("samples") or 0) for r in rows),
+        "minutes_above_80": count_80 * LONG_TERM_SAMPLE_MINUTES,
+        "minutes_above_95": count_95 * LONG_TERM_SAMPLE_MINUTES,
     }
 
 
@@ -279,8 +315,11 @@ class ResourceGovernanceService:
         ``recent`` reads sys.dm_db_resource_stats (15-second samples, about one
         hour retained). ``long_term`` reads sys.resource_stats in master (5-minute
         samples, about 14 days retained) and returns hourly average and maximum
-        buckets so long windows stay compact. ``auto`` picks recent for windows of
-        60 minutes or less and long_term beyond that.
+        buckets so long windows stay compact; its summary adds the bucket peaks
+        (max_cpu_percent, max_data_io_percent, max_log_write_percent), and the
+        time above 80% and 95% counts the 5-minute samples, not the buckets.
+        ``auto`` picks recent for windows of 60 minutes or less and long_term
+        beyond that.
         """
         window_minutes = max(1, min(int(window_minutes), MAX_RESOURCE_HISTORY_MINUTES))
         if source not in {"auto", "recent", "long_term"}:
@@ -319,12 +358,18 @@ class ResourceGovernanceService:
                     continue
                 values = [float(r.get(metric, 0) or 0) for r in rows]
                 summary[metric] = summarize_resource_metric(values, sample_seconds=sample_seconds)
+                if resolved == "long_term" and metric in LONG_TERM_SAMPLE_COUNTS:
+                    summary[metric].update(
+                        _long_term_sample_time(rows, LONG_TERM_SAMPLE_COUNTS[metric])
+                    )
 
         # Generate warnings for sustained pressure; memory is information only.
         warnings: list[dict[str, Any]] = []
         informational: list[dict[str, Any]] = []
         for metric_name, info in summary.items():
-            if info.get("samples_above_80_pct", 0) > len(rows) * 0.3:
+            if metric_name in LONG_TERM_PEAK_METRICS:
+                continue
+            if info.get("samples_above_80_pct", 0) > info.get("total_samples", len(rows)) * 0.3:
                 friendly = metric_name.replace("avg_", "").replace("_", " ").title()
                 message = (
                     f"{friendly} was above 80% for "

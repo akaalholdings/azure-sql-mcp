@@ -47,6 +47,7 @@ from azure_sql_mcp.incident_log import (
     render_markdown,
     resolve_incident_dir,
     summarize_backlog,
+    tool_failure_code,
 )
 from azure_sql_mcp.index_review import IndexReviewNotFoundError
 from azure_sql_mcp.index_review import IndexReviewSchemaError
@@ -68,6 +69,7 @@ from azure_sql_mcp.performance_store import (
 from azure_sql_mcp.plan_tree import PlanParseError
 from azure_sql_mcp.safe_sql import SafeSqlValidator
 from azure_sql_mcp.tuning_sessions import InvalidTransitionError
+from azure_sql_mcp.view_workflows import ViewVerificationError
 from tests.unit.test_index_history_repository import _Executor as HistoryExecutor
 from tests.unit.test_index_history_repository import _policy as history_policy
 from tests.unit.test_index_history_repository import _probe_rows as history_probe_rows
@@ -379,6 +381,120 @@ def test_a_missing_row_key_in_package_code_keeps_a_code_style_key_name(tmp_path)
     items = build_backlog(tmp_path / "incidents", now=FIXED_NOW)["items"]
     assert {item["example"]["error"]["message"] for item in items} == set(messages)
     assert any(item["title"].endswith("- 'query_plan_hash'") for item in items)
+
+
+def test_view_verification_failure_after_ddl_is_not_a_caller_error() -> None:
+    # The DDL ran before verification failed: the change may be left behind,
+    # so it is not a P4 caller error hidden from the default backlog.
+    verify = package_function(
+        """
+        def verify(error_class):
+            raise error_class("view verification failed and exact rollback failed: lost")
+        """,
+        "verify",
+    )
+    exc = raised(verify, ViewVerificationError)
+    described = describe_exception(tool_error_chain(exc))
+    assert (described["category"], described["priority"]) == ("outcome_unknown", "P1")
+    assert tool_failure_code(exc) == "verification_failed"
+
+
+def test_outcome_unknown_after_dispatch_is_not_reported_as_sql_failure() -> None:
+    # A write was dispatched, then the MCP could not record its outcome (a
+    # state conflict re-raised as *OutcomeUnknownError). No SQL error caused
+    # it, so the agent must get "read state first", not sql_execution_failed.
+    record = package_function(
+        """
+        class PlanActionOutcomeUnknownError(RuntimeError):
+            pass
+
+        def record():
+            raise PlanActionOutcomeUnknownError("plan action outcome could not be recorded")
+        """,
+        "record",
+    )
+    exc = raised(record)
+    assert describe_exception(exc)["category"] == "outcome_unknown"
+    assert tool_failure_code(exc) == "verification_failed"
+
+
+def test_plan_outcome_unknown_wins_over_a_driver_cause() -> None:
+    # The plan action was dispatched; then the confirm read failed with an
+    # engine error. The engine answered the READ, not the write: the agent must
+    # still read state first, so neither the code nor the incident may turn
+    # into an ordinary SQL failure.
+    record = package_function(
+        """
+        class PlanActionOutcomeUnknownError(RuntimeError):
+            pass
+
+        def record():
+            try:
+                raise ProgrammingError("Base table or view not found", "Invalid object name 'sys.query_store_plan'. (208)")
+            except ProgrammingError as exc:
+                raise PlanActionOutcomeUnknownError("plan action outcome could not be recorded") from exc
+        """,
+        "record",
+    )
+    record.__globals__["ProgrammingError"] = ProgrammingError
+    exc = raised(record)
+    assert describe_exception(exc)["category"] == "outcome_unknown"
+    assert describe_exception(exc)["priority"] == "P1"
+    assert tool_failure_code(exc) == "verification_failed"
+
+
+def test_tool_failure_code_follows_the_incident_category() -> None:
+    """The client diagnostic code and the backlog category come from one
+    classification, so a refusal is never filed as an MCP bug or the reverse."""
+
+    reject = package_function(
+        """
+        def reject(value):
+            raise ValueError("filtered index predicate must compare columns with a plain literal")
+        """,
+        "reject",
+    )
+    gate = package_function(
+        """
+        def gate():
+            raise PermissionError("Plan apply kill switch is engaged.")
+        """,
+        "gate",
+    )
+    wrong_type = package_function(
+        """
+        def wrong_type(value):
+            raise TypeError("Expected LessonV1.")
+        """,
+        "wrong_type",
+    )
+    to_int = package_function(
+        """
+        def to_int(value):
+            return int(value)
+        """,
+        "to_int",
+    )
+    cases = [
+        (raised(reject, "x"), "caller_error", "request_refused"),
+        (raised(gate), "policy", "policy_refused"),
+        (raised(wrong_type, None), "product_bug", "internal_error"),
+        (raised(to_int, "1,234"), "product_bug", "internal_error"),
+        (PlanParseError("plan_rejected"), "product_gap", "internal_error"),
+        (InvalidTransitionError("Session is completed."), "caller_error", "request_refused"),
+    ]
+    for exc, category, code in cases:
+        assert describe_exception(exc)["category"] == category
+        assert tool_failure_code(exc) == code
+
+    # A driver error keeps the SQL diagnostic even when a package error wraps it.
+    try:
+        try:
+            raise ProgrammingError("Base table or view not found", "Invalid object name 't'. (208)")
+        except ProgrammingError as driver_error:
+            raise ValueError("Catalog query failed.") from driver_error
+    except ValueError as wrapped:
+        assert tool_failure_code(wrapped) is None
 
 
 def test_caller_value_error_redacts_tokens_and_keeps_tsql_function_names() -> None:

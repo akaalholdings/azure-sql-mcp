@@ -139,6 +139,21 @@ def test_usage_query_preserves_null_dmv_counters() -> None:
     assert "i.is_auto_created" not in EXISTING_INDEX_METADATA_SQL
 
 
+def test_parser_keeps_statistics_date_as_the_index_age_bound() -> None:
+    # Azure SQL Database has no index create_date; STATS_DATE is the only
+    # catalog fact that bounds a new index's age, so the removal advice can
+    # tell an index created yesterday from one unused for months.
+    assert "STATS_DATE(i.object_id, i.index_id)" in EXISTING_INDEX_METADATA_SQL
+    [dated] = parse_existing_index_rows(
+        [{**row, "statistics_updated_utc": "2026-07-14T09:00:00.123"} for row in _rows()]
+    )
+    [undated] = parse_existing_index_rows(_rows())
+
+    assert dated.statistics_updated_utc == "2026-07-14T09:00:00.123"
+    assert undated.statistics_updated_utc is None
+    assert dated.definition_fingerprint == undated.definition_fingerprint
+
+
 def test_azure_sql_identity_queries_use_physical_database_and_server_epoch() -> None:
     assert "sys.databases" in DATABASE_INCARNATION_SQL
     assert "physical_database_name" in DATABASE_INCARNATION_SQL
@@ -578,6 +593,27 @@ def test_protection_evidence_preserves_fk_roles_and_composite_order() -> None:
         "leading_key_supported"
     ] is True
     assert index.protection_evidence["has_index_extended_properties"] is True
+
+
+def test_char2_object_type_padding_from_the_driver_is_ignored() -> None:
+    # sys.objects.type is char(2): Azure SQL returns 'U ' and 'V '. Live
+    # (2026-11-04) every user-table index got the blocker parent_is_not_user_table,
+    # so widen/extend/consolidate advice had no rollback DDL.
+    from azure_sql_mcp.index_ddl import render_reverse_index_ddl
+
+    [table_index] = parse_existing_index_rows(
+        [{**_complete_rows()[0], "parent_object_type_code": "U "}]
+    )
+    assert table_index.parent_object_type_code == "U"
+    assert "parent_is_not_user_table" not in render_reverse_index_ddl(table_index).get(
+        "blockers", []
+    )
+
+    view_row = {**_complete_rows()[0], "parent_object_type_code": "V "}
+    view_row.pop("is_indexed_view", None)
+    [view_index] = parse_existing_index_rows([view_row])
+    assert view_index.parent_object_type_code == "V"
+    assert view_index.protection_evidence["indexed_view"] is True
 
 
 @pytest.mark.parametrize(

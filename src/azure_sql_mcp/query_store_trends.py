@@ -41,6 +41,17 @@ _BUCKET = (
     "CAST('20000101' AS datetime2))"
 )
 
+# execution_type: 0 Regular, 3 Aborted (timeout or cancel), 4 Exception. The
+# executions and avg_* fields count every run; these columns show the failed runs
+# and give the Regular-only average that compare_query_plans reports.
+_EXECUTION_OUTCOME_COLUMNS = """
+    SUM(CASE WHEN rs.execution_type = 0 THEN rs.count_executions ELSE 0 END) AS regular_executions,
+    SUM(CASE WHEN rs.execution_type = 0 THEN rs.avg_duration * rs.count_executions END) / 1000.0
+        AS regular_total_duration_ms,
+    SUM(CASE WHEN rs.execution_type = 3 THEN rs.count_executions ELSE 0 END) AS aborted_executions,
+    SUM(CASE WHEN rs.execution_type = 4 THEN rs.count_executions ELSE 0 END) AS exception_executions,
+"""
+
 _TREND_SQL_TEMPLATE = """
 SELECT
     {bucket_expr} AS bucket_start_utc,
@@ -49,6 +60,7 @@ SELECT
     SUM(rs.avg_cpu_time * rs.count_executions) / 1000.0 AS total_cpu_ms,
     SUM(rs.avg_duration * rs.count_executions) / 1000.0 AS total_duration_ms,
     SUM(rs.avg_logical_io_reads * rs.count_executions) AS total_logical_reads,
+    {outcome_columns}
     SUM(rs.avg_physical_io_reads * rs.count_executions) AS total_physical_reads
 FROM sys.query_store_runtime_stats AS rs
 INNER JOIN sys.query_store_runtime_stats_interval AS rsi
@@ -62,11 +74,12 @@ GROUP BY {bucket_expr}
 ORDER BY bucket_start_utc
 """
 
-_PLAN_BREAKDOWN_SQL = """
+_PLAN_BREAKDOWN_SQL = f"""
 SELECT
     rs.plan_id,
     MAX(CAST(p.is_forced_plan AS int)) AS is_forced_plan,
     SUM(rs.count_executions) AS executions,
+    {_EXECUTION_OUTCOME_COLUMNS}
     SUM(rs.avg_cpu_time * rs.count_executions) / 1000.0 AS total_cpu_ms,
     SUM(rs.avg_duration * rs.count_executions) / 1000.0 AS total_duration_ms,
     SUM(rs.avg_logical_io_reads * rs.count_executions) AS total_logical_reads,
@@ -93,6 +106,7 @@ WITH runtime AS (
             WHEN rsi.start_time >= TODATETIMEOFFSET(CAST(? AS datetime2), 0) THEN 'recent'
             ELSE 'baseline'
         END AS period,
+        rs.execution_type,
         rs.count_executions,
         rs.avg_duration,
         rs.avg_cpu_time,
@@ -113,7 +127,16 @@ plan_period AS (
         SUM(CAST(count_executions AS float)) AS executions,
         SUM(avg_duration * count_executions) AS total_duration_us,
         SUM(avg_cpu_time * count_executions) AS total_cpu_us,
-        SUM(avg_logical_io_reads * count_executions) AS total_logical_reads
+        SUM(avg_logical_io_reads * count_executions) AS total_logical_reads,
+        -- execution_type: 0 Regular, 3 Aborted (timeout or cancel), 4 Exception.
+        SUM(CASE WHEN execution_type = 0 THEN CAST(count_executions AS float) ELSE 0 END)
+            AS regular_executions,
+        SUM(CASE WHEN execution_type = 0 THEN avg_duration * count_executions ELSE 0 END)
+            AS regular_total_duration_us,
+        SUM(CASE WHEN execution_type = 3 THEN CAST(count_executions AS float) ELSE 0 END)
+            AS aborted_executions,
+        SUM(CASE WHEN execution_type = 4 THEN CAST(count_executions AS float) ELSE 0 END)
+            AS exception_executions
     FROM runtime
     GROUP BY query_id, period, plan_id
 ),
@@ -125,6 +148,10 @@ query_period AS (
         SUM(total_duration_us) AS total_duration_us,
         SUM(total_cpu_us) AS total_cpu_us,
         SUM(total_logical_reads) AS total_logical_reads,
+        SUM(regular_executions) AS regular_executions,
+        SUM(regular_total_duration_us) AS regular_total_duration_us,
+        SUM(aborted_executions) AS aborted_executions,
+        SUM(exception_executions) AS exception_executions,
         STRING_AGG(CAST(plan_id AS varchar(20)), ',') AS plan_ids
     FROM plan_period
     GROUP BY query_id, period
@@ -136,11 +163,19 @@ SELECT TOP (2000)
     r.total_cpu_us AS recent_total_cpu_us,
     r.total_logical_reads AS recent_total_logical_reads,
     r.plan_ids AS recent_plan_ids,
+    r.regular_executions AS recent_regular_executions,
+    r.regular_total_duration_us AS recent_regular_total_duration_us,
+    r.aborted_executions AS recent_aborted_executions,
+    r.exception_executions AS recent_exception_executions,
     b.executions AS baseline_executions,
     b.total_duration_us AS baseline_total_duration_us,
     b.total_cpu_us AS baseline_total_cpu_us,
     b.total_logical_reads AS baseline_total_logical_reads,
     b.plan_ids AS baseline_plan_ids,
+    b.regular_executions AS baseline_regular_executions,
+    b.regular_total_duration_us AS baseline_regular_total_duration_us,
+    b.aborted_executions AS baseline_aborted_executions,
+    b.exception_executions AS baseline_exception_executions,
     OBJECT_SCHEMA_NAME(q.object_id) AS object_schema,
     OBJECT_NAME(q.object_id) AS object_name,
     LEFT(qt.query_sql_text, 300) AS query_text_preview
@@ -204,7 +239,11 @@ class QueryStoreTrendService:
             params.append(int(query_id))
         rows = await self.executor.fetch_all(
             database_name,
-            _TREND_SQL_TEMPLATE.format(bucket_expr=bucket_expr, query_filter=query_filter),
+            _TREND_SQL_TEMPLATE.format(
+                bucket_expr=bucket_expr,
+                query_filter=query_filter,
+                outcome_columns=_EXECUTION_OUTCOME_COLUMNS,
+            ),
             params=params,
         )
         buckets = [_trend_bucket(row) for row in rows]
@@ -215,7 +254,7 @@ class QueryStoreTrendService:
             "bucket_minutes": bucket_minutes,
             "bucket_size_adjusted": adjusted,
             "buckets": buckets,
-            "totals": _totals(buckets),
+            "totals": _totals(buckets, rows),
         }
         if query_id is not None:
             plans = await self.executor.fetch_all(
@@ -338,10 +377,22 @@ def _trend_bucket(row: dict[str, Any]) -> dict[str, Any]:
         "avg_cpu_ms": round(_float(row.get("total_cpu_ms")) / executions, 3) if executions else None,
         "avg_duration_ms": round(_float(row.get("total_duration_ms")) / executions, 3) if executions else None,
         "avg_logical_reads": round(_float(row.get("total_logical_reads")) / executions, 1) if executions else None,
+        **_execution_outcomes(row),
     }
 
 
-def _totals(buckets: list[dict[str, Any]]) -> dict[str, Any]:
+def _execution_outcomes(row: dict[str, Any]) -> dict[str, Any]:
+    regular = _float(row.get("regular_executions"))
+    return {
+        "aborted_executions": _float(row.get("aborted_executions")),
+        "exception_executions": _float(row.get("exception_executions")),
+        "regular_avg_duration_ms": (
+            round(_float(row.get("regular_total_duration_ms")) / regular, 3) if regular else None
+        ),
+    }
+
+
+def _totals(buckets: list[dict[str, Any]], rows: list[dict[str, Any]]) -> dict[str, Any]:
     executions = sum(bucket["executions"] for bucket in buckets)
     duration = sum(bucket["total_duration_ms"] for bucket in buckets)
     cpu = sum(bucket["total_cpu_ms"] for bucket in buckets)
@@ -352,6 +403,17 @@ def _totals(buckets: list[dict[str, Any]]) -> dict[str, Any]:
         "total_duration_ms": round(duration, 3),
         "avg_duration_ms": round(duration / executions, 3) if executions else None,
         "peak_bucket_utc": peak["bucket_start_utc"] if peak else None,
+        **_execution_outcomes(
+            {
+                key: sum(_float(row.get(key)) for row in rows)
+                for key in (
+                    "regular_executions",
+                    "regular_total_duration_ms",
+                    "aborted_executions",
+                    "exception_executions",
+                )
+            }
+        ),
     }
 
 
@@ -364,6 +426,7 @@ def _plan_row(row: dict[str, Any]) -> dict[str, Any]:
         "avg_cpu_ms": round(_float(row.get("total_cpu_ms")) / executions, 3) if executions else None,
         "avg_duration_ms": round(_float(row.get("total_duration_ms")) / executions, 3) if executions else None,
         "avg_logical_reads": round(_float(row.get("total_logical_reads")) / executions, 1) if executions else None,
+        **_execution_outcomes(row),
         "first_seen_utc": row.get("first_seen_utc"),
         "last_seen_utc": row.get("last_seen_utc"),
     }
@@ -399,6 +462,20 @@ def _regression_row(
         "new_plan_ids": sorted(recent_plans - baseline_plans),
         "plan_changed": bool(recent_plans - baseline_plans),
         "query_text_preview": row.get("query_text_preview"),
+        **_period_outcomes(row, "recent"),
+        **_period_outcomes(row, "baseline"),
+    }
+
+
+def _period_outcomes(row: dict[str, Any], period: str) -> dict[str, Any]:
+    # The regression compares averages over every run; these fields show the
+    # failed runs and the Regular-only duration so a timeout storm reads as one.
+    regular = _float(row.get(f"{period}_regular_executions"))
+    total = _float(row.get(f"{period}_regular_total_duration_us"))
+    return {
+        f"{period}_aborted_executions": _float(row.get(f"{period}_aborted_executions")),
+        f"{period}_exception_executions": _float(row.get(f"{period}_exception_executions")),
+        f"{period}_regular_avg_duration_ms": round(total / regular / 1000.0, 3) if regular else None,
     }
 
 

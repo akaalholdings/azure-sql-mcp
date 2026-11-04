@@ -1968,6 +1968,47 @@ class PerformanceStore:
             )
             return {"replayed": False}
 
+    def release_index_benchmark_request(
+        self,
+        session_id: str,
+        candidate_id: str,
+        phase: str,
+        request_fingerprint: str,
+        *,
+        idempotency_key: str,
+    ) -> bool:
+        """Drop a binding whose request was refused before any reservation."""
+
+        fingerprint = self._require_fingerprint(request_fingerprint)
+        scope = f"index-benchmark.request.{phase}"
+        with self._transaction():
+            reservation = self._connection.execute(
+                """
+                SELECT 1 FROM execution_reservations
+                WHERE session_id = ? AND candidate_id = ?
+                  AND request_fingerprint = ?
+                LIMIT 1
+                """,
+                (session_id, candidate_id, fingerprint),
+            ).fetchone()
+            if reservation is not None:
+                return False
+            deleted = self._connection.execute(
+                """
+                DELETE FROM operation_idempotency
+                WHERE scope = ? AND idempotency_key = ?
+                  AND aggregate_type = 'candidate' AND aggregate_id = ?
+                  AND request_fingerprint = ?
+                """,
+                (
+                    scope,
+                    self._hashed_idempotency_key(scope, idempotency_key),
+                    candidate_id,
+                    fingerprint,
+                ),
+            )
+            return deleted.rowcount > 0
+
     def execution_budget_usage(self, session_id: str) -> dict[str, int]:
         """Return conservative consumed/reserved execution counts."""
 

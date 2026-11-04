@@ -314,3 +314,99 @@ async def test_managed_index_ddl_uses_private_atomic_ownership_marker(
     assert "DROP INDEX" in drop_action.sql
     assert owner not in drop_action.sql
     assert drop_action.params == (owner, definition_fingerprint, 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("user_filter", "catalog_filter"),
+    [
+        ("status = 1", "([status]=(1))"),
+        ("status IN (1, 2)", "([status]=(1) OR [status]=(2))"),
+    ],
+)
+async def test_filtered_benchmark_drops_index_stored_in_sql_server_spelling(
+    server_config_factory,
+    monkeypatch: pytest.MonkeyPatch,
+    user_filter: str,
+    catalog_filter: str,
+) -> None:
+    """A filtered candidate written without brackets must still be verified as
+    ours after CREATE. Otherwise the index stays on the database, the lease goes
+    to cleanup_required, and no further index test can run there."""
+
+    from azure_sql_mcp.index_metadata import ExistingIndex
+    from azure_sql_mcp.index_metadata import parse_candidate_key
+    from azure_sql_mcp.index_optimizer import IndexCandidate
+    from tests.unit.test_index_benchmark_workflow import _app
+    from tests.unit.test_index_benchmark_workflow import _candidate
+    from tests.unit.test_index_benchmark_workflow import _profile
+
+    app = _app(server_config_factory)
+    sql = "SELECT id FROM dbo.Items WHERE status = 1"
+    session_id, candidate_id = _candidate(app, sql)
+    index_name = "IX_Testing_" + IndexCandidate(
+        schema="dbo",
+        table="Items",
+        key_columns=("status",),
+        include_columns=("id",),
+        filter_definition=user_filter,
+    ).definition_fingerprint[:16]
+    stored_index = ExistingIndex(
+        schema="dbo",
+        table="Items",
+        index_id=2,
+        name=index_name,
+        index_type="NONCLUSTERED",
+        key_columns=(parse_candidate_key("status"),),
+        include_columns=("id",),
+        filter_definition=catalog_filter,
+    )
+    database = {"index_exists": False}
+
+    async def catalog(*_args: object, **_kwargs: object) -> list[ExistingIndex]:
+        return [stored_index] if database["index_exists"] else []
+
+    async def create(*_args: object, **_kwargs: object) -> dict[str, str]:
+        database["index_exists"] = True
+        return {"status": "completed"}
+
+    async def drop(*_args: object, **_kwargs: object) -> dict[str, str]:
+        database["index_exists"] = False
+        return {"status": "completed"}
+
+    monkeypatch.setattr("azure_sql_mcp.server.collect_existing_indexes", catalog)
+    app._create_test_index = AsyncMock(side_effect=create)  # type: ignore[method-assign]
+    app._drop_test_index = AsyncMock(side_effect=drop)  # type: ignore[method-assign]
+    app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[_profile(100) for _ in range(3)]
+        + [_profile(50, index_name=index_name) for _ in range(3)]
+        + [_profile(100) for _ in range(3)]
+    )
+
+    result = await app._benchmark_index_candidate(
+        "appdb",
+        session_id,
+        candidate_id,
+        sql,
+        "dbo",
+        "Items",
+        ["status"],
+        ["id"],
+        user_filter,
+        False,
+        "screening",
+        True,
+        True,
+        30,
+        f"filtered-catalog-spelling-{user_filter}",
+    )
+
+    # The owner-marker fallback would also drop the index, but it rejects the
+    # candidate. Only an exact post-create match lets the benchmark measure it.
+    lease_metadata = result["lease"]["metadata"]
+    assert lease_metadata["creation_observation"] == "post_create"
+    assert lease_metadata.get("cleanup_policy") != "dropped_by_owner_marker"
+    assert result["classification"] == "improved"
+    assert result["lease"]["status"] == "cleaned"
+    assert database["index_exists"] is False
+    app._drop_test_index.assert_awaited_once()

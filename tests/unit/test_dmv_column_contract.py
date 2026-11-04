@@ -283,3 +283,26 @@ def test_view_dependency_read_uses_documented_columns() -> None:
     executor.check(VIEW_DEPENDENCIES_SQL)
 
     assert executor.violations == []
+
+
+def test_readable_replica_geo_read_uses_a_user_database_dmv() -> None:
+    # MCP runs this read in the user database. sys.geo_replication_links lives
+    # in master and shows rows only to the server or Entra admin, so from the
+    # user database it fails (every General Purpose drop is capped as
+    # "unknown") or returns 0 rows (a real geo secondary is missed).
+    import sqlglot
+    from sqlglot import exp
+
+    from azure_sql_mcp.index_metadata import GEO_REPLICATION_LINK_COUNT_SQL
+
+    sources = {
+        f"{table.db}.{table.name}".lower()
+        for table in sqlglot.parse_one(GEO_REPLICATION_LINK_COUNT_SQL, read="tsql").find_all(exp.Table)
+    }
+    contract = documented_entries()
+
+    assert sources == {GEO_LINK}
+    assert contract[GEO_LINK]["permission"]["default"] == "VIEW DATABASE STATE"
+    executor = StrictDmvExecutor()
+    executor.check(GEO_REPLICATION_LINK_COUNT_SQL)
+    assert executor.violations == []

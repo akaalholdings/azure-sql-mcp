@@ -266,7 +266,9 @@ async def plan_checks(
         check(
             results,
             "actual plan ranked by self time",
-            digest.get("ranking_basis") == "self_elapsed_ms" and bool(tops),
+            # A run under 1 ms ranks nothing; the digest must then say why.
+            digest.get("ranking_basis") == "self_elapsed_ms"
+            and (bool(tops) or bool(statement.get("top_operators_note"))),
             json.dumps([(item.get("node_id"), item.get("operator"), item.get("self_elapsed_ms")) for item in tops[:3]]),
         )
         check(
