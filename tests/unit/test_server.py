@@ -31,6 +31,7 @@ from azure_sql_mcp.learning_store import LearningStoreError
 from azure_sql_mcp.index_review import CONTRACT_SCHEMA_FINGERPRINT
 from azure_sql_mcp.performance_contracts import EvidenceEnvelopeV1
 from azure_sql_mcp.performance_store import ContractNotFoundError
+from azure_sql_mcp.performance_store import IdempotencyConflictError
 from azure_sql_mcp.query_identity import legacy_database_fingerprint
 from azure_sql_mcp.performance_workflows import database_fingerprint
 from azure_sql_mcp.performance_workflows import fingerprint_json
@@ -39,7 +40,11 @@ from azure_sql_mcp.server import AzureSqlMcpApplication
 from azure_sql_mcp.tuning_sessions import InvalidTransitionError
 from azure_sql_mcp.view_workflows import ViewChangeRequest
 from azure_sql_mcp.view_workflows import ViewSnapshot
+from azure_sql_mcp.view_workflows import ViewWorkflowService
 from azure_sql_mcp.view_workflows import prepared_view_change_state
+from tests.unit.test_view_workflows import FakeViewExecutor
+from tests.unit.test_view_workflows import _admin
+from tests.unit.test_view_workflows import _policy
 
 
 def make_config(
@@ -2552,6 +2557,86 @@ async def test_durable_view_prepare_replays_intent_before_generating_marker(
     app.performance_store.close()
 
 
+def _durable_view_app(
+    server_config_factory,
+    tmp_path: Path,
+    *,
+    prior_bound: bool,
+) -> AzureSqlMcpApplication:
+    options = " WITH SCHEMABINDING" if prior_bound else ""
+    executor = FakeViewExecutor(
+        f"CREATE VIEW [dbo].[SalesView]{options} AS SELECT [Id] FROM [dbo].[OldSales];"
+    )
+    executor.catalog_schema_bound[("dbo", "SalesView")] = prior_bound
+    app = AzureSqlMcpApplication(
+        server_config_factory(
+            access_mode=AccessMode.UNRESTRICTED,
+            write_policy=WritePolicy.APPLY,
+            profile=McpProfile.SANDBOX,
+            performance_state_dir=str(tmp_path / "state"),
+            persist_view_sql_state=True,
+        )
+    )
+    app.view_workflows = ViewWorkflowService(
+        executor,
+        _policy(),
+        _admin(server_config_factory, tmp_path / "audit", WritePolicy.APPLY),
+    )
+    return app
+
+
+_DURABLE_VIEW_ARGS = (
+    "testdb",
+    "dbo",
+    "SalesView",
+    "SELECT [Id] FROM [dbo].[NewSales]",
+    "alter",
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_bound", (False, True))
+async def test_durable_view_prepare_retry_with_unset_schema_bound_replays_intent(
+    server_config_factory,
+    tmp_path: Path,
+    prior_bound: bool,
+) -> None:
+    # The tool default is schema_bound=None and durable state stores the request
+    # resolved against the prior view. An MCP retry with the same key and the
+    # same arguments must replay the intent, not report a key conflict.
+    app = _durable_view_app(server_config_factory, tmp_path, prior_bound=prior_bound)
+
+    first = await app._prepare_view_change(
+        *_DURABLE_VIEW_ARGS, None, False, "replay-key"
+    )
+    app.view_workflows.prepare_view_change = AsyncMock(  # type: ignore[method-assign]
+        side_effect=AssertionError("replay must not prepare again")
+    )
+    second = await app._prepare_view_change(
+        *_DURABLE_VIEW_ARGS, None, False, "replay-key"
+    )
+
+    assert second["change_id"] == first["change_id"]
+    app.view_workflows.prepare_view_change.assert_not_awaited()
+    app.performance_store.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_view_prepare_explicit_unbind_conflicts_with_kept_binding(
+    server_config_factory,
+    tmp_path: Path,
+) -> None:
+    # The first call kept SCHEMABINDING (unset resolved to True). Reusing the key
+    # with an explicit False asks for a different change and must not replay it.
+    app = _durable_view_app(server_config_factory, tmp_path, prior_bound=True)
+
+    await app._prepare_view_change(*_DURABLE_VIEW_ARGS, None, False, "replay-key")
+
+    with pytest.raises(IdempotencyConflictError):
+        await app._prepare_view_change(*_DURABLE_VIEW_ARGS, False, False, "replay-key")
+    app.performance_store.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("history", "parameter_buckets", "available", "complete", "status"),
@@ -3222,3 +3307,316 @@ async def test_tool_error_marks_failures_the_server_would_retry_as_transient(
 
     assert diagnostics[0]["transient"] is True
     assert "transient" not in diagnostics[1]
+
+
+_MISSING_HISTORY = (
+    "Index history tables are missing: dbatools.IndexReviewRun, "
+    "dbatools.IndexReviewSnapshot."
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "service_method", "arguments", "rights"),
+    [
+        ("review_index_portfolio", "review_portfolio", {}, "GRANT SELECT ON"),
+        ("get_index_review", "get_review", {"review_id": "review-1"}, "GRANT SELECT ON"),
+        (
+            "capture_index_review_snapshot",
+            "capture_snapshot",
+            {},
+            "GRANT SELECT, INSERT ON",
+        ),
+    ],
+)
+async def test_missing_index_history_setup_is_a_precondition_not_an_error(
+    app: AzureSqlMcpApplication,
+    tool_name: str,
+    service_method: str,
+    arguments: dict[str, Any],
+    rights: str,
+) -> None:
+    # The history tables are an optional DBA install. Their absence is a setup
+    # step to show the DBA, not a tool failure the agent should retry or debug.
+    from azure_sql_mcp.index_review import IndexReviewSetupError
+
+    app.database_policy = make_read_policy("appdb")
+    setattr(
+        app.index_review,
+        service_method,
+        AsyncMock(side_effect=IndexReviewSetupError(_MISSING_HISTORY)),
+    )
+
+    payload = await app.mcp._tool_manager.call_tool(
+        tool_name, {"database_name": "appdb", **arguments}
+    )
+
+    assert payload["result_status"] == "precondition"
+    assert "sql/Install-IndexReviewHistory-v1.sql" in payload["remediation"]
+    assert rights in payload["remediation"]
+    assert "artifacts" not in payload
+
+
+@pytest.mark.asyncio
+async def test_index_history_contract_mismatch_stays_a_tool_error(
+    app: AzureSqlMcpApplication,
+) -> None:
+    from azure_sql_mcp.index_review import IndexReviewSchemaError
+
+    app.database_policy = make_read_policy("appdb")
+    app.index_review.review_portfolio = AsyncMock(  # type: ignore[method-assign]
+        side_effect=IndexReviewSchemaError("Index history column contract mismatch.")
+    )
+
+    with pytest.raises(ToolError) as raised:
+        await app.mcp._tool_manager.call_tool(
+            "review_index_portfolio", {"database_name": "appdb"}
+        )
+
+    assert '"code":"tool_error"' in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_result_comparison_tools_leave_compare_order_to_the_sql(
+    app: AzureSqlMcpApplication,
+) -> None:
+    # A hard-coded compare_order=True fails every rewrite or index that returns
+    # the same rows in a new order when the query has no outer ORDER BY.
+    app.database_policy = make_read_policy("appdb")
+    app.tuning_sessions.get_session = Mock(  # type: ignore[method-assign]
+        return_value=Mock(deadline_at_utc=None)
+    )
+    app.performance_workflows.benchmark_candidate = AsyncMock(  # type: ignore[method-assign]
+        return_value={"classification": "improved"}
+    )
+    app.performance_workflows.compare_query_results = AsyncMock(  # type: ignore[method-assign]
+        return_value={"status": "match"}
+    )
+    app._benchmark_query_rewrite = AsyncMock(  # type: ignore[method-assign]
+        return_value={"classification": "improved"}
+    )
+    app._benchmark_index_candidate = AsyncMock(  # type: ignore[method-assign]
+        return_value={"classification": "improved"}
+    )
+    sql = "SELECT id FROM dbo.Items WHERE status = 1"
+
+    await app.mcp._tool_manager.call_tool(
+        "benchmark_tuning_candidate",
+        {
+            "session_id": "session-1",
+            "candidate_id": "candidate-1",
+            "baseline_sql": sql,
+            "candidate_sql": sql,
+            "database_name": "appdb",
+        },
+    )
+    await app.mcp._tool_manager.call_tool(
+        "compare_query_results",
+        {"baseline_sql": sql, "candidate_sql": sql, "database_name": "appdb"},
+    )
+    await app.mcp._tool_manager.call_tool(
+        "benchmark_query_rewrite",
+        {"baseline_sql": sql, "rewrite_sql": sql, "database_name": "appdb"},
+    )
+    await app.mcp._tool_manager.call_tool(
+        "benchmark_index_candidate",
+        {
+            "session_id": "session-1",
+            "candidate_id": "candidate-1",
+            "sql": sql,
+            "schema_name": "dbo",
+            "table_name": "Items",
+            "key_columns": ["status"],
+            "idempotency_key": "index-default-order",
+            "database_name": "appdb",
+        },
+    )
+
+    benchmark_call = app.performance_workflows.benchmark_candidate.await_args
+    assert benchmark_call.kwargs["compare_order"] is None
+    compare_call = app.performance_workflows.compare_query_results.await_args
+    assert compare_call.kwargs["compare_order"] is None
+    rewrite_call = app._benchmark_query_rewrite.await_args
+    assert rewrite_call.args[8] is None
+    index_call = app._benchmark_index_candidate.await_args
+    assert index_call.args[12] is None
+
+
+@pytest.mark.asyncio
+async def test_tool_statements_share_the_tool_time_budget(
+    app: AzureSqlMcpApplication,
+) -> None:
+    # Each statement gets min(query timeout, time left), so a late statement
+    # cannot run a full query timeout past the tool deadline.
+    import time as time_module
+
+    from azure_sql_mcp import connection
+
+    app.database_policy = make_read_policy("appdb")
+    seen: dict[str, float | None] = {}
+
+    async def single(_database: str) -> dict[str, Any]:
+        seen["single"] = connection._STATEMENT_DEADLINE.get()
+        return {"ok": True}
+
+    async def pair(_source: str, _target: str) -> dict[str, Any]:
+        seen["pair"] = connection._STATEMENT_DEADLINE.get()
+        return {"ok": True}
+
+    started = time_module.monotonic()
+    await app._run_tool("get_wait_stats", "appdb", single)
+    await app._run_database_pair_tool("compare_schemas", "appdb", "appdb", pair)
+
+    budget = app._timeout_for_tool("get_wait_stats", "appdb")
+    assert seen["single"] is not None
+    assert started < seen["single"] <= time_module.monotonic() + budget
+    assert seen["pair"] is not None
+    assert seen["pair"] <= (
+        time_module.monotonic() + app.config.tool_timeout_seconds
+    )
+    assert connection._STATEMENT_DEADLINE.get() is None
+
+
+@pytest.mark.asyncio
+async def test_index_benchmark_cleanup_is_not_cut_off_by_the_tool_deadline(
+    app: AzureSqlMcpApplication,
+) -> None:
+    # After a timeout the benchmark still drops its temporary index; a passed
+    # statement deadline would refuse that DROP and orphan the index.
+    from azure_sql_mcp import connection
+
+    seen: dict[str, float | None] = {}
+
+    async def benchmark(_database: str) -> dict[str, Any]:
+        seen["index"] = connection._STATEMENT_DEADLINE.get()
+        return {"classification": "improved"}
+
+    await app._run_tool("benchmark_index_candidate", "appdb", benchmark)
+
+    assert seen["index"] is None
+
+
+@pytest.mark.asyncio
+async def test_verify_plan_action_reads_its_own_evidence_without_caller_input(
+    tmp_path: Path,
+) -> None:
+    # The MCP reads post-apply Query Store evidence itself; requiring the caller
+    # to supply it invites invented or stale windows.
+    app = AzureSqlMcpApplication(
+        make_config(tmp_path, access_mode=AccessMode.UNRESTRICTED)
+    )
+    app.plan_actions.verify = AsyncMock(  # type: ignore[method-assign]
+        return_value={"decision": "keep"}
+    )
+
+    await app.mcp._tool_manager.call_tool(
+        "verify_plan_action",
+        {
+            "intent_id": "intent-1",
+            "authorization_reference": "CHG-1",
+            "database_name": "appdb",
+        },
+    )
+
+    assert app.plan_actions.verify.await_args.kwargs["candidate_evidence"] is None
+
+
+def test_prepare_view_change_description_says_view_header_is_kept(
+    app: AzureSqlMcpApplication,
+) -> None:
+    # The tool takes a SELECT body only, so an agent must learn up front that a
+    # change of column list or WITH options needs a change outside the tool.
+    tool = app.mcp._tool_manager.get_tool("prepare_view_change")
+    assert tool is not None
+    description = tool.description or ""
+    assert "column list and WITH options" in description
+    assert "cannot be changed through prepare_view_change" in description
+
+
+@pytest.mark.asyncio
+async def test_prepare_view_change_default_keeps_existing_schemabinding(
+    app: AzureSqlMcpApplication,
+) -> None:
+    # An explicit False from the tool default would unbind a schema-bound view
+    # on a body-only ALTER; unset lets the workflow keep the existing option.
+    app.view_workflows.prepare_view_change = AsyncMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("stop after request capture")
+    )
+
+    with pytest.raises(ToolError):
+        await app.mcp._tool_manager.call_tool(
+            "prepare_view_change",
+            {
+                "schema_name": "dbo",
+                "view_name": "BoundView",
+                "definition": "SELECT [Id] FROM [dbo].[Source]",
+                "operation": "alter",
+                "database_name": "appdb",
+            },
+        )
+
+    request = app.view_workflows.prepare_view_change.await_args.args[0]
+    assert request.schema_bound is None
+
+
+def _batch_statement(index: int, cost: float, plan_hash: str) -> str:
+    return (
+        f'<StmtSimple StatementText="s{index}" StatementType="SELECT" '
+        f'StatementSubTreeCost="{cost}" QueryPlanHash="{plan_hash}">'
+        '<QueryPlan><RelOp NodeId="0" PhysicalOp="Clustered Index Scan" '
+        f'LogicalOp="Clustered Index Scan" EstimateRows="10" EstimatedTotalSubtreeCost="{cost}">'
+        '<OutputList/><RunTimeInformation><RunTimeCountersPerThread Thread="0" '
+        'ActualRows="500000" ActualExecutions="1"/></RunTimeInformation>'
+        f'<IndexScan><Object Database="[db]" Schema="[dbo]" Table="[T{index}]" '
+        'Index="[PK]" IndexKind="Clustered"/></IndexScan></RelOp></QueryPlan></StmtSimple>'
+    )
+
+
+@pytest.mark.asyncio
+async def test_last_actual_plan_keeps_the_requested_statement_of_a_large_batch(
+    app: AzureSqlMcpApplication,
+) -> None:
+    # The cached batch has six costlier statements; without pinning, the digest
+    # cut drops the one the user asked about and its siblings read as the answer.
+    target_hash = "0xAAAAAAAAAAAAAAAA"
+    body = "".join(
+        _batch_statement(index, 10 + index, f"0x000000000000000{index}")
+        for index in range(6)
+    ) + _batch_statement(6, 0.5, target_hash)
+    plan_xml = (
+        '<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">'
+        f"<BatchSequence><Batch><Statements>{body}</Statements></Batch>"
+        "</BatchSequence></ShowPlanXML>"
+    )
+    app.executor.fetch_all = _plan_source_fetch(  # type: ignore[method-assign]
+        {
+            "LAST_QUERY_PLAN_STATS": [{"value": "1"}],
+            "dm_exec_query_plan_stats": [
+                {
+                    "plan_id": 7,
+                    "query_id": 3,
+                    "query_plan_hash": target_hash,
+                    "last_execution_time": datetime(2026, 10, 1, tzinfo=timezone.utc),
+                    "query_plan": plan_xml,
+                }
+            ],
+        }
+    )
+
+    payload = await app.mcp._tool_manager.call_tool(
+        "analyze_query_plan",
+        {"database_name": "appdb", "query_id": 3, "last_actual": True},
+    )
+
+    assert payload["requested_statement_indexes"] == [6]
+    requested = [
+        entry
+        for entry in payload["digest"]["statements"]
+        if entry.get("is_requested_statement")
+    ]
+    assert [entry["statement_index"] for entry in requested] == [6]
+    assert payload["findings"]
+    for finding in payload["findings"]:
+        assert finding["is_requested_statement"] is (
+            finding.get("statement_index") == 6
+        )
