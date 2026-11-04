@@ -26,6 +26,47 @@ SHOWPLAN_NAMESPACE = {"sp": "http://schemas.microsoft.com/sqlserver/2004/07/show
 SHOWPLAN_NAMESPACE_URI = SHOWPLAN_NAMESPACE["sp"]
 logger = logging.getLogger(__name__)
 parse_statistics_io = parse_statistics_io_messages
+# Statement types that SQL Server compiles without a query plan.
+_NO_QUERY_STATEMENT_TYPES = frozenset({"select without query", "assign"})
+# Operators that pass every input row through; an actual-plan root of this kind
+# can lack counters when a parallel-shaped plan ran serially.
+_ROW_PRESERVING_OPERATORS = frozenset({"Parallelism", "Compute Scalar"})
+
+
+def _no_query_statement_types(raw_xml: str) -> list[str] | None:
+    """Statement types when no statement has a query plan, else ``None``."""
+
+    statements = ET.fromstring(raw_xml).findall(".//sp:StmtSimple", SHOWPLAN_NAMESPACE)
+    if any(
+        statement.find("sp:QueryPlan", SHOWPLAN_NAMESPACE) is not None
+        for statement in statements
+    ):
+        return None
+    return [statement.attrib.get("StatementType", "") for statement in statements]
+
+
+def _only_no_query_statements(statement_types: list[str]) -> bool:
+    return bool(statement_types) and all(
+        kind.casefold() in _NO_QUERY_STATEMENT_TYPES for kind in statement_types
+    )
+
+
+def require_compiled_plan(raw_xml: str) -> str:
+    """Return estimated plan XML only when it holds a compiled query plan.
+
+    Live: SHOWPLAN_XML of ``EXEC sys.sp_executesql`` is an EXECUTE PROC stub
+    with no QueryPlan, which read as a valid plan with no operators and no
+    missing-index hint. A constant-only SELECT legitimately has no plan.
+    """
+
+    statement_types = _no_query_statement_types(raw_xml)
+    if statement_types is None or _only_no_query_statements(statement_types):
+        return raw_xml
+    raise RuntimeError(
+        "SHOWPLAN XML holds no compiled query plan; statement types: "
+        f"{', '.join(sorted(set(statement_types))) or 'none'}. "
+        "It has no operators, so it is not returned as a plan."
+    )
 
 
 def parse_showplan_index_evidence(
@@ -142,7 +183,7 @@ def parse_showplan_index_evidence(
             if object_node.attrib.get("Index"):
                 blockers.append("index_reference_identity_incomplete")
             continue
-        relop = _nearest_ancestor_relop(root, object_node)
+        relop = _nearest_ancestor_named(object_node, parent_map, "RelOp")
         physical = relop.attrib.get("PhysicalOp") if relop is not None else None
         logical = relop.attrib.get("LogicalOp") if relop is not None else None
         operator_kinds = tuple(
@@ -284,16 +325,6 @@ def _unquote_showplan_identifier(value: str) -> str:
     if len(text) >= 2 and text[0] == "[" and text[-1] == "]":
         return text[1:-1].replace("]]", "]")
     return text
-
-
-def _nearest_ancestor_relop(root: ET.Element, node: ET.Element) -> ET.Element | None:
-    parents = {child: parent for parent in root.iter() for child in parent}
-    parent = parents.get(node)
-    while parent is not None:
-        if parent.tag.rsplit("}", 1)[-1] == "RelOp":
-            return parent
-        parent = parents.get(parent)
-    return None
 
 
 def _nearest_ancestor_named(
@@ -484,17 +515,19 @@ class PlansService:
                 contract,
             )
             return profiled.plan
-        raw_xml = await self._get_plan_xml(
-            database_name=database_name,
-            sql=contract.sp_executesql_sql,
-            analyze=False,
-            params=contract.sp_executesql_values,
-            input_sizes=contract.sp_executesql_input_sizes,
+        raw_xml = require_compiled_plan(
+            await self._get_plan_xml(
+                database_name=database_name,
+                sql=contract.estimated_showplan_sql,
+                analyze=False,
+            )
         )
+        summary = self.summarize_showplan_xml(raw_xml)
+        summary["estimated_plan_basis"] = contract.estimated_showplan_basis
         return ExplainPlanArtifact(
             database_name=database_name,
             analyze=False,
-            summary=self.summarize_showplan_xml(raw_xml),
+            summary=summary,
             raw_xml=raw_xml,
             plan_kind="estimated",
             query_executed=False,
@@ -627,6 +660,18 @@ class PlansService:
         # The middle entry corresponds to the user query — that's where
         # the plan XML is returned by SQL Server.
         plan_results = per_statement_results[1] if len(per_statement_results) > 1 else []
+        if analyze and not params and showplan_from_results(plan_results) is None:
+            # Live: STATISTICS XML returns no plan for a statement without a
+            # query, such as SELECT 1. The estimated plan says whether that is why.
+            estimated = await self._get_plan_xml(database_name, sql, analyze=False)
+            statement_types = _no_query_statement_types(estimated)
+            if statement_types and _only_no_query_statements(statement_types):
+                raise RuntimeError(
+                    "No actual plan was returned: the statement has no query plan, "
+                    f"statement types: {', '.join(sorted(set(statement_types)))}. "
+                    "SQL Server returns no actual plan for a constant-only SELECT; "
+                    "use analyze=false for this statement."
+                )
         return self._extract_plan_xml(plan_results)
 
     def summarize_showplan_xml(self, raw_xml: str) -> dict[str, Any]:
@@ -1026,25 +1071,45 @@ class PlansService:
             )
             if root_operator is None:
                 continue
-            counters = root_operator.findall(
+            operator = root_operator
+            counters = operator.findall(
                 "sp:RunTimeInformation/sp:RunTimeCountersPerThread",
                 SHOWPLAN_NAMESPACE,
             )
+            # Live: a serially run parallel plan has no counters on its Gather
+            # Streams root; its row-preserving child has the query's rows.
+            while not counters and operator.attrib.get("PhysicalOp") in _ROW_PRESERVING_OPERATORS:
+                child = operator.find("*/sp:RelOp", SHOWPLAN_NAMESPACE)
+                if child is None:
+                    break
+                operator = child
+                counters = operator.findall(
+                    "sp:RunTimeInformation/sp:RunTimeCountersPerThread",
+                    SHOWPLAN_NAMESPACE,
+                )
+            if not counters:
+                operator = root_operator
             root_operator_metrics.append(
                 {
                     "statement_ordinal": ordinal,
-                    "node_id": root_operator.attrib.get("NodeId"),
-                    "physical_op": root_operator.attrib.get("PhysicalOp"),
+                    "node_id": operator.attrib.get("NodeId"),
+                    "physical_op": operator.attrib.get("PhysicalOp"),
                     "thread_counter_count": len(counters),
                     "actual_rows": sum(
                         self._to_float(counter.attrib.get("ActualRows"))
                         for counter in counters
-                    ),
+                    )
+                    if counters
+                    else None,
                     "actual_executions": sum(
                         self._to_int(counter.attrib.get("ActualExecutions"))
                         for counter in counters
-                    ),
-                    "source": "showplan_root_operator_thread_counters",
+                    )
+                    if counters
+                    else None,
+                    "source": "showplan_root_operator_thread_counters"
+                    if operator is root_operator
+                    else "showplan_first_counted_descendant",
                 }
             )
 
@@ -1248,7 +1313,8 @@ class PlansService:
             # records. No parentheses: incident redaction blanks them.
             raise RuntimeError(
                 f"No SHOWPLAN XML was returned; {describe_result_shape(results)}. "
-                "Confirm SHOWPLAN access and that the statement is supported."
+                "Confirm SHOWPLAN access and that the statement is supported; "
+                "a constant-only SELECT has no actual plan."
             )
         return plan_xml
 

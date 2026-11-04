@@ -399,6 +399,67 @@ async def test_repository_round_trip_preserves_dmv_only_source_marker() -> None:
     assert restored_subject["aggregates"]["dmv_only"] is True
 
 
+def _as_driver_datetime2(value: object) -> object:
+    """datetime2(7) column read back through mssql-python: naive, microseconds."""
+    if value is None:
+        return None
+    text = str(value).replace("Z", "+00:00")
+    return datetime.fromisoformat(text).replace(tzinfo=None)
+
+
+@pytest.mark.asyncio
+async def test_capture_with_engine_precision_timestamps_reads_back_after_commit() -> None:
+    # Live repro (2026-11-04, Azure SQL Database): the collector carries
+    # CONVERT(varchar(33), SYSUTCDATETIME(), 127) text with 100 ns precision and no
+    # offset. The row id digested that text, the datetime2 column read back as
+    # microseconds, and read-back failed with "non-canonical snapshot id".
+    executor = _Executor()
+    repository = SqlIndexHistoryRepository(executor, _policy(allow_write=True))
+    original = _capture()
+    subject = dict(original.snapshot.subjects[0])
+    subject["observed_at_utc"] = "2026-11-04T14:23:44.7487081"
+    subject["first_observed_at_utc"] = "2026-11-01T08:00:00.1234567"
+    subject["last_observed_at_utc"] = "2026-11-04T14:23:44.7487081"
+    subject["subject_fingerprint"] = _subject_fingerprint(str(subject["subject_kind"]), subject)
+    snapshot = replace(original.snapshot, subjects=(subject,), inventory_fingerprint="", snapshot_fingerprint="")
+    run = replace(
+        original.run,
+        inventory_fingerprint=snapshot.inventory_fingerprint,
+        snapshot_set_fingerprint=snapshot.snapshot_fingerprint,
+    )
+    capture = CaptureResult(run, snapshot)
+    context = CaptureContext(
+        "appdb",
+        run.database_fingerprint,
+        run.run_id,
+        run.idempotency_key_hash,
+        run.request_fingerprint,
+        run.observed_at_utc,
+        90,
+    )
+
+    def collector(session, _context):
+        session.capture = capture
+        return capture
+
+    original_transaction = executor.execute_transaction_exactly_once
+
+    async def transaction_with_driver_types(database_name, callback):
+        result = await original_transaction(database_name, callback)
+        for row in executor.snapshot_rows:
+            for column in ("ObservedAtUtc", "FirstObservedAtUtc", "LastObservedAtUtc"):
+                row[column] = _as_driver_datetime2(row[column])
+        return result
+
+    executor.execute_transaction_exactly_once = transaction_with_driver_types
+
+    result = await repository.append_capture(context, collector)
+
+    restored_subject = result.snapshot.subjects[0]
+    assert restored_subject["observed_at_utc"] == "2026-11-04T14:23:44.748708Z"
+    assert restored_subject["first_observed_at_utc"] == "2026-11-01T08:00:00.123456Z"
+
+
 def _policy(*, allow_write: bool) -> DatabasePolicySet:
     return DatabasePolicySet.from_mapping(
         {
@@ -543,10 +604,9 @@ async def test_capture_isolation_change_never_reaches_a_pooled_connection(
 
     assert result.already_captured is False
     statements = [call.args[0] for call in cursor.execute.call_args_list]
-    assert statements[:6] == [
+    assert statements[:5] == [
         "SET XACT_ABORT ON",
         "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
-        "BEGIN TRANSACTION",
         IDEMPOTENCY_LOCK_SQL,
         READ_COMMITTED_SQL,
         EXISTING_INDEX_METADATA_SQL,
@@ -618,3 +678,271 @@ def _stored_rows(capture: CaptureResult, session: _Session):
         for values in session.snapshot_params
     ]
     return [run_row], snapshot_rows
+
+
+class _RealDatabaseSession(_Session):
+    """Realistic catalog, Query Store and DMV rows for the real collector."""
+
+    def fetch_all(self, statement, params=None):
+        from azure_sql_mcp.index_review import DATABASE_INCARNATION_SQL
+        from azure_sql_mcp.index_review import ENGINE_START_TIME_SQL
+        from azure_sql_mcp.index_review import INDEX_PROTECTION_METADATA_SQL
+        from azure_sql_mcp.index_review import MISSING_INDEX_DMV_SQL
+        from azure_sql_mcp.index_review import QUERY_STORE_WINDOW_SQL
+        from azure_sql_mcp.query_store import INDEX_CANDIDATE_ROW_COUNT_SQL
+        from azure_sql_mcp.query_store import INDEX_CANDIDATE_WRITE_RATIO_SQL
+
+        self.statements.append(statement)
+        if "DATABASEPROPERTYEX(DB_NAME(), 'Edition')" in statement or "geo_replication" in statement:
+            # The capture transaction runs with SET XACT_ABORT ON: a failed
+            # read here rolls back the idempotency lock and the snapshot.
+            self.owner.transaction_doomed = True
+            raise RuntimeError("The SELECT permission was denied. (229)")
+        if statement == IDEMPOTENCY_LOCK_SQL:
+            return self.owner.lock_rows
+        if statement == EXISTING_INDEX_METADATA_SQL:
+            base = {
+                "object_id": 101, "parent_object_type_code": "U",
+                "parent_object_type": "USER_TABLE", "schema_name": "Sales",
+                "table_name": "Orders", "index_id": 2,
+                "index_name": "IX_Orders_CustomerID", "index_type_code": 2,
+                "index_type": "NONCLUSTERED", "is_unique": False,
+                "is_primary_key": False, "is_unique_constraint": False,
+                "is_disabled": False, "is_hypothetical": False,
+                "auto_created": False, "has_filter": False,
+                "filter_definition": None, "fill_factor": 0,
+                "data_space_name": "PRIMARY", "data_space_type": "ROWS_FILEGROUP",
+                "partition_number": 1, "partition_row_count": 1000,
+                "partition_page_count": 8, "data_compression_desc": "NONE",
+                "xml_compression_desc": "OFF", "user_seeks": 0, "user_scans": 0,
+                "user_lookups": 0, "user_updates": 25,
+                "collected_at_utc": "2026-11-03T10:00:00Z",
+            }
+            return [{
+                **base, "index_column_id": 1, "key_ordinal": 1,
+                "is_included_column": False, "is_descending_key": False,
+                "partition_ordinal": 0, "column_name": "CustomerID",
+            }]
+        if statement == ENGINE_START_TIME_SQL:
+            return [{
+                "engine_start_time_utc": "2026-09-01T00:00:00Z",
+                "engine_identity": "srv.database.windows.net",
+            }]
+        if statement == INDEX_PROTECTION_METADATA_SQL:
+            return [{
+                "object_id": 101, "index_id": 2, "index_type_code": 2,
+                "index_type": "NONCLUSTERED", "is_unique": 0, "is_primary_key": 0,
+                "is_unique_constraint": 0, "is_disabled": 0, "is_hypothetical": 0,
+                "auto_created": 0, "partition_switch_dependency": 0,
+                "is_indexed_view": 0, "has_index_extended_properties": 0,
+                "child_foreign_key_ids": None, "referenced_foreign_key_ids": None,
+            }]
+        if statement == DATABASE_INCARNATION_SQL:
+            return [{"database_incarnation_identity": "phys-appdb-1"}]
+        if "sys.database_query_store_options" in statement:
+            return [{
+                "actual_state_desc": "READ_WRITE", "desired_state_desc": "READ_WRITE",
+                "query_capture_mode_desc": "ALL", "current_storage_size_mb": 100,
+                "max_storage_size_mb": 1000, "stale_query_threshold_days": 60,
+            }]
+        if statement == QUERY_STORE_WINDOW_SQL:
+            return [{
+                "window_start_utc": "2026-09-29T10:00:00Z",
+                "window_end_utc": "2026-11-03T09:00:00Z",
+                "runtime_interval_count": 840,
+            }]
+        if statement == MISSING_INDEX_DMV_SQL:
+            return [{
+                "schema_name": "Sales", "table_name": "Orders",
+                "equality_columns": "[SalespersonPersonID]",
+                "inequality_columns": None, "included_columns": "[OrderDate]",
+                "user_seeks": 40, "user_scans": 0, "avg_total_user_cost": 2.5,
+                "avg_user_impact": 80.0, "estimated_improvement": 8000.0,
+            }]
+        if statement == INDEX_CANDIDATE_ROW_COUNT_SQL:
+            return [{"row_count": 1000}]
+        if "max_length" in statement and "sys.columns" in statement:
+            return [{"column_name": name, "max_length": 4} for name in params[3:]]
+        if statement == INDEX_CANDIDATE_WRITE_RATIO_SQL:
+            return [{"write_ratio": 0.1}]
+        if "sys.database_files" in statement:
+            return [{"max_size_bytes": 32 * 1024**3, "used_size_bytes": 1024**3}]
+        return []
+
+
+class _RealCaptureExecutor(_Executor):
+    config = SimpleNamespace(server="srv.database.windows.net")
+    transaction_doomed = False
+    edition = "GeneralPurpose"
+    geo_links: object = 0
+
+    async def fetch_all(self, database_name, statement, params=None, **_):
+        # Pooled reads outside the capture transaction.
+        if "DATABASEPROPERTYEX(DB_NAME(), 'Edition')" in statement:
+            return [{"edition": self.edition}]
+        if "FROM sys.dm_geo_replication_link_status" in statement:
+            if isinstance(self.geo_links, Exception):
+                raise self.geo_links
+            return [{"geo_replication_link_count": self.geo_links}]
+        if "sys.geo_replication_links" in statement:
+            raise RuntimeError("Invalid object name 'sys.geo_replication_links'. (208)")
+        raise AssertionError(f"unexpected read: {statement[:80]}")
+
+    async def execute_batches(self, database_name, statement, params=None):
+        from azure_sql_mcp.index_review import HISTORY_READ_SQL
+
+        if statement == HISTORY_READ_SQL:
+            return [_CursorResult(self.run_rows), _CursorResult(self.snapshot_rows)]
+        return await super().execute_batches(database_name, statement, params)
+
+    async def execute_transaction_exactly_once(self, database_name, callback):
+        self.transaction_calls += 1
+        session = _RealDatabaseSession(self)
+        self.sessions.append(session)
+        result = callback(session)
+        if session.run_params is not None:
+            run_rows, snapshot_rows = _stored_rows(
+                SimpleNamespace(run=SimpleNamespace(created_at_utc=session.run_params[13])),
+                session,
+            )
+            self.run_rows, self.snapshot_rows = run_rows, snapshot_rows
+            self.lock_rows = [{"RunId": run_rows[0]["RunId"], "RequestFingerprint": run_rows[0]["RequestFingerprint"]}]
+        return result
+
+
+@pytest.mark.asyncio
+async def test_real_collector_capture_is_stored_and_read_back_as_history() -> None:
+    # The 35-day removal evidence only exists if the real collector output
+    # passes the persisted-field allowlists. Every run carries DMV coverage
+    # and most real databases have at least one missing-index request, so a
+    # rejected key here means no portfolio history is ever stored.
+    from datetime import timezone
+
+    from azure_sql_mcp.index_review import IndexReviewService
+
+    executor = _RealCaptureExecutor()
+    policy = _policy(allow_write=True)
+    repository = SqlIndexHistoryRepository(executor, policy)
+    service = IndexReviewService(
+        executor,
+        repository,
+        database_policy=policy,
+        clock=lambda: datetime(2026, 11, 3, 10, 0, tzinfo=timezone.utc),
+    )
+
+    result = await service.capture_snapshot("appdb")
+
+    assert result.already_captured is False
+    assert executor.sessions[0].statements.count(INSERT_RUN_SQL) == 1
+    kinds = sorted(subject["subject_kind"] for subject in result.snapshot.subjects)
+    assert kinds == ["existing_index", "missing_index"]
+    assert result.run.coverage["missing_index_dmv"]["status"] == "complete"
+    history = await repository.list_history("appdb")
+    assert [run.run_id for run, _snapshot in history] == [result.run.run_id]
+    missing = next(
+        subject
+        for subject in history[0][1].subjects
+        if subject["subject_kind"] == "missing_index"
+    )
+    assert missing["aggregates"]["estimated_index_size_mb"] is not None
+    review = await service.review_portfolio("appdb")
+    assert review.observation.get("history_status") != "missing"
+    assert review.as_of_run_id == result.run.run_id
+    assert len(review.subjects) == 2
+
+
+@pytest.mark.asyncio
+async def test_missing_history_tables_map_to_precondition_with_installer_step() -> None:
+    # The history tables are an optional DBA install. An agent must get
+    # result_status=precondition with the installer step to show a DBA, not a
+    # raw tool_error it may retry or report as an MCP failure.
+    from azure_sql_mcp.index_review import IndexReviewSetupError
+    from azure_sql_mcp.index_review import index_history_setup_precondition
+
+    repository = SqlIndexHistoryRepository(
+        _Executor([[], [], [], [], []]), _policy(allow_write=True)
+    )
+    with pytest.raises(IndexReviewSetupError) as raised:
+        await repository.list_history("appdb")
+
+    payload = index_history_setup_precondition(raised.value)
+    assert payload["result_status"] == "precondition"
+    assert "dbatools.IndexReviewRun" in payload["result_status_reason"]
+    assert "sql/Install-IndexReviewHistory-v1.sql" in payload["remediation"]
+    assert "GRANT SELECT ON dbatools.IndexReviewSnapshot" in payload["remediation"]
+    assert "INSERT" not in payload["remediation"]
+
+    capture = index_history_setup_precondition(raised.value, for_write=True)
+    assert "GRANT SELECT, INSERT ON dbatools.IndexReviewRun" in capture["remediation"]
+
+
+def test_history_contract_mismatch_is_not_a_setup_precondition() -> None:
+    # A wrong column set means a broken or foreign install; that must stay an
+    # error, never be reported as a missing optional setup step.
+    from azure_sql_mcp.index_review import IndexReviewSetupError
+    from azure_sql_mcp.index_review import validate_contract_probe
+
+    probe = _probe_rows()
+    probe[0] = [row for row in probe[0] if row["ColumnName"] != "CoverageJson"]
+    with pytest.raises(IndexReviewSchemaError) as raised:
+        validate_contract_probe(probe)
+    assert not isinstance(raised.value, IndexReviewSetupError)
+
+
+def _real_capture_service(executor):
+    from datetime import timezone
+
+    from azure_sql_mcp.index_review import IndexReviewService
+
+    policy = _policy(allow_write=True)
+    return IndexReviewService(
+        executor,
+        SqlIndexHistoryRepository(executor, policy),
+        database_policy=policy,
+        clock=lambda: datetime(2026, 11, 3, 10, 0, tzinfo=timezone.utc),
+    )
+
+
+def _existing_subject_coverage(result: CaptureResult) -> dict:
+    subject = next(
+        subject for subject in result.snapshot.subjects if subject["subject_kind"] == "existing_index"
+    )
+    return subject["coverage"]
+
+
+@pytest.mark.asyncio
+async def test_capture_reads_replica_signals_outside_its_transaction() -> None:
+    # The capture transaction holds the idempotency lock under XACT_ABORT ON.
+    # An optional replica read that fails inside it would roll that back and
+    # let the snapshot inserts run in a new implicit transaction. A General
+    # Purpose database with no geo link must also record "none", or the
+    # removal gate can never reach drop_candidate on that tier.
+    executor = _RealCaptureExecutor()
+
+    result = await _real_capture_service(executor).capture_snapshot("appdb")
+
+    assert executor.transaction_doomed is False
+    assert _existing_subject_coverage(result)["readable_replicas"] == "none"
+    assert executor.sessions[0].statements.count(INSERT_RUN_SQL) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("edition", "geo_links", "expected"),
+    [
+        ("BusinessCritical", 0, "possible"),
+        ("GeneralPurpose", 1, "possible"),
+        ("GeneralPurpose", PermissionError("VIEW DATABASE STATE denied"), "unknown"),
+    ],
+)
+async def test_capture_records_replica_status_without_failing_the_capture(
+    edition: str, geo_links: object, expected: str
+) -> None:
+    executor = _RealCaptureExecutor()
+    executor.edition = edition
+    executor.geo_links = geo_links
+
+    result = await _real_capture_service(executor).capture_snapshot("appdb")
+
+    assert executor.transaction_doomed is False
+    assert _existing_subject_coverage(result)["readable_replicas"] == expected

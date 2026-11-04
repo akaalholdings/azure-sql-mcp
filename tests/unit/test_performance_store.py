@@ -535,6 +535,64 @@ def test_index_benchmark_request_binding_requires_exact_key_and_shape() -> None:
     store.close()
 
 
+def test_index_benchmark_binding_release_keeps_reserved_requests_bound() -> None:
+    """A request refused before reservation frees the phase for a corrected
+    request; a request that reserved budget stays bound (it may have run)."""
+
+    store = PerformanceStore(db_path=":memory:")
+    case = store.create_performance_case(
+        PerformanceCaseV1(case_id="case-index-release", query_fingerprint="query-hash")
+    )
+    session = store.create_session(
+        TuningSessionV1(
+            session_id="session-index-release",
+            performance_case_id=case.case_id,
+        )
+    )
+    candidate = store.create_candidate_and_attach(
+        session,
+        TuningCandidateV1(
+            candidate_id="candidate-index-release",
+            session_id=session.session_id,
+        ),
+    )
+
+    def bind(fingerprint: str, key: str) -> dict[str, bool]:
+        return store.bind_index_benchmark_request(
+            session.session_id,
+            candidate.candidate_id,
+            "screening",
+            fingerprint,
+            idempotency_key=key,
+        )
+
+    def release(fingerprint: str, key: str) -> bool:
+        return store.release_index_benchmark_request(
+            session.session_id,
+            candidate.candidate_id,
+            "screening",
+            fingerprint,
+            idempotency_key=key,
+        )
+
+    bind("request-refused", "refused-key")
+    assert release("request-refused", "refused-key") is True
+    assert bind("request-corrected", "corrected-key") == {"replayed": False}
+    store.reserve_execution_attempts(
+        session.session_id,
+        candidate.candidate_id,
+        1,
+        "request-corrected",
+        idempotency_key="corrected-key",
+        owner_reference="owner",
+    )
+
+    assert release("request-corrected", "corrected-key") is False
+    with pytest.raises(IdempotencyConflictError, match="different request"):
+        bind("request-other", "other-key")
+    store.close()
+
+
 def test_candidate_ordinals_skip_all_historical_slots() -> None:
     store = PerformanceStore(db_path=":memory:")
     case = store.create_performance_case(

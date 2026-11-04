@@ -41,7 +41,7 @@ def render_reverse_index_ddl(index: ExistingIndex) -> dict[str, Any]:
         blockers.append("key_columns_unavailable")
     if not index.data_space_name:
         blockers.append("data_space_unavailable")
-    if index.parent_object_type_code not in {None, "U"}:
+    if (index.parent_object_type_code or "").strip().upper() not in {"", "U"}:
         blockers.append("parent_is_not_user_table")
     if index.parent_object_type_code is None and index.parent_object_type not in {
         None,

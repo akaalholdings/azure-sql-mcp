@@ -11,6 +11,8 @@ from typing import Any, Mapping
 
 
 _METRICS = ("avg_duration", "avg_cpu_time", "avg_logical_io_reads")
+# Tail signals: optional, compared only when both sides report them.
+_TAIL_METRICS = ("max_duration", "stdev_duration")
 _PROVENANCE_FIELDS = ("source", "provenance", "environment", "database_name", "query_id")
 
 
@@ -42,8 +44,15 @@ def decide_verification(
     min_executions: int = 30,
     min_improvement_pct: float = 0.20,
     regression_tolerance_pct: float = 0.10,
+    require_parameter_buckets: bool = True,
 ) -> VerificationDecision:
-    """Return keep, rollback, or hold from comparable non-overlapping windows."""
+    """Return keep, rollback, or hold from comparable non-overlapping windows.
+
+    Named parameter buckets must carry per-bucket metrics on both sides. With
+    ``require_parameter_buckets=False`` evidence without buckets may still be
+    compared, and a ``max_duration`` or ``stdev_duration`` regression (when
+    both sides report it) blocks a keep.
+    """
 
     baseline_meta = _evidence_metadata(baseline)
     candidate_meta = _evidence_metadata(candidate)
@@ -75,10 +84,15 @@ def decide_verification(
 
     baseline_buckets = _parameter_buckets(baseline_meta.get("parameter_buckets"))
     candidate_buckets = _parameter_buckets(candidate_meta.get("parameter_buckets"))
-    if baseline_buckets is None or candidate_buckets is None:
-        return _hold("Named parameter buckets are required for verification.")
-    if baseline_buckets != candidate_buckets:
-        return _hold("Pre/post parameter buckets do not match.")
+    buckets_given = (
+        baseline_meta.get("parameter_buckets") is not None
+        or candidate_meta.get("parameter_buckets") is not None
+    )
+    if require_parameter_buckets or buckets_given:
+        if baseline_buckets is None or candidate_buckets is None:
+            return _hold("Named parameter buckets are required for verification.")
+        if baseline_buckets != candidate_buckets:
+            return _hold("Pre/post parameter buckets do not match.")
 
     baseline_start = _timestamp(baseline_meta.get("window_start"))
     baseline_end = _timestamp(baseline_meta.get("window_end"))
@@ -122,6 +136,17 @@ def decide_verification(
         for metric, improvement in deltas.items()
         if improvement < -regression_tolerance_pct
     )
+    if baseline_buckets is not None and candidate_buckets is not None:
+        # A blended average hides a regression in a minority bucket, so the
+        # tolerance applies to each named bucket on its own.
+        bucket_deltas = _bucket_deltas(baseline, candidate, baseline_buckets)
+        if bucket_deltas is None:
+            return _hold("Per-bucket metrics are required for every named parameter bucket.")
+        regressed += tuple(
+            name
+            for name, improvement in bucket_deltas.items()
+            if improvement < -regression_tolerance_pct
+        )
     duration_improvement = deltas["avg_duration"]
     if regressed:
         return VerificationDecision(
@@ -129,6 +154,21 @@ def decide_verification(
             reason="One or more verified metrics regressed beyond tolerance.",
             improvement_pct=duration_improvement,
             regressed_metrics=regressed,
+        )
+    tail_regressed = tuple(
+        metric
+        for metric in _TAIL_METRICS
+        if _regressed(baseline.get(metric), candidate.get(metric), regression_tolerance_pct)
+    )
+    if tail_regressed:
+        return VerificationDecision(
+            action="hold",
+            reason=(
+                f"{', '.join(tail_regressed)} regressed beyond tolerance; a slower "
+                "minority of executions cannot be ruled out."
+            ),
+            improvement_pct=duration_improvement,
+            regressed_metrics=tail_regressed,
         )
     if duration_improvement >= min_improvement_pct:
         return VerificationDecision(
@@ -155,6 +195,52 @@ def _parameter_buckets(value: Any) -> tuple[str, ...] | None:
     if any(not bucket for bucket in buckets) or len(set(buckets)) != len(buckets):
         return None
     return tuple(sorted(buckets))
+
+
+def _bucket_deltas(
+    baseline: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    buckets: tuple[str, ...],
+) -> dict[str, float] | None:
+    baseline_metrics = _per_bucket(baseline)
+    candidate_metrics = _per_bucket(candidate)
+    if baseline_metrics is None or candidate_metrics is None:
+        return None
+    deltas: dict[str, float] = {}
+    for bucket in buckets:
+        before_bucket = baseline_metrics.get(bucket)
+        after_bucket = candidate_metrics.get(bucket)
+        if not isinstance(before_bucket, Mapping) or not isinstance(after_bucket, Mapping):
+            return None
+        for metric in _METRICS:
+            if metric not in before_bucket and metric not in after_bucket:
+                if metric == "avg_duration":
+                    return None
+                continue
+            before = _finite_nonnegative(before_bucket.get(metric))
+            after = _finite_nonnegative(after_bucket.get(metric))
+            if before is None or after is None or before == 0:
+                return None
+            deltas[f"{bucket}.{metric}"] = (before - after) / before
+    return deltas
+
+
+def _per_bucket(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    value = payload.get("per_bucket")
+    if value is None:
+        metadata = _evidence_metadata(payload)
+        value = metadata.get("per_bucket") if metadata is not None else None
+    if not isinstance(value, Mapping):
+        return None
+    return {str(name).strip(): metrics for name, metrics in value.items()}
+
+
+def _regressed(before_value: Any, after_value: Any, tolerance: float) -> bool:
+    before = _finite_nonnegative(before_value)
+    after = _finite_nonnegative(after_value)
+    if before is None or after is None or before == 0:
+        return False
+    return (before - after) / before < -tolerance
 
 
 def _timestamp(value: Any) -> datetime | None:

@@ -12,6 +12,8 @@ from azure_sql_mcp.query_store import QUERY_STORE_QUERY_HINTS_SQL
 from azure_sql_mcp.query_store import QUERY_STORE_TEXT_HINTS_SQL
 from azure_sql_mcp.query_store import QueryStoreService
 from azure_sql_mcp.query_store import _resolve_index_hints
+from tests.unit.test_query_regression import QueryStoreSqlite
+from tests.unit.test_query_regression import _hourly_intervals
 
 
 INDEX_EVIDENCE_XML = """\
@@ -389,6 +391,75 @@ async def test_top_queries_uses_resource_blend_query_shape():
     assert "MAX(total_logical_io_reads) AS max_logical_io_reads" in executor.query
     assert "CAST(MAX(rsi.end_time) AS datetime2(7)) AS last_seen_utc" in executor.query
     assert executor.params == [60, 7]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sort_by", ["total_duration", "avg_duration", "resource_blend"])
+async def test_top_queries_show_timeouts_and_a_regular_only_average(sort_by):
+    # Plan 399: 53 Regular runs at 0.1 ms and 7 timeouts at 2 s. The mixed
+    # avg_duration_us (about 233 ms) hides the timeouts; the row must show the
+    # aborted count and the Regular-only average that compare_query_plans uses.
+    store = QueryStoreSqlite()
+    _hourly_intervals(store, 2)
+    store.add_query(372, {399: "Index Seek"})
+    store.add_runtime(399, 1, 53, 100)
+    store.add_runtime(399, 2, 7, 2_000_000, execution_type=3)  # Aborted
+    store.add_runtime(399, 2, 1, 50, execution_type=4)  # Exception
+
+    [row] = await QueryStoreService(store).get_top_queries("db", sort_by, 1440, 5)
+
+    assert row["executions"] == 61
+    assert row["avg_duration_us"] == pytest.approx((53 * 100 + 7 * 2_000_000 + 50) / 61)
+    assert row["aborted_executions"] == 7
+    assert row["exception_executions"] == 1
+    assert row["regular_avg_duration_us"] == pytest.approx(100.0)
+
+
+@pytest.mark.asyncio
+async def test_index_evidence_skips_query_store_internal_queries() -> None:
+    # ALTER INDEX REBUILD and UPDATE STATISTICS run as internal queries whose
+    # plans scan the index. They are not user reads, so an index touched only by
+    # maintenance must not look used to review_index_portfolio.
+    store = QueryStoreSqlite()
+    _hourly_intervals(store, 2)
+    store.add_query(500, {600: "Index Seek"})
+    store.add_query(501, {601: "Index Scan"}, is_internal=True)  # REBUILD
+    store.add_runtime(600, 1, 5, 100)
+    store.add_runtime(601, 2, 1, 900_000)
+
+    rows = await store.fetch_all("db", INDEX_EVIDENCE_QUERY, params=[100, 1440])
+
+    assert [(row["query_id"], row["plan_id"]) for row in rows] == [(500, 600)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "identity"),
+    [
+        ("get_query_history_by_id", 372),
+        ("get_query_history_by_hash", "0x0000000000000174"),
+        ("get_query_history_by_text", "q372"),
+    ],
+)
+async def test_query_history_shows_timeouts_and_a_regular_only_average(method, identity):
+    # Same plan 399 as the top-queries case: the mixed avg_duration_ms (about
+    # 233 ms) stays as it is, and the row also shows the failed runs and the
+    # Regular-only average (0.1 ms) that compare_query_plans uses.
+    store = QueryStoreSqlite()
+    _hourly_intervals(store, 2)
+    store.add_query(372, {399: "Index Seek"})
+    store.add_runtime(399, 1, 53, 100)
+    store.add_runtime(399, 2, 7, 2_000_000, execution_type=3)  # Aborted
+    store.add_runtime(399, 2, 1, 50, execution_type=4)  # Exception
+
+    result = await getattr(QueryStoreService(store), method)("db", identity, 1440, 5)
+
+    [row] = result["matches"]
+    assert row["executions"] == 61
+    assert row["avg_duration_ms"] == pytest.approx((53 * 100 + 7 * 2_000_000 + 50) / 61 / 1000)
+    assert row["aborted_executions"] == 7
+    assert row["exception_executions"] == 1
+    assert row["regular_avg_duration_ms"] == pytest.approx(0.1)
 
 
 @pytest.mark.asyncio

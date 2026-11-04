@@ -34,8 +34,11 @@ from .index_metadata import existing_index_covers_candidate
 from .index_metadata import reversible_index_definition_fingerprint
 from .index_metadata import parse_existing_index_rows
 from .index_metadata import parse_protection_evidence
+from .index_metadata import collect_readable_replica_status
 from .index_recommendations import IndexRecommendationService
 from .plans import parse_showplan_index_evidence
+from .result_status import ResultStatus
+from .result_status import status_payload
 from .index_optimizer import score_index_candidate
 from .query_store import INDEX_EVIDENCE_QUERY
 from .query_store import MODULE_HINTS_SQL
@@ -135,7 +138,7 @@ _SUBJECT_KEYS = frozenset(
         "candidate_fingerprint",
         "survivor_reference", "overlap_relation", "read_count", "request_count", "query_store_executions",
         "runtime_interval_count", "covered_by", "projected_database_storage_percent",
-        "statement_subtree_cost", "estimated_index_size_bytes", "material_score",
+        "statement_subtree_cost", "estimated_index_size_bytes", "estimated_index_size_mb", "material_score",
         "dmv_user_seeks", "dmv_user_scans", "dmv_avg_user_impact", "dmv_avg_total_user_cost",
     }
 )
@@ -186,7 +189,7 @@ _COVERAGE_KEYS = frozenset(
      "capture_mode", "state", "runtime_intervals", "runtime_interval_count", "required",
      "covered", "reason", "error_type", "requested_window_minutes", "required_window_minutes",
      "plan_evidence_empty_allowed", "interval_count", "plan_evidence", "runtime_window",
-     "engine", "database_incarnation"}
+     "engine", "database_incarnation", "missing_index_dmv", "readable_replicas"}
 )
 _PROTECTION_KEYS = frozenset(
     {"object_id", "index_id", "coverage", "blockers", "primary_key", "unique_constraint", "standalone_unique",
@@ -271,6 +274,24 @@ class IndexReviewSchemaError(IndexReviewError):
 
 class IndexReviewSetupError(IndexReviewSchemaError):
     """The optional history tables, or the identity's rights on them, are absent."""
+
+
+def index_history_setup_precondition(
+    exc: IndexReviewSetupError, *, for_write: bool = False
+) -> dict[str, Any]:
+    """Map a missing optional history setup to result_status=precondition.
+
+    Only IndexReviewSetupError maps here; a contract mismatch stays an error.
+    The remediation is text for a DBA to run, never something MCP executes.
+    """
+
+    rights = "SELECT, INSERT" if for_write else "SELECT"
+    remediation = (
+        "A DBA runs sql/Install-IndexReviewHistory-v1.sql in this database, then "
+        f"GRANT {rights} ON dbatools.IndexReviewRun TO [<MCP identity>]; "
+        f"GRANT {rights} ON dbatools.IndexReviewSnapshot TO [<MCP identity>];"
+    )
+    return status_payload(ResultStatus.PRECONDITION, str(exc), remediation=remediation)
 
 
 class IndexReviewIntegrityError(IndexReviewError):
@@ -364,7 +385,7 @@ _SCHEMA_ALLOWED_KEYS: dict[str, frozenset[str]] = {
             "exact_request_recurs_in_two_runtime_intervals", "executed_plan_source",
             "exact_filter_reconstruction_available", "material_positive_existing_mcp_score",
             "no_exact_or_covering_index", "projected_storage_strictly_below_90_percent",
-            "complete_evidence",
+            "complete_evidence", "readable_replica_usage_observed",
         }
     ) | _GATE_KEYS,
     "gate_map": _GATE_KEYS,
@@ -844,6 +865,7 @@ def _redacted_index(
     hint_coverage: Mapping[str, Any] | None = None,
     query_store_coverage: Mapping[str, Any] | None = None,
     hint_evidence: Sequence[Mapping[str, Any]] = (),
+    readable_replicas: str = "unknown",
 ) -> dict[str, Any]:
     protection = _safe_payload(index.protection_evidence, schema="protections")
     hinted = any(
@@ -882,6 +904,7 @@ def _redacted_index(
             if protection.get("partition_switch_dependency") is None
             else "complete"
         ),
+        "readable_replicas": readable_replicas,
         "malformed": [],
     }
     subject: dict[str, Any] = {
@@ -1755,6 +1778,62 @@ CONTRACT_CHECKS: tuple[tuple[str, str, str], ...] = (
     ("IndexReviewSnapshot", "CK_IndexReviewSnapshot_CoverageJson", "ISJSON(CoverageJson) = 1 AND JSON_QUERY(CoverageJson) IS NOT NULL"),
     ("IndexReviewSnapshot", "CK_IndexReviewSnapshot_SubjectActionInvariants", "SubjectKind IN ('existing_index', 'missing_index') AND (SubjectKind = 'existing_index' OR MissingSignatureJson IS NOT NULL)"),
 )
+# SQL Server stores a CHECK in its own rewritten form (sys.check_constraints.definition):
+# `x NOT LIKE p` becomes `NOT [x] like p`, an IN list becomes a reversed OR chain, and
+# parentheses that AND precedence makes redundant are dropped. Token canonicalization
+# cannot undo that, so the exact form a fresh install stores is accepted as well (read
+# live from Azure SQL Database, compat 170). CONTRACT_CHECKS stays the fingerprinted source.
+_FINGERPRINT_CHECK_ENGINE_FORM = "(NOT [{0}] like '%[^0-9a-fA-F]%' AND len([{0}])=(64))"
+_NULLABLE_FINGERPRINT_CHECK_ENGINE_FORM = (
+    "([{0}] IS NULL OR NOT [{0}] like '%[^0-9a-fA-F]%' AND len([{0}])=(64))"
+)
+_SUBJECT_KIND_ENGINE_FORM = "([SubjectKind]='missing_index' OR [SubjectKind]='existing_index')"
+CONTRACT_CHECK_ENGINE_FORMS: dict[tuple[str, str], str] = {
+    **{
+        ("IndexReviewRun", f"CK_IndexReviewRun_{column}"): _FINGERPRINT_CHECK_ENGINE_FORM.format(column)
+        for column in (
+            "DatabaseFingerprint",
+            "IdempotencyKeyHash",
+            "RequestFingerprint",
+            "InventoryFingerprint",
+            "QueryStoreFingerprint",
+            "SnapshotSetFingerprint",
+        )
+    },
+    **{
+        ("IndexReviewRun", f"CK_IndexReviewRun_{column}"): _NULLABLE_FINGERPRINT_CHECK_ENGINE_FORM.format(column)
+        for column in (
+            "DatabaseIncarnationFingerprint",
+            "EngineFingerprint",
+            "CounterEpochFingerprint",
+        )
+    },
+    ("IndexReviewRun", "CK_IndexReviewRun_DatabaseIncarnationIdentity"): (
+        "([DatabaseIncarnationFingerprint] IS NULL AND [DatabaseIncarnationIdentity] IS NULL "
+        "OR [DatabaseIncarnationFingerprint] IS NOT NULL AND [DatabaseIncarnationIdentity] IS NOT NULL)"
+    ),
+    ("IndexReviewRun", "CK_IndexReviewRun_EngineEpochIdentity"): (
+        "([EngineFingerprint] IS NULL AND [EngineIdentity] IS NULL AND [EngineStartTimeUtc] IS NULL "
+        "OR [EngineFingerprint] IS NOT NULL AND [EngineIdentity] IS NOT NULL AND [EngineStartTimeUtc] IS NOT NULL)"
+    ),
+    ("IndexReviewSnapshot", "CK_IndexReviewSnapshot_SubjectKind"): _SUBJECT_KIND_ENGINE_FORM,
+    ("IndexReviewSnapshot", "CK_IndexReviewSnapshot_SubjectFingerprint"): _FINGERPRINT_CHECK_ENGINE_FORM.format(
+        "SubjectFingerprint"
+    ),
+    ("IndexReviewSnapshot", "CK_IndexReviewSnapshot_DefinitionFingerprint"): _FINGERPRINT_CHECK_ENGINE_FORM.format(
+        "DefinitionFingerprint"
+    ),
+    ("IndexReviewSnapshot", "CK_IndexReviewSnapshot_CounterEpochFingerprint"): (
+        _NULLABLE_FINGERPRINT_CHECK_ENGINE_FORM.format("CounterEpochFingerprint")
+    ),
+    ("IndexReviewSnapshot", "CK_IndexReviewSnapshot_MissingSignatureJson"): (
+        "([MissingSignatureJson] IS NULL OR isjson([MissingSignatureJson])=(1) "
+        "AND json_query([MissingSignatureJson]) IS NOT NULL)"
+    ),
+    ("IndexReviewSnapshot", "CK_IndexReviewSnapshot_SubjectActionInvariants"): (
+        f"({_SUBJECT_KIND_ENGINE_FORM} AND ([SubjectKind]='existing_index' OR [MissingSignatureJson] IS NOT NULL))"
+    ),
+}
 
 
 def _schema_material() -> dict[str, Any]:
@@ -2097,8 +2176,14 @@ def validate_contract_probe(result_sets: Sequence[Any]) -> ContractProbeResult:
             raise IndexReviewSchemaError(f"History contract default {table}.{name} is missing or drifted.")
     for table, name, definition in CONTRACT_CHECKS:
         actual_constraint = actual_constraints.get((table, name))
-        if actual_constraint != ("CHECK", _canonical_sql_tokens(definition)):
+        accepted = {("CHECK", _canonical_sql_tokens(definition))}
+        engine_form = CONTRACT_CHECK_ENGINE_FORMS.get((table, name))
+        if engine_form is not None:
+            accepted.add(("CHECK", _canonical_sql_tokens(engine_form)))
+        if actual_constraint not in accepted:
             raise IndexReviewSchemaError(f"History contract check {table}.{name} is missing or drifted.")
+        # Fingerprint the matched contract source, not the engine's spelling of it.
+        actual_constraints[(table, name)] = ("CHECK", _canonical_sql_tokens(definition))
 
     permissions = sets[4]
     if len(permissions) != 2 or {str(row.get("TableName")) for row in permissions} != {"IndexReviewRun", "IndexReviewSnapshot"}:
@@ -2747,8 +2832,24 @@ def _snapshot_params(run: IndexReviewRunV1, subject: Mapping[str, Any]) -> list[
             raise IndexReviewIntegrityError(f"Capture contains invalid non-negative {name}.")
         return value
 
+    def timestamp(value: Any, name: str) -> str | None:
+        return None if value in (None, "") else _timestamp(value, name)
+
+    # The row id digests the stored row, so it must use the same observed-time
+    # default (DMV-only candidates carry no last_seen) and the same text the
+    # datetime2 column reads back as: collectors carry SYSUTCDATETIME() text
+    # with 100 ns precision and no offset; read-back yields microseconds + Z.
+    observed_at = timestamp(subject.get("observed_at_utc") or run.observed_at_utc, "observed_at_utc")
+    first_observed_at = timestamp(subject.get("first_observed_at_utc"), "first_observed_at_utc")
+    last_observed_at = timestamp(subject.get("last_observed_at_utc"), "last_observed_at_utc")
+    stored_subject = {
+        **subject,
+        "observed_at_utc": observed_at,
+        "first_observed_at_utc": first_observed_at,
+        "last_observed_at_utc": last_observed_at,
+    }
     return [
-        _snapshot_row_id(run.run_id, subject),
+        _snapshot_row_id(run.run_id, stored_subject),
         run.run_id,
         subject.get("subject_id"),
         subject.get("subject_kind"),
@@ -2762,9 +2863,9 @@ def _snapshot_params(run: IndexReviewRunV1, subject: Mapping[str, Any]) -> list[
         subject.get("definition_fingerprint"),
         subject.get("counter_epoch_fingerprint"),
         _canonical(subject.get("counters", {})),
-        subject.get("observed_at_utc") or run.observed_at_utc,
-        subject.get("first_observed_at_utc"),
-        subject.get("last_observed_at_utc"),
+        observed_at,
+        first_observed_at,
+        last_observed_at,
         nonnegative("size_pages"),
         nonnegative("size_bytes"),
         nonnegative("write_burden"),
@@ -2841,14 +2942,30 @@ class IndexReviewService:
             observed_at_utc=moment.isoformat().replace("+00:00", "Z"),
             minimum_observation_days=minimum_days,
         )
+        # Read before the capture transaction opens: it runs under XACT_ABORT
+        # ON, so a failed optional read inside it would roll back the
+        # idempotency lock and leave the inserts in a new implicit transaction.
+        readable_replicas = await collect_readable_replica_status(
+            self.executor, database_name, site="index_review"
+        )
+
+        def collector(session: SqlTransactionSession, captured: CaptureContext) -> CaptureResult:
+            return self._collect_capture(session, captured, readable_replicas=readable_replicas)
+
         try:
-            return await self.repository.append_capture(context, self._collect_capture)
+            return await self.repository.append_capture(context, collector)
         except (IndexReviewError, TransactionCommitOutcomeUnknownError):
             raise
         except Exception as exc:
             raise IndexReviewCollectionError("Index review telemetry collection failed.") from exc
 
-    def _collect_capture(self, session: SqlTransactionSession, context: CaptureContext) -> CaptureResult:
+    def _collect_capture(
+        self,
+        session: SqlTransactionSession,
+        context: CaptureContext,
+        *,
+        readable_replicas: str = "unknown",
+    ) -> CaptureResult:
         try:
             index_rows = session.fetch_all(EXISTING_INDEX_METADATA_SQL)
             engine_rows = session.fetch_all(ENGINE_START_TIME_SQL)
@@ -2957,6 +3074,7 @@ class IndexReviewService:
                     hint_coverage=hint_coverage,
                     query_store_coverage=query_store.get("coverage", {}),
                     hint_evidence=hint_evidence,
+                    readable_replicas=readable_replicas,
                 )
             )
         missing = [
@@ -3873,6 +3991,38 @@ def _missing_history_review(
     )
 
 
+# Showplan operators that only maintain an index for an INSERT, UPDATE, DELETE
+# or MERGE (every write plan lists each NC index it keeps current). They are
+# write burden, not use.
+_WRITE_MAINTENANCE_OPERATORS = frozenset(
+    {
+        "Insert", "Update", "Delete", "Merge",
+        "Index Insert", "Index Update", "Index Delete",
+        "Clustered Index Insert", "Clustered Index Update",
+        "Clustered Index Delete", "Clustered Index Merge",
+        "Table Insert", "Table Update", "Table Delete", "Table Merge",
+        "Columnstore Index Insert", "Columnstore Index Update",
+        "Columnstore Index Delete", "Columnstore Index Merge",
+        "Online Index Insert",
+    }
+)
+
+
+def _reference_is_read(reference: Mapping[str, Any]) -> bool:
+    kinds = {str(kind) for kind in reference.get("operator_kinds") or () if kind}
+    operator_kind = reference.get("operator_kind")
+    if operator_kind and operator_kind != "Multiple":
+        kinds.add(str(operator_kind))
+    # No operator recorded (older captures): stay conservative, count as use.
+    return not kinds or bool(kinds - _WRITE_MAINTENANCE_OPERATORS)
+
+
+def _reference_is_use(reference: Mapping[str, Any]) -> bool:
+    # A forced plan that only maintains the index still depends on it: after a
+    # drop the forcing stops applying with no force failure recorded.
+    return _reference_is_read(reference) or _as_bool(reference.get("is_forced_plan"))
+
+
 def _reference_has_execution(reference: Mapping[str, Any]) -> bool:
     if reference.get("executed") is True:
         return True
@@ -4308,7 +4458,9 @@ def evaluate_removal_gate(
         reference
         for item in history
         for reference in item.get("query_store_references", [])
-        if isinstance(reference, Mapping) and _reference_in_window(reference, window_start)
+        if isinstance(reference, Mapping)
+        and _reference_in_window(reference, window_start)
+        and _reference_is_use(reference)
     ]
     executed_reference = any(_reference_has_execution(reference) for reference in references)
     stored_plan_without_execution = bool(references) and not executed_reference
@@ -4398,10 +4550,18 @@ def evaluate_removal_gate(
         "no_stored_plan_without_execution": not stored_plan_without_execution,
     }
     blockers = [name for name, passed in gate.items() if not passed]
+    # Kept out of the gate map: only a drop with no survivor needs it, because
+    # a replica read served by a duplicate or covered index is served by the
+    # survivor too.
+    readable_replica_usage_observed = all(
+        _mapping_value(item.get("coverage")).get("readable_replicas") == "none"
+        for item in [*history, subject]
+    )
     return {
         "passed": not blockers,
         "gates": gate,
         "blockers": blockers,
+        "readable_replica_usage_observed": readable_replica_usage_observed,
         "observation": observation,
         "historical_reference": executed_reference,
         "read_count": selected_reads,
@@ -4652,8 +4812,10 @@ def review_index_portfolio(
             )
             if protected or has_valid_read_delta or has_reference:
                 state, reasons = "keep", ["protected_or_used"]
-            elif removal["passed"]:
+            elif removal["passed"] and removal["readable_replica_usage_observed"]:
                 state, reasons = "drop_candidate", []
+            elif removal["passed"]:
+                state, reasons = "observe", ["readable_replica_usage_unobserved"]
             else:
                 state, reasons = "observe", removal["blockers"]
             entry = {**dict(subject), "state": state, "reason_codes": reasons, "removal_gate": removal}
@@ -4820,7 +4982,7 @@ def classify_index_subject(
         any(
             _reference_has_execution(reference)
             for reference in references
-            if isinstance(reference, Mapping)
+            if isinstance(reference, Mapping) and _reference_is_use(reference)
         )
         if isinstance(references, (list, tuple))
         else False
@@ -4835,7 +4997,7 @@ def classify_index_subject(
         )
     ) or executed_reference:
         state = "keep"
-    elif gate["passed"]:
+    elif gate["passed"] and gate["readable_replica_usage_observed"]:
         state = "drop_candidate"
     else:
         state = "observe"

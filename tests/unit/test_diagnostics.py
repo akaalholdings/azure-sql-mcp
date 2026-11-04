@@ -255,3 +255,27 @@ async def test_get_object_index_diagnostics_collects_sections_and_handles_option
     assert result["lock_waits"]["rows"][0]["row_lock_wait_count"] == 2
     assert result["resumable_index_operations"]["rows"][0]["percent_complete"] == 50
     assert executor.calls[0][2] == ("dbo", "dbo", "Orders", "Orders")
+
+
+@pytest.mark.asyncio
+async def test_object_index_usage_sections_keep_a_missing_usage_row_unknown() -> None:
+    # No sys.dm_db_index_usage_stats row means no use recorded since the
+    # counters last reset (restart, failover, serverless resume), not a
+    # measured zero. review_workload_indexes shows such an index as NULL; the
+    # raw diagnostics must not turn it into 0 reads either.
+    executor = FakeExecutor()
+    service = DiagnosticQueryService(executor)
+
+    await service.get_object_index_diagnostics("appdb", schema_name="dbo", table_name="Orders")
+
+    usage_sections = [
+        query
+        for _database, query, _params in executor.calls
+        if "FROM sys.tables AS t" in query and "sys.dm_db_index_usage_stats" in query
+    ]
+    assert len(usage_sections) == 2
+    for query in usage_sections:
+        assert "AS has_usage_row" in query
+        assert "COALESCE(ius." not in query
+    reads_query = next(query for query in usage_sections if "AS user_reads" in query)
+    assert "WHEN ius.index_id IS NULL THEN NULL" in reads_query

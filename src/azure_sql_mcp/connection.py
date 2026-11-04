@@ -4,14 +4,18 @@ import asyncio
 import contextlib
 import inspect
 import logging
+import math
 import re
 import sys
+import threading
 import time
 import warnings
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 from typing import Callable
+from typing import Iterator
 from typing import Mapping
 from typing import Sequence
 from typing import TypeVar
@@ -22,6 +26,33 @@ from .connection_pool import ConnectionPool
 from .retry import with_retry
 
 logger = logging.getLogger(__name__)
+
+# Monotonic time after which no statement may be dispatched. It flows into
+# asyncio.to_thread workers because to_thread copies the caller's context.
+_STATEMENT_DEADLINE: ContextVar[float | None] = ContextVar(
+    "azure_sql_mcp_statement_deadline", default=None
+)
+
+
+@contextlib.contextmanager
+def statement_deadline(seconds: float | None) -> Iterator[None]:
+    """Cap every statement started in this context to ``seconds`` from now.
+
+    A nested deadline never extends an outer one. ``None`` adds no limit.
+    """
+
+    if seconds is None:
+        yield
+        return
+    deadline = time.monotonic() + max(0.0, seconds)
+    outer = _STATEMENT_DEADLINE.get()
+    if outer is not None:
+        deadline = min(deadline, outer)
+    token = _STATEMENT_DEADLINE.set(deadline)
+    try:
+        yield
+    finally:
+        _STATEMENT_DEADLINE.reset(token)
 
 
 @dataclass(frozen=True)
@@ -111,6 +142,10 @@ class StatementDispatchPrevented(RuntimeError):
         self.cause = cause
 
 
+class StatementDispatchStopped(TimeoutError):
+    """A statement was not sent: the caller was cancelled or the deadline passed."""
+
+
 TransactionResultT = TypeVar("TransactionResultT")
 
 
@@ -177,6 +212,7 @@ class AzureSqlExecutor:
         self.config = config
         self.authenticator = authenticator
         self.pool = pool
+        self._cancel_unsupported_logged = False
 
     async def fetch_all(
         self,
@@ -212,6 +248,7 @@ class AzureSqlExecutor:
             succeeded = False
             deferred_cleanup = False
             execution_task: asyncio.Task[list[QueryResult]] | None = None
+            cancel_event = threading.Event()
             try:
                 execution_task = asyncio.create_task(
                     asyncio.to_thread(
@@ -223,6 +260,7 @@ class AzureSqlExecutor:
                         max_rows,
                         drain_all_result_sets=is_admin_batch,
                         outcome_unknown_after_dispatch=is_admin_batch,
+                        cancel_event=cancel_event,
                     )
                 )
                 result = await asyncio.shield(execution_task)
@@ -230,6 +268,7 @@ class AzureSqlExecutor:
                 return result
             except asyncio.CancelledError:
                 if execution_task is not None:
+                    cancel_event.set()
                     self._request_cancel(connection)
                     deferred_cleanup = True
                     asyncio.create_task(
@@ -289,6 +328,7 @@ class AzureSqlExecutor:
             succeeded = False
             deferred_cleanup = False
             execution_task: asyncio.Task[list[list[QueryResult]]] | None = None
+            cancel_event = threading.Event()
             try:
                 execution_task = asyncio.create_task(
                     asyncio.to_thread(
@@ -299,6 +339,7 @@ class AzureSqlExecutor:
                         max_rows,
                         statement_params=normalized_params,
                         statement_input_sizes=normalized_input_sizes,
+                        cancel_event=cancel_event,
                     )
                 )
                 result = await asyncio.shield(execution_task)
@@ -306,6 +347,7 @@ class AzureSqlExecutor:
                 return result
             except asyncio.CancelledError:
                 if execution_task is not None:
+                    cancel_event.set()
                     self._request_cancel(connection)
                     deferred_cleanup = True
                     asyncio.create_task(
@@ -365,6 +407,7 @@ class AzureSqlExecutor:
         succeeded = False
         deferred_cleanup = False
         execution_task: asyncio.Task[list[list[QueryResult]]] | None = None
+        cancel_event = threading.Event()
         try:
             execution_task = asyncio.create_task(
                 asyncio.to_thread(
@@ -376,6 +419,7 @@ class AzureSqlExecutor:
                     statement_params=normalized_params,
                     before_statement_dispatch=before_statement_dispatch,
                     statement_input_sizes=normalized_input_sizes,
+                    cancel_event=cancel_event,
                 )
             )
             result = await asyncio.shield(execution_task)
@@ -383,6 +427,7 @@ class AzureSqlExecutor:
             return result
         except asyncio.CancelledError:
             if execution_task is not None:
+                cancel_event.set()
                 self._request_cancel(connection)
                 deferred_cleanup = True
                 asyncio.create_task(
@@ -463,7 +508,9 @@ class AzureSqlExecutor:
                 setup_cursor.execute(
                     "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
                 )
-                setup_cursor.execute("BEGIN TRANSACTION")
+                # No BEGIN TRANSACTION: with autocommit off the driver already
+                # opens one. A second level makes commit() end only the inner
+                # one, and the discarded connection then rolls everything back.
             finally:
                 with contextlib.suppress(Exception):
                     setup_cursor.close()
@@ -568,6 +615,7 @@ class AzureSqlExecutor:
         succeeded = False
         deferred_cleanup = False
         execution_task: asyncio.Task[ProfiledExecution] | None = None
+        cancel_event = threading.Event()
         try:
             execution_task = asyncio.create_task(
                 asyncio.to_thread(
@@ -577,6 +625,7 @@ class AzureSqlExecutor:
                     query,
                     tuple(params or ()),
                     max_rows,
+                    cancel_event=cancel_event,
                     **execution_kwargs,
                 )
             )
@@ -585,6 +634,7 @@ class AzureSqlExecutor:
             return result
         except asyncio.CancelledError:
             if execution_task is not None:
+                cancel_event.set()
                 self._request_cancel(connection)
                 deferred_cleanup = True
                 asyncio.create_task(
@@ -630,6 +680,7 @@ class AzureSqlExecutor:
         *,
         drain_all_result_sets: bool = False,
         outcome_unknown_after_dispatch: bool = False,
+        cancel_event: threading.Event | None = None,
     ) -> list[QueryResult]:
         logger.debug(
             "Executing query",
@@ -638,9 +689,8 @@ class AzureSqlExecutor:
                 "server": self.config.server,
             },
         )
-        cursor = connection.cursor()
+        cursor = self._open_cursor(connection, cancel_event)
         try:
-            self._configure_cursor(cursor)
             self._set_lock_timeout(cursor)
             try:
                 cursor.execute(query, params)
@@ -666,6 +716,7 @@ class AzureSqlExecutor:
         statement_params: Sequence[Sequence[Any]] | None = None,
         before_statement_dispatch: Callable[[int], Any] | None = None,
         statement_input_sizes: Sequence[Sequence[Any] | None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> list[list[QueryResult]]:
         logger.debug(
             "Executing session",
@@ -677,9 +728,8 @@ class AzureSqlExecutor:
         )
         per_statement_results: list[list[QueryResult]] = []
         for index, statement in enumerate(statements):
-            cursor = connection.cursor()
+            cursor = self._open_cursor(connection, cancel_event)
             try:
-                self._configure_cursor(cursor)
                 if index == 0:
                     self._set_lock_timeout(cursor)
                 params = statement_params[index] if statement_params is not None else ()
@@ -693,6 +743,7 @@ class AzureSqlExecutor:
                         before_statement_dispatch(index)
                     except Exception as exc:
                         raise StatementDispatchPrevented(index, exc) from exc
+                self._raise_if_cancelled(cancel_event)
                 self._execute_statement(
                     cursor,
                     statement,
@@ -747,15 +798,15 @@ class AzureSqlExecutor:
         params: Sequence[Any],
         max_rows: int | None,
         input_sizes: Sequence[Any] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> ProfiledExecution:
         logger.debug(
             "Executing one profiled query sample",
             extra={"database_name": database_name, "server": self.config.server},
         )
 
-        setup_cursor = connection.cursor()
+        setup_cursor = self._open_cursor(connection, cancel_event)
         try:
-            self._configure_cursor(setup_cursor)
             self._set_lock_timeout(setup_cursor)
             setup_cursor.execute("SET STATISTICS XML ON", ())
             setup_cursor.execute("SET STATISTICS IO ON", ())
@@ -763,9 +814,8 @@ class AzureSqlExecutor:
             with contextlib.suppress(Exception):
                 setup_cursor.close()
 
-        query_cursor = connection.cursor()
+        query_cursor = self._open_cursor(connection, cancel_event)
         try:
-            self._configure_cursor(query_cursor)
             started = time.perf_counter()
             self._execute_statement(
                 query_cursor,
@@ -810,6 +860,49 @@ class AzureSqlExecutor:
     def _configure_cursor(self, cursor) -> None:
         with contextlib.suppress(Exception):
             cursor.timeout = self.config.query_timeout_seconds
+
+    def _open_cursor(self, connection, cancel_event: threading.Event | None = None):
+        """Open a cursor whose timeout fits the time left for this call.
+
+        mssql-python has no SQLCancel, and closing a cursor that runs on
+        another thread is not safe. So a cancelled call cannot stop the
+        statement in flight. Instead, no later statement is dispatched, and
+        each statement gets min(query timeout, time left + about 1 s) so the
+        driver itself sends the attention soon after the budget runs out.
+        """
+
+        self._raise_if_cancelled(cancel_event)
+        timeout = self.config.query_timeout_seconds
+        deadline = _STATEMENT_DEADLINE.get()
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise StatementDispatchStopped(
+                    "The statement deadline has passed; the statement was not sent."
+                )
+            # Fire just after the deadline, not before it, so the caller's
+            # wait_for still reports a timeout and not a driver error.
+            timeout = max(1, min(timeout, math.ceil(remaining) + 1))
+        # mssql-python copies connection.timeout into each new cursor.
+        original_timeout = getattr(connection, "timeout", None)
+        if original_timeout is None or original_timeout == timeout:
+            cursor = connection.cursor()
+        else:
+            connection.timeout = timeout
+            try:
+                cursor = connection.cursor()
+            finally:
+                connection.timeout = original_timeout
+        with contextlib.suppress(Exception):
+            cursor.timeout = timeout
+        return cursor
+
+    @staticmethod
+    def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise StatementDispatchStopped(
+                "The call was cancelled; no further statements were sent."
+            )
 
     @staticmethod
     def _execute_statement(
@@ -859,6 +952,12 @@ class AzureSqlExecutor:
                 with contextlib.suppress(Exception):
                     method()
                 return
+        if not self._cancel_unsupported_logged:
+            self._cancel_unsupported_logged = True
+            logger.warning(
+                "The database driver has no cancel call. A cancelled statement "
+                "runs until its own timeout; later statements are not sent."
+            )
 
     def _consume_batches(
         self,

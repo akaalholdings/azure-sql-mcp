@@ -1898,9 +1898,12 @@ async def test_uncertain_index_create_is_reconciled_and_cleaned(
         "uncertain-index-create",
     )
 
+    # The fake markers match the lease, so reconcile proves ownership and the
+    # finally block drops the index instead of leaving it for a person.
     assert result["classification"] == "inconclusive"
-    assert result["lease"]["status"] == "cleanup_required"
-    app._drop_test_index.assert_not_awaited()
+    assert result["lease"]["status"] == "cleaned"
+    app._drop_test_index.assert_awaited_once()
+    assert app._drop_test_index.await_args.kwargs["expected_index_id"] == 2
 
 
 @pytest.mark.asyncio
@@ -2684,3 +2687,493 @@ async def test_index_cleanup_cancellation_is_durable_and_re_raised(
     lease = app.performance_store.list_open_index_leases()[0]
     assert lease["status"] == "cleanup_required"
     assert app.tuning_sessions.get_candidate(candidate_id).state == "cleanup_required"
+
+
+def _stateful_index_catalog(
+    app: AzureSqlMcpApplication,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    candidate_filter: str | None,
+    catalog_filter: str | None,
+    create_error: BaseException | None = None,
+) -> tuple[str, dict[str, bool]]:
+    """Model a database whose catalog shows the index once CREATE committed."""
+
+    index_name = "IX_Testing_" + IndexCandidate(
+        schema="dbo",
+        table="Items",
+        key_columns=("status",),
+        include_columns=(),
+        filter_definition=candidate_filter,
+    ).definition_fingerprint[:16]
+    existing = ExistingIndex(
+        schema="dbo",
+        table="Items",
+        index_id=2,
+        name=index_name,
+        index_type="NONCLUSTERED",
+        key_columns=(parse_candidate_key("status"),),
+        filter_definition=catalog_filter,
+    )
+    state = {"created": False}
+
+    async def catalog(*_args: object, **_kwargs: object) -> list[ExistingIndex]:
+        return [existing] if state["created"] else []
+
+    async def create(*_args: object, **_kwargs: object) -> dict[str, str]:
+        # The CREATE and its ownership markers commit together, even when the
+        # client then loses the reply.
+        state["created"] = True
+        if create_error is not None:
+            raise create_error
+        return {"status": "completed"}
+
+    async def drop(*_args: object, **_kwargs: object) -> dict[str, str]:
+        state["created"] = False
+        return {"status": "completed"}
+
+    app._create_test_index = AsyncMock(side_effect=create)  # type: ignore[method-assign]
+    app._drop_test_index = AsyncMock(side_effect=drop)  # type: ignore[method-assign]
+    monkeypatch.setattr("azure_sql_mcp.server.collect_existing_indexes", catalog)
+    return index_name, state
+
+
+def _mismatched_owner_marker(app: AzureSqlMcpApplication) -> None:
+    async def rows(
+        _database_name: str,
+        sql_text: str,
+        **_kwargs: object,
+    ) -> list[dict[str, object]]:
+        if "owner_marker" in sql_text and "definition_marker" in sql_text:
+            return [
+                {
+                    "index_id": 2,
+                    "owner_marker": "index-lease-someone-else-1234",
+                    "definition_marker": "not-this-lease",
+                }
+            ]
+        return [{"schema_name": "dbo", "table_name": "Items"}]
+
+    app.executor.fetch_all = AsyncMock(side_effect=rows)  # type: ignore[method-assign]
+
+
+async def _run_status_benchmark(
+    app: AzureSqlMcpApplication,
+    session_id: str,
+    candidate_id: str,
+    sql: str,
+    filter_definition: str | None,
+    key: str,
+) -> dict[str, object]:
+    return await app._benchmark_index_candidate(
+        "appdb",
+        session_id,
+        candidate_id,
+        sql,
+        "dbo",
+        "Items",
+        ["status"],
+        None,
+        filter_definition,
+        False,
+        "screening",
+        True,
+        True,
+        30,
+        key,
+    )
+
+
+@pytest.mark.asyncio
+async def test_uncertain_create_with_matching_owner_marker_is_dropped_in_process(
+    server_config_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A lost CREATE reply must not orphan an index the marker proves is ours:
+    # an orphan blocks every later index benchmark on the sandbox database.
+    app = _app(server_config_factory)
+    sql = "SELECT id FROM dbo.Items WHERE status = 1"
+    session_id, candidate_id = _candidate(app, sql)
+    app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[_profile(100) for _ in range(3)]
+    )
+    _, state = _stateful_index_catalog(
+        app,
+        monkeypatch,
+        candidate_filter=None,
+        catalog_filter=None,
+        create_error=TimeoutError("reply lost after commit"),
+    )
+
+    result = await _run_status_benchmark(
+        app, session_id, candidate_id, sql, None, "uncertain-create-marker"
+    )
+
+    assert result["classification"] == "inconclusive"
+    assert result["lease"]["status"] == "cleaned"  # type: ignore[index]
+    app._drop_test_index.assert_awaited_once()
+    assert app._drop_test_index.await_args.kwargs["expected_index_id"] == 2
+    assert state["created"] is False
+
+
+@pytest.mark.asyncio
+async def test_uncertain_create_with_foreign_marker_is_never_dropped(
+    server_config_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _app(server_config_factory)
+    sql = "SELECT id FROM dbo.Items WHERE status = 1"
+    session_id, candidate_id = _candidate(app, sql)
+    app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[_profile(100) for _ in range(3)]
+    )
+    _, state = _stateful_index_catalog(
+        app,
+        monkeypatch,
+        candidate_filter=None,
+        catalog_filter=None,
+        create_error=TimeoutError("reply lost after commit"),
+    )
+    _mismatched_owner_marker(app)
+
+    result = await _run_status_benchmark(
+        app, session_id, candidate_id, sql, None, "uncertain-create-foreign"
+    )
+
+    assert result["lease"]["status"] == "cleanup_required"  # type: ignore[index]
+    app._drop_test_index.assert_not_awaited()
+    assert state["created"] is True
+
+
+@pytest.mark.asyncio
+async def test_post_create_definition_mismatch_drops_index_proven_by_owner_marker(
+    server_config_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The catalog definition differs, so the benchmark cannot measure it, but the
+    # marker written in the CREATE transaction proves the index is ours to drop.
+    app = _app(server_config_factory)
+    sql = "SELECT id FROM dbo.Items WHERE status = 1"
+    session_id, candidate_id = _candidate(app, sql)
+    app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[_profile(100) for _ in range(3)]
+    )
+    _, state = _stateful_index_catalog(
+        app,
+        monkeypatch,
+        candidate_filter="[status] = 1",
+        catalog_filter="([status]=(2))",
+    )
+
+    result = await _run_status_benchmark(
+        app, session_id, candidate_id, sql, "[status] = 1", "post-create-mismatch"
+    )
+
+    assert result["classification"] in {"inconclusive", "rejected"}
+    lease = app.performance_store.get_index_lease(
+        result["lease"]["lease_id"]  # type: ignore[index]
+    )
+    assert lease["status"] == "cleaned"
+    assert lease["metadata"]["cleanup_policy"] == "dropped_by_owner_marker"
+    assert lease["metadata"]["creation_observation"] == (
+        "post_create_definition_mismatch"
+    )
+    app._drop_test_index.assert_awaited_once()
+    assert app._drop_test_index.await_args.kwargs["expected_index_id"] == 2
+    assert state["created"] is False
+
+
+@pytest.mark.asyncio
+async def test_post_create_definition_mismatch_with_foreign_marker_is_kept(
+    server_config_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _app(server_config_factory)
+    sql = "SELECT id FROM dbo.Items WHERE status = 1"
+    session_id, candidate_id = _candidate(app, sql)
+    app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[_profile(100) for _ in range(3)]
+    )
+    _, state = _stateful_index_catalog(
+        app,
+        monkeypatch,
+        candidate_filter="[status] = 1",
+        catalog_filter="([status]=(2))",
+    )
+    _mismatched_owner_marker(app)
+
+    result = await _run_status_benchmark(
+        app, session_id, candidate_id, sql, "[status] = 1", "post-create-foreign"
+    )
+
+    assert result["lease"]["status"] == "cleanup_required"  # type: ignore[index]
+    app._drop_test_index.assert_not_awaited()
+    assert state["created"] is True
+
+
+def _expired_uncertain_create_lease(
+    app: AzureSqlMcpApplication,
+) -> tuple[str, ExistingIndex, IndexCandidate]:
+    candidate = IndexCandidate(
+        schema="dbo",
+        table="Items",
+        key_columns=("status",),
+        include_columns=(),
+        index_name="IX_Testing_uncertain_owned",
+    )
+    existing = ExistingIndex(
+        schema="dbo",
+        table="Items",
+        index_id=2,
+        name=candidate.index_name or "",
+        index_type="NONCLUSTERED",
+        key_columns=(parse_candidate_key("status"),),
+    )
+    owner = "index-lease-uncertain-owned-1234"
+    app.performance_store.create_index_lease(
+        lease_id="lease-uncertain-owned",
+        database_fingerprint=database_fingerprint("appdb", app.config.server),
+        session_id="session-recovery",
+        candidate_id="candidate-recovery",
+        index_name=existing.name,
+        object_fingerprint=candidate.definition_fingerprint,
+        expires_at_utc=(datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+        metadata={
+            "target_schema": "dbo",
+            "target_table": "Items",
+            "key_columns": ["status"],
+            "include_columns": [],
+            "filter_definition": None,
+            "is_unique": False,
+            "marker_definition_fingerprint": candidate.definition_fingerprint,
+            "fingerprint_provenance": "candidate_intent",
+            "lease_owner_fence": owner,
+            "create_dispatch_state": "dispatched",
+        },
+        owner_reference=owner,
+    )
+    # The state an in-process reconcile left before 2.6.3.
+    app.performance_store.update_index_lease(
+        "lease-uncertain-owned",
+        status="cleanup_required",
+        metadata={
+            "ownership_status": "uncertain_after_create_dispatch",
+            "ownership_proof": "none",
+            "cleanup_policy": "do_not_adopt_or_drop",
+        },
+        owner_reference=owner,
+    )
+    return owner, existing, candidate
+
+
+@pytest.mark.asyncio
+async def test_expired_uncertain_create_lease_is_cleaned_by_owner_marker(
+    server_config_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Without this, a cleanup_required lease is retried forever and never drops
+    # the index that its own marker proves the MCP created.
+    app = _app(server_config_factory)
+    owner, existing, candidate = _expired_uncertain_create_lease(app)
+    monkeypatch.setattr(
+        "azure_sql_mcp.server.collect_existing_indexes",
+        AsyncMock(return_value=[existing]),
+    )
+    app.executor.fetch_all = AsyncMock(  # type: ignore[method-assign]
+        return_value=[
+            {
+                "index_id": 2,
+                "owner_marker": owner,
+                "definition_marker": candidate.definition_fingerprint,
+            }
+        ]
+    )
+    app._drop_test_index = AsyncMock(return_value={"status": "completed"})  # type: ignore[method-assign]
+
+    summary = await app._cleanup_expired_index_leases()
+
+    assert summary == {"examined": 1, "cleaned": 1, "cleanup_required": 0}
+    assert app.performance_store.get_index_lease("lease-uncertain-owned")[
+        "status"
+    ] == "cleaned"
+    app._drop_test_index.assert_awaited_once()
+    assert app._drop_test_index.await_args.kwargs["expected_index_id"] == 2
+
+
+@pytest.mark.asyncio
+async def test_expired_uncertain_create_lease_with_foreign_marker_is_kept(
+    server_config_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _app(server_config_factory)
+    _owner, existing, candidate = _expired_uncertain_create_lease(app)
+    monkeypatch.setattr(
+        "azure_sql_mcp.server.collect_existing_indexes",
+        AsyncMock(return_value=[existing]),
+    )
+    app.executor.fetch_all = AsyncMock(  # type: ignore[method-assign]
+        return_value=[
+            {
+                "index_id": 2,
+                "owner_marker": "index-lease-someone-else-1234",
+                "definition_marker": candidate.definition_fingerprint,
+            }
+        ]
+    )
+    app._drop_test_index = AsyncMock(return_value={"status": "completed"})  # type: ignore[method-assign]
+
+    summary = await app._cleanup_expired_index_leases()
+
+    assert summary == {"examined": 1, "cleaned": 0, "cleanup_required": 1}
+    app._drop_test_index.assert_not_awaited()
+
+
+def _ordered_profile(
+    elapsed_ms: float,
+    values: tuple[int, ...],
+    *,
+    index_name: str | None = None,
+) -> ProfiledPlanResult:
+    profile = _profile(elapsed_ms, index_name=index_name)
+    return ProfiledPlanResult(
+        plan=profile.plan,
+        result_sets=[
+            QueryResult(
+                columns=("id",),
+                rows=[{"id": value} for value in values],
+                column_type_signatures=("synthetic-int",),
+                positional_rows=tuple((value,) for value in values),
+            )
+        ],
+        elapsed_wall_ms=elapsed_ms,
+        user_query_executions=1,
+        truncated=False,
+        metric_provenance="test",
+    )
+
+
+async def _run_reordering_index(
+    app: AzureSqlMcpApplication,
+    monkeypatch: pytest.MonkeyPatch,
+    sql: str,
+    compare_order: bool | None,
+    key: str,
+) -> dict[str, object]:
+    session_id, candidate_id = _candidate(app, sql)
+    app._create_test_index = AsyncMock(return_value={"status": "completed"})  # type: ignore[method-assign]
+    app._drop_test_index = AsyncMock(return_value={"status": "completed"})  # type: ignore[method-assign]
+    index_name, _ = _install_catalog(monkeypatch, key_columns=["status"])
+    # Same rows; the new index returns them in a different order.
+    app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[
+            *[_ordered_profile(100, (1, 2)) for _ in range(3)],
+            *[_ordered_profile(50, (2, 1), index_name=index_name) for _ in range(3)],
+            *[_ordered_profile(100, (1, 2)) for _ in range(3)],
+        ]
+    )
+    return await app._benchmark_index_candidate(
+        "appdb",
+        session_id,
+        candidate_id,
+        sql,
+        "dbo",
+        "Items",
+        ["status"],
+        None,
+        None,
+        False,
+        "screening",
+        True,
+        compare_order,  # type: ignore[arg-type]
+        30,
+        key,
+    )
+
+
+@pytest.mark.asyncio
+async def test_index_that_reorders_rows_of_an_unordered_query_is_not_a_mismatch(
+    server_config_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Without an outer ORDER BY the row order is not part of the result, so a
+    # new access path that reorders rows must not fail equivalence.
+    app = _app(server_config_factory)
+
+    result = await _run_reordering_index(
+        app,
+        monkeypatch,
+        "SELECT id FROM dbo.Items WHERE status = 1",
+        None,
+        "reorder-unordered-default",
+    )
+
+    assert result["equivalence"][0]["status"] == "match"  # type: ignore[index]
+    assert result["equivalence"][0]["order_compared"] is False  # type: ignore[index]
+    assert result["classification"] == "improved"
+
+
+@pytest.mark.asyncio
+async def test_outer_order_by_is_always_order_compared_and_reorder_is_inconclusive(
+    server_config_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # compare_order=false cannot waive a contractual ORDER BY; a reorder there is
+    # unproven (inconclusive), not a proven semantic change (equivalence_failed).
+    app = _app(server_config_factory)
+
+    result = await _run_reordering_index(
+        app,
+        monkeypatch,
+        "SELECT id FROM dbo.Items WHERE status = 1 ORDER BY id",
+        False,
+        "reorder-ordered-waived",
+    )
+
+    assert result["equivalence"][0]["status"] == "order_only_mismatch"  # type: ignore[index]
+    assert result["equivalence"][0]["order_compared"] is True  # type: ignore[index]
+    assert result["classification"] == "inconclusive"
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_ownership_probe_keeps_the_lease_open(
+    server_config_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The ownership probe now awaits the database. A cancel there must still
+    # leave cleanup_required (an open lease), never create_failed, which would
+    # hide a possibly created index from expiry cleanup.
+    app = _app(server_config_factory)
+    sql = "SELECT id FROM dbo.Items WHERE status = 1"
+    session_id, candidate_id = _candidate(app, sql)
+    app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[_profile(100) for _ in range(3)]
+    )
+    app._create_test_index = AsyncMock(  # type: ignore[method-assign]
+        side_effect=TimeoutError("reply lost after commit")
+    )
+    app._drop_test_index = AsyncMock()  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "azure_sql_mcp.server.collect_existing_indexes",
+        AsyncMock(side_effect=[[], asyncio.CancelledError()]),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await _run_status_benchmark(
+            app, session_id, candidate_id, sql, None, "cancel-during-probe"
+        )
+
+    leases = app.performance_store.list_open_index_leases()
+    assert [lease["status"] for lease in leases] == ["cleanup_required"]
+    app._drop_test_index.assert_not_awaited()
+    # The cancel must still reach the durable settlement tail: the executions
+    # already run are counted, and the reservation is not left 'reserved'.
+    reservation_row = app.performance_store._connection.execute(
+        "SELECT reservation_id FROM execution_reservations WHERE candidate_id = ?",
+        (candidate_id,),
+    ).fetchone()
+    assert reservation_row is not None
+    reservation = app.performance_store.get_execution_reservation(
+        reservation_row["reservation_id"]
+    )
+    assert reservation["status"] != "reserved"
+    assert reservation["dispatched_attempt_count"] == 3

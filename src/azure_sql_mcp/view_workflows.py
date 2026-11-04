@@ -26,7 +26,15 @@ SELECT
     m.definition,
     m.is_schema_bound,
     m.uses_ansi_nulls,
-    m.uses_quoted_identifier
+    m.uses_quoted_identifier,
+    -- The column collation wins over the literal, so SQL decides whether
+    -- this catalog folds every ASCII letter. Turkish and Azeri CI do not
+    -- fold I and i, so they read 0, as CS and BIN collations do.
+    CASE
+        WHEN s.name + N'ABCDEFGHIJKLMNOPQRSTUVWXYZ' = s.name + N'abcdefghijklmnopqrstuvwxyz'
+         AND v.name + N'ABCDEFGHIJKLMNOPQRSTUVWXYZ' = v.name + N'abcdefghijklmnopqrstuvwxyz'
+        THEN 1 ELSE 0
+    END AS catalog_names_ignore_case
 FROM sys.views AS v
 INNER JOIN sys.schemas AS s
     ON s.schema_id = v.schema_id
@@ -163,6 +171,11 @@ class ViewHeader:
 class _ParsedViewDefinition:
     header: ViewHeader
     body: str
+    # Offsets into the module text, so a restore can reuse it as written.
+    keyword_end: int = 0
+    name_start: int = 0
+    name_end: int = 0
+    name_parts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -185,6 +198,11 @@ class ViewSnapshot:
     marker_value: str | None = None
     reserved_marker_names: tuple[str, ...] = ()
     dispatch_proof: dict[str, str] | None = None
+    # Names as sys.schemas/sys.views store them; the request may use other
+    # case on a case-insensitive collation.
+    catalog_schema_name: str | None = None
+    catalog_view_name: str | None = None
+    catalog_names_ignore_case: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -230,7 +248,8 @@ class ViewChangeRequest:
     reviewed_intent: bool = False
     idempotency_key: str | None = None
     indexed_view: bool = False
-    schema_bound: bool = False
+    # None keeps the existing view's SCHEMABINDING state (unbound for CREATE).
+    schema_bound: bool | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -586,6 +605,8 @@ def build_view_statement(
     *,
     schema_bound: bool = False,
     indexed_view: bool = False,
+    column_list: tuple[str, ...] = (),
+    attributes: tuple[str, ...] = (),
 ) -> str:
     operation = operation.casefold()
     if operation not in {"create", "alter"}:
@@ -597,11 +618,84 @@ def build_view_statement(
         indexed_view=indexed_view,
         schema_bound=schema_bound,
     )
-    options = " WITH SCHEMABINDING" if schema_bound else ""
+    columns = ""
+    if column_list:
+        select_count = _select_column_count(definition)
+        if select_count is not None and select_count != len(column_list):
+            raise ViewDefinitionError(
+                f"the existing view column list ({', '.join(column_list)}) "
+                f"names {len(column_list)} columns but the new SELECT returns "
+                f"{select_count}; the column list and WITH options are kept "
+                "from the existing view and cannot be changed through "
+                "prepare_view_change, so a change of column count needs a "
+                "DBA-run change outside this tool"
+            )
+        columns = f" ({', '.join(column_list)})"
+    attribute_list = [
+        attribute
+        for attribute in attributes
+        if attribute.upper() != "SCHEMABINDING" or schema_bound
+    ]
+    if schema_bound and "SCHEMABINDING" not in {a.upper() for a in attribute_list}:
+        attribute_list.append("SCHEMABINDING")
+    options = f" WITH {', '.join(attribute_list)}" if attribute_list else ""
     body = str(definition).strip().rstrip(";").strip()
     return (
         f"{operation.upper()} VIEW {_quote_identifier(schema_name)}."
-        f"{_quote_identifier(view_name)}{options} AS {body};"
+        f"{_quote_identifier(view_name)}{columns}{options} AS {body};"
+    )
+
+
+def _select_column_count(definition: str) -> int | None:
+    """Return the SELECT list width, or None when a star hides it."""
+
+    try:
+        statement = sqlglot.parse_one(str(definition), read="tsql")
+    except Exception:
+        return None
+    if not isinstance(statement, exp.Query):
+        return None
+    selects = statement.selects
+    if any(select.is_star for select in selects):
+        return None
+    return len(selects)
+
+
+def _inherited_view_header(
+    prior: ViewSnapshot,
+    operation: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return the prior column list and WITH options an ALTER must keep."""
+
+    if not prior.exists or prior.header is None or operation == "create":
+        return (), ()
+    return prior.header.column_list, prior.header.attributes
+
+
+def resolve_view_request_schema_bound(
+    request: ViewChangeRequest,
+    prior: ViewSnapshot,
+) -> ViewChangeRequest:
+    if request.schema_bound is not None:
+        return request
+    return replace(request, schema_bound=prior.schema_bound if prior.exists else False)
+
+
+def _build_target_module(
+    request: ViewChangeRequest,
+    prior: ViewSnapshot,
+    operation: str,
+) -> str:
+    column_list, attributes = _inherited_view_header(prior, operation)
+    return build_view_statement(
+        "create",
+        request.schema_name,
+        request.view_name,
+        request.definition,
+        schema_bound=bool(request.schema_bound),
+        indexed_view=request.indexed_view,
+        column_list=column_list,
+        attributes=attributes,
     )
 
 
@@ -743,6 +837,22 @@ def _build_fenced_view_execution_batch(
         1 if marker_action == "add" else -1
     )
     locked_marker_value_literal = _sql_string_literal(locked_marker_value or "")
+    # The fence reads the request-named view; the DDL resolves the name the
+    # statement writes. They must be the same object.
+    target_guard: list[str] = []
+    parsed_statement = _parse_view_module(statement) if expected_exists else None
+    if parsed_statement is not None:
+        # The written identifier tokens without the trivia between them:
+        # CREATE VIEW accepts "s . v", OBJECT_ID returns NULL for it.
+        written_literal = _sql_string_literal(".".join(parsed_statement.name_parts))
+        target_guard = [
+            f"IF OBJECT_ID(N'{written_literal}', N'V') IS NULL",
+            f"   OR OBJECT_ID(N'{written_literal}', N'V') <> @actual_object_id",
+            "BEGIN",
+            "    ROLLBACK TRANSACTION;",
+            "    THROW 51003, N'view mutation statement does not target the fenced view', 1;",
+            "END;",
+        ]
     escaped = statement.replace("'", "''")
     fence_comment = (
         "-- AzureSqlMcp view fence "
@@ -912,6 +1022,7 @@ def _build_fenced_view_execution_batch(
             "    ROLLBACK TRANSACTION;",
             "    THROW 51001, N'view mutation precondition no longer matches', 1;",
             "END;",
+            *target_guard,
             f"EXEC sys.sp_executesql N'{escaped}';",
             *(
                 [
@@ -1197,6 +1308,9 @@ def prepared_view_change_state(prepared: PreparedViewChange) -> dict[str, Any]:
             "marker_present": prior.marker_present,
             "marker_value": prior.marker_value,
             "reserved_marker_names": list(prior.reserved_marker_names),
+            "catalog_schema_name": prior.catalog_schema_name,
+            "catalog_view_name": prior.catalog_view_name,
+            "catalog_names_ignore_case": prior.catalog_names_ignore_case,
         },
         "marker_name": prepared.marker_name,
         "marker_value": prepared.marker_value,
@@ -1251,14 +1365,14 @@ def prepared_view_change_from_state(payload: Any) -> PreparedViewChange:
     legality = require_valid_view_definition(
         request.definition,
         indexed_view=request.indexed_view,
-        schema_bound=request.schema_bound,
+        schema_bound=bool(request.schema_bound),
     )
     operation = str(payload.get("operation") or "").casefold()
     if operation not in {"create", "alter", "noop"}:
         raise ViewWorkflowError("durable view operation is invalid")
     target_fingerprint = view_definition_fingerprint(
-        request.definition,
-        schema_bound=request.schema_bound,
+        _build_target_module(request, prior, operation),
+        schema_bound=bool(request.schema_bound),
         uses_ansi_nulls=_target_ansi_nulls(request, prior),
         uses_quoted_identifier=_target_quoted_identifier(request, prior),
     )
@@ -1287,14 +1401,17 @@ def prepared_view_change_from_state(payload: Any) -> PreparedViewChange:
 
     apply_sql = None
     if operation != "noop":
+        column_list, attributes = _inherited_view_header(prior, operation)
         apply_sql = _build_fenced_view_execution_batch(
             build_view_statement(
                 operation,
                 request.schema_name,
                 request.view_name,
                 request.definition,
-                schema_bound=request.schema_bound,
+                schema_bound=bool(request.schema_bound),
                 indexed_view=request.indexed_view,
+                column_list=column_list,
+                attributes=attributes,
             ),
             database_name=request.database_name,
             schema_name=request.schema_name,
@@ -1542,7 +1659,9 @@ class ViewWorkflowService:
         definition = row.get("definition")
         if definition is None:
             raise ViewWorkflowError(
-                f"view {schema_name}.{view_name} exists but its definition is unavailable"
+                f"view {schema_name}.{view_name} exists but its definition is "
+                "unavailable (a WITH ENCRYPTION view, or no VIEW DEFINITION "
+                "permission), so no exact rollback can be captured"
             )
         definition_text = str(definition)
         parsed = _parse_view_module(definition_text)
@@ -1637,30 +1756,48 @@ class ViewWorkflowService:
             marker_present=marker_present,
             marker_value=marker_value,
             reserved_marker_names=reserved_marker_names,
+            catalog_schema_name=(
+                str(row["schema_name"]) if row.get("schema_name") is not None else None
+            ),
+            catalog_view_name=(
+                str(row["view_name"]) if row.get("view_name") is not None else None
+            ),
+            catalog_names_ignore_case=bool(_as_bool(row.get("catalog_names_ignore_case"))),
         )
 
     async def prepare(self, request: ViewChangeRequest) -> PreparedViewChange:
+        require_valid_view_definition(
+            request.definition,
+            indexed_view=request.indexed_view,
+            schema_bound=bool(request.schema_bound),
+        )
+        marker_name = _new_marker_name()
+        try:
+            prior = await self.capture_view(
+                request.database_name,
+                request.schema_name,
+                request.view_name,
+                marker_name=marker_name,
+            )
+        except ViewWorkflowError as exc:
+            # Prepare only reads, so here (unlike after apply or rollback DDL)
+            # the refusal can promise that nothing changed.
+            raise type(exc)(f"{exc}; nothing was changed") from exc
+        _require_azure_sql_module_options(prior)
+        request = resolve_view_request_schema_bound(request, prior)
         legality = require_valid_view_definition(
             request.definition,
             indexed_view=request.indexed_view,
-            schema_bound=request.schema_bound,
+            schema_bound=bool(request.schema_bound),
         )
-        marker_name = _new_marker_name()
-        prior = await self.capture_view(
-            request.database_name,
-            request.schema_name,
-            request.view_name,
-            marker_name=marker_name,
-        )
-        _require_azure_sql_module_options(prior)
         requested_operation = request.operation.casefold()
         if requested_operation == "auto":
             operation = "alter" if prior.exists else "create"
         else:
             operation = requested_operation
         target_fingerprint = view_definition_fingerprint(
-            request.definition,
-            schema_bound=request.schema_bound,
+            _build_target_module(request, prior, operation),
+            schema_bound=bool(request.schema_bound),
             uses_ansi_nulls=_target_ansi_nulls(request, prior),
             uses_quoted_identifier=_target_quoted_identifier(request, prior),
         )
@@ -1694,14 +1831,17 @@ class ViewWorkflowService:
 
         apply_sql = None
         if operation != "noop":
+            column_list, attributes = _inherited_view_header(prior, operation)
             apply_sql = _build_fenced_view_execution_batch(
                 build_view_statement(
                     operation,
                     request.schema_name,
                     request.view_name,
                     request.definition,
-                    schema_bound=request.schema_bound,
+                    schema_bound=bool(request.schema_bound),
                     indexed_view=request.indexed_view,
+                    column_list=column_list,
+                    attributes=attributes,
                 ),
                 database_name=request.database_name,
                 schema_name=request.schema_name,
@@ -1786,7 +1926,8 @@ class ViewWorkflowService:
                 )
             verification = await self.verify(prepared)
             if not verification.verified:
-                raise ViewVerificationError(
+                # No DDL ran here, so this is not a post-write verification error.
+                raise ViewWorkflowError(
                     "no-op view verification failed; prepare a new reviewed change"
                 )
             return {
@@ -1863,13 +2004,18 @@ class ViewWorkflowService:
             verification_required=True,
         )
         execution = await self._execute_once(action)
-        verification = await self.verify(prepared)
-        dispatch_proof = _build_dispatch_proof(
-            execution,
-            action.sql,
-            prepared,
-            object_id=verification.actual.object_id,
-        )
+        try:
+            verification = await self.verify(prepared)
+            dispatch_proof = _build_dispatch_proof(
+                execution,
+                action.sql,
+                prepared,
+                object_id=verification.actual.object_id,
+            )
+        except ViewVerificationError:
+            raise
+        except ViewWorkflowError as exc:
+            raise _dispatched_outcome_unknown("view DDL", exc) from exc
         confirmed = replace(verification.actual, dispatch_proof=dispatch_proof)
         self._applied_receipts[self._receipt_key(prepared)] = confirmed
         if not verification.verified:
@@ -2051,17 +2197,47 @@ class ViewWorkflowService:
             verification_required=True,
         )
         await self._execute_once(action)
-        after = await self.capture_view(
-            request.database_name,
-            request.schema_name,
-            request.view_name,
-            marker_name=prepared.marker_name,
-        )
-        restored = _snapshot_matches_prior(after, prepared.prior)
-        if not restored:
-            raise ViewVerificationError("exact prior view state was not restored")
+        try:
+            after = await self.capture_view(
+                request.database_name,
+                request.schema_name,
+                request.view_name,
+                marker_name=prepared.marker_name,
+            )
+            if not _snapshot_matches_prior(after, prepared.prior):
+                raise ViewVerificationError("exact prior view state was not restored")
+            exactness = self.restore_exactness(prepared, after)
+        except ViewVerificationError:
+            raise
+        except ViewWorkflowError as exc:
+            raise _dispatched_outcome_unknown("view restore", exc) from exc
         self._applied_receipts.pop(receipt_key, None)
-        return {"status": "rolled_back", "snapshot": after.as_dict()}
+        # The restore has committed: text drift is reported, not raised, so a
+        # retry cannot turn it into an unqualified "already rolled back".
+        return {
+            "status": "rolled_back",
+            "snapshot": after.as_dict(),
+            **exactness,
+        }
+
+    def restore_exactness(
+        self,
+        prepared: PreparedViewChange,
+        current: ViewSnapshot,
+    ) -> dict[str, bool]:
+        """Byte-level outcome of a restore; the fingerprint normalises text.
+
+        ``text_drift`` is true when the catalog holds neither the prior text
+        nor the text the restore writes (only a qualified name may differ).
+        """
+        prior = prepared.prior
+        definition_exact = current.definition == prior.definition
+        text_drift = (
+            prior.exists
+            and not definition_exact
+            and current.definition != _restored_catalog_definition(prior)
+        )
+        return {"definition_exact": definition_exact, "text_drift": text_drift}
 
     async def rollback_view_change(self, prepared: PreparedViewChange) -> dict[str, Any]:
         return await self.rollback(prepared)
@@ -2212,6 +2388,15 @@ def _target_quoted_identifier(
     return True if request.indexed_view or not prior.exists else prior.uses_quoted_identifier
 
 
+def _dispatched_outcome_unknown(
+    what: str, exc: ViewWorkflowError
+) -> ViewVerificationError:
+    return ViewVerificationError(
+        f"{what} was dispatched, then its outcome could not be confirmed: {exc}; "
+        "read the view with verify_view_change before any retry"
+    )
+
+
 def _build_dispatch_proof(
     execution: dict[str, Any],
     sql: str,
@@ -2261,13 +2446,17 @@ def _parse_view_module(definition: str) -> _ParsedViewDefinition | None:
     if _matches_keyword(text, position, "OR"):
         position = _consume_keyword(text, position, "OR")
         position = _consume_keyword(text, position, "ALTER")
+    keyword_end = position
     position = _consume_keyword(text, position, "VIEW")
 
-    _, position = _consume_sql_identifier(text, position, "view name")
+    name_start = _skip_space(text, position)
+    name_part, position = _consume_sql_identifier(text, position, "view name")
+    name_parts = [name_part]
     view_name_end = position
     position = _skip_space(text, position)
     if position < len(text) and text[position] == ".":
-        _, position = _consume_sql_identifier(text, position + 1, "view name")
+        name_part, position = _consume_sql_identifier(text, position + 1, "view name")
+        name_parts.append(name_part)
         view_name_end = position
         position = _skip_space(text, position)
     if position < len(text) and text[position] == ".":
@@ -2311,7 +2500,14 @@ def _parse_view_module(definition: str) -> _ParsedViewDefinition | None:
         attributes=tuple(attributes),
         raw_suffix=text[option_start:position],
     )
-    return _ParsedViewDefinition(header=header, body=text[as_position:])
+    return _ParsedViewDefinition(
+        header=header,
+        body=text[as_position:],
+        keyword_end=keyword_end,
+        name_start=name_start,
+        name_end=view_name_end,
+        name_parts=tuple(name_parts),
+    )
 
 
 def _view_snapshot_from_state(payload: dict[str, Any]) -> ViewSnapshot:
@@ -2353,6 +2549,18 @@ def _view_snapshot_from_state(payload: dict[str, Any]) -> ViewSnapshot:
         _validate_reserved_marker_inventory(reserved_marker_names)
         marker_name = marker_name_value
         definition_value = payload.get("definition")
+        # Optional: state from an earlier version has no catalog names.
+        catalog_schema_name = payload.get("catalog_schema_name")
+        catalog_view_name = payload.get("catalog_view_name")
+        if not all(
+            value is None or isinstance(value, str)
+            for value in (catalog_schema_name, catalog_view_name)
+        ):
+            raise ViewWorkflowError("durable prior view catalog names are invalid")
+        catalog_names_ignore_case = _state_bool(
+            payload.get("catalog_names_ignore_case", False),
+            "prior catalog_names_ignore_case",
+        )
     except (KeyError, TypeError, ValueError) as exc:
         raise ViewWorkflowError("durable prior view state is invalid") from exc
     if not exists:
@@ -2396,6 +2604,9 @@ def _view_snapshot_from_state(payload: dict[str, Any]) -> ViewSnapshot:
         marker_present=marker_present,
         marker_value=marker_value,
         reserved_marker_names=reserved_marker_names,
+        catalog_schema_name=catalog_schema_name,
+        catalog_view_name=catalog_view_name,
+        catalog_names_ignore_case=catalog_names_ignore_case,
     )
     _require_azure_sql_module_options(snapshot)
     return snapshot
@@ -2571,29 +2782,65 @@ def _build_snapshot_restore_module(snapshot: ViewSnapshot) -> str:
     if not snapshot.exists or snapshot.definition is None or snapshot.header is None:
         raise ViewWorkflowError("exact prior view header capture is required")
     _require_azure_sql_module_options(snapshot)
-    parsed = _parse_view_module(snapshot.definition)
+    text = snapshot.definition
+    parsed = _parse_view_module(text)
     if parsed is None:
         raise ViewWorkflowError("exact prior view header capture is required")
+    # Reuse the module text as written: the catalog then holds the prior bytes
+    # again (Azure SQL shows only the ALTER keyword as CREATE). A name that is
+    # unqualified, or stale after sp_rename, would not resolve to this view.
+    name = text[parsed.name_start : parsed.name_end]
+    if not _written_name_is_view(parsed.name_parts, snapshot):
+        name = (
+            f"{_quote_identifier(snapshot.catalog_schema_name or snapshot.schema_name)}."
+            f"{_quote_identifier(snapshot.catalog_view_name or snapshot.view_name)}"
+        )
     return (
-        f"{snapshot.header.leading_comments}ALTER VIEW "
-        f"{_quote_identifier(snapshot.schema_name)}.{_quote_identifier(snapshot.view_name)}"
-        f"{snapshot.header.raw_suffix}AS{_strip_statement_terminator(parsed.body)};"
+        f"{parsed.header.leading_comments}ALTER"
+        f"{text[parsed.keyword_end : parsed.name_start]}{name}"
+        f"{text[parsed.name_end :]}"
     )
+
+
+def _written_name_is_view(name_parts: tuple[str, ...], snapshot: ViewSnapshot) -> bool:
+    if len(name_parts) != 2:
+        return False
+    try:
+        schema_name = _canonical_identifier(name_parts[0], "schema name")
+        view_name = _canonical_identifier(name_parts[1], "view name")
+    except ViewDefinitionError:
+        return False
+    return _same_catalog_name(
+        schema_name, snapshot.catalog_schema_name or snapshot.schema_name, snapshot
+    ) and _same_catalog_name(
+        view_name, snapshot.catalog_view_name or snapshot.view_name, snapshot
+    )
+
+
+def _same_catalog_name(written: str, catalog: str, snapshot: ViewSnapshot) -> bool:
+    if written == catalog:
+        return True
+    # Case-only match on a CI catalog. ASCII only: every CI collation folds
+    # ASCII case, while non-ASCII folding differs between Python and SQL.
+    return (
+        snapshot.catalog_names_ignore_case
+        and written.isascii()
+        and catalog.isascii()
+        and written.lower() == catalog.lower()
+    )
+
+
+def _restored_catalog_definition(snapshot: ViewSnapshot) -> str:
+    module = _build_snapshot_restore_module(snapshot)
+    keyword = _consume_leading_trivia(module)
+    return f"{module[:keyword]}CREATE{module[keyword + len('ALTER') :]}"
 
 
 def _build_target_catalog_definition(prepared: PreparedViewChange) -> str:
-    request = prepared.request
     # SQL Server exposes altered module text using the CREATE form in its
     # catalog.  This is also the form used by the fake executor and gives the
     # rollback fence a deterministic exact-definition hash after restart.
-    return build_view_statement(
-        "create",
-        request.schema_name,
-        request.view_name,
-        request.definition,
-        schema_bound=request.schema_bound,
-        indexed_view=request.indexed_view,
-    )
+    return _build_target_module(prepared.request, prepared.prior, prepared.operation)
 
 
 def _normalized_view_header_identity(

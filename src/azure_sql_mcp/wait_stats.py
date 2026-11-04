@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .connection import AzureSqlExecutor
+from .query_store import _RELATIVE_WINDOW_PREDICATE
 
 # Benign waits to exclude — these are background/idle waits that inflate totals
 # without indicating real performance problems.
@@ -336,16 +337,28 @@ class WaitStatsService:
         window_minutes: int = 60,
         top_n: int = 20,
     ) -> dict[str, Any]:
-        """Per-query wait breakdown from Query Store wait stats."""
-        query = """
-        SELECT TOP ({top_n})
+        """Per-query wait breakdown from Query Store wait stats.
+
+        An interval counts when it ends inside the window (the same predicate as
+        the other Query Store tools), so the closed interval that holds most of
+        the window is not dropped. ``interval_coverage`` is the time the returned
+        rows really cover.
+        """
+        # avg_query_wait_time_ms is per execution, so total / avg is the row's
+        # execution count: SUM(total) / SUM(total / avg) is the execution-weighted
+        # mean, SUM(avg * executions) / SUM(executions).
+        query = f"""
+        SELECT TOP (?)
             q.query_id,
             qt.query_sql_text,
             ws.wait_category_desc,
             SUM(ws.total_query_wait_time_ms) AS total_wait_time_ms,
-            SUM(ws.avg_query_wait_time_ms * ws.total_query_wait_time_ms)
-                / NULLIF(SUM(ws.total_query_wait_time_ms), 0) AS weighted_avg_wait_ms,
-            MAX(ws.max_query_wait_time_ms) AS max_wait_time_ms
+            SUM(ws.total_query_wait_time_ms)
+                / NULLIF(SUM(ws.total_query_wait_time_ms / NULLIF(ws.avg_query_wait_time_ms, 0)), 0)
+                AS weighted_avg_wait_ms,
+            MAX(ws.max_query_wait_time_ms) AS max_wait_time_ms,
+            MIN(rsi.start_time) AS first_interval_start_utc,
+            MAX(rsi.end_time) AS last_interval_end_utc
         FROM sys.query_store_wait_stats AS ws
         INNER JOIN sys.query_store_plan AS p
             ON ws.plan_id = p.plan_id
@@ -355,15 +368,23 @@ class WaitStatsService:
             ON q.query_text_id = qt.query_text_id
         INNER JOIN sys.query_store_runtime_stats_interval AS rsi
             ON ws.runtime_stats_interval_id = rsi.runtime_stats_interval_id
-        WHERE rsi.start_time >= DATEADD(MINUTE, -{window_minutes}, GETUTCDATE())
+        WHERE {_RELATIVE_WINDOW_PREDICATE}
         GROUP BY q.query_id, qt.query_sql_text, ws.wait_category_desc
         ORDER BY total_wait_time_ms DESC
-        """.format(top_n=int(top_n), window_minutes=int(window_minutes))
+        """
 
-        rows = await self.executor.fetch_all(database_name, query)
+        rows = await self.executor.fetch_all(
+            database_name, query, params=[int(top_n), int(window_minutes)]
+        )
+        starts = [row["first_interval_start_utc"] for row in rows if row.get("first_interval_start_utc")]
+        ends = [row["last_interval_end_utc"] for row in rows if row.get("last_interval_end_utc")]
         return {
             "database_name": database_name,
             "window_minutes": window_minutes,
+            "interval_coverage": {
+                "start_utc": min(starts) if starts else None,
+                "end_utc": max(ends) if ends else None,
+            },
             "query_wait_stats": rows,
         }
 

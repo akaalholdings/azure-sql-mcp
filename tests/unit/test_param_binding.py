@@ -661,6 +661,175 @@ def test_sp_executesql_supports_query_parameters_named_stmt_and_params() -> None
     assert contract.parameter_definition == "@stmt int, @params int"
 
 
+def _showplan_contract(sql: str, *parameters: tuple[str, str, Any]) -> Any:
+    return TypedParameterBucket(
+        bucket_id="showplan",
+        parameters=tuple(
+            TypedParameter(
+                name=name,
+                sql_type=SqlParameterType.from_sql(sql_type),
+                value=value,
+                provenance="synthetic",
+            )
+            for name, sql_type, value in parameters
+        ),
+    ).for_sql(sql)
+
+
+def test_showplan_form_compiles_the_statement_itself_for_typed_constants() -> None:
+    # Live (2026-11-04, Azure SQL Database): SHOWPLAN_XML returns no result set
+    # for parameter markers, and for EXEC sys.sp_executesql with constants it
+    # returns only an EXECUTE PROC stub with no RelOp. Uninitialized typed
+    # locals plus OPTIMIZE FOR give the same plan as the actual run.
+    contract = _showplan_contract(
+        "SELECT 1 WHERE N'it''s' <> @Name AND @Code IS NULL AND @At > 0 AND @Amount > 0",
+        ("@Name", "nvarchar(40)", "O'Reilly"),
+        ("@Code", "varchar(10)", None),
+        ("@At", "datetime", datetime(2026, 11, 4, 14, 23, 44, 748708)),
+        ("@Amount", "decimal(18,2)", Decimal("12.50")),
+    )
+
+    assert contract.estimated_showplan_sql == (
+        "DECLARE @Name nvarchar(40), @Code varchar(10), @At datetime, @Amount decimal(18,2);\n"
+        "SELECT 1 WHERE N'it''s' <> @Name AND @Code IS NULL AND @At > 0 AND @Amount > 0\n"
+        "OPTION (OPTIMIZE FOR (@Name = N'O''Reilly', @Code = NULL, "
+        "@At = '2026-11-04T14:23:44.748', @Amount = 12.50))"
+    )
+    assert "?" not in contract.estimated_showplan_sql
+    assert "sp_executesql" not in contract.estimated_showplan_sql
+
+
+def test_showplan_form_merges_into_an_existing_option_clause() -> None:
+    # A second OPTION clause is a syntax error; the hint joins the user's own.
+    contract = _showplan_contract(
+        "SELECT o.id FROM dbo.Orders AS o "
+        "WHERE o.id IN (SELECT id FROM dbo.Lines OPTION_LIKE WHERE n = @Id) "
+        "OPTION (MAXDOP 1, RECOMPILE);",
+        ("@Id", "int", 7),
+    )
+
+    sql = contract.estimated_showplan_sql
+
+    assert sql == (
+        "DECLARE @Id int;\n"
+        "SELECT o.id FROM dbo.Orders AS o "
+        "WHERE o.id IN (SELECT id FROM dbo.Lines OPTION_LIKE WHERE n = @Id) "
+        "OPTION (OPTIMIZE FOR (@Id = 7), MAXDOP 1, RECOMPILE) "
+    )
+    assert sql.upper().count("OPTION (") == 1
+
+
+def test_showplan_form_ignores_option_text_in_comments_strings_and_subqueries() -> None:
+    contract = _showplan_contract(
+        ";WITH c AS (SELECT id FROM dbo.t OPTION_X WHERE a = 'OPTION (x)') "
+        "SELECT id FROM c /* OPTION (MAXDOP 1) */ WHERE id = @Id -- OPTION (y)",
+        ("@Id", "int", 1),
+    )
+
+    sql = contract.estimated_showplan_sql
+
+    # The trailing line comment must not swallow the hint.
+    assert sql.endswith("-- OPTION (y)\nOPTION (OPTIMIZE FOR (@Id = 1))")
+    assert sql.startswith("DECLARE @Id int;\n WITH c AS")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "DECLARE @x int = 5; SELECT @x + @Id",
+        "SET NOCOUNT ON\nSELECT @Id",
+        "SELECT @Id; SELECT 2",
+    ],
+)
+def test_showplan_form_refuses_more_than_one_statement(sql: str) -> None:
+    # The hint applies to one statement only; it must not silently cover a
+    # different statement than the one whose plan is reported.
+    contract = _showplan_contract(sql, ("@Id", "int", 1))
+
+    with pytest.raises(ValueError, match="single SELECT statement"):
+        contract.estimated_showplan_sql
+
+
+def test_showplan_form_refuses_a_user_optimize_for_hint() -> None:
+    contract = _showplan_contract(
+        "SELECT id FROM dbo.t WHERE id = @Id OPTION (OPTIMIZE FOR UNKNOWN)",
+        ("@Id", "int", 1),
+    )
+
+    with pytest.raises(ValueError, match="already has an OPTIMIZE FOR hint"):
+        contract.estimated_showplan_sql
+
+
+def test_showplan_form_keeps_reserved_parameter_names() -> None:
+    contract = _showplan_contract(
+        "SELECT @stmt + @params",
+        ("@stmt", "int", 1),
+        ("@params", "int", 2),
+    )
+
+    assert contract.estimated_showplan_sql == (
+        "DECLARE @stmt int, @params int;\nSELECT @stmt + @params\n"
+        "OPTION (OPTIMIZE FOR (@stmt = 1, @params = 2))"
+    )
+
+
+def test_showplan_form_leaves_xml_parameters_out_of_optimize_for() -> None:
+    # Live: OPTIMIZE FOR (@x = N'<root/>') fails for an xml variable ("could
+    # not be implicitly converted"), so every estimated plan with an xml
+    # parameter failed. An xml value does not drive cardinality: the variable
+    # stays declared and unknown, and the basis says so.
+    contract = _showplan_contract(
+        "SELECT id FROM dbo.t WHERE id = @Id AND @Doc IS NOT NULL",
+        ("@Id", "int", 7),
+        ("@Doc", "xml", "<root/>"),
+    )
+
+    assert contract.estimated_showplan_sql == (
+        "DECLARE @Id int, @Doc xml;\n"
+        "SELECT id FROM dbo.t WHERE id = @Id AND @Doc IS NOT NULL\n"
+        "OPTION (OPTIMIZE FOR (@Id = 7))"
+    )
+    basis = contract.estimated_showplan_basis
+    assert basis["optimize_for_parameters"] == ["@Id"]
+    assert basis["unknown_parameters"] == ["@Doc"]
+
+
+def test_showplan_form_with_only_xml_parameters_adds_no_hint() -> None:
+    # An empty OPTIMIZE FOR () is a syntax error; with nothing to hint the
+    # user's own OPTION clause stays as it is.
+    contract = _showplan_contract(
+        "SELECT 1 WHERE @Doc IS NOT NULL OPTION (MAXDOP 1)",
+        ("@Doc", "xml", "<root/>"),
+    )
+
+    assert contract.estimated_showplan_sql == (
+        "DECLARE @Doc xml;\nSELECT 1 WHERE @Doc IS NOT NULL OPTION (MAXDOP 1)"
+    )
+
+
+def test_showplan_basis_says_what_the_estimate_does_not_model() -> None:
+    # Live: for (@p IS NULL OR col = @p) the parameterized run compiles a
+    # Dispatcher plan variant (optional-parameter / PSP optimization); a local
+    # variable never can. The caller must be told the estimate is not that plan.
+    contract = _showplan_contract("SELECT @Id", ("@Id", "int", 1))
+
+    basis = contract.estimated_showplan_basis
+
+    assert basis["basis"] == "local_variables_optimize_for"
+    assert basis["optimize_for_parameters"] == ["@Id"]
+    assert basis["unknown_parameters"] == []
+    for limit in ("parameter_sensitive_plan", "optional_parameter_plan", "parameter_embedding"):
+        assert limit in basis["not_modeled"]
+    assert "analyze=true" in basis["note"]
+
+
+def test_showplan_form_refuses_a_value_that_is_not_its_type() -> None:
+    contract = _showplan_contract("SELECT @Id", ("@Id", "int", "1; DROP TABLE dbo.t"))
+
+    with pytest.raises(ValueError):
+        contract.estimated_showplan_sql
+
+
 def test_driver_binding_ignores_escaped_bracketed_identifier_parameters() -> None:
     bucket = TypedParameterBucket(
         bucket_id="escaped-identifier",

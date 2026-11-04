@@ -18,6 +18,7 @@ from typing import Any
 from .azure_tier import dmv_permission_hint
 from .connection import AzureSqlExecutor
 from .observability import sanitize_error_message
+from .plan_digest import matches_plan_hash
 from .plan_tree import PlanParseError
 from .plan_tree import parse_showplan
 from .plan_tree import statements
@@ -204,19 +205,27 @@ class PlanSourceService:
                 ),
             )
         row = rows[0]
+        plan_xml = str(row["query_plan"])
+        requested = _requested_statement_indexes(plan_xml, row.get("query_plan_hash"))
         source.update(
             {
                 "plan_id": row.get("plan_id"),
                 "query_id": row.get("query_id"),
                 "query_plan_hash": row.get("query_plan_hash"),
                 "last_execution_time": _text(row.get("last_execution_time")),
+                "requested_statement_indexes": requested,
                 "source_note": (
-                    "The plan of the last execution of the whole cached batch; find this statement by "
-                    "query_plan_hash. Row counts are actual."
+                    "The plan of the last execution of the whole cached batch; "
+                    + (
+                        "requested_statement_indexes are the statements with this query_plan_hash. "
+                        if requested
+                        else "the statement with this query_plan_hash was not found in it. "
+                    )
+                    + "Row counts are actual."
                 ),
             }
         )
-        return PlanSource(str(row["query_plan"]), source)
+        return PlanSource(plan_xml, source)
 
     async def live(self, database_name: str, session_id: int) -> PlanSource:
         source: dict[str, Any] = {"source": "live_session", "session_id": session_id}
@@ -316,6 +325,18 @@ def _statement_estimated_rows(plan_xml: str) -> float | None:
         if value is not None:
             return value
     return None
+
+
+def _requested_statement_indexes(plan_xml: str, plan_hash: Any) -> list[int]:
+    """Statements of a cached batch plan that carry the requested hash; a batch can repeat one."""
+
+    if not plan_hash:
+        return []
+    try:
+        root = parse_showplan(plan_xml)
+    except PlanParseError:
+        return []
+    return [index for index, (statement, _) in enumerate(statements(root)) if matches_plan_hash(statement, str(plan_hash))]
 
 
 def _unreadable(what: str, exc: Exception, dmv: str | None = None) -> dict[str, Any]:

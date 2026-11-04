@@ -13,7 +13,7 @@ class FakeExecutor:
     def __init__(self, results: list[dict] | None = None):
         self.results = results or []
 
-    async def fetch_all(self, database_name: str, query: str) -> list[dict]:
+    async def fetch_all(self, database_name: str, query: str, params: list | None = None) -> list[dict]:
         return self.results
 
 
@@ -228,3 +228,65 @@ async def test_sample_length_is_capped():
     await WaitStatsService(executor).get_wait_stats("testdb", sample_seconds=999, sleep=fake_sleep)
 
     assert slept == [30]
+
+
+def _wait_store_with_interval_ending(minutes_ago: int):
+    from datetime import UTC, datetime, timedelta
+
+    from tests.unit.test_query_regression import QueryStoreSqlite
+
+    store = QueryStoreSqlite()
+    store.add_query(1, {10: "Index Seek"})
+    now = datetime.now(UTC).replace(tzinfo=None, microsecond=0)
+    # Aligned 60-minute Query Store intervals: one closed minutes_ago, one open now.
+    store.add_interval(1, now - timedelta(minutes=60 + minutes_ago))
+    store.add_interval(2, now - timedelta(minutes=minutes_ago))
+    return store
+
+
+def _add_wait(store, interval_id: int, total_ms: float, avg_ms: float, category: str = "Lock") -> None:
+    store.insert(
+        "query_store_wait_stats",
+        plan_id=10,
+        runtime_stats_interval_id=interval_id,
+        execution_type=0,
+        wait_category_desc=category,
+        total_query_wait_time_ms=total_ms,
+        avg_query_wait_time_ms=avg_ms,
+        max_query_wait_time_ms=avg_ms,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("window_minutes", [60, 30])
+async def test_query_wait_stats_keeps_the_interval_that_covers_most_of_the_window(window_minutes):
+    # At 13:10 a blocking incident from 12:20 to 13:00 sits in interval
+    # [12:00, 13:00). A 60-minute window must include it; filtering on
+    # start_time dropped it and reported only the 10 ms of the open interval.
+    store = _wait_store_with_interval_ending(10)
+    _add_wait(store, 1, 3_000_000, 30_000)
+    _add_wait(store, 2, 10, 10)
+
+    result = await WaitStatsService(store).get_query_wait_stats("db", window_minutes, 20)
+
+    [row] = result["query_wait_stats"]
+    assert row["total_wait_time_ms"] == 3_000_010
+    query, params = store.calls[0]
+    assert "rsi.end_time >= DATEADD(MINUTE, -?, SYSUTCDATETIME())" in query
+    assert window_minutes in params
+    assert result["interval_coverage"]["start_utc"] == row["first_interval_start_utc"]
+    assert result["interval_coverage"]["end_utc"] == row["last_interval_end_utc"]
+
+
+@pytest.mark.asyncio
+async def test_query_wait_stats_average_is_per_execution():
+    # 1000 executions waited 1 ms each and 1 execution waited 1000 ms: the mean
+    # wait per execution is about 2 ms, not 500 ms (weighting by total time).
+    store = _wait_store_with_interval_ending(10)
+    _add_wait(store, 1, 1000, 1)
+    _add_wait(store, 2, 1000, 1000)
+
+    result = await WaitStatsService(store).get_query_wait_stats("db", 60, 20)
+
+    [row] = result["query_wait_stats"]
+    assert row["weighted_avg_wait_ms"] == pytest.approx(2000 / 1001)

@@ -67,6 +67,24 @@ _WEIGHTED_AVG_LOGICAL_READS = _weighted_runtime_average("avg_logical_io_reads")
 _WEIGHTED_AVG_PHYSICAL_READS = _weighted_runtime_average("avg_physical_io_reads")
 _WEIGHTED_AVG_MEMORY = _weighted_runtime_average("avg_query_max_used_memory")
 _WEIGHTED_AVG_ROWS = _weighted_runtime_average("avg_rowcount")
+# execution_type: 0 Regular, 3 Aborted (timeout or cancel), 4 Exception. The
+# avg_* columns above include failed runs; these show them, and the Regular-only
+# average is the one compare_query_plans and detect_parameter_sniffing use.
+_FAILED_EXECUTION_COLUMNS = """
+    SUM(CASE WHEN rs.execution_type = 3 THEN rs.count_executions ELSE 0 END) AS aborted_executions,
+    SUM(CASE WHEN rs.execution_type = 4 THEN rs.count_executions ELSE 0 END) AS exception_executions,
+"""
+_REGULAR_AVG_DURATION = (
+    "SUM(CASE WHEN rs.execution_type = 0 THEN rs.avg_duration * rs.count_executions END) "
+    "/ NULLIF(SUM(CASE WHEN rs.execution_type = 0 THEN rs.count_executions END), 0)"
+)
+_EXECUTION_OUTCOME_COLUMNS = (
+    f"{_FAILED_EXECUTION_COLUMNS}    {_REGULAR_AVG_DURATION} AS regular_avg_duration_us,\n"
+)
+# The query history rows report milliseconds.
+_HISTORY_OUTCOME_COLUMNS = (
+    f"{_FAILED_EXECUTION_COLUMNS}    {_REGULAR_AVG_DURATION} / 1000.0 AS regular_avg_duration_ms,\n"
+)
 
 
 _RELATIVE_WINDOW_PREDICATE = "rsi.end_time >= DATEADD(MINUTE, -?, SYSUTCDATETIME())"
@@ -115,6 +133,9 @@ LEFT JOIN
     WHERE intervals.end_time >= DATEADD(MINUTE, -?, SYSUTCDATETIME())
 ) AS rs
     ON rs.plan_id = p.plan_id
+-- Index maintenance (ALTER INDEX REBUILD, UPDATE STATISTICS) runs as internal
+-- queries whose plans scan the index; that is not use of the index.
+WHERE q.is_internal_query = 0
 GROUP BY
     q.query_id,
     p.plan_id,
@@ -785,6 +806,7 @@ class QueryStoreService:
             SUM(rs.count_executions) AS executions,
             SUM(rs.avg_duration * rs.count_executions) / 1000.0 AS total_duration_ms,
             {_WEIGHTED_AVG_DURATION} / 1000.0 AS avg_duration_ms,
+            {_HISTORY_OUTCOME_COLUMNS}
             SUM(rs.avg_cpu_time * rs.count_executions) / 1000.0 AS total_cpu_ms,
             {_WEIGHTED_AVG_CPU} / 1000.0 AS avg_cpu_ms,
             SUM(rs.avg_logical_io_reads * rs.count_executions) AS total_logical_io_reads,
@@ -860,6 +882,7 @@ class QueryStoreService:
             SUM(rs.count_executions) AS executions,
             SUM(rs.avg_duration * rs.count_executions) / 1000.0 AS total_duration_ms,
             {_WEIGHTED_AVG_DURATION} / 1000.0 AS avg_duration_ms,
+            {_HISTORY_OUTCOME_COLUMNS}
             SUM(rs.avg_cpu_time * rs.count_executions) / 1000.0 AS total_cpu_ms,
             {_WEIGHTED_AVG_CPU} / 1000.0 AS avg_cpu_ms,
             SUM(rs.avg_logical_io_reads * rs.count_executions) AS total_logical_io_reads,
@@ -927,6 +950,7 @@ class QueryStoreService:
             SUM(rs.count_executions) AS executions,
             SUM(rs.avg_duration * rs.count_executions) / 1000.0 AS total_duration_ms,
             {_WEIGHTED_AVG_DURATION} / 1000.0 AS avg_duration_ms,
+            {_HISTORY_OUTCOME_COLUMNS}
             SUM(rs.avg_cpu_time * rs.count_executions) / 1000.0 AS total_cpu_ms,
             {_WEIGHTED_AVG_CPU} / 1000.0 AS avg_cpu_ms,
             SUM(rs.avg_logical_io_reads * rs.count_executions) AS total_logical_io_reads,
@@ -1808,6 +1832,7 @@ class QueryStoreService:
                     SUM(rs.count_executions) AS executions,
                     SUM(rs.avg_duration * rs.count_executions) AS total_duration_us,
                     {_WEIGHTED_AVG_DURATION} AS avg_duration_us,
+                    {_EXECUTION_OUTCOME_COLUMNS}
                     SUM(rs.avg_cpu_time * rs.count_executions) AS total_cpu_us,
                     SUM(rs.avg_logical_io_reads * rs.count_executions) AS total_logical_io_reads,
                     SUM(rs.avg_physical_io_reads * rs.count_executions) AS total_physical_io_reads,
@@ -1878,6 +1903,7 @@ class QueryStoreService:
             SUM(rs.count_executions) AS executions,
             SUM(rs.avg_duration * rs.count_executions) AS total_duration_us,
             {_WEIGHTED_AVG_DURATION} AS avg_duration_us,
+            {_EXECUTION_OUTCOME_COLUMNS}
             SUM(rs.avg_cpu_time * rs.count_executions) AS total_cpu_us,
             SUM(rs.avg_logical_io_reads * rs.count_executions) AS total_logical_io_reads,
             SUM(rs.avg_physical_io_reads * rs.count_executions) AS total_physical_io_reads,

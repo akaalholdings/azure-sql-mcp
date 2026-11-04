@@ -71,8 +71,15 @@ REPEATED_OBJECT_NOTE = (
 
 
 def build_plan_digest(
-    plan_xml: str, *, top_n: int = TOP_OPERATORS, tree_budget: int = TREE_BUDGET
+    plan_xml: str,
+    *,
+    top_n: int = TOP_OPERATORS,
+    tree_budget: int = TREE_BUDGET,
+    pin_plan_hash: str | None = None,
 ) -> dict[str, Any]:
+    """``pin_plan_hash`` names the requested statement in a batch plan (a last actual plan is the
+    whole cached batch): every statement with that QueryPlanHash is kept past the statement cut."""
+
     try:
         root = parse_showplan(plan_xml)
         parsed = [(statement, query_plan, build_tree(query_plan)) for statement, query_plan in statements(root)]
@@ -81,15 +88,27 @@ def build_plan_digest(
     nodes = [node for _, _, statement_nodes in parsed for node in statement_nodes]
     row_counts = any(node.has_runtime for node in nodes)
     operator_times = any(node.has_timing for node in nodes)
+    pinned = (
+        [index for index, (statement, _, _) in enumerate(parsed) if matches_plan_hash(statement, pin_plan_hash)]
+        if pin_plan_hash
+        else []
+    )
     ranked = sorted(
         enumerate(parsed),
-        key=lambda item: -(
-            (statement_elapsed_ms(item[1][1], item[1][2]) or 0.0)
-            if operator_times
-            else _number(item[1][0].get("StatementSubTreeCost"))
+        key=lambda item: (
+            item[0] not in pinned,
+            -(
+                (statement_elapsed_ms(item[1][1], item[1][2]) or 0.0)
+                if operator_times
+                else _number(item[1][0].get("StatementSubTreeCost"))
+            ),
         ),
-    )[:MAX_STATEMENTS]
-    return {
+    )[: max(MAX_STATEMENTS, len(pinned))]
+    kept = [
+        _statement_digest(index, statement, query_plan, statement_nodes, top_n, tree_budget)
+        for index, (statement, query_plan, statement_nodes) in sorted(ranked)
+    ]
+    digest: dict[str, Any] = {
         "contract": DIGEST_CONTRACT,
         "parse_error": None,
         "plan_kind": "actual" if row_counts else "estimated",
@@ -105,13 +124,27 @@ def build_plan_digest(
         "ranking_basis": "self_elapsed_ms" if operator_times else "estimated_self_cost",
         "what_this_plan_can_show": _can_show(row_counts, operator_times),
         "statement_count": len(parsed),
-        "statements": [
-            _statement_digest(index, statement, query_plan, statement_nodes, top_n, tree_budget)
-            for index, (statement, query_plan, statement_nodes) in sorted(ranked)
-        ],
-        "statements_truncated": len(parsed) > MAX_STATEMENTS,
+        "statements": kept,
+        "statements_truncated": len(parsed) > len(kept),
         "untrusted_text": UNTRUSTED_TEXT,
     }
+    if pin_plan_hash:
+        for entry in kept:
+            entry["is_requested_statement"] = entry["statement_index"] in pinned
+        digest["requested_plan_hash"] = pin_plan_hash
+        digest["requested_statement_indexes"] = pinned
+        if not pinned:
+            digest["requested_statement_note"] = (
+                "The requested query_plan_hash was not found in this plan; the digest shows the top "
+                "statements of the whole batch."
+            )
+    return digest
+
+
+def matches_plan_hash(statement: ET.Element, plan_hash: str) -> bool:
+    """Case-insensitive: CONVERT(varchar(18), hash, 1) and the showplan attribute can differ in case."""
+
+    return (statement.get("QueryPlanHash") or "").strip().lower() == plan_hash.strip().lower()
 
 
 def describe_plan_node(
@@ -192,6 +225,11 @@ def _statement_digest(
             ),
         }
     )
+    if timed and not entry["top_operators"]:
+        entry["top_operators_note"] = (
+            "Every operator ran in under 1 ms of self time on this run, so none is "
+            "ranked. For a frequent statement, judge it by its Query Store totals."
+        )
     if entry.get("local_variables"):
         entry["local_variables_note"] = LOCAL_VARIABLE_NOTE
     repeated = _repeated_objects(nodes, timed)

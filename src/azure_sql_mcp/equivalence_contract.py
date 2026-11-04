@@ -244,6 +244,185 @@ def has_outer_literal_top_zero(sql: str) -> bool:
     )
 
 
+OrderKeys = tuple[tuple[str, bool], ...]
+
+
+def outer_order_by_keys(sql: str) -> tuple[OrderKeys | None, ...]:
+    """Return the outer ORDER BY keys of each result-returning statement.
+
+    Each entry is ``None`` when that statement has no outer ORDER BY. An
+    ORDER BY inside a derived table, CTE, TOP, or window does not count:
+    only the outermost one promises an order to the caller.
+    """
+
+    try:
+        statements = [statement for statement in parse(sql, read="tsql") if statement]
+    except ParseError as exc:
+        raise ValueError("SQL could not be parsed for equivalence preflight.") from exc
+    orders: list[OrderKeys | None] = []
+    for statement in statements:
+        if not isinstance(statement, exp.Query) or statement.args.get("into"):
+            continue
+        order = statement.args.get("order")
+        last_member = statement
+        while order is None and isinstance(last_member, exp.SetOperation):
+            # sqlglot attaches a T-SQL UNION's trailing ORDER BY to the last
+            # member; T-SQL applies it to the whole result.
+            last_member = last_member.expression
+            order = last_member.args.get("order")
+        if not isinstance(order, exp.Order) or not order.expressions:
+            orders.append(None)
+            continue
+        scope = last_member if isinstance(last_member, exp.Select) and last_member is statement else None
+        orders.append(
+            tuple(_order_key(ordered, scope) for ordered in order.expressions)
+        )
+    return tuple(orders)
+
+
+def resolve_compare_order(sql: str) -> bool:
+    """Return whether result order is contractual for this SQL."""
+
+    try:
+        return any(keys is not None for keys in outer_order_by_keys(sql))
+    except ValueError:
+        # Unparseable SQL keeps the stricter comparison; an order-only
+        # difference is reported as unproven, never as a result difference.
+        return True
+
+
+def effective_compare_order(sql: str, requested: bool | None) -> bool:
+    """Resolve ``compare_order``; an outer ORDER BY cannot be waived."""
+
+    if resolve_compare_order(sql):
+        return True
+    return bool(requested)
+
+
+def order_contract_risk(
+    baseline_sql: str,
+    candidate_sql: str,
+) -> dict[str, Any] | None:
+    """Return a blocking risk when the candidate weakens the baseline order.
+
+    A sandbox run can return key order by accident, so result comparison
+    cannot detect a dropped or changed outer ORDER BY. The candidate must keep
+    the baseline keys, in order and direction, as a prefix of its own keys.
+    """
+
+    candidate_orders = outer_order_by_keys(candidate_sql)
+    for ordinal, baseline_keys in enumerate(
+        outer_order_by_keys(baseline_sql),
+        start=1,
+    ):
+        if baseline_keys is None:
+            continue
+        candidate_keys = (
+            candidate_orders[ordinal - 1]
+            if ordinal <= len(candidate_orders)
+            else None
+        )
+        if candidate_keys is None:
+            reason = "candidate removes the baseline outer ORDER BY"
+        elif candidate_keys[: len(baseline_keys)] != baseline_keys:
+            reason = "candidate outer ORDER BY does not start with the baseline keys"
+        else:
+            continue
+        return {
+            "risk": "order_contract_changed",
+            "source": "baseline_vs_candidate",
+            "result_set_ordinal": ordinal,
+            "reason": reason,
+            "proof_requirement": (
+                "keep the baseline outer ORDER BY keys and directions as a "
+                "prefix of the candidate outer ORDER BY"
+            ),
+        }
+    return None
+
+
+def _order_sources(select: exp.Select) -> dict[str, str] | None:
+    """Map each FROM/JOIN source name or alias to the table it names."""
+
+    sources: dict[str, str] = {}
+    from_clause = select.args.get("from") or select.args.get("from_")
+    items = [from_clause.this] if from_clause is not None else []
+    items += [join.this for join in select.args.get("joins") or []]
+    for item in items:
+        if isinstance(item, exp.Table):
+            target = ".".join(
+                part.casefold() for part in (item.catalog, item.db, item.name) if part
+            )
+            sources[(item.alias_or_name or item.name).casefold()] = target
+            sources.setdefault(target, target)
+        elif item is not None and item.alias_or_name:
+            # Derived table or other source: its alias is its identity.
+            sources[item.alias_or_name.casefold()] = item.alias_or_name.casefold()
+        else:
+            return None
+    return sources
+
+
+def _resolve_order_expression(expression: exp.Expr, select: exp.Select) -> exp.Expr:
+    """Rewrite an ORDER BY key to the column it binds to, when that is certain.
+
+    T-SQL binds an ORDER BY ordinal to the select list, an unqualified name to a
+    select-list alias first, and a qualifier to its FROM source. Anything that
+    cannot be resolved for certain is returned unchanged, so the comparison
+    stays at least as strict as plain text.
+    """
+
+    projections = list(select.expressions)
+    if any(isinstance(item, exp.Star) or isinstance(item.this, exp.Star) for item in projections):
+        return expression
+    if isinstance(expression, exp.Literal) and expression.is_int:
+        position = int(expression.name)
+        if 1 <= position <= len(projections):
+            expression = projections[position - 1].unalias().copy()
+        else:
+            return expression
+    elif isinstance(expression, exp.Column) and not expression.table:
+        for item in projections:
+            if isinstance(item, exp.Alias) and item.alias.casefold() == expression.name.casefold():
+                expression = item.this.copy()
+                break
+    sources = _order_sources(select)
+    if not sources:
+        return expression
+    targets = set(sources.values())
+
+    def qualify(node: exp.Expr) -> exp.Expr:
+        if not isinstance(node, exp.Column) or isinstance(node.this, exp.Star):
+            return node
+        qualifier = ".".join(
+            part.casefold() for part in (node.catalog, node.db, node.table) if part
+        )
+        if qualifier:
+            target = sources.get(qualifier) or sources.get(node.table.casefold())
+        else:
+            target = next(iter(targets)) if len(targets) == 1 else None
+        if target is None:
+            return node
+        # One opaque identifier: the resolved source is compared, not re-parsed.
+        return exp.Column(this=exp.to_identifier(node.name), table=exp.to_identifier(target))
+
+    return expression.transform(qualify)
+
+
+def _order_key(ordered: exp.Expr, select: exp.Select | None = None) -> tuple[str, bool]:
+    expression = ordered.this.copy() if isinstance(ordered, exp.Ordered) else ordered.copy()
+    if select is not None:
+        expression = _resolve_order_expression(expression, select)
+    # Identifier case and quoting do not change T-SQL name resolution.
+    for identifier in expression.find_all(exp.Identifier):
+        identifier.set("this", identifier.name.casefold())
+        identifier.set("quoted", False)
+    return (
+        expression.sql(dialect="tsql"),
+        bool(isinstance(ordered, exp.Ordered) and ordered.args.get("desc")),
+    )
+
+
 def _function_name(node: exp.Expr) -> str | None:
     if isinstance(node, exp.CurrentTimestampLTZ):
         return "SYSDATETIMEOFFSET"

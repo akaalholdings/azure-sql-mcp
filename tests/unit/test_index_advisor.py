@@ -67,6 +67,7 @@ def _index(
     pages: int = 128,
     protection: dict[str, Any] | None = None,
     filter_definition: str | None = None,
+    statistics_updated_utc: str | None = "2025-06-01T00:00:00",
 ) -> ExistingIndex:
     usage: dict[str, int | None] = {
         "user_seeks": reads,
@@ -114,6 +115,7 @@ def _index(
         partition_page_counts=((1, pages),),
         # Complete protection metadata unless a test states otherwise.
         protection_evidence=protection if protection is not None else {"coverage": "complete"},
+        statistics_updated_utc=statistics_updated_utc,
     )
 
 
@@ -1727,3 +1729,192 @@ def test_unresolved_index_hint_withholds_every_removal_ddl() -> None:
         assert rec["confidence"] == "low"
         assert rec["ddl"] is None and rec["rollback_ddl"] is None
         assert any(rec["index_name"] in step for step in rec["prerequisites"])
+
+
+def _unused_orders_report(index: ExistingIndex, **changes: Any) -> dict[str, Any]:
+    # Engine up 61 days and a 40-day Query Store window: only the index's own
+    # age can stop a high-confidence drop.
+    return build_index_advice(
+        replace(
+            _inputs(
+                [],
+                _orders_indexes() + [index],
+                references={("sales", "orders", _norm_name(index.name)): 0},
+                window_days=40,
+            ),
+            **changes,
+        )
+    )
+
+
+def _norm_name(name: str) -> str:
+    return name.casefold()
+
+
+@pytest.mark.parametrize("reads", [None, 0], ids=["no_usage_row", "writes_only"])
+def test_index_created_yesterday_is_never_a_drop(reads: int | None) -> None:
+    # Engine uptime is not index age. An index created yesterday (often one
+    # the agent itself proposed and benchmarked) has had no chance to be read,
+    # so it must never get drop DDL, with or without a usage-stats row.
+    index = _index(
+        "Sales", "Orders", "IX_CreatedYesterday", ("ExpectedDeliveryDate",),
+        index_id=7, reads=reads, updates=0 if reads is None else 500,
+        statistics_updated_utc="2026-09-30T00:00:00",
+    )
+    if reads is None:
+        index = replace(index, usage={key: None for key in index.usage})
+
+    report = _unused_orders_report(index)
+
+    assert _recs(report, "drop_index", "Orders") == []
+    if reads == 0:
+        [review] = [
+            rec for rec in _recs(report, "review_index", "Orders")
+            if rec["index_name"] == "IX_CreatedYesterday"
+        ]
+        assert review["reason_codes"] == ["index_younger_than_removal_window"]
+        assert review["ddl"] is None
+
+
+def test_index_younger_than_the_removal_window_caps_drop_at_medium() -> None:
+    index = _index(
+        "Sales", "Orders", "IX_Recent", ("ExpectedDeliveryDate",), index_id=7,
+        reads=0, updates=500, statistics_updated_utc="2026-09-11T00:00:00",
+    )
+
+    [rec] = _recs(_unused_orders_report(index), "drop_index", "Orders")
+
+    assert rec["confidence"] == "medium"
+    assert rec["ddl"] is not None
+
+
+def test_unknown_index_age_caps_drop_at_medium() -> None:
+    index = _index(
+        "Sales", "Orders", "IX_NoStats", ("ExpectedDeliveryDate",), index_id=7,
+        reads=0, updates=500, statistics_updated_utc=None,
+    )
+
+    [rec] = _recs(_unused_orders_report(index), "drop_index", "Orders")
+
+    assert rec["confidence"] == "medium"
+    assert "index_age_unknown" in rec["blockers"]
+
+
+def test_old_unused_index_keeps_a_high_confidence_drop() -> None:
+    index = _index(
+        "Sales", "Orders", "IX_Old", ("ExpectedDeliveryDate",), index_id=7,
+        reads=0, updates=500,
+    )
+
+    [rec] = _recs(_unused_orders_report(index), "drop_index", "Orders")
+
+    assert rec["confidence"] == "high"
+    assert rec["blockers"] == []
+
+
+@pytest.mark.parametrize(
+    ("readable_replicas", "blocker"),
+    [
+        ("possible", "readable_replica_usage_unobserved"),
+        ("unknown", "readable_replica_check_unavailable"),
+    ],
+)
+def test_readable_replica_caps_unused_drop_confidence(
+    readable_replicas: str, blocker: str
+) -> None:
+    # Usage counters and Query Store see only the primary; reports on a
+    # read scale-out, Hyperscale or geo replica read this index unseen.
+    index = _index(
+        "Sales", "Orders", "IX_ReportOnly", ("ExpectedDeliveryDate",), index_id=7,
+        reads=0, updates=500,
+    )
+
+    [rec] = _recs(
+        _unused_orders_report(index, readable_replicas=readable_replicas),
+        "drop_index",
+        "Orders",
+    )
+
+    assert rec["confidence"] == "medium"
+    assert blocker in rec["blockers"]
+    assert any("ApplicationIntent=ReadOnly" in risk for risk in rec["risks"])
+
+
+def test_no_readable_replica_keeps_a_high_confidence_drop() -> None:
+    index = _index(
+        "Sales", "Orders", "IX_Unused", ("ExpectedDeliveryDate",), index_id=7,
+        reads=0, updates=500,
+    )
+
+    [rec] = _recs(
+        _unused_orders_report(index, readable_replicas="none"), "drop_index", "Orders"
+    )
+
+    assert rec["confidence"] == "high"
+
+
+def _range_seek_query(query_id: int, *, lookup: bool) -> WorkloadQuery:
+    from azure_sql_mcp.showplan_access import PlanAccessSummary
+    from azure_sql_mcp.showplan_access import StatementAccess
+    from azure_sql_mcp.showplan_access import TableAccess
+
+    # OrderDate is a seek predicate on IX_Orders_OrderDate; a seek predicate
+    # column need not be in the OutputList, as in real showplans.
+    seek = TableAccess(
+        node_id=1, physical_op="Index Seek", logical_op="Index Seek",
+        schema="Sales", table="Orders", alias=None,
+        index_name="IX_Orders_OrderDate", index_kind="nonclustered", storage="rowstore",
+        operation="seek", seek_range_columns=("OrderDate",),
+        residual={} if lookup else {"ExpectedDeliveryDate": "range"},
+        output_columns=("OrderID",) if lookup else ("OrderID", "CustomerID"),
+        estimated_rows=500.0, cost_share=0.5 if lookup else 1.0, own_cost=1.0,
+    )
+    accesses = [seek]
+    if lookup:
+        accesses.append(
+            TableAccess(
+                node_id=2, physical_op="Clustered Index Seek", logical_op="Clustered Index Seek",
+                schema="Sales", table="Orders", alias=None,
+                index_name="PK_Sales_Orders", index_kind="clustered", storage="rowstore",
+                operation="lookup", residual={"ExpectedDeliveryDate": "range"},
+                output_columns=("CustomerID",), estimated_rows=500.0, estimated_executions=500.0,
+                cost_share=0.5, own_cost=1.0, paired_index="IX_Orders_OrderDate", paired_node_id=1,
+            )
+        )
+    plan = PlanAccessSummary(statements=[StatementAccess("SELECT", 1.0, None, None, accesses=accesses)])
+    return WorkloadQuery(
+        query_id=query_id, plan_id=query_id * 10, plan=plan, executions=1000,
+        total_cpu_us=9e6, total_duration_us=1e7, total_logical_reads=1e6, active_days=5,
+    )
+
+
+@pytest.mark.parametrize("lookup", [False, True], ids=["seek_residual", "seek_plus_lookup"])
+def test_every_range_predicate_column_stays_in_the_designed_index(lookup: bool) -> None:
+    # Only one range column can be the trailing key. A second range column
+    # (here OrderDate, which lost the selectivity tie) must still be in the
+    # index, or the index cannot evaluate that predicate without a lookup.
+    existing = _orders_indexes() + [
+        _index("Sales", "Orders", "IX_Orders_OrderDate", ("OrderDate",), index_id=3, reads=900),
+    ]
+    selectivity = {
+        ("sales", "orders", "orderdate"): ColumnSelectivity(distinct_estimate=1_400, rows=73_595),
+        ("sales", "orders", "expecteddeliverydate"): ColumnSelectivity(distinct_estimate=1_500, rows=73_595),
+    }
+
+    report = build_index_advice(
+        _inputs(
+            [_range_seek_query(1, lookup=lookup), _range_seek_query(2, lookup=lookup)],
+            existing,
+            selectivity=selectivity,
+        )
+    )
+
+    designed = [
+        rec
+        for rec in report["recommendations"]
+        if rec["action"] in {"create_index", "widen_index", "extend_index"}
+    ]
+    assert designed
+    for rec in designed:
+        columns = {column["name"] for column in rec["key_columns"]} | set(rec["include_columns"])
+        assert {"OrderDate", "ExpectedDeliveryDate", "CustomerID"} <= columns

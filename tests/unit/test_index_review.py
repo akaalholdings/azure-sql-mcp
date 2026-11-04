@@ -29,12 +29,15 @@ from azure_sql_mcp.index_review import MAX_CAPTURE_ROWS
 from azure_sql_mcp.index_review import MIN_OBSERVATION_DAYS
 from azure_sql_mcp.index_review import _column_names
 from azure_sql_mcp.index_review import _redacted_index
+from azure_sql_mcp.index_review import _reference_is_read
+from azure_sql_mcp.index_review import classify_index_subject
 from azure_sql_mcp.index_review import daily_idempotency_key
 from azure_sql_mcp.index_review import idempotency_key_hash
 from azure_sql_mcp.index_review import parse_review_id
 from azure_sql_mcp.index_review import render_index_review_artifacts
 from azure_sql_mcp.index_review import review_index_portfolio
 from azure_sql_mcp.index_review import validate_contract_probe
+from azure_sql_mcp.plans import parse_showplan_index_evidence
 
 
 def _reversible(
@@ -151,6 +154,7 @@ def _index(
             "dependency": "complete",
             "protection": "complete",
             "usage": "covered",
+            "readable_replicas": "none",
             "malformed": [],
         },
         "size_pages": 20,
@@ -528,6 +532,92 @@ def test_contract_probe_preserves_logical_grouping() -> None:
         "(EngineStartTimeUtc IS NULL OR EngineFingerprint IS NOT NULL) AND "
         "EngineIdentity IS NOT NULL AND EngineStartTimeUtc IS NOT NULL"
     )
+    with pytest.raises(Exception):
+        validate_contract_probe(probe)
+
+
+# sys.check_constraints.definition / sys.default_constraints.definition as Azure SQL
+# Database (compat 170) stores them after a fresh run of
+# sql/Install-IndexReviewHistory-v1.sql, read live on 2026-11-04. The engine rewrites
+# `x NOT LIKE` to `NOT [x] like`, an IN list to a reversed OR chain, drops the
+# parentheses that AND precedence makes redundant, and lowercases built-ins.
+ENGINE_STORED_DEFINITIONS = {
+    "DF_IndexReviewRun_CreatedAtUtc": "(sysutcdatetime())",
+    "CK_IndexReviewRun_ContractVersion": "([ContractVersion]='2.3.0')",
+    "CK_IndexReviewRun_SchemaVersion": "([SchemaVersion]='index-history-v1')",
+    "CK_IndexReviewRun_DatabaseFingerprint": "(NOT [DatabaseFingerprint] like '%[^0-9a-fA-F]%' AND len([DatabaseFingerprint])=(64))",
+    "CK_IndexReviewRun_DatabaseIncarnationFingerprint": "([DatabaseIncarnationFingerprint] IS NULL OR NOT [DatabaseIncarnationFingerprint] like '%[^0-9a-fA-F]%' AND len([DatabaseIncarnationFingerprint])=(64))",
+    "CK_IndexReviewRun_EngineFingerprint": "([EngineFingerprint] IS NULL OR NOT [EngineFingerprint] like '%[^0-9a-fA-F]%' AND len([EngineFingerprint])=(64))",
+    "CK_IndexReviewRun_IdempotencyKeyHash": "(NOT [IdempotencyKeyHash] like '%[^0-9a-fA-F]%' AND len([IdempotencyKeyHash])=(64))",
+    "CK_IndexReviewRun_RequestFingerprint": "(NOT [RequestFingerprint] like '%[^0-9a-fA-F]%' AND len([RequestFingerprint])=(64))",
+    "CK_IndexReviewRun_CounterEpochFingerprint": "([CounterEpochFingerprint] IS NULL OR NOT [CounterEpochFingerprint] like '%[^0-9a-fA-F]%' AND len([CounterEpochFingerprint])=(64))",
+    "CK_IndexReviewRun_InventoryFingerprint": "(NOT [InventoryFingerprint] like '%[^0-9a-fA-F]%' AND len([InventoryFingerprint])=(64))",
+    "CK_IndexReviewRun_QueryStoreFingerprint": "(NOT [QueryStoreFingerprint] like '%[^0-9a-fA-F]%' AND len([QueryStoreFingerprint])=(64))",
+    "CK_IndexReviewRun_CoverageJson": "(isjson([CoverageJson])=(1) AND json_query([CoverageJson]) IS NOT NULL)",
+    "CK_IndexReviewRun_SubjectCount": "([SubjectCount]>=(0))",
+    "CK_IndexReviewRun_SnapshotSetFingerprint": "(NOT [SnapshotSetFingerprint] like '%[^0-9a-fA-F]%' AND len([SnapshotSetFingerprint])=(64))",
+    "CK_IndexReviewRun_QueryStoreJson": "(isjson([QueryStoreJson])=(1) AND json_query([QueryStoreJson]) IS NOT NULL)",
+    "CK_IndexReviewRun_DatabaseIncarnationIdentity": "([DatabaseIncarnationFingerprint] IS NULL AND [DatabaseIncarnationIdentity] IS NULL OR [DatabaseIncarnationFingerprint] IS NOT NULL AND [DatabaseIncarnationIdentity] IS NOT NULL)",
+    "CK_IndexReviewRun_EngineEpochIdentity": "([EngineFingerprint] IS NULL AND [EngineIdentity] IS NULL AND [EngineStartTimeUtc] IS NULL OR [EngineFingerprint] IS NOT NULL AND [EngineIdentity] IS NOT NULL AND [EngineStartTimeUtc] IS NOT NULL)",
+    "CK_IndexReviewSnapshot_SubjectKind": "([SubjectKind]='missing_index' OR [SubjectKind]='existing_index')",
+    "CK_IndexReviewSnapshot_SubjectFingerprint": "(NOT [SubjectFingerprint] like '%[^0-9a-fA-F]%' AND len([SubjectFingerprint])=(64))",
+    "CK_IndexReviewSnapshot_DefinitionJson": "(isjson([DefinitionJson])=(1) AND json_query([DefinitionJson]) IS NOT NULL)",
+    "CK_IndexReviewSnapshot_DefinitionFingerprint": "(NOT [DefinitionFingerprint] like '%[^0-9a-fA-F]%' AND len([DefinitionFingerprint])=(64))",
+    "CK_IndexReviewSnapshot_CounterEpochFingerprint": "([CounterEpochFingerprint] IS NULL OR NOT [CounterEpochFingerprint] like '%[^0-9a-fA-F]%' AND len([CounterEpochFingerprint])=(64))",
+    "CK_IndexReviewSnapshot_CountersJson": "(isjson([CountersJson])=(1) AND json_query([CountersJson]) IS NOT NULL)",
+    "CK_IndexReviewSnapshot_SizePages": "([SizePages] IS NULL OR [SizePages]>=(0))",
+    "CK_IndexReviewSnapshot_SizeBytes": "([SizeBytes] IS NULL OR [SizeBytes]>=(0))",
+    "CK_IndexReviewSnapshot_WriteBurden": "([WriteBurden] IS NULL OR [WriteBurden]>=(0))",
+    "CK_IndexReviewSnapshot_QueryStoreReferencesJson": "(isjson([QueryStoreReferencesJson])=(1) AND left(ltrim([QueryStoreReferencesJson]),(1))='[')",
+    "CK_IndexReviewSnapshot_ProtectionsJson": "(isjson([ProtectionsJson])=(1) AND json_query([ProtectionsJson]) IS NOT NULL)",
+    "CK_IndexReviewSnapshot_MissingSignatureJson": "([MissingSignatureJson] IS NULL OR isjson([MissingSignatureJson])=(1) AND json_query([MissingSignatureJson]) IS NOT NULL)",
+    "CK_IndexReviewSnapshot_AggregatesJson": "(isjson([AggregatesJson])=(1) AND json_query([AggregatesJson]) IS NOT NULL)",
+    "CK_IndexReviewSnapshot_CoverageJson": "(isjson([CoverageJson])=(1) AND json_query([CoverageJson]) IS NOT NULL)",
+    "CK_IndexReviewSnapshot_SubjectActionInvariants": "(([SubjectKind]='missing_index' OR [SubjectKind]='existing_index') AND ([SubjectKind]='existing_index' OR [MissingSignatureJson] IS NOT NULL))",
+}
+
+
+def _engine_stored_probe_rows() -> list[list[dict[str, object]]]:
+    probe = _probe_rows()
+    for row in probe[3]:
+        row["Definition"] = ENGINE_STORED_DEFINITIONS[str(row["ConstraintName"])]
+    return probe
+
+
+def test_contract_probe_accepts_a_fresh_install_as_azure_sql_stores_it() -> None:
+    # Before: a correct install with the repo script failed as "missing or drifted",
+    # so capture could never store a run on Azure SQL Database.
+    assert {row["ConstraintName"] for row in _probe_rows()[3]} == set(ENGINE_STORED_DEFINITIONS)
+
+    result = validate_contract_probe(_engine_stored_probe_rows())
+
+    assert result.schema_fingerprint == CONTRACT_SCHEMA_FINGERPRINT
+    assert result.allow_write is True
+
+
+@pytest.mark.parametrize(
+    ("constraint_name", "definition"),
+    [
+        (
+            "CK_IndexReviewRun_DatabaseFingerprint",
+            "(NOT [DatabaseFingerprint] like '%[^0-9a-fA-F]%' AND len([DatabaseFingerprint])=(63))",
+        ),
+        (
+            "CK_IndexReviewSnapshot_SubjectKind",
+            "([SubjectKind]='missing_index' OR [SubjectKind]='other_index')",
+        ),
+        (
+            "CK_IndexReviewRun_EngineEpochIdentity",
+            "([EngineFingerprint] IS NULL AND ([EngineIdentity] IS NULL AND [EngineStartTimeUtc] IS NULL OR [EngineFingerprint] IS NOT NULL) AND [EngineIdentity] IS NOT NULL AND [EngineStartTimeUtc] IS NOT NULL)",
+        ),
+    ],
+)
+def test_contract_probe_still_rejects_drift_in_the_engine_stored_form(
+    constraint_name: str, definition: str
+) -> None:
+    probe = _engine_stored_probe_rows()
+    row = next(row for row in probe[3] if row["ConstraintName"] == constraint_name)
+    row["Definition"] = definition
     with pytest.raises(Exception):
         validate_contract_probe(probe)
 
@@ -1134,6 +1224,108 @@ def test_executed_query_store_reference_counts_only_inside_the_window() -> None:
 
     before_window = review_index_portfolio("appdb", history(10)).subjects[0]
     assert before_window["state"] == "drop_candidate"
+
+
+def _referenced_history(
+    operator_kinds: list[str], *, is_forced_plan: bool = False
+) -> list[IndexReviewSnapshotV1]:
+    snapshots = []
+    for day in range(40):
+        index = _index(reads=0)
+        index["query_store_references"] = [
+            {
+                "query_id": 7,
+                "plan_id": 70,
+                "execution_count": 30,
+                "operator_kind": operator_kinds[0] if len(operator_kinds) == 1 else "Multiple",
+                "operator_kinds": operator_kinds,
+                "is_forced_plan": is_forced_plan,
+                "last_seen": _utc(_BASE_TIME + timedelta(days=39)),
+            }
+        ]
+        snapshots.append(_snapshot(day, index=index))
+    return snapshots
+
+
+@pytest.mark.parametrize(
+    "operator_kinds",
+    [
+        ["Index Insert", "Insert"],
+        ["Clustered Index Insert", "Insert"],
+        ["Clustered Index Update", "Update"],
+        ["Clustered Index Delete", "Delete"],
+        ["Table Insert", "Insert"],
+    ],
+)
+def test_write_maintenance_reference_does_not_keep_unread_index(
+    operator_kinds: list[str],
+) -> None:
+    # Every INSERT/UPDATE/DELETE plan on the table lists each NC index it
+    # maintains. That is write burden, not use: counting it as use keeps the
+    # write-only, never-read index the review exists to find.
+    snapshots = _referenced_history(operator_kinds)
+
+    subject = review_index_portfolio("appdb", snapshots).subjects[0]
+    assert subject["state"] == "drop_candidate"
+    assert subject["removal_gate"]["historical_reference"] is False
+    assert subject["removal_gate"]["gates"]["no_stored_plan_without_execution"] is True
+    assert classify_index_subject(snapshots[-1].subjects[0], snapshots)["state"] == "drop_candidate"
+
+
+@pytest.mark.parametrize(
+    "operator_kinds", [["Clustered Index Insert", "Insert"], ["Clustered Index Update", "Update"]]
+)
+def test_forced_plan_that_only_maintains_the_index_keeps_it(operator_kinds: list[str]) -> None:
+    # Live Azure: after DROP INDEX, a forced INSERT plan whose Object list held
+    # the index stopped applying with no force failure recorded. The forcing
+    # someone set to fix a regression is lost silently, so it stays use.
+    snapshots = _referenced_history(operator_kinds, is_forced_plan=True)
+
+    subject = review_index_portfolio("appdb", snapshots).subjects[0]
+    assert subject["state"] == "keep"
+    assert subject["removal_gate"]["historical_reference"] is True
+    assert classify_index_subject(snapshots[-1].subjects[0], snapshots)["state"] == "keep"
+
+
+def test_parsed_narrow_update_plan_reads_only_the_seeked_index() -> None:
+    # Azure-shaped narrow UPDATE ... WHERE plan: an Index Seek on IX_Y finds
+    # the rows, and the Clustered Index Update maintains PK and IX_X.
+    obj = 'Database="[appdb]" Schema="[dbo]" Table="[Orders]"'
+    plan = (
+        '<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">'
+        "<BatchSequence><Batch><Statements>"
+        '<StmtSimple StatementType="UPDATE"><QueryPlan>'
+        '<RelOp NodeId="0" PhysicalOp="Clustered Index Update" LogicalOp="Update">'
+        f'<Update><Object {obj} Index="[PK_Orders]" IndexKind="Clustered"/>'
+        f'<Object {obj} Index="[IX_X]" IndexKind="NonClustered"/>'
+        '<RelOp NodeId="1" PhysicalOp="Index Seek" LogicalOp="Index Seek">'
+        f'<IndexScan><Object {obj} Index="[IX_Y]" IndexKind="NonClustered"/>'
+        "</IndexScan></RelOp></Update></RelOp>"
+        "</QueryPlan></StmtSimple></Statements></Batch></BatchSequence></ShowPlanXML>"
+    )
+
+    parsed = parse_showplan_index_evidence(plan, query_id=1, plan_id=1, execution_count=5)
+    reads = {
+        reference["index_name"]: _reference_is_read(reference)
+        for reference in parsed["index_references"]
+    }
+
+    assert reads == {"PK_Orders": False, "IX_X": False, "IX_Y": True}
+
+
+@pytest.mark.parametrize(
+    "operator_kinds",
+    [["Index Seek"], ["Index Scan"], ["Index Seek", "Clustered Index Update", "Update"], ["Unknown"]],
+)
+def test_read_reference_keeps_index(operator_kinds: list[str]) -> None:
+    # A seek or scan of the index is use, also inside a write plan; an
+    # unknown operator stays conservative.
+    snapshots = _referenced_history(operator_kinds)
+
+    subject = review_index_portfolio("appdb", snapshots).subjects[0]
+    assert subject["state"] == "keep"
+    assert subject["removal_gate"]["historical_reference"] is True
+    assert classify_index_subject(snapshots[-1].subjects[0], snapshots)["state"] == "keep"
 
 
 def test_epoch_counter_definition_protection_and_special_type_gates() -> None:
@@ -1815,3 +2007,100 @@ def test_index_review_remote_surface_is_exactly_the_base_tools(monkeypatch) -> N
         "get_top_queries",
         "get_query_store_trend",
     }
+
+
+def _replica_history(readable_replicas: object) -> list[IndexReviewSnapshotV1]:
+    snapshots = _history(40)
+    for snapshot in snapshots:
+        coverage = snapshot.subjects[0]["coverage"]
+        if readable_replicas is None:
+            coverage.pop("readable_replicas", None)
+        else:
+            coverage["readable_replicas"] = readable_replicas
+    return snapshots
+
+
+@pytest.mark.parametrize("readable_replicas", ["possible", "unknown", None])
+def test_unused_index_is_not_drop_candidate_when_replica_reads_are_unseen(
+    readable_replicas: object,
+) -> None:
+    # Usage counters and Query Store see only the primary. On Premium,
+    # Business Critical, Hyperscale or with a geo secondary, reports that
+    # connect with ApplicationIntent=ReadOnly read on another replica, so 35
+    # days of zero primary reads do not prove the index is unused there.
+    subject = review_index_portfolio(
+        "appdb", _replica_history(readable_replicas)
+    ).subjects[0]
+
+    assert subject["removal_gate"]["passed"] is True
+    assert subject["state"] == "observe"
+    assert subject["reason_codes"] == ["readable_replica_usage_unobserved"]
+    assert subject["removal_gate"]["readable_replica_usage_observed"] is False
+
+
+def test_unused_index_on_tier_without_readable_replicas_stays_drop_candidate() -> None:
+    subject = review_index_portfolio("appdb", _replica_history("none")).subjects[0]
+
+    assert subject["state"] == "drop_candidate"
+    assert subject["removal_gate"]["readable_replica_usage_observed"] is True
+
+
+def test_readable_replica_gap_does_not_block_exact_duplicate_consolidation() -> None:
+    # A replica read served by a duplicate is served equally by the survivor.
+    snapshots = []
+    for day in range(40):
+        subjects = []
+        for name in ("IX_A", "IX_B"):
+            index = _index(name=name)
+            index["coverage"]["readable_replicas"] = "possible"
+            subjects.append(index)
+        snapshots.append(_snapshot(day, subjects=tuple(subjects)))
+
+    states = {
+        item["index_name"]: item["state"]
+        for item in review_index_portfolio("appdb", snapshots).subjects
+    }
+
+    assert states == {"IX_A": "keep", "IX_B": "consolidate_candidate"}
+
+
+@pytest.mark.parametrize(
+    ("edition", "geo_links", "expected"),
+    [
+        ("BusinessCritical", 0, "possible"),
+        ("Premium", 0, "possible"),
+        ("Hyperscale", 0, "possible"),
+        ("GeneralPurpose", 1, "possible"),
+        ("GeneralPurpose", 0, "none"),
+        ("Standard", None, "unknown"),
+        (None, 0, "unknown"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_capture_records_whether_readable_replicas_are_possible(
+    edition: object, geo_links: object, expected: str
+) -> None:
+    from azure_sql_mcp.index_metadata import GEO_REPLICATION_LINK_COUNT_SQL
+    from azure_sql_mcp.index_metadata import READABLE_REPLICA_EDITION_SQL
+    from azure_sql_mcp.index_metadata import collect_readable_replica_status
+
+    class Executor:
+        async def fetch_all(self, database_name, sql, params=None, **kwargs):
+            if sql == READABLE_REPLICA_EDITION_SQL:
+                return [{"edition": edition}]
+            if sql == GEO_REPLICATION_LINK_COUNT_SQL:
+                if geo_links is None:
+                    raise PermissionError("VIEW DATABASE STATE denied")
+                return [{"geo_replication_link_count": geo_links}]
+            raise AssertionError(sql)
+
+    status = await collect_readable_replica_status(Executor(), "appdb", site="test")  # type: ignore[arg-type]
+    subject = _redacted_index(
+        _captured_index(),
+        hint_coverage={"status": "complete"},
+        query_store_coverage={"status": "complete"},
+        readable_replicas=status,
+    )
+
+    assert status == expected
+    assert subject["coverage"]["readable_replicas"] == expected

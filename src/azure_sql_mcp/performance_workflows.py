@@ -24,7 +24,9 @@ from .connection import QueryResult
 from .connection import StatementDispatchPrevented
 from .database_policy import DatabasePolicySet
 from .equivalence_contract import analyze_equivalence_preflight
+from .equivalence_contract import effective_compare_order
 from .equivalence_contract import has_outer_literal_top_zero
+from .equivalence_contract import order_contract_risk
 from .incident_log import note_exception
 from .observability import extract_failure_diagnostic
 from .performance_contracts import (
@@ -487,12 +489,23 @@ def compare_result_sets(
     )
     baseline_canonical = [_canonical_row(row) for row in baseline_rows]
     candidate_canonical = [_canonical_row(row) for row in candidate_rows]
+    multiset_match = Counter(baseline_canonical) == Counter(candidate_canonical)
     if compare_order:
         rows_match = baseline_canonical == candidate_canonical
     else:
-        rows_match = Counter(baseline_canonical) == Counter(candidate_canonical)
+        rows_match = multiset_match
     truncated = baseline_truncated or candidate_truncated
-    if not columns_match or not row_widths_match or not rows_match or types_match is False:
+    if (
+        not rows_match
+        and multiset_match
+        and columns_match
+        and row_widths_match
+        and types_match is not False
+    ):
+        status = "order_only_mismatch"
+        reason = "the same rows were returned in a different order"
+        proven = False
+    elif not columns_match or not row_widths_match or not rows_match or types_match is False:
         status = "mismatch"
         reason = "result shape, types, duplicates, values, or required order differ"
         proven = False
@@ -588,6 +601,9 @@ def compare_result_collections(
     if "mismatch" in statuses:
         status = "mismatch"
         reason = "at least one tabular result set differs"
+    elif "order_only_mismatch" in statuses:
+        status = "order_only_mismatch"
+        reason = "at least one tabular result set returned the same rows in a different order"
     elif statuses == {"match"}:
         status = "match"
         reason = "every tabular result set matches completely"
@@ -666,12 +682,59 @@ def profile_result_fingerprint(
         "status": "complete",
         "complete": True,
         "fingerprint": fingerprint_json(result_payloads),
+        "multiset_fingerprint": fingerprint_json(
+            [
+                {**payload, "rows": sorted(payload["rows"]), "order_compared": False}
+                for payload in result_payloads
+            ]
+        ),
         "result_set_count": len(results),
         "row_counts": [len(payload["rows"]) for payload in result_payloads],
         "row_count": sum(len(payload["rows"]) for payload in result_payloads),
         "order_compared": compare_order,
         "truncated": False,
     }
+
+
+def with_order_contract(
+    preflight: Mapping[str, Mapping[str, Any]],
+    baseline_sql: str,
+    candidate_sql: str,
+) -> dict[str, dict[str, Any]]:
+    """Add the pairwise outer ORDER BY risk to the candidate preflight."""
+
+    updated = {side: dict(item) for side, item in preflight.items()}
+    risk = order_contract_risk(baseline_sql, candidate_sql)
+    if risk is None:
+        return updated
+    candidate = updated["candidate"]
+    candidate["risk_codes"] = [*candidate.get("risk_codes", ()), risk["risk"]]
+    candidate["direct_snapshot_supported"] = False
+    candidate["classification"] = "proof_contract_required"
+    detail_key = "details" if "details" in candidate else "risks"
+    candidate[detail_key] = [*candidate.get(detail_key, ()), risk]
+    return updated
+
+
+def aba_result_status(
+    result_evidence: Sequence[Mapping[str, Any]],
+    *,
+    complete: bool,
+) -> str:
+    """Classify A-B-A result fingerprints for one parameter case.
+
+    A new index often changes the access order of rows. When only the order
+    changes, the result is unproven, but it is not a result difference.
+    """
+
+    if not complete:
+        return "inconclusive"
+    if len({item.get("fingerprint") for item in result_evidence}) == 1:
+        return "match"
+    multiset = {item.get("multiset_fingerprint") for item in result_evidence}
+    if len(multiset) == 1 and None not in multiset:
+        return "order_only_mismatch"
+    return "mismatch"
 
 
 def profile_payload(
@@ -908,6 +971,12 @@ def classify_benchmark(
             )
         if any(result.get("status") == "mismatch" for result in equivalence):
             return "equivalence_failed", "at least one parameter case returned different results"
+        if any(result.get("status") == "order_only_mismatch" for result in equivalence):
+            return (
+                "inconclusive",
+                "at least one parameter case returned the same rows in a "
+                "different order; order equivalence is not proven",
+            )
         if not equivalence or any(
             result.get("status") != "match" for result in equivalence
         ):
@@ -1892,15 +1961,20 @@ class PerformanceWorkflowService:
         baseline_sql: str,
         candidate_sql: str,
         *,
-        compare_order: bool = True,
+        compare_order: bool | None = None,
         parameter_case: ParameterCase | None = None,
     ) -> dict[str, Any]:
         baseline = self.validator.validate_read_only(baseline_sql).execution_sql
         candidate = self.validator.validate_read_only(candidate_sql).execution_sql
-        preflight = {
-            "baseline": await self._analyze_equivalence(database_name, baseline),
-            "candidate": await self._analyze_equivalence(database_name, candidate),
-        }
+        preflight = with_order_contract(
+            {
+                "baseline": await self._analyze_equivalence(database_name, baseline),
+                "candidate": await self._analyze_equivalence(database_name, candidate),
+            },
+            baseline,
+            candidate,
+        )
+        compare_order = effective_compare_order(baseline, compare_order)
         statically_zero_row = (
             has_outer_literal_top_zero(baseline)
             and has_outer_literal_top_zero(candidate)
@@ -2556,7 +2630,7 @@ class PerformanceWorkflowService:
         *,
         phase: str = "screening",
         parameter_cases: Sequence[ParameterCase] | None = None,
-        compare_order: bool = True,
+        compare_order: bool | None = None,
         runs_override: int | None = None,
         prove_equivalence: bool | None = None,
         idempotency_key: str | None = None,
@@ -2649,10 +2723,15 @@ class PerformanceWorkflowService:
         should_prove_equivalence = (
             phase == "finalist" if prove_equivalence is None else prove_equivalence
         )
-        equivalence_preflight = {
-            "baseline": await self._analyze_equivalence(database_name, baseline),
-            "candidate": await self._analyze_equivalence(database_name, rewrite),
-        }
+        equivalence_preflight = with_order_contract(
+            {
+                "baseline": await self._analyze_equivalence(database_name, baseline),
+                "candidate": await self._analyze_equivalence(database_name, rewrite),
+            },
+            baseline,
+            rewrite,
+        )
+        compare_order = effective_compare_order(baseline, compare_order)
         direct_snapshot_supported = all(
             item["direct_snapshot_supported"]
             for item in equivalence_preflight.values()

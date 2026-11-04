@@ -47,16 +47,20 @@ from .config import ServerConfig
 from .config import TransportMode
 from .config import load_server_config
 from .connection import AzureSqlExecutor
+from .connection import statement_deadline
 from .connection_pool import ConnectionPool
 from .database_diagnosis import DatabaseDiagnosisService
 from .database_policy import load_database_policy_or_deny
 from .diagnostics import DiagnosticQueryService
+from .equivalence_contract import effective_compare_order
 from .equivalence_preflight import EquivalencePreflightService
 from .health import HealthService
 from .incident_log import IncidentLog
+from .incident_log import native_codes
 from .incident_log import note_exception
 from .incident_log import record_startup_failure
 from .incident_log import summarize_backlog
+from .incident_log import tool_failure_code
 from .index_optimizer import IndexCandidate
 from .index_optimizer import IndexOptimizer
 from .index_optimizer import build_index_candidate_statement
@@ -66,6 +70,8 @@ from .index_metadata import collect_existing_indexes
 from .index_metadata import existing_index_covers_candidate
 from .index_recommendations import IndexRecommendationService
 from .index_review import IndexReviewService
+from .index_review import IndexReviewSetupError
+from .index_review import index_history_setup_precondition
 from .index_review import CONTRACT_SCHEMA_FINGERPRINT
 from .index_review import SqlIndexHistoryRepository
 from .index_review import render_index_review_artifacts
@@ -89,8 +95,11 @@ from .performance_contracts import STOPPING_REASON_MAX_LENGTH
 from .performance_store import ContractNotFoundError
 from .performance_store import IdempotencyConflictError
 from .performance_store import PerformanceStore
+from .performance_store import PerformanceStoreError
+from .performance_store import ReservationError
 from .performance_workflows import COMPARISON_DECISION_BASIS
 from .performance_workflows import PerformanceWorkflowService
+from .performance_workflows import aba_result_status
 from .performance_workflows import aggregate_samples
 from .performance_workflows import classify_benchmark
 from .performance_workflows import compare_plan_summaries_payload
@@ -156,9 +165,11 @@ from .wait_stats import WaitStatsService
 from .workload_index_advisor import WorkloadIndexAdvisor
 from .view_workflows import PreparedViewChange
 from .view_workflows import ViewChangeRequest
+from .view_workflows import ViewVerificationError
 from .view_workflows import ViewWorkflowService
 from .view_workflows import prepared_view_change_from_state
 from .view_workflows import prepared_view_change_state
+from .view_workflows import resolve_view_request_schema_bound
 from .view_workflows import view_apply_receipt
 from .view_workflows import view_snapshot_from_receipt
 
@@ -262,8 +273,56 @@ _CATALOG_PAIR_TOOLS = frozenset(
 )
 
 
+def _driver_exception(exc: BaseException) -> BaseException | None:
+    current: BaseException | None = exc
+    while current is not None:
+        if type(current).__module__.startswith(("mssql_python", "pyodbc")):
+            return current
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _label_unknown_parameters(digest: dict[str, Any], unknown: list[str]) -> None:
+    """The typed estimate leaves some contract parameters out of OPTIMIZE FOR
+    (xml), so its plan lists them as local variables; they are parameters."""
+
+    names = {name.casefold() for name in unknown}
+    for entry in digest.get("statements") or ():
+        local = entry.get("local_variables") or []
+        found = [name for name in local if name.casefold() in names]
+        if not found:
+            continue
+        entry["unknown_parameters"] = found
+        entry["unknown_parameters_note"] = (
+            "Caller parameters this estimate compiled as unknown (not in OPTIMIZE FOR); "
+            "see summary.estimated_plan_basis. Use analyze=true for their compiled values."
+        )
+        remaining = [name for name in local if name.casefold() not in names]
+        if remaining:
+            entry["local_variables"] = remaining
+        else:
+            entry.pop("local_variables", None)
+            entry.pop("local_variables_note", None)
+
+
 def _tool_failure_diagnostic(exc: Exception) -> dict[str, Any]:
+    driver_exc = _driver_exception(exc)
     failure_diagnostic = extract_failure_diagnostic(exc)
+    # The incident log's classification names failures no SQL error caused;
+    # a recognised engine diagnostic (214) in the text still wins.
+    code = tool_failure_code(exc)
+    if code is not None and (
+        code == "verification_failed"
+        or failure_diagnostic["diagnostic_code"] == "sql_execution_failed"
+    ):
+        return {"diagnostic_code": code}
+    if driver_exc is not None:
+        # mssql-python text has no bracketed SQLSTATE; map its driver class.
+        native, sqlstate = native_codes(driver_exc)
+        if sqlstate is not None:
+            failure_diagnostic.setdefault("sqlstate", sqlstate)
+        if native is not None:
+            failure_diagnostic.setdefault("native_error_code", native)
     if _is_transient(exc):
         # Skills retry these before they report a blocker.
         failure_diagnostic["transient"] = True
@@ -1289,11 +1348,12 @@ class AzureSqlMcpApplication:
                 default=None,
                 description="Optional exact SQL types shared by baseline and rewrite.",
             ),
-            compare_order: bool = Field(
-                default=True,
+            compare_order: bool | None = Field(
+                default=None,
                 description=(
-                    "Compare result rows in returned order. Set false only when the "
-                    "query contract does not require ordering."
+                    "Compare result rows in returned order. Default: resolved from "
+                    "the SQL; true only when the baseline has an outer ORDER BY. An "
+                    "outer ORDER BY is always order-compared."
                 ),
             ),
             include_raw_xml: bool = Field(
@@ -1655,7 +1715,14 @@ class AzureSqlMcpApplication:
                     "Exact unchanged subset of the performance-case parameter inputs."
                 ),
             ),
-            compare_order: bool = Field(default=True),
+            compare_order: bool | None = Field(
+                default=None,
+                description=(
+                    "Compare rows in returned order. Default: resolved from the SQL; "
+                    "true only when the baseline has an outer ORDER BY. An outer "
+                    "ORDER BY is always order-compared."
+                ),
+            ),
             runs: int | None = Field(
                 default=None,
                 ge=2,
@@ -1736,9 +1803,12 @@ class AzureSqlMcpApplication:
                 description="Benchmark phase: screening or finalist.",
             ),
             online: bool = Field(default=True),
-            compare_order: bool = Field(
-                default=True,
-                description="Preserve ordered-result semantics during A-B-A stability checks.",
+            compare_order: bool | None = Field(
+                default=None,
+                description=(
+                    "Compare rows in returned order during A-B-A checks. Default: "
+                    "resolved from the SQL; true only when it has an outer ORDER BY."
+                ),
             ),
             lease_minutes: int = Field(default=30, ge=5, le=120),
             idempotency_key: str = Field(
@@ -1842,7 +1912,7 @@ class AzureSqlMcpApplication:
         async def compare_query_results(
             baseline_sql: str = Field(description="Baseline read-only SQL."),
             candidate_sql: str = Field(description="Candidate read-only SQL."),
-            compare_order: bool = Field(default=True),
+            compare_order: bool | None = Field(default=None),
             parameter_case: ParameterCaseInput | None = Field(
                 default=None,
                 description=(
@@ -1892,6 +1962,8 @@ class AzureSqlMcpApplication:
         @self.mcp.tool(
             description=(
                 "Prepare and preview a reversible CREATE VIEW or ALTER VIEW change. "
+                "ALTER keeps the column list and WITH options from the existing "
+                "view; they cannot be changed through prepare_view_change. "
                 "Optimizer preparations are process-local previews; sandbox "
                 "preparations become restart-safe only with explicit raw-SQL state opt-in."
             ),
@@ -1910,7 +1982,13 @@ class AzureSqlMcpApplication:
                 description="Complete SELECT-shaped view body, without CREATE/ALTER VIEW."
             ),
             operation: str = Field(default="auto", description="auto, create, or alter"),
-            schema_bound: bool = Field(default=False),
+            schema_bound: bool | None = Field(
+                default=None,
+                description=(
+                    "Leave unset to keep the existing view's SCHEMABINDING on ALTER "
+                    "(unbound on CREATE). True adds it; False removes it."
+                ),
+            ),
             indexed_view: bool = Field(default=False),
             idempotency_key: str | None = Field(default=None),
             database_name: str | None = Field(default=None),
@@ -3290,10 +3368,19 @@ class AzureSqlMcpApplication:
         async def compare_query_plans(
             query_id: int = Field(description="Query Store query_id."),
             plan_id_a: int | None = Field(
-                default=None, description="First plan_id to compare (optional, uses best by default)."
+                default=None,
+                description=(
+                    "Baseline plan_id. Give both plan ids or neither (then best vs "
+                    "worst by duration). Ratios are plan_id_b / plan_id_a "
+                    "(comparison.compared_plan_id / baseline_plan_id)."
+                ),
             ),
             plan_id_b: int | None = Field(
-                default=None, description="Second plan_id to compare (optional, uses worst by default)."
+                default=None,
+                description=(
+                    "Compared plan_id. Give both plan ids or neither (then worst "
+                    "by duration)."
+                ),
             ),
             database_name: str | None = Field(
                 default=None,
@@ -3592,8 +3679,10 @@ class AzureSqlMcpApplication:
 
         @self.mcp.tool(
             description=(
-                "Verify non-overlapping pre/post Query Store windows with matching parameter "
-                "buckets. Regression restores the exact prior force and hint state."
+                "Read pre/post-apply Query Store runtime stats for the query, check "
+                "force failures and that the forced plan ran most executions, then "
+                "keep, hold, or restore the exact prior force and hint state. "
+                "Parameter buckets are reported as unavailable."
             ),
             annotations=ToolAnnotations(
                 title="Verify Plan Action",
@@ -3605,8 +3694,13 @@ class AzureSqlMcpApplication:
         )
         async def verify_plan_action(
             intent_id: str = Field(description="Applied plan-action intent identifier."),
-            candidate_evidence: dict[str, Any] = Field(
-                description="Post-change Query Store evidence window."
+            candidate_evidence: dict[str, Any] | None = Field(
+                default=None,
+                description=(
+                    "Optional caller context. The MCP reads post-apply Query Store "
+                    "evidence itself; caller evidence can turn a keep into a hold "
+                    "but never produces a keep."
+                ),
             ),
             authorization_reference: str = Field(
                 description="Authorization used if verification requires rollback."
@@ -5356,10 +5450,13 @@ class AzureSqlMcpApplication:
         database_name: str,
         idempotency_key: str | None,
     ) -> dict[str, Any]:
-        result = await self.index_review.capture_snapshot(
-            database_name,
-            idempotency_key=idempotency_key,
-        )
+        try:
+            result = await self.index_review.capture_snapshot(
+                database_name,
+                idempotency_key=idempotency_key,
+            )
+        except IndexReviewSetupError as exc:
+            return index_history_setup_precondition(exc, for_write=True)
         return result.as_dict()
 
     async def _review_index_portfolio(
@@ -5368,11 +5465,14 @@ class AzureSqlMcpApplication:
         as_of_run_id: str | None,
         prior_review_id: str | None,
     ) -> dict[str, Any]:
-        review = await self.index_review.review_portfolio(
-            database_name,
-            as_of_run_id=as_of_run_id,
-            prior_review_id=prior_review_id,
-        )
+        try:
+            review = await self.index_review.review_portfolio(
+                database_name,
+                as_of_run_id=as_of_run_id,
+                prior_review_id=prior_review_id,
+            )
+        except IndexReviewSetupError as exc:
+            return index_history_setup_precondition(exc)
         payload = review.as_dict()
         payload["artifacts"] = render_index_review_artifacts(review)
         return payload
@@ -5382,7 +5482,10 @@ class AzureSqlMcpApplication:
         database_name: str,
         review_id: str,
     ) -> dict[str, Any]:
-        review = await self.index_review.get_review(database_name, review_id)
+        try:
+            review = await self.index_review.get_review(database_name, review_id)
+        except IndexReviewSetupError as exc:
+            return index_history_setup_precondition(exc)
         payload = review.as_dict()
         payload["artifacts"] = render_index_review_artifacts(review)
         return payload
@@ -5801,7 +5904,7 @@ class AzureSqlMcpApplication:
         view_name: str,
         definition: str,
         operation: str,
-        schema_bound: bool,
+        schema_bound: bool | None,
         indexed_view: bool,
         idempotency_key: str | None,
     ) -> dict[str, Any]:
@@ -5841,8 +5944,11 @@ class AzureSqlMcpApplication:
             )
             if intent is not None:
                 prepared = prepared_view_change_from_state(intent["payload"])
+                # Stored requests hold schema_bound resolved against the prior
+                # view; resolve the retry the same way before comparing.
+                incoming = resolve_view_request_schema_bound(request, prepared.prior)
                 if _view_change_request_fingerprint(database_fp, prepared.request) != (
-                    _view_change_request_fingerprint(database_fp, request)
+                    _view_change_request_fingerprint(database_fp, incoming)
                 ):
                     raise IdempotencyConflictError(
                         "View idempotency key was reused for a different request."
@@ -6160,7 +6266,7 @@ class AzureSqlMcpApplication:
         if intent["status"] == "rolled_back":
             raise ValueError("Rolled-back view intent cannot be applied again.")
         if intent["status"] != "prepared":
-            raise ValueError(f"View intent is not applyable from {intent['status']!r}.")
+            raise ValueError(f"View intent is not applyable from status={intent['status']}.")
         normalized_idempotency_key = _view_idempotency_identity(idempotency_key)
         existing_key = prepared.request.idempotency_key
         if existing_key and existing_key != normalized_idempotency_key:
@@ -6183,27 +6289,37 @@ class AzureSqlMcpApplication:
             raw_sql_persistence_authorized=True,
         )
         result = await self.view_workflows.apply_prepared_view_change(prepared)
-        verification = await self.view_workflows.verify_view_change(prepared)
         workflow_applied = result.get("workflow_applied") is True
-        if workflow_applied:
-            receipt_payload = result.get("apply_receipt")
-            receipt_snapshot = view_snapshot_from_receipt(receipt_payload)
-            self.view_workflows.register_apply_receipt(
-                prepared,
-                receipt_snapshot,
+        try:
+            verification = await self.view_workflows.verify_view_change(prepared)
+            if workflow_applied:
+                receipt_payload = result.get("apply_receipt")
+                receipt_snapshot = view_snapshot_from_receipt(receipt_payload)
+                self.view_workflows.register_apply_receipt(
+                    prepared,
+                    receipt_snapshot,
+                )
+                receipt = view_apply_receipt(receipt_snapshot)
+                status = "applied" if verification.verified else "hold"
+            else:
+                receipt = None
+                status = "already_applied" if verification.verified else "hold"
+            intent = self.performance_store.update_view_change_intent(
+                change_id,
+                status=status,
+                expected_version=int(intent["version"]),
+                raw_sql_persistence_authorized=True,
+                receipt=receipt,
             )
-            receipt = view_apply_receipt(receipt_snapshot)
-            status = "applied" if verification.verified else "hold"
-        else:
-            receipt = None
-            status = "already_applied" if verification.verified else "hold"
-        intent = self.performance_store.update_view_change_intent(
-            change_id,
-            status=status,
-            expected_version=int(intent["version"]),
-            raw_sql_persistence_authorized=True,
-            receipt=receipt,
-        )
+        except (ValueError, LookupError, PerformanceStoreError) as exc:
+            if not workflow_applied:
+                raise
+            # The workflow-owned DDL was dispatched: a refusal here does not
+            # mean nothing changed, so it is not request_refused.
+            raise ViewVerificationError(
+                "the view change was dispatched, then its outcome could not be "
+                "recorded; read the view with verify_view_change before any retry"
+            ) from exc
         response = {
             "change_id": change_id,
             "intent_status": intent["status"],
@@ -6279,6 +6395,7 @@ class AzureSqlMcpApplication:
                 "status": "already_rolled_back",
                 "intent_status": "rolled_back",
                 "snapshot": current.as_dict(),
+                **self.view_workflows.restore_exactness(prepared, current),
             }
         if intent["status"] == "applying" or (
             intent["status"] == "hold" and intent.get("receipt") is None
@@ -6317,14 +6434,22 @@ class AzureSqlMcpApplication:
                 "status": "already_rolled_back",
                 "intent_status": updated["status"],
                 "snapshot": current.as_dict(),
+                **self.view_workflows.restore_exactness(prepared, current),
             }
         result = await self.view_workflows.rollback_view_change(prepared)
-        updated = self.performance_store.update_view_change_intent(
-            change_id,
-            status="rolled_back",
-            expected_version=int(intent["version"]),
-            raw_sql_persistence_authorized=True,
-        )
+        try:
+            updated = self.performance_store.update_view_change_intent(
+                change_id,
+                status="rolled_back",
+                expected_version=int(intent["version"]),
+                raw_sql_persistence_authorized=True,
+            )
+        except (ValueError, LookupError, PerformanceStoreError) as exc:
+            # The restore DDL was dispatched: not request_refused.
+            raise ViewVerificationError(
+                "the view rollback was dispatched, then its outcome could not be "
+                "recorded; read the view with verify_view_change before any retry"
+            ) from exc
         return {
             "change_id": change_id,
             "intent_status": updated["status"],
@@ -6510,7 +6635,7 @@ class AzureSqlMcpApplication:
         is_unique: bool,
         phase: str,
         online: bool,
-        compare_order: bool,
+        compare_order: bool | None,
         lease_minutes: int,
         idempotency_key: str | None,
         parameter_cases: list[dict[str, Any]] | None = None,
@@ -6555,6 +6680,7 @@ class AzureSqlMcpApplication:
                 "session_continues": False,
             }
         normalized_sql = self.validator.validate_read_only(sql).execution_sql
+        compare_order = effective_compare_order(normalized_sql, compare_order)
         candidate = self.tuning_sessions.get_candidate(candidate_id)
         case = self.performance_store.get_performance_case(session.performance_case_id)
         if candidate.session_id != session_id:
@@ -6742,54 +6868,10 @@ class AzureSqlMcpApplication:
                 "lineage": lineage,
             }
         )
-        self._require_tuning_session_time(session_id)
-        self.performance_store.bind_index_benchmark_request(
-            session_id,
-            candidate_id,
-            phase,
-            request_fingerprint,
-            idempotency_key=idempotency_key,
-        )
-        existing_reservation = (
-            self.performance_store.get_idempotent_execution_reservation(
-                session_id,
-                candidate_id,
-                request_fingerprint,
-                idempotency_key=idempotency_key,
-                owner_reference=execution_owner,
-            )
-        )
-        if existing_reservation is None and candidate.is_terminal:
-            if candidate.executions == 0:
-                return {
-                    "session_id": session_id,
-                    "candidate_id": candidate_id,
-                    "classification": candidate.state,
-                    "durable_state": candidate.state,
-                    "reason": (
-                        "Replayed the durable zero-execution candidate result; "
-                        "no catalog lookup, DDL, or benchmark query was dispatched."
-                    ),
-                    "executions": 0,
-                    "session_continues": candidate.state != "cleanup_required",
-                    "replayed_zero_execution_result": True,
-                }
-            raise ValueError("Index candidate already has a terminal benchmark result.")
-        if (
-            existing_reservation is None
-            and not candidate.is_terminal
-            and phase == "screening"
-            and candidate.screen_runs
-        ):
-            raise ValueError("Index candidate screening has already been measured.")
-        if (
-            existing_reservation is None
-            and not candidate.is_terminal
-            and phase == "finalist"
-            and candidate.finalist_runs
-        ):
-            raise ValueError("Index candidate finalist validation has already been measured.")
-
+        # Request-validation reads and refusals run before the request binds
+        # the candidate; else the corrected request is refused as a replay.
+        # The budget reservation runs after the bind, so its refusal releases
+        # a fresh binding.
         self._require_tuning_session_time(session_id)
         bound_cases = [
             {
@@ -6825,6 +6907,54 @@ class AzureSqlMcpApplication:
         object_fingerprint = index_candidate.definition_fingerprint
         index_ddl = build_index_candidate_statement(index_candidate, online=online)
         rollback_ddl = f"DROP INDEX [{index_name}] ON [{schema}].[{table}];"
+        self._require_tuning_session_time(session_id)
+        self.performance_store.bind_index_benchmark_request(
+            session_id,
+            candidate_id,
+            phase,
+            request_fingerprint,
+            idempotency_key=idempotency_key,
+        )
+        existing_reservation = (
+            self.performance_store.get_idempotent_execution_reservation(
+                session_id,
+                candidate_id,
+                request_fingerprint,
+                idempotency_key=idempotency_key,
+                owner_reference=execution_owner,
+            )
+        )
+        if existing_reservation is None and candidate.is_terminal:
+            if candidate.executions == 0:
+                return {
+                    "session_id": session_id,
+                    "candidate_id": candidate_id,
+                    "classification": candidate.state,
+                    "durable_state": candidate.state,
+                    "reason": (
+                        "Replayed the durable zero-execution candidate result; "
+                        "no DDL or benchmark query was dispatched."
+                    ),
+                    "executions": 0,
+                    "session_continues": candidate.state != "cleanup_required",
+                    "replayed_zero_execution_result": True,
+                }
+            raise ValueError("Index candidate already has a terminal benchmark result.")
+        if (
+            existing_reservation is None
+            and not candidate.is_terminal
+            and phase == "screening"
+            and candidate.screen_runs
+        ):
+            raise ValueError("Index candidate screening has already been measured.")
+        if (
+            existing_reservation is None
+            and not candidate.is_terminal
+            and phase == "finalist"
+            and candidate.finalist_runs
+        ):
+            raise ValueError("Index candidate finalist validation has already been measured.")
+
         if existing_reservation is not None:
             return self._recover_index_benchmark_result(
                 session_id=session_id,
@@ -6921,14 +7051,27 @@ class AzureSqlMcpApplication:
             }
 
         self._require_tuning_session_time(session_id)
-        execution_reservation = self.performance_store.reserve_execution_attempts(
-            session_id,
-            candidate_id,
-            requested_executions,
-            request_fingerprint,
-            idempotency_key=idempotency_key,
-            owner_reference=execution_owner,
-        )
+        try:
+            execution_reservation = self.performance_store.reserve_execution_attempts(
+                session_id,
+                candidate_id,
+                requested_executions,
+                request_fingerprint,
+                idempotency_key=idempotency_key,
+                owner_reference=execution_owner,
+            )
+        except ReservationError:
+            # Also for a replayed binding: an earlier attempt may have bound the
+            # request and failed before reserving. The store keeps any binding
+            # that holds a reservation, so only an unreserved one is freed.
+            self.performance_store.release_index_benchmark_request(
+                session_id,
+                candidate_id,
+                phase,
+                request_fingerprint,
+                idempotency_key=idempotency_key,
+            )
+            raise
         if (
             execution_reservation["status"] != "reserved"
             or execution_reservation.get("replayed") is True
@@ -7071,6 +7214,9 @@ class AzureSqlMcpApplication:
         cleanup_error: str | None = None
         create_attempted = False
         ownership_recorded = False
+        # True once an unverified create was dropped or recorded through its owner
+        # marker, so reconcile_create_outcome never overwrites that lease state.
+        create_outcome_settled = False
         benchmark_error: str | None = None
         benchmark_failure_diagnostic: dict[str, Any] | None = None
         terminal_error: InvalidTransitionError | None = None
@@ -7113,10 +7259,126 @@ class AzureSqlMcpApplication:
             ownership_recorded = True
             return True
 
-        async def reconcile_create_outcome() -> None:
-            nonlocal lease
-            if not create_attempted or ownership_recorded or lease is None:
+        def find_created_index(indexes: list[Any]) -> Any:
+            return next(
+                (
+                    existing
+                    for existing in indexes
+                    if existing.schema == schema
+                    and existing.table == table
+                    and existing.name == index_name
+                ),
+                None,
+            )
+
+        async def drop_index_proven_by_owner_marker(observed_index: Any) -> None:
+            """Drop a created index whose catalog definition differs from the candidate."""
+
+            nonlocal lease, create_outcome_settled
+            if lease is None:
                 return
+            marker_matched = False
+            try:
+                marker_matched = await self._index_owner_marker_matches(
+                    database_name,
+                    schema,
+                    table,
+                    index_name,
+                    ownership_proof=lease_owner,
+                    definition_fingerprint=str(lease["object_fingerprint"]),
+                    index_id=observed_index.index_id,
+                )
+                if not marker_matched:
+                    return
+                # The guarded DROP rechecks both markers and the index_id
+                # inside its own SERIALIZABLE transaction.
+                await self._drop_test_index(
+                    database_name,
+                    schema,
+                    table,
+                    index_name,
+                    dry_run=False,
+                    workflow_managed=True,
+                    idempotency_key=cleanup_operation_key,
+                    ownership_proof=lease_owner,
+                    expected_definition_fingerprint=str(lease["object_fingerprint"]),
+                    expected_index_id=observed_index.index_id,
+                )
+                if find_created_index(
+                    await collect_existing_indexes(self.executor, database_name)
+                ) is not None:
+                    raise RuntimeError("Temporary index removal was not verified.")
+                lease = self.performance_store.update_index_lease(
+                    lease_id,
+                    status="cleaned",
+                    metadata={
+                        "cleaned_at_utc": datetime.now(timezone.utc).isoformat(),
+                        "creation_observation": "post_create_definition_mismatch",
+                        "ownership_proof": "owner_marker",
+                        "cleanup_policy": "dropped_by_owner_marker",
+                    },
+                    owner_reference=lease_owner,
+                    expected_version=lease["version"],
+                )
+                create_outcome_settled = True
+            except Exception:
+                logger.exception(
+                    "Unable to drop a created index proven by its owner marker",
+                    extra={"lease_id": lease_id},
+                )
+                if not marker_matched:
+                    return
+                try:
+                    lease = self.performance_store.update_index_lease(
+                        lease_id,
+                        status="cleanup_required",
+                        metadata={
+                            "ownership_status": "owner_marker_matched",
+                            "creation_observation": "post_create_definition_mismatch",
+                            "ownership_proof": "owner_marker",
+                            "cleanup_policy": "retry_only_with_observed_ownership",
+                        },
+                        owner_reference=lease_owner,
+                        expected_version=lease["version"],
+                    )
+                    create_outcome_settled = True
+                except Exception:
+                    logger.exception(
+                        "Unable to record temporary index ownership",
+                        extra={"lease_id": lease_id},
+                    )
+
+        async def reconcile_create_outcome() -> bool:
+            """Settle an uncertain CREATE; True when a cancel hit the probe."""
+            nonlocal lease
+            if (
+                not create_attempted
+                or ownership_recorded
+                or create_outcome_settled
+                or lease is None
+            ):
+                return False
+            # The CREATE batch commits the ownership markers with the index, so a
+            # visible index whose markers match is ours even when the reply was lost.
+            cancelled_during_probe = False
+            try:
+                observed_index = find_created_index(
+                    await collect_existing_indexes(self.executor, database_name)
+                )
+                if await record_observed_index(
+                    observed_index,
+                    observation="reconciled_after_create_dispatch",
+                ):
+                    return False
+            except asyncio.CancelledError:
+                # Record the uncertain create first, so the lease stays open.
+                cancelled_during_probe = True
+            except Exception:
+                logger.warning(
+                    "Temporary index ownership could not be proven after CREATE",
+                    extra={"lease_id": lease_id},
+                    exc_info=True,
+                )
             lease = self.performance_store.update_index_lease(
                 lease_id,
                 status="cleanup_required",
@@ -7128,6 +7390,8 @@ class AzureSqlMcpApplication:
                 owner_reference=lease_owner,
                 expected_version=lease["version"],
             )
+            # The caller sets `cancelled`; the durable tail re-raises it.
+            return cancelled_during_probe
 
         try:
             for measurement in measurements:
@@ -7202,6 +7466,8 @@ class AzureSqlMcpApplication:
                 observed_index,
                 observation="post_create",
             ):
+                if observed_index is not None:
+                    await drop_index_proven_by_owner_marker(observed_index)
                 raise RuntimeError(
                     "Created index definition could not be verified exactly."
                 )
@@ -7241,7 +7507,12 @@ class AzureSqlMcpApplication:
             }
             cancelled = True
             try:
-                await reconcile_create_outcome()
+                if await reconcile_create_outcome():
+                    cancelled = True
+                    benchmark_error = "timeout"
+                    benchmark_failure_diagnostic = {
+                        "diagnostic_code": "benchmark_cancelled",
+                    }
             except Exception:
                 logger.exception(
                     "Unable to durably reconcile temporary index ownership",
@@ -7251,7 +7522,12 @@ class AzureSqlMcpApplication:
             benchmark_error = type(exc).__name__
             terminal_error = exc
             try:
-                await reconcile_create_outcome()
+                if await reconcile_create_outcome():
+                    cancelled = True
+                    benchmark_error = "timeout"
+                    benchmark_failure_diagnostic = {
+                        "diagnostic_code": "benchmark_cancelled",
+                    }
             except Exception:
                 logger.exception(
                     "Unable to durably reconcile temporary index ownership",
@@ -7262,7 +7538,12 @@ class AzureSqlMcpApplication:
             benchmark_error = type(exc).__name__
             benchmark_failure_diagnostic = extract_failure_diagnostic(exc)
             try:
-                await reconcile_create_outcome()
+                if await reconcile_create_outcome():
+                    cancelled = True
+                    benchmark_error = "timeout"
+                    benchmark_failure_diagnostic = {
+                        "diagnostic_code": "benchmark_cancelled",
+                    }
             except Exception:
                 logger.exception(
                     "Unable to durably reconcile temporary index ownership",
@@ -7376,7 +7657,7 @@ class AzureSqlMcpApplication:
                         expected_version=lease["version"],
                     )
             elif benchmark_error:
-                if lease["status"] != "cleanup_required":
+                if lease["status"] not in {"cleanup_required", "cleaned"}:
                     lease = self.performance_store.update_index_lease(
                         lease_id,
                         status="create_failed",
@@ -7458,25 +7739,18 @@ class AzureSqlMcpApplication:
                     "baseline_after_results",
                 )
             )
-            fingerprints = {
-                str(item["fingerprint"])
-                for item in result_evidence
-                if item.get("fingerprint")
-            }
             plan_used = bool(measurement["plan_use"]) and all(
                 item.get("used") is True for item in measurement["plan_use"]
             )
-            stable = complete_results and len(fingerprints) == 1
+            # An index often changes row access order; an order-only difference
+            # is unproven, never a result mismatch.
+            status = aba_result_status(result_evidence, complete=complete_results)
+            stable = status == "match"
             equivalence.append(
                 {
                     "parameter_case": measurement["parameter_case"],
-                    "status": (
-                        "match"
-                        if stable
-                        else "inconclusive"
-                        if not complete_results
-                        else "mismatch"
-                    ),
+                    "status": status,
+                    "order_compared": compare_order,
                     "proven_for_parameter_case": stable,
                     "same_sql": True,
                     "same_snapshot": False,
@@ -7868,10 +8142,17 @@ class AzureSqlMcpApplication:
                     "correlation_id": correlation_id,
                 },
             )
-            payload = await asyncio.wait_for(
-                callback(resolved_database),
-                timeout=timeout_seconds,
-            )
+            # The index benchmark drops its temporary index after a timeout;
+            # a passed statement deadline would refuse that DROP.
+            with statement_deadline(
+                None
+                if tool_name == "benchmark_index_candidate"
+                else timeout_seconds
+            ):
+                payload = await asyncio.wait_for(
+                    callback(resolved_database),
+                    timeout=timeout_seconds,
+                )
             if decision_id is not None:
                 payload = await self._attach_learning_terminal_link(
                     tool_name,
@@ -8086,10 +8367,11 @@ class AzureSqlMcpApplication:
                     "correlation_id": correlation_id,
                 },
             )
-            payload = await asyncio.wait_for(
-                callback(resolved_source, resolved_target),
-                timeout=self.config.tool_timeout_seconds,
-            )
+            with statement_deadline(self.config.tool_timeout_seconds):
+                payload = await asyncio.wait_for(
+                    callback(resolved_source, resolved_target),
+                    timeout=self.config.tool_timeout_seconds,
+                )
             duration_ms = self._duration_ms(started_at)
             logger.info(
                 "Tool completed",
@@ -8656,7 +8938,7 @@ class AzureSqlMcpApplication:
         value = cls._validate_plain_identifier(index_name, "index_name")
         if not value.upper().startswith(TEST_INDEX_PREFIX.upper()):
             raise ValueError(
-                f"index_name must start with the test prefix {TEST_INDEX_PREFIX!r} — "
+                f"index_name must start with the test prefix {TEST_INDEX_PREFIX} — "
                 "these tools only manage disposable test indexes."
             )
         return value
@@ -8771,7 +9053,7 @@ class AzureSqlMcpApplication:
         include_raw_xml: bool,
         runs: int = 3,
         parameter_values: dict[str, Any] | None = None,
-        compare_order: bool = True,
+        compare_order: bool | None = None,
         parameter_types: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         if not analyze:
@@ -9129,8 +9411,21 @@ class AzureSqlMcpApplication:
                 }
             return {**base, "node": node, **status_payload(ResultStatus.OK, "Operator detail returned.")}
         result = {**base, **analyze_plan(found.xml)}
+        # A cached batch plan holds sibling statements; tag which findings belong
+        # to the statement that was asked about.
+        requested = found.source.get("requested_statement_indexes")
+        if requested:
+            for finding in result.get("findings", []):
+                finding["is_requested_statement"] = (
+                    finding.get("statement_index") in requested
+                )
         if include_digest:
-            result["digest"] = build_plan_digest(found.xml)
+            pin = (
+                found.source.get("query_plan_hash")
+                if found.source.get("source") == "last_actual_plan"
+                else None
+            )
+            result["digest"] = build_plan_digest(found.xml, pin_plan_hash=pin)
         if found.source.get("source") == "query_store" and found.source.get("plan_id"):
             result["query_store_runtime"] = await self.plan_sources.query_store_runtime(
                 database_name, int(found.source["plan_id"]), found.xml
@@ -9196,6 +9491,9 @@ class AzureSqlMcpApplication:
         if artifact.raw_xml:
             result["plan_findings"] = _compact_plan_findings(analyze_plan(artifact.raw_xml))
             result["plan_digest"] = build_plan_digest(artifact.raw_xml, top_n=5, tree_budget=40)
+            basis = artifact.summary.get("estimated_plan_basis")
+            if basis:
+                _label_unknown_parameters(result["plan_digest"], basis["unknown_parameters"])
         return result
 
     @staticmethod
@@ -9500,6 +9798,32 @@ class AzureSqlMcpApplication:
                 "pending CREATE index structure does not match its persisted candidate"
             )
 
+        if not await self._index_owner_marker_matches(
+            database_name,
+            schema_name,
+            table_name,
+            index_name,
+            ownership_proof=ownership_proof,
+            definition_fingerprint=marker_fingerprint,
+            index_id=current_index.index_id,
+        ):
+            raise ValueError(
+                "pending CREATE ownership or definition marker is missing or mismatched"
+            )
+
+    async def _index_owner_marker_matches(
+        self,
+        database_name: str,
+        schema_name: str,
+        table_name: str,
+        index_name: str,
+        *,
+        ownership_proof: str,
+        definition_fingerprint: str,
+        index_id: int,
+    ) -> bool:
+        """Check only the markers the CREATE batch wrote in its own transaction."""
+
         rows = await self.executor.fetch_all(
             database_name,
             _PENDING_INDEX_OWNERSHIP_SQL,
@@ -9512,23 +9836,18 @@ class AzureSqlMcpApplication:
             ),
         )
         if len(rows) != 1:
-            raise ValueError("pending CREATE ownership marker lookup was ambiguous")
+            return False
         row = rows[0]
-        raw_index_id = row.get("index_id")
-        if raw_index_id is None:
-            raise ValueError("pending CREATE ownership marker has no index identity")
         try:
-            marker_index_id = int(str(raw_index_id))
-        except (TypeError, ValueError) as exc:
-            raise ValueError("pending CREATE ownership marker has no index identity") from exc
-        if marker_index_id <= 0 or marker_index_id != current_index.index_id:
-            raise ValueError("pending CREATE ownership marker index identity mismatch")
-        if row.get("owner_marker") != ownership_proof:
-            raise ValueError("pending CREATE ownership marker is missing or mismatched")
-        if row.get("definition_marker") != marker_fingerprint:
-            raise ValueError(
-                "pending CREATE definition marker is missing or mismatched"
-            )
+            marker_index_id = int(str(row.get("index_id")))
+        except (TypeError, ValueError):
+            return False
+        return (
+            marker_index_id > 0
+            and marker_index_id == index_id
+            and row.get("owner_marker") == ownership_proof
+            and row.get("definition_marker") == definition_fingerprint
+        )
 
     async def _cleanup_expired_index_leases(self) -> dict[str, int]:
         """Retry expired temporary-index cleanup before a sandbox accepts work."""
@@ -9612,7 +9931,29 @@ class AzureSqlMcpApplication:
                             "pre-dispatch temporary-index lease has an unexpected "
                             "visible index"
                         )
-                    if lease["status"] == "pending_create":
+                    if metadata.get("ownership_proof") == "owner_marker":
+                        # In-process cleanup already saw a catalog definition
+                        # that differs from the candidate; only the markers from
+                        # the CREATE transaction can prove ownership.
+                        if not await self._index_owner_marker_matches(
+                            database_name,
+                            schema_name,
+                            table_name,
+                            str(lease["index_name"]),
+                            ownership_proof=ownership_proof,
+                            definition_fingerprint=str(lease["object_fingerprint"]),
+                            index_id=current_index.index_id,
+                        ):
+                            raise RuntimeError(
+                                "expired lease ownership marker no longer matches"
+                            )
+                    elif lease["status"] == "pending_create" or (
+                        metadata.get("create_dispatch_state") == "dispatched"
+                        and metadata.get("fingerprint_provenance") == "candidate_intent"
+                    ):
+                        # An uncertain create (pending_create after a crash, or
+                        # cleanup_required after an in-process reconcile) is
+                        # proven by the markers the CREATE batch commits.
                         await self._verify_pending_index_ownership(
                             database_name,
                             lease,

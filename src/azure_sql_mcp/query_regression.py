@@ -47,6 +47,191 @@ GROUP BY p.plan_id, p.query_id, p.is_forced_plan
 _PLAN_ID_CHUNK = 1000
 
 
+
+# Plans are ranked on per-plan weighted averages; the text is joined after the
+# aggregation, so nvarchar(max) is not a GROUP BY key. Averages use Regular
+# runs only (execution_type 0); Aborted (3, timeout or cancel) and Exception (4)
+# runs are counted per plan. A plan whose failed runs are 10% or more of its
+# runs has material failures: it never ranks best and it ranks worst first, so
+# a plan that only times out (no Regular average) is still the worst plan.
+_PARAMETER_SNIFFING_SQL = """
+WITH plan_avg AS (
+    SELECT
+        p.query_id,
+        rs.plan_id,
+        SUM(CASE WHEN rs.execution_type = 0 THEN rs.count_executions ELSE 0 END) AS executions,
+        SUM(CASE WHEN rs.execution_type = 3 THEN rs.count_executions ELSE 0 END) AS aborted_executions,
+        SUM(CASE WHEN rs.execution_type = 4 THEN rs.count_executions ELSE 0 END) AS exception_executions,
+        SUM(CASE WHEN rs.execution_type = 0 THEN rs.avg_duration * rs.count_executions END)
+            / NULLIF(SUM(CASE WHEN rs.execution_type = 0 THEN rs.count_executions END), 0) AS avg_duration_us,
+        SUM(CASE WHEN rs.execution_type = 0 THEN rs.avg_cpu_time * rs.count_executions END)
+            / NULLIF(SUM(CASE WHEN rs.execution_type = 0 THEN rs.count_executions END), 0) AS avg_cpu_us
+    FROM sys.query_store_runtime_stats AS rs
+    INNER JOIN sys.query_store_runtime_stats_interval AS rsi
+        ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
+    INNER JOIN sys.query_store_plan AS p
+        ON p.plan_id = rs.plan_id
+    WHERE rsi.end_time >= DATEADD(MINUTE, -?, SYSUTCDATETIME())
+    GROUP BY p.query_id, rs.plan_id
+    HAVING SUM(rs.count_executions) > 0
+),
+plan_health AS (
+    SELECT
+        plan_avg.*,
+        CASE
+            WHEN avg_duration_us IS NULL
+              OR (aborted_executions + exception_executions) * 10
+                 >= executions + aborted_executions + exception_executions
+            THEN 1 ELSE 0
+        END AS material_failures
+    FROM plan_avg
+),
+ranked AS (
+    SELECT
+        query_id,
+        plan_id,
+        executions,
+        aborted_executions,
+        exception_executions,
+        material_failures,
+        avg_duration_us,
+        avg_cpu_us,
+        ROW_NUMBER() OVER (
+            PARTITION BY query_id
+            ORDER BY material_failures ASC, avg_duration_us ASC, plan_id ASC
+        ) AS best_rn,
+        ROW_NUMBER() OVER (
+            PARTITION BY query_id
+            ORDER BY material_failures DESC,
+                     CASE WHEN avg_duration_us IS NULL THEN 0 ELSE 1 END,
+                     avg_duration_us DESC, plan_id DESC
+        ) AS worst_rn,
+        COUNT(*) OVER (PARTITION BY query_id) AS plan_count,
+        SUM(executions) OVER (PARTITION BY query_id) AS total_executions
+    FROM plan_health
+)
+SELECT TOP (?)
+    b.query_id,
+    qt.query_sql_text,
+    b.plan_count,
+    b.avg_duration_us / 1000.0 AS best_avg_duration_ms,
+    w.avg_duration_us / 1000.0 AS worst_avg_duration_ms,
+    -- A Regular-only average of a failing plan omits its timeouts: no ratio.
+    CASE WHEN w.material_failures = 0
+        THEN w.avg_duration_us * 1.0 / NULLIF(b.avg_duration_us, 0)
+    END AS duration_variance_ratio,
+    b.avg_cpu_us / 1000.0 AS best_avg_cpu_ms,
+    w.avg_cpu_us / 1000.0 AS worst_avg_cpu_ms,
+    b.total_executions,
+    b.plan_id AS best_plan_id,
+    w.plan_id AS worst_plan_id,
+    b.executions AS best_plan_executions,
+    w.executions AS worst_plan_executions,
+    b.aborted_executions AS best_plan_aborted_executions,
+    b.exception_executions AS best_plan_exception_executions,
+    b.material_failures AS best_plan_material_failures,
+    w.aborted_executions AS worst_plan_aborted_executions,
+    w.exception_executions AS worst_plan_exception_executions,
+    w.material_failures AS worst_plan_material_failures
+FROM ranked AS b
+INNER JOIN ranked AS w
+    ON w.query_id = b.query_id
+   AND w.worst_rn = 1
+INNER JOIN sys.query_store_query AS q
+    ON q.query_id = b.query_id
+INNER JOIN sys.query_store_query_text AS qt
+    ON qt.query_text_id = q.query_text_id
+WHERE b.best_rn = 1
+  AND b.plan_count > 1
+  AND b.material_failures = 0
+  AND b.avg_duration_us > 0
+  AND (w.material_failures = 1 OR w.avg_duration_us >= ? * b.avg_duration_us)
+ORDER BY w.material_failures DESC, duration_variance_ratio DESC
+"""
+
+# One row per plan: aggregate runtime stats first, then join the plan (and its
+# XML) only for the rows that are returned.
+_COMPARE_PLANS_SQL = """
+WITH plan_stats AS (
+    -- execution_type: 0 Regular, 3 Aborted (timeout or cancel), 4 Exception.
+    -- Averages are execution-weighted over Regular runs only.
+    SELECT
+        rs.plan_id,
+        SUM(CASE WHEN rs.execution_type = 0 THEN rs.count_executions ELSE 0 END) AS count_executions,
+        SUM(CASE WHEN rs.execution_type = 3 THEN rs.count_executions ELSE 0 END) AS aborted_executions,
+        SUM(CASE WHEN rs.execution_type = 4 THEN rs.count_executions ELSE 0 END) AS exception_executions,
+        SUM(CASE WHEN rs.execution_type = 0 THEN rs.avg_duration * rs.count_executions END)
+            / NULLIF(SUM(CASE WHEN rs.execution_type = 0 THEN rs.count_executions END), 0)
+            / 1000.0 AS avg_duration_ms,
+        SUM(CASE WHEN rs.execution_type = 0 THEN rs.avg_cpu_time * rs.count_executions END)
+            / NULLIF(SUM(CASE WHEN rs.execution_type = 0 THEN rs.count_executions END), 0)
+            / 1000.0 AS avg_cpu_ms,
+        SUM(CASE WHEN rs.execution_type = 0 THEN rs.avg_logical_io_reads * rs.count_executions END)
+            / NULLIF(SUM(CASE WHEN rs.execution_type = 0 THEN rs.count_executions END), 0)
+            AS avg_logical_io_reads,
+        SUM(CASE WHEN rs.execution_type = 0 THEN rs.avg_physical_io_reads * rs.count_executions END)
+            / NULLIF(SUM(CASE WHEN rs.execution_type = 0 THEN rs.count_executions END), 0)
+            AS avg_physical_io_reads,
+        MIN(rs.first_execution_time) AS first_execution_time,
+        MAX(rs.last_execution_time) AS last_execution_time
+    FROM sys.query_store_runtime_stats AS rs
+    INNER JOIN sys.query_store_plan AS p
+        ON p.plan_id = rs.plan_id
+    WHERE p.query_id = ?
+      {plan_filter}
+    GROUP BY rs.plan_id
+),
+plan_health AS (
+    -- Same rule as detect_parameter_sniffing: no Regular average, or 10% or
+    -- more aborted/exception runs, is a material failure.
+    SELECT
+        plan_stats.*,
+        CASE
+            WHEN avg_duration_ms IS NULL
+              OR (aborted_executions + exception_executions) * 10
+                 >= count_executions + aborted_executions + exception_executions
+            THEN 1 ELSE 0
+        END AS material_failures
+    FROM plan_stats
+),
+ranked AS (
+    SELECT
+        plan_health.*,
+        -- A failing plan never ranks best and ranks worst first.
+        ROW_NUMBER() OVER (
+            ORDER BY material_failures ASC, avg_duration_ms ASC, plan_id ASC
+        ) AS best_rank,
+        ROW_NUMBER() OVER (
+            ORDER BY material_failures DESC,
+                     CASE WHEN avg_duration_ms IS NULL THEN 0 ELSE 1 END,
+                     avg_duration_ms DESC, plan_id DESC
+        ) AS worst_rank
+    FROM plan_health
+)
+SELECT
+    p.plan_id,
+    p.query_id,
+    p.is_forced_plan,
+    p.force_failure_count,
+    r.avg_duration_ms,
+    r.avg_cpu_ms,
+    r.avg_logical_io_reads,
+    r.avg_physical_io_reads,
+    r.count_executions,
+    r.aborted_executions,
+    r.exception_executions,
+    r.material_failures,
+    r.first_execution_time,
+    r.last_execution_time,
+    CAST(p.query_plan AS NVARCHAR(MAX)) AS query_plan_xml
+FROM ranked AS r
+INNER JOIN sys.query_store_plan AS p
+    ON p.plan_id = r.plan_id
+{rank_filter}
+ORDER BY {order_by}
+"""
+
+
 class QueryRegressionService:
     def __init__(self, executor: AzureSqlExecutor):
         self.executor = executor
@@ -58,47 +243,22 @@ class QueryRegressionService:
         window_minutes: int = 1440,
         top_n: int = 20,
     ) -> dict[str, Any]:
-        """Find queries with multiple plans where perf varies wildly (parameter sniffing indicator)."""
-        query = """
-        SELECT TOP ({top_n})
-            q.query_id,
-            qt.query_sql_text,
-            COUNT(DISTINCT p.plan_id) AS plan_count,
-            MIN(rs.avg_duration / 1000.0) AS best_avg_duration_ms,
-            MAX(rs.avg_duration / 1000.0) AS worst_avg_duration_ms,
-            CASE WHEN MIN(rs.avg_duration) > 0
-                 THEN MAX(rs.avg_duration) * 1.0 / MIN(rs.avg_duration)
-                 ELSE 0
-            END AS duration_variance_ratio,
-            MIN(rs.avg_cpu_time / 1000.0) AS best_avg_cpu_ms,
-            MAX(rs.avg_cpu_time / 1000.0) AS worst_avg_cpu_ms,
-            SUM(rs.count_executions) AS total_executions,
-            MIN(p.plan_id) AS best_plan_id,
-            MAX(p.plan_id) AS worst_plan_id
-        FROM sys.query_store_query AS q
-        INNER JOIN sys.query_store_query_text AS qt
-            ON q.query_text_id = qt.query_text_id
-        INNER JOIN sys.query_store_plan AS p
-            ON q.query_id = p.query_id
-        INNER JOIN sys.query_store_runtime_stats AS rs
-            ON p.plan_id = rs.plan_id
-        INNER JOIN sys.query_store_runtime_stats_interval AS rsi
-            ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
-        WHERE rsi.start_time >= DATEADD(MINUTE, -{window_minutes}, GETUTCDATE())
-        GROUP BY q.query_id, qt.query_sql_text
-        HAVING COUNT(DISTINCT p.plan_id) > 1
-           AND CASE WHEN MIN(rs.avg_duration) > 0
-                    THEN MAX(rs.avg_duration) * 1.0 / MIN(rs.avg_duration)
-                    ELSE 0
-               END >= {threshold}
-        ORDER BY duration_variance_ratio DESC
-        """.format(
-            top_n=int(top_n),
-            window_minutes=int(window_minutes),
-            threshold=float(variance_threshold),
-        )
+        """Find queries with multiple plans where perf varies wildly (parameter sniffing indicator).
 
-        rows = await self.executor.fetch_all(database_name, query)
+        Each plan's averages are weighted by executions over Regular runs only,
+        then the plans are ranked: best/worst are the fastest and slowest plan,
+        so one timeout row or one slow interval cannot set the ratio. A plan
+        with material aborted/exception runs never ranks best and ranks worst
+        first; with no Regular runs its averages and the ratio are None.
+        """
+        query = _PARAMETER_SNIFFING_SQL
+        params: list[object] = [int(window_minutes), int(top_n), float(variance_threshold)]
+
+        rows = await self.executor.fetch_all(database_name, query, params=params)
+        for row in rows:
+            for key in ("best_plan_material_failures", "worst_plan_material_failures"):
+                if key in row:
+                    row[key] = bool(row[key])
         return {
             "database_name": database_name,
             "window_minutes": window_minutes,
@@ -166,91 +326,71 @@ class QueryRegressionService:
         plan_id_a: int | None = None,
         plan_id_b: int | None = None,
     ) -> dict[str, Any]:
-        """Compare two plans for a query. If plan IDs not given, uses best/worst by duration."""
-        if plan_id_a is not None and plan_id_b is not None:
-            plans_query = """
-            SELECT
-                p.plan_id,
-                p.query_id,
-                p.is_forced_plan,
-                p.force_failure_count,
-                rs.avg_duration / 1000.0 AS avg_duration_ms,
-                rs.avg_cpu_time / 1000.0 AS avg_cpu_ms,
-                rs.avg_logical_io_reads,
-                rs.avg_physical_io_reads,
-                rs.count_executions,
-                rs.first_execution_time,
-                rs.last_execution_time,
-                CAST(p.query_plan AS NVARCHAR(MAX)) AS query_plan_xml
-            FROM sys.query_store_plan AS p
-            INNER JOIN sys.query_store_runtime_stats AS rs
-                ON p.plan_id = rs.plan_id
-            WHERE p.query_id = {query_id}
-              AND p.plan_id IN ({plan_a}, {plan_b})
-            ORDER BY p.plan_id
-            """.format(
-                query_id=int(query_id),
-                plan_a=int(plan_id_a),
-                plan_b=int(plan_id_b),
-            )
-        else:
-            plans_query = """
-            WITH PlanStats AS (
-                SELECT
-                    p.plan_id,
-                    p.query_id,
-                    p.is_forced_plan,
-                    p.force_failure_count,
-                    rs.avg_duration / 1000.0 AS avg_duration_ms,
-                    rs.avg_cpu_time / 1000.0 AS avg_cpu_ms,
-                    rs.avg_logical_io_reads,
-                    rs.avg_physical_io_reads,
-                    rs.count_executions,
-                    rs.first_execution_time,
-                    rs.last_execution_time,
-                    CAST(p.query_plan AS NVARCHAR(MAX)) AS query_plan_xml,
-                    ROW_NUMBER() OVER (ORDER BY rs.avg_duration ASC) AS best_rank,
-                    ROW_NUMBER() OVER (ORDER BY rs.avg_duration DESC) AS worst_rank
-                FROM sys.query_store_plan AS p
-                INNER JOIN sys.query_store_runtime_stats AS rs
-                    ON p.plan_id = rs.plan_id
-                WHERE p.query_id = {query_id}
-            )
-            SELECT * FROM PlanStats
-            WHERE best_rank = 1 OR worst_rank = 1
-            ORDER BY avg_duration_ms ASC
-            """.format(query_id=int(query_id))
+        """Compare two plans for a query. If plan IDs not given, uses best/worst by duration.
 
-        rows = await self.executor.fetch_all(database_name, plans_query)
+        Runtime stats are aggregated per plan first (execution-weighted, Regular
+        runs only; aborted and exception counts are separate fields), so each
+        plan is one row and its XML is read once. Plans come back in the
+        caller's a/b order (best, worst by default) and each ratio is
+        compared_plan_id / baseline_plan_id.
+        """
+        if (plan_id_a is None) != (plan_id_b is None):
+            raise ValueError("Give both plan_id_a and plan_id_b, or neither (best vs worst).")
+        if plan_id_a is not None and plan_id_b is not None:
+            plans_query = _COMPARE_PLANS_SQL.format(
+                plan_filter="AND p.plan_id IN (?, ?)",
+                rank_filter="",
+                order_by="r.plan_id",
+            )
+            params: list[object] = [int(query_id), int(plan_id_a), int(plan_id_b)]
+        else:
+            plans_query = _COMPARE_PLANS_SQL.format(
+                plan_filter="",
+                rank_filter="WHERE r.best_rank = 1 OR r.worst_rank = 1",
+                order_by="r.best_rank",
+            )
+            params = [int(query_id)]
+
+        rows = await self.executor.fetch_all(database_name, plans_query, params=params)
 
         plans: list[dict[str, Any]] = []
         for row in rows:
             plan_xml = row.pop("query_plan_xml", None) or ""
+            if "material_failures" in row:
+                row["material_failures"] = bool(row["material_failures"])
             row["plan_xml_length"] = len(plan_xml)
             # Extract top operators from plan XML (lightweight parse)
             row["top_operators"] = self._extract_top_operators(plan_xml)
             plans.append(row)
+        if plan_id_a is not None and plan_id_b is not None:
+            # The SQL sorts by plan_id; put the rows in the caller's a/b order.
+            by_id = {int(plan["plan_id"]): plan for plan in plans}
+            plans = [by_id[i] for i in dict.fromkeys((int(plan_id_a), int(plan_id_b))) if i in by_id]
 
         comparison: dict[str, Any] = {}
         if len(plans) == 2:
             a, b = plans[0], plans[1]
+            # A Regular-only average of a failing plan omits its timeouts, so
+            # a ratio would understate it: no ratios then.
+            failing = [p["plan_id"] for p in plans if p.get("material_failures")]
+            metrics = (
+                ("duration_ratio", "avg_duration_ms"),
+                ("cpu_ratio", "avg_cpu_ms"),
+                ("io_ratio", "avg_logical_io_reads"),
+            )
             comparison = {
-                "duration_ratio": round(
-                    (b.get("avg_duration_ms") or 1)
-                    / max(a.get("avg_duration_ms") or 1, 0.001),
-                    2,
-                ),
-                "cpu_ratio": round(
-                    (b.get("avg_cpu_ms") or 1)
-                    / max(a.get("avg_cpu_ms") or 1, 0.001),
-                    2,
-                ),
-                "io_ratio": round(
-                    (b.get("avg_logical_io_reads") or 1)
-                    / max(a.get("avg_logical_io_reads") or 1, 0.001),
-                    2,
-                ),
+                name: None if failing else _plan_ratio(a, b, column) for name, column in metrics
             }
+            # Each ratio is compared / baseline.
+            comparison["baseline_plan_id"] = a["plan_id"]
+            comparison["compared_plan_id"] = b["plan_id"]
+            # A plan with only aborted/exception runs has no Regular average,
+            # so its ratios are None; it is not 1 ms (it may always time out).
+            without_regular = [p["plan_id"] for p in plans if p.get("avg_duration_ms") is None]
+            if without_regular:
+                comparison["plans_without_regular_runs"] = without_regular
+            if failing:
+                comparison["plans_with_material_failures"] = failing
 
         return {
             "database_name": database_name,
@@ -628,3 +768,11 @@ def _float_or_none(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _plan_ratio(a: Mapping[str, Any], b: Mapping[str, Any], key: str) -> float | None:
+    """b / a for one metric; None when either plan has no Regular-run average."""
+    a_value, b_value = _float_or_none(a.get(key)), _float_or_none(b.get(key))
+    if a_value is None or b_value is None:
+        return None
+    return round((b_value or 1) / max(a_value or 1, 0.001), 2)

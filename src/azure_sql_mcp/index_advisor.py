@@ -76,6 +76,9 @@ _SOFT_REMOVAL_BLOCKERS = frozenset(
         "query_store_reference_window_shorter_than_usage_window",
         "query_store_window_coverage_unknown",
         "statistics_reference_check_unavailable",
+        "index_age_unknown",
+        "readable_replica_usage_unobserved",
+        "readable_replica_check_unavailable",
     }
 )
 
@@ -227,6 +230,9 @@ class AdvisorInputs:
     # hint_coverage "unresolved": a hint names no single index, so removals fail closed.
     forced_plan_coverage: str = "not_checked"
     hint_coverage: str = "not_checked"
+    # readable_replica_status(): "possible", "none" or "unknown"; None when the
+    # caller did not check. Usage counters and Query Store see only the primary.
+    readable_replicas: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -728,7 +734,14 @@ def _access_candidate(
                 keys.append((column, direction))
     keys = keys[:MAX_KEY_COLUMNS]
 
-    needed = list(access.output_columns) + list(access.residual) + list(access.nonsargable)
+    # Range columns that did not become the key still need to be in the index;
+    # _set_includes skips the ones that are keys.
+    needed = (
+        list(access.output_columns)
+        + list(access.residual)
+        + list(access.nonsargable)
+        + ranges
+    )
     candidate = _Candidate(
         schema=schema,
         table=table,
@@ -842,6 +855,7 @@ def _lookup_candidate(
         + list(feed.residual)
         + list(access.output_columns)
         + list(access.residual)
+        + ranges
     )
     candidate = _Candidate(
         schema=access.schema,
@@ -1571,7 +1585,8 @@ def _protection_reasons(index: ExistingIndex) -> list[str]:
 def _reads(index: ExistingIndex) -> int | None:
     values = [index.usage.get(metric) for metric in ("user_seeks", "user_scans", "user_lookups")]
     if all(value is None for value in values):
-        return 0 if index.usage else None
+        # No usage-stats row: never touched since the counters reset, or new.
+        return None
     return sum(int(value or 0) for value in values)
 
 
@@ -1660,10 +1675,35 @@ def _unused_drop_recommendation(
             f"No reads, but usage counters reset {uptime_days:.1f} day(s) ago. Re-check "
             f"after at least {UNUSED_MIN_UPTIME_DAYS} days, ideally a full business cycle.",
         )
+    # Counters only cover the index's own life. STATS_DATE is a lower bound on
+    # its age (maintenance moves it later, never earlier).
+    index_age_days = _days_since(index.statistics_updated_utc, inputs.observed_at_utc)
+    if index_age_days is None:
+        blockers.append("index_age_unknown")
+    elif index_age_days < UNUSED_MIN_UPTIME_DAYS:
+        return _review_recommendation(
+            schema,
+            table,
+            index.name,
+            "index_younger_than_removal_window",
+            f"No reads, but its statistics were built or updated {index_age_days:.1f} day(s) "
+            "ago, so the index may be new and not yet used. Re-check after at least "
+            f"{UNUSED_HIGH_CONFIDENCE_DAYS} days. A statistics update or rebuild also moves "
+            "this date; if change records show the index is older, review it then.",
+        )
+    observed_days = (
+        min(uptime_days, index_age_days)
+        if uptime_days is not None and index_age_days is not None
+        else uptime_days
+    )
+    if inputs.readable_replicas == "possible":
+        blockers.append("readable_replica_usage_unobserved")
+    elif inputs.readable_replicas == "unknown":
+        blockers.append("readable_replica_check_unavailable")
     # Plan references should cover as much of the removal window as the counters do.
     usage_days = float(UNUSED_HIGH_CONFIDENCE_DAYS)
-    if uptime_days is not None:
-        usage_days = min(uptime_days, usage_days)
+    if observed_days is not None:
+        usage_days = min(observed_days, usage_days)
     if reference_days < usage_days:
         blockers.append("query_store_reference_window_shorter_than_usage_window")
     hard = [
@@ -1674,8 +1714,8 @@ def _unused_drop_recommendation(
     if hard:
         confidence = "low"
     elif (
-        uptime_days is not None
-        and uptime_days >= UNUSED_HIGH_CONFIDENCE_DAYS
+        observed_days is not None
+        and observed_days >= UNUSED_HIGH_CONFIDENCE_DAYS
         and not blockers
         and not statistics_used
     ):
@@ -1695,6 +1735,12 @@ def _unused_drop_recommendation(
         "Rare jobs (month-end, quarter-end) may need it; confirm a full business cycle.",
         "Index hints or plan guides that name it will fail after removal.",
     ]
+    if inputs.readable_replicas in {"possible", "unknown"}:
+        risks.append(
+            "Usage counters and Query Store see only the primary. Reports that connect with "
+            "ApplicationIntent=ReadOnly (read scale-out, Hyperscale or geo replicas) may read "
+            "it unseen; check usage on each readable replica first."
+        )
     if statistics_used:
         # Auto-created statistics would bring back only a sampled single-column
         # histogram, not this index's multi-column density or full-scan histogram.
@@ -1713,8 +1759,8 @@ def _unused_drop_recommendation(
             "PERCENT instead and keep PERSIST_SAMPLE_PERCENT = ON."
         )
     rationale = (
-        f"No seeks, scans, or lookups in {uptime_days:.0f} day(s) of usage counters"
-        if uptime_days is not None
+        f"No seeks, scans, or lookups in {observed_days:.0f} day(s) of usage counters"
+        if observed_days is not None
         else "No seeks, scans, or lookups since the usage counters reset"
     )
     rationale += f", {updates} write(s) maintained it"

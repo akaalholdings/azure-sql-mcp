@@ -56,21 +56,43 @@ _CREATE_VIEW_HEADER = re.compile(
     r"^\s*(?:CREATE|ALTER)\s+(?:OR\s+ALTER\s+)?VIEW\b.*?\bAS\s+",
     re.IGNORECASE | re.DOTALL,
 )
+_CREATE_INLINE_FUNCTION_HEADER = re.compile(
+    r"^\s*(?:CREATE|ALTER)\s+(?:OR\s+ALTER\s+)?FUNCTION\b.*?"
+    r"\bRETURNS\s+TABLE\b.*?\bAS\s+RETURN\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_CREATE_MULTI_STATEMENT_FUNCTION = re.compile(
+    r"^\s*(?:CREATE|ALTER)\s+(?:OR\s+ALTER\s+)?FUNCTION\b.*?"
+    r"\bRETURNS\s+@\w+\s+TABLE\b.*?\bAS\s+BEGIN\b(?P<body>.*)\bEND\s*;?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
 _VIEW_TYPE_VALUES = frozenset({"V", "VIEW", "SQL_VIEW"})
+_TABLE_FUNCTION_TYPE_VALUES = frozenset(
+    {
+        "IF",
+        "TF",
+        "SQL_INLINE_TABLE_VALUED_FUNCTION",
+        "SQL_TABLE_VALUED_FUNCTION",
+    }
+)
 _DYNAMIC_EXTERNAL_SOURCE = "dynamic_external_source"
+# Rowset functions that read another server or a file. Azure SQL Database has
+# no linked servers, but the source is still outside this database.
+_EXTERNAL_ROWSET_FUNCTIONS = frozenset(
+    {"OPENDATASOURCE", "OPENQUERY", "OPENROWSET", "OPENXML"}
+)
+# Built-in rowset functions whose rows depend only on their arguments.
+_DETERMINISTIC_BUILTIN_ROWSET_FUNCTIONS = frozenset({"STRING_SPLIT"})
 _NON_VIEW_TYPE_VALUES = frozenset(
     {
         "AF",
         "FN",
         "FS",
         "FT",
-        "IF",
         "P",
         "PROCEDURE",
-        "SQL_INLINE_TABLE_VALUED_FUNCTION",
         "SQL_SCALAR_FUNCTION",
         "SQL_STORED_PROCEDURE",
-        "SQL_TABLE_VALUED_FUNCTION",
         "TABLE",
         "U",
         "USER_TABLE",
@@ -151,6 +173,10 @@ class _ObjectReference:
     object_name: str
     source: str
     catalog_name: str = ""
+    is_function: bool = False
+    # `name.nodes(...)` is a schema function or the XML nodes() method on a
+    # column; only the catalog can tell.
+    xml_method_candidate: bool = False
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -167,6 +193,7 @@ class _Resolution:
     definition: str | None = None
     schema_name: str | None = None
     object_name: str | None = None
+    missing: bool = False
 
 
 class EquivalencePreflightService:
@@ -297,12 +324,18 @@ class EquivalencePreflightService:
                 reference,
             )
         resolution = resolution_cache[reference.key]
-        if resolution.status == "non_view":
+        if reference.xml_method_candidate and (
+            resolution.missing or resolution.status == "non_view"
+        ):
+            return  # no such function: SQL binds nodes() to the XML column
+        is_function = reference.is_function or resolution.status == "function"
+        if resolution.status == "non_view" and not is_function:
             return
         canonical_reference = _ObjectReference(
             resolution.schema_name or reference.schema_name,
             resolution.object_name or reference.object_name,
             reference.source,
+            is_function=is_function,
         )
         if canonical_reference.key in path:
             _mark_unresolved(
@@ -317,7 +350,7 @@ class EquivalencePreflightService:
             return
         if canonical_reference.key in analyzed_views:
             return
-        if depth > self.max_depth and resolution.status == "resolved":
+        if depth > self.max_depth and resolution.status in {"resolved", "function"}:
             _mark_unresolved(
                 unresolved,
                 risk_codes,
@@ -328,15 +361,24 @@ class EquivalencePreflightService:
                 "maximum view dependency depth exceeded",
             )
             return
-        if resolution.status != "resolved" or resolution.definition is None:
+        readable_statuses = {"resolved", "function"} if is_function else {"resolved"}
+        if resolution.status not in readable_statuses or resolution.definition is None:
+            kind = "function" if is_function else "view"
             reason_by_status = {
-                "encrypted": "view definition is encrypted and cannot be inspected",
-                "inaccessible": "view definition could not be read",
-                "unresolved": "view dependency could not be resolved",
+                "encrypted": f"{kind} definition is encrypted and cannot be inspected",
+                "inaccessible": f"{kind} definition could not be read",
+                "unresolved": f"{kind} dependency could not be resolved",
             }
             reason = reason_by_status.get(
                 resolution.status,
-                "view dependency could not be analyzed",
+                f"{kind} dependency could not be analyzed",
+            )
+            # A function name that resolves to a table or CLR object has no
+            # readable T-SQL body.
+            status = (
+                "unresolved"
+                if is_function and resolution.status not in reason_by_status
+                else resolution.status
             )
             _mark_unresolved(
                 unresolved,
@@ -344,14 +386,20 @@ class EquivalencePreflightService:
                 risks,
                 reference,
                 depth,
-                f"{resolution.status}_view_dependency",
+                f"{status}_{kind}_dependency",
                 reason,
             )
             return
 
-        body = _view_definition_body(resolution.definition)
         source_name = _qualified_name(canonical_reference)
         try:
+            body = (
+                _function_definition_body(resolution.definition)
+                if is_function
+                else _view_definition_body(resolution.definition)
+            )
+            if body is None:
+                raise ValueError("function definition is not a T-SQL table function")
             view_preflight = analyze_equivalence_preflight(body)
             view_references = _referenced_objects(
                 body,
@@ -363,14 +411,15 @@ class EquivalencePreflightService:
                 source_name,
             )
         except (ParseError, ValueError):
+            kind = "function" if is_function else "view"
             _mark_unresolved(
                 unresolved,
                 risk_codes,
                 risks,
                 reference,
                 depth,
-                "invalid_view_definition",
-                "view definition could not be parsed for equivalence analysis",
+                f"invalid_{kind}_definition",
+                f"{kind} definition could not be parsed for equivalence analysis",
             )
             return
 
@@ -380,6 +429,11 @@ class EquivalencePreflightService:
                 "object_name": canonical_reference.object_name,
                 "depth": depth,
                 "source": reference.source,
+                **(
+                    {"dependency_type": "table_valued_function"}
+                    if is_function
+                    else {}
+                ),
             }
         )
         analyzed_views.add(canonical_reference.key)
@@ -500,9 +554,11 @@ def _normalize_resolution(
             fallback_schema,
             fallback_object,
         )
+    if value is None:
+        return _Resolution("unresolved", missing=True)
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         if not value:
-            return _Resolution("unresolved")
+            return _Resolution("unresolved", missing=True)
         value = value[0]
     if not isinstance(value, Mapping):
         return _Resolution("unresolved")
@@ -517,7 +573,7 @@ def _normalize_resolution(
     ):
         return _Resolution("inaccessible")
     if status in {"unresolved", "not_found", "missing"}:
-        return _Resolution("unresolved")
+        return _Resolution("unresolved", missing=True)
 
     object_type = (
         str(
@@ -535,6 +591,10 @@ def _normalize_resolution(
     definition = value.get("definition")
     if object_type in _NON_VIEW_TYPE_VALUES:
         return _Resolution("non_view", None, schema_name or None, object_name)
+    if object_type in _TABLE_FUNCTION_TYPE_VALUES:
+        if not isinstance(definition, str) or not definition.strip() or not schema_name:
+            return _Resolution("unresolved")
+        return _Resolution("function", definition, schema_name, object_name)
     if object_type and object_type not in _VIEW_TYPE_VALUES:
         return _Resolution("unresolved")
     if not isinstance(definition, str) or not definition.strip():
@@ -552,6 +612,27 @@ def _as_bool(value: Any) -> bool:
 
 def _view_definition_body(definition: str) -> str:
     return _CREATE_VIEW_HEADER.sub("", definition, count=1).strip()
+
+
+def _function_definition_body(definition: str) -> str | None:
+    """Return the T-SQL body of an inline or multi-statement table function."""
+
+    inline = _CREATE_INLINE_FUNCTION_HEADER.match(definition)
+    if inline is not None:
+        return definition[inline.end() :].strip()
+    multi_statement = _CREATE_MULTI_STATEMENT_FUNCTION.match(definition)
+    if multi_statement is not None:
+        body = multi_statement.group("body").strip()
+        # An opaque statement could hide a volatile call from the analysis.
+        if any(
+            isinstance(node, exp.Command)
+            for statement in parse(body, read="tsql")
+            if statement is not None
+            for node in statement.walk()
+        ):
+            return None
+        return body
+    return None
 
 
 def _qualified_name(reference: _ObjectReference) -> str:
@@ -576,7 +657,27 @@ def _referenced_objects(
     references: list[_ObjectReference] = []
     seen: set[tuple[str, str, str]] = set()
     for statement in statements:
+        source_aliases = _source_aliases(statement)
         for table in statement.find_all(exp.Table):
+            if isinstance(table.this, exp.Parameter):
+                continue  # table variable: its rows come from this batch
+            if isinstance(table.this, exp.Anonymous):
+                if isinstance(table.args.get("db"), exp.Parameter) and (
+                    table.this.name.casefold() == "nodes"
+                ):
+                    continue  # @xml.nodes(): shreds a variable from this batch
+                catalog_name = _table_catalog_name(table)
+                reference = _function_reference(
+                    table.this.name,
+                    [part for part in (catalog_name, table.db) if part],
+                    source,
+                    default_schema=default_schema,
+                    dynamic_catalog=catalog_name == _DYNAMIC_EXTERNAL_SOURCE,
+                    source_aliases=source_aliases,
+                )
+                if reference is not None:
+                    _add_reference(references, seen, reference)
+                continue
             if (
                 table.name in cte_names
                 and not table.db
@@ -593,7 +694,87 @@ def _referenced_objects(
                     _table_catalog_name(table),
                 ),
             )
+        for lateral in statement.find_all(exp.Lateral):
+            call = lateral.this
+            prefix: list[str] | None = []
+            if isinstance(call, exp.Dot):
+                prefix = _identifier_parts(call.this)
+                call = call.expression
+            if isinstance(call, exp.Anonymous) and prefix is not None:
+                reference = _function_reference(
+                    call.name,
+                    prefix,
+                    source,
+                    default_schema=default_schema,
+                    source_aliases=source_aliases,
+                )
+                if reference is not None:
+                    _add_reference(references, seen, reference)
     return references
+
+
+def _identifier_parts(node: exp.Expr) -> list[str] | None:
+    if isinstance(node, exp.Identifier):
+        return [node.name]
+    if isinstance(node, exp.Dot):
+        left = _identifier_parts(node.this)
+        right = _identifier_parts(node.expression)
+        return None if left is None or right is None else [*left, *right]
+    return None
+
+
+def _source_aliases(statement: exp.Expr) -> frozenset[str]:
+    """Casefolded names a column reference can be qualified with."""
+
+    names = {alias.name for alias in statement.find_all(exp.TableAlias)}
+    names.update(
+        table.name
+        for table in statement.find_all(exp.Table)
+        if isinstance(table.this, exp.Identifier)
+    )
+    return frozenset(name.casefold() for name in names if name)
+
+
+def _function_reference(
+    function_name: str,
+    prefix: Sequence[str],
+    source: str,
+    *,
+    default_schema: str,
+    dynamic_catalog: bool = False,
+    source_aliases: frozenset[str] = frozenset(),
+) -> _ObjectReference | None:
+    """Map a table-valued function call in FROM, JOIN, or APPLY to a reference."""
+
+    name = str(function_name or "").strip()
+    if name.upper() in _EXTERNAL_ROWSET_FUNCTIONS or dynamic_catalog:
+        # Arguments can carry connection strings, so no name is retained.
+        return _ObjectReference(
+            prefix[-1] if prefix else "",
+            "",
+            source,
+            _DYNAMIC_EXTERNAL_SOURCE,
+        )
+    if name.casefold() == "nodes":
+        if len(prefix) >= 2 and prefix[0].casefold() in source_aliases:
+            return None  # alias.column.nodes(): shreds a value already read
+        if len(prefix) == 1:
+            return _ObjectReference(
+                prefix[0],
+                name,
+                source,
+                is_function=True,
+                xml_method_candidate=True,
+            )
+    if not prefix and name.upper() in _DETERMINISTIC_BUILTIN_ROWSET_FUNCTIONS:
+        return None
+    return _ObjectReference(
+        prefix[-1] if prefix else default_schema,
+        name,
+        source,
+        ".".join(prefix[:-1]),
+        is_function=True,
+    )
 
 
 def _table_catalog_name(table: exp.Table) -> str:
@@ -605,8 +786,6 @@ def _table_catalog_name(table: exp.Table) -> str:
         return _DYNAMIC_EXTERNAL_SOURCE
     if table.catalog:
         return table.catalog
-    if isinstance(table.this, exp.Anonymous):
-        return _DYNAMIC_EXTERNAL_SOURCE
     return ""
 
 

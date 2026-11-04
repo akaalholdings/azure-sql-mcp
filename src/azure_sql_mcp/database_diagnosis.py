@@ -179,6 +179,11 @@ def _resource_findings(history: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         avg = float(stats.get("avg") or 0.0)
         peak = float(stats.get("max") or 0.0)
+        # Long windows summarize hourly buckets: the bucket maximum (max_*) is
+        # the 5-minute peak; the highest hourly average hides a short saturation.
+        peak_stats = summary.get(metric.replace("avg_", "max_", 1))
+        if metric.startswith("avg_") and isinstance(peak_stats, dict):
+            peak = max(peak, float(peak_stats.get("max") or 0.0))
         if peak >= 95 or avg >= 80:
             severity = "high"
         elif peak >= 85 or avg >= 60:
