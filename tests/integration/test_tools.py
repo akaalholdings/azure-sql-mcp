@@ -82,8 +82,10 @@ async def test_parameterized_execution_pins_only_sp_executesql_controls(
     integration_database_name: str,
     prepared_test_schema: str,
 ) -> None:
+    # The probe reads a table: STATISTICS XML returns no actual plan for a
+    # constant-only SELECT on Azure SQL Database.
     probe = ParameterExecutionContract(
-        sql_text="SELECT @P1 AS probe_value",
+        sql_text=f"SELECT TOP (1) [OrderId] FROM [{prepared_test_schema}].[Orders] WHERE [OrderId] > @P1",
         bucket_id="driver-probe",
         parameters=(
             TypedParameter(
