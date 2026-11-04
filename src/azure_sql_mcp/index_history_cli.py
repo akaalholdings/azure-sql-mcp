@@ -74,6 +74,9 @@ def _print_result(payload: dict[str, Any], output: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from . import driver_openssl
+
+    driver_openssl.ensure_driver_openssl()  # macOS: the ODBC driver needs OpenSSL 1.1 or 3.
     args = build_parser().parse_args(argv)
     try:
         payload = asyncio.run(_capture(args))

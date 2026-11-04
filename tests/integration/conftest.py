@@ -9,7 +9,27 @@ import pytest
 from azure_sql_mcp.auth import ConnectionArguments
 from azure_sql_mcp.config import AuthMode
 from azure_sql_mcp.config import load_server_config
+from azure_sql_mcp.driver_openssl import ensure_driver_openssl
 from azure_sql_mcp.server import AzureSqlMcpApplication
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Live run on macOS: the ODBC driver needs OpenSSL 1.1 or 3 (may re-exec pytest).
+
+    pytest has already redirected stdout/stderr into its capture files, so the
+    capture is suspended first; else the re-executed run's output is lost.
+    """
+
+    if not os.getenv("AZURE_SQL_SERVER"):
+        return
+    capture = config.pluginmanager.getplugin("capturemanager")
+    if capture is not None:
+        capture.suspend_global_capture(in_=True)
+    try:
+        ensure_driver_openssl()
+    finally:
+        if capture is not None:
+            capture.resume_global_capture()
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("AZURE_SQL_SERVER"),

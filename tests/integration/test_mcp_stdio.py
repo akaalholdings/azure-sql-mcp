@@ -20,7 +20,13 @@ pytestmark = pytest.mark.skipif(
 
 
 def _server_env(app: AzureSqlMcpApplication, database_name: str) -> dict[str, str]:
-    env = os.environ.copy()
+    # No inherited OpenSSL fix: the server's own startup guard must make the
+    # connection work on macOS (pytest itself may have been re-executed).
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("DYLD_") and key != "AZURE_SQL_MCP_OPENSSL_REEXEC"
+    }
     env.update(
         {
             "AZURE_SQL_SERVER": app.config.server,

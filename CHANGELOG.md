@@ -6,9 +6,27 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
-Correctness fixes from the 2026-11-03 review (2.6.3a).
+Correctness fixes from the 2026-11-03 review (2.6.3a), and live testing on macOS.
+
+### Added
+
+- `scripts/azure_test_db.sh up|ip|status|down`: a disposable free-offer Azure
+  SQL Database for live testing, with the env and policy files the MCP needs.
+  It acts only on the resource group it creates (tagged
+  `purpose=azure-sql-mcp-testing`).
 
 ### Fixed
+
+macOS:
+
+- The MCP could not connect to any database on a Mac where Homebrew's default
+  `openssl` is OpenSSL 4: the ODBC driver bundled in mssql-python accepts only
+  OpenSSL 1.1 or 3 and failed with "OpenSSL library could not be loaded". The
+  server (`azure-sql-mcp`, `python -m azure_sql_mcp.server`) and
+  `azure-sql-mcp-index-history` now re-execute once at startup with Homebrew's
+  `openssl@3` first on `DYLD_LIBRARY_PATH`, and say `brew install openssl@3`
+  when it is missing. The live acceptance script and the integration tests do
+  the same.
 
 Index advice and removal:
 

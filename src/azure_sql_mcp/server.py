@@ -10150,4 +10150,7 @@ def main(argv: list[str] | None = None) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # "python -m azure_sql_mcp.server": same guarded entry as the console script.
+    from azure_sql_mcp import main as guarded_main
+
+    guarded_main()
