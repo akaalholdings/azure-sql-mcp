@@ -6,7 +6,10 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
-Correctness fixes from the 2026-11-03 review (2.6.3a), and live testing on macOS.
+## [2.6.3] - 2026-11-06
+
+Correctness fixes from the 2026-11-03 review, found and proven by live testing on
+Azure SQL Database; the macOS OpenSSL fix; the plan-reader fixes.
 
 ### Added
 

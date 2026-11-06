@@ -5412,7 +5412,7 @@ class AzureSqlMcpApplication:
             **checks,
             "azure_sql_database": platform,
             "mcp_contract": {
-                "contract_version": "2.6.2",
+                "contract_version": "2.6.3",
                 "performance_tuning": 1,
                 "durable_view_change": 1,
                 "prepared_plan_action": 1,
