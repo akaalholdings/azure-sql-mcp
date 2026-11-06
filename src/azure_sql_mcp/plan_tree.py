@@ -436,6 +436,21 @@ def statements(root: ET.Element) -> list[tuple[ET.Element, ET.Element | None]]:
     return found
 
 
+def cursor_operation(statement: ET.Element, query_plan: ET.Element | None) -> tuple[str | None, str | None]:
+    """(OperationType, CursorActualType) of a cursor plan from ``statements``; (None, None) otherwise.
+
+    Populate and fetch plans share the cursor's text and hash: the operation tells them apart.
+    """
+
+    if statement.tag != f"{_Q}StmtCursor" or query_plan is None:
+        return None, None
+    cursor_plan = statement.find(f"{_Q}CursorPlan")
+    for operation in statement.findall(f"{_Q}CursorPlan/{_Q}Operation"):
+        if operation.find(f"{_Q}QueryPlan") is query_plan:
+            return operation.get("OperationType"), cursor_plan.get("CursorActualType") if cursor_plan is not None else None
+    return None, None
+
+
 def build_tree(query_plan: ET.Element | None) -> list[PlanNode]:
     """Operators of one statement in document order, with self times attributed."""
 

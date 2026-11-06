@@ -25,6 +25,7 @@ from .plan_tree import build_tree
 from .plan_tree import ce_guess_fraction
 from .plan_tree import clean_text
 from .plan_tree import cross_join_check
+from .plan_tree import cursor_operation
 from .plan_tree import estimate_check
 from .plan_tree import is_true
 from .plan_tree import parse_showplan
@@ -47,11 +48,20 @@ ESTIMATE_GAP_ROW_FLOOR = 1_000
 SCAN_TABLE_ROW_FLOOR = 10_000
 EXCESSIVE_GRANT_KB = 1024 * 1024
 UDF_TIME_SHARE_FLOOR = 0.1
+# The default cost threshold for parallelism: a cheaper plan is never made parallel,
+# so its NonParallelPlanReason changes nothing. The database setting is not in the plan.
+PARALLELISM_COST_FLOOR = 5.0
+# A seek that reads at least this fraction of the table tests a residual LIKE on most rows, as a scan does.
+WIDE_SEEK_READ_FRACTION = 0.5
 MAX_FINDINGS = 50
 _UDF = f"{_Q}UserDefinedFunction"
 _COLUMN_REFERENCE = f"{_Q}ColumnReference"
 _PREDICATE_TAGS = {f"{_Q}{name}" for name in ("Predicate", "SeekPredicates", "ProbeResidual", "BuildResidual", "Residual")}
 _NAME_PART = re.compile(r"\[((?:[^\]]|\]\])*)\]")
+_WILDCARD_FIX = (
+    "Search by prefix (LIKE 'abc%') if the requirement allows. For an ends-with search, index a "
+    "computed REVERSE() column and search it by prefix; for a contains search, use full-text search."
+)
 _COMPUTED_COLUMN_INDEX = (
     "index a deterministic computed column on the expression (every writer then needs the required "
     "SET options, for example QUOTED_IDENTIFIER and ANSI_NULLS ON when a module was created, or its "
@@ -119,10 +129,13 @@ def analyze_plan(plan_xml: str) -> dict[str, Any]:
             )
             statement_findings = _statement_findings(index, statement, query_plan, nodes, accesses, actual)
             findings.extend(statement_findings)
+            operation_type, cursor_type = cursor_operation(statement, query_plan)
             statements_out.append(
                 {
                     "statement_index": index,
                     "statement_type": (statement.get("StatementType") or "").upper(),
+                    "cursor_operation": operation_type,
+                    "cursor_actual_type": cursor_type,
                     "statement_cost": _float(statement.get("StatementSubTreeCost")),
                     "elapsed_ms": statement_elapsed_ms(query_plan, nodes) if actual else None,
                     "query_hash": statement.get("QueryHash"),
@@ -287,9 +300,11 @@ def _access_rules(accesses: list[Any], add, impact, by_id: dict[int, PlanNode]) 
                     f"{table}.{column_name} is searched with LIKE and a leading wildcard: there is no prefix to "
                     "seek, so every row is read and tested."
                 )
-                fix = (
-                    "Search by prefix (LIKE 'abc%') if the requirement allows. For an ends-with search, index a "
-                    "computed REVERSE() column and search it by prefix; for a contains search, use full-text search."
+                fix = _WILDCARD_FIX + (
+                    " The column is also under an implicit conversion: type the pattern as the column "
+                    "(for a varchar column, '...' rather than N'...')."
+                    if column in access.implicit_conversion_columns
+                    else ""
                 )
             else:
                 message = (
@@ -318,10 +333,64 @@ def _access_rules(accesses: list[Any], add, impact, by_id: dict[int, PlanNode]) 
                     "dynamic_seek": dynamic,
                 },
             )
+        node = by_id.get(access.node_id)
+        rows_read = _float(node.element.get("EstimatedRowsRead")) if node is not None else 0.0
+        cardinality = node.table_cardinality if node is not None else 0.0
+        wildcard_fix = _WILDCARD_FIX[0].lower() + _WILDCARD_FIX[1:]
+        for column in access.residual_wildcard_columns:
+            column_name = clean_text(column, 128)
+            seek_on = ", ".join(clean_text(item, 128) or "" for item in access.seek_eq_columns + access.seek_range_columns)
+            severity = "low"
+            if access.operation in {"lookup", "rid_lookup"}:
+                # The lookup fetches one row per outer row: the index that feeds it limits the rows.
+                feeder = clean_text(access.paired_index, 128)
+                message = (
+                    f"{table}.{column_name} is searched with LIKE and a leading wildcard in a residual predicate on "
+                    f"the {access.operation.replace('_', ' ')}: {feeder or 'the index access that feeds it'} limits "
+                    "the rows, and the LIKE is tested on each row the lookup fetches."
+                )
+                fix = (
+                    f"Add {column_name} as an INCLUDE column to {feeder or 'the index that feeds the lookup'}, so "
+                    "the LIKE filters the rows before the lookups run (or let review_workload_indexes design it); "
+                    "otherwise " + wildcard_fix
+                )
+            elif cardinality > 0 and rows_read >= cardinality * WIDE_SEEK_READ_FRACTION:
+                severity = _share_severity(share, high=0.3, medium=0.05)
+                message = (
+                    f"{table}.{column_name} is searched with LIKE and a leading wildcard in a residual predicate: the "
+                    f"seek on {seek_on or 'the index'} reads about {rows_read:,.0f} of {cardinality:,.0f} rows, so "
+                    "the LIKE is tested on most of the table."
+                )
+                fix = "Make the seek more selective, or " + wildcard_fix
+            else:
+                message = (
+                    f"{table}.{column_name} is searched with LIKE and a leading wildcard in a residual predicate: "
+                    f"the {'seek on ' + seek_on if seek_on else access.operation.replace('_', ' ')} limits the "
+                    "rows, and the LIKE filters the rows it returns."
+                )
+                fix = (
+                    "Usually acceptable. If the LIKE discards most of the rows the seek reads, make the seek more "
+                    "selective; otherwise " + wildcard_fix
+                )
+            add(
+                "non_sargable_predicate",
+                severity,
+                "predicates",
+                message,
+                fix,
+                node_id=access.node_id,
+                cost_share=access.cost_share,
+                evidence={
+                    "table": table,
+                    "column": column_name,
+                    "wrapper": "leading_wildcard",
+                    "operation": access.operation,
+                    "dynamic_seek": False,
+                },
+            )
         # An actual plan counts the lookups that ran: an underestimated outer
         # input can run a lookup the optimizer expected once 200,000 times, and
         # an overestimated one can run it far less often (or never).
-        node = by_id.get(access.node_id)
         actual_executions = node.actual_executions if node is not None and node.has_runtime else None
         measured = actual_executions is not None
         timed = node is not None and node.has_timing
@@ -451,14 +520,27 @@ def _statement_warning_rules(statement: ET.Element, query_plan: ET.Element, add,
             "Use a literal for the filter predicate, OPTION (RECOMPILE), or an unfiltered index.",
         )
     reason = clean_text(query_plan.get("NonParallelPlanReason"), 120)
-    if reason and reason not in {"MaxDOPSetToOne", "EstimatedDOPIsOne", "NoParallelPlansInDesktopOrExpressEdition"}:
+    root = query_plan.find(f"{_Q}RelOp")
+    # A cursor's plans share one statement: each plan's own root cost decides.
+    plan_cost = _float(root.get("EstimatedTotalSubtreeCost")) if root is not None else 0.0
+    plan_cost = plan_cost or _float(statement.get("StatementSubTreeCost"))
+    if (
+        reason
+        and reason not in {"MaxDOPSetToOne", "EstimatedDOPIsOne", "NoParallelPlansInDesktopOrExpressEdition"}
+        and plan_cost >= PARALLELISM_COST_FLOOR
+    ):
         add(
             "non_parallel_plan_reason",
             "medium" if "UserDefinedFunction" in reason or "TableVariable" in reason else "info",
             "parallelism",
             f"The plan could not go parallel: {reason}.",
-            "Remove the blocker (for example a non-inlinable scalar UDF, which often reports "
-            "CouldNotGenerateValidParallelPlan) if the query is CPU-bound and large.",
+            (
+                "A FAST_FORWARD cursor never runs in parallel: rewrite the loop as a set-based statement, "
+                "or declare the cursor STATIC if its populate query must go parallel."
+                if reason == "NoParallelFastForwardCursor"
+                else "Remove the blocker (for example a non-inlinable scalar UDF, which often reports "
+                "CouldNotGenerateValidParallelPlan) if the query is CPU-bound and large."
+            ),
             evidence={"non_parallel_plan_reason": reason},
         )
     abort = statement.get("StatementOptmEarlyAbortReason")

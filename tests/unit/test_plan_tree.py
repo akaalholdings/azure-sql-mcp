@@ -445,3 +445,16 @@ def test_deeply_nested_plan_fails_cleanly_without_recursion(showplan) -> None:
 
     with pytest.raises(PlanParseError, match="plan_too_deep"):
         build_tree(query_plan)
+
+
+def test_cursor_operation_names_each_cursor_plan(showplan) -> None:
+    # Populate and fetch plans share the DECLARE CURSOR text and hash: only the
+    # Operation element tells them apart.
+    plan = showplan.batch(
+        showplan.cursor(("PopulateQuery", showplan.scan(0, "Orders")), ("FetchQuery", showplan.scan(0, "Orders")), cursor_type="Keyset"),
+        showplan.simple(showplan.scan(0, "Customers")),
+    )
+
+    found = [plan_tree.cursor_operation(statement, query_plan) for statement, query_plan in statements(parse_showplan(plan))]
+
+    assert found == [("PopulateQuery", "Keyset"), ("FetchQuery", "Keyset"), (None, None)]
