@@ -168,14 +168,33 @@ returns recommend-only DDL with exact rollback. Query Store must be
 `READ_WRITE` or `READ_ONLY`; otherwise the tool returns `precondition` with
 the enabling statement and still reports catalog-only findings.
 
-For an end-to-end check against a disposable database, run:
+For an end-to-end check against a disposable database, create one first (free
+offer, Entra-only, `az login` and `uv` required), then run the acceptance script
+and the integration tests:
 
 ```bash
-uv run python scripts/azure_live_acceptance.py --database testdb --confirm-disposable-database --with-deadlock
+scripts/azure_test_db.sh up
+set -a; . ~/.config/azure-sql-mcp/test.env; set +a
+uv run python scripts/azure_live_acceptance.py --database mcptest --confirm-disposable-database --with-deadlock
+uv run pytest -q tests/integration
+scripts/azure_test_db.sh down
 ```
 
-It creates and drops only its own `mcp_accept` schema objects and restores the
-Query Store capture mode it changes.
+The acceptance script creates and drops only its own `mcp_accept` schema
+objects and restores the Query Store capture mode it changes; the integration
+tests use their own `mcp_integration` schema. `scripts/azure_test_db.sh up`
+leaves the test database's Query Store capturing ALL queries in 1-minute
+intervals with `LAST_QUERY_PLAN_STATS` on, writes an env file with no secrets
+and a database policy file (without a policy the MCP refuses every read), and
+acts only on the resource group it creates. `scripts/azure_test_db.sh ip`
+allows a new client IP after a network change.
+
+On macOS, the ODBC driver bundled in mssql-python loads OpenSSL from Homebrew's
+default `openssl` link and accepts only OpenSSL 1.1 or 3. When that link is
+OpenSSL 4, the server re-executes itself once at startup with Homebrew's
+`openssl@3` first on `DYLD_LIBRARY_PATH`; if `openssl@3` is not installed it
+prints `brew install openssl@3` on stderr. A program fed to `python -` cannot
+be re-executed: start it with `DYLD_LIBRARY_PATH` set instead.
 
 ### Optional index history capture and review
 

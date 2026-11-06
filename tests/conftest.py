@@ -200,3 +200,25 @@ class ShowplanBuilder:
 @pytest.fixture
 def showplan() -> ShowplanBuilder:
     return ShowplanBuilder()
+
+
+@pytest.fixture(autouse=True)
+def _no_openssl_reexec_inside_tests(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A test that calls a real CLI main() must never re-exec pytest.
+
+    On a Mac with Homebrew OpenSSL 4 the guard would replace the test process,
+    and the rest of the run would write into pytest's capture files: exit 0 and
+    no visible results. test_driver_openssl tests the guard itself (it holds
+    direct references and fakes os.execve); the integration conftest imports the
+    real function directly, so live runs keep their guard.
+    """
+
+    if request.module.__name__.endswith("test_driver_openssl"):
+        return
+    from azure_sql_mcp import driver_openssl
+
+    monkeypatch.setattr(
+        driver_openssl,
+        "ensure_driver_openssl",
+        lambda **_: driver_openssl.OpenSSLDecision("none"),
+    )

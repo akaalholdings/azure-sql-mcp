@@ -419,4 +419,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    from azure_sql_mcp.driver_openssl import ensure_driver_openssl
+
+    ensure_driver_openssl()  # macOS: the ODBC driver needs OpenSSL 1.1 or 3.
     raise SystemExit(main())
