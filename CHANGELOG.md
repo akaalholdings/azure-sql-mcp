@@ -128,8 +128,14 @@ comparison with PerformanceMonitor; see NOTICE):
 - Self CPU of a parallel row-mode operator took the busiest thread, so a scan
   whose four workers burned 400 ms reported 100 ms. CPU now sums across
   threads, and elapsed still takes the slowest thread. The "waited" note
-  compares CPU per worker thread with elapsed, so an operator that waited on
-  every thread is still called waited.
+  judges the slowest thread, which sets the operator's time: it waited when
+  that thread's own CPU is far below its own elapsed and no thread that worked
+  ran nearly as long. A skewed operator whose one busy thread did all the work
+  is not called waited.
+- A plan with parallel operators that ran serially (runtime
+  DegreeOfParallelism 0 or 1) says so, and names the usual causes: a worker
+  thread shortage, or a workload group or resource governor MAX_DOP. On the
+  Azure SQL free offer the workload group caps MAX_DOP at 1.
 - Under a row goal, the "may stop early" note replaced the "reads far more rows
   than it returns" flag. A seek that read 1.37 billion rows to return 5,718 was
   not flagged.
@@ -139,12 +145,26 @@ comparison with PerformanceMonitor; see NOTICE):
   - The node drill-down reports `end_of_scans`.
 - Cursor statements (`StmtCursor`) got no digest and no findings. Each cursor
   operation's plan is now analyzed. Predicate findings stay on the correct
-  statement in a batch that mixes cursors and other statements.
+  statement in a batch that mixes cursors and other statements. Statements
+  name their `cursor_operation` (PopulateQuery, FetchQuery) and
+  `cursor_actual_type`, and one cursor's operations share its cost once in the
+  workload attribution. A fast-forward cursor that blocks parallelism gets
+  cursor-specific advice, and plans below the default cost threshold for
+  parallelism (5) get no `non_parallel_plan_reason` finding.
 - A constant `LIKE` pattern that starts with `%` or `_` was an ordinary
   residual. Plan rules now report it as a non-SARGable predicate
   (`leading_wildcard`) with its own advice: prefix search, an indexed
   `REVERSE()` computed column, or full-text search. The index review routes it
   to `sql-optimizer`.
+  - On a scan it is high: every row is read and tested.
+  - As a residual on a seek of another column it is low: the seek limits the
+    rows. A seek that reads most of the table is graded like a scan, and a
+    lookup names the feeding index and suggests adding the column as INCLUDE.
+  - A leading wildcard under a function or an implicit conversion is named as
+    the blocker. `NOT LIKE` gets no wildcard advice.
+- `review_workload_indexes` no longer says "the stored plans did not use" an
+  index that the plans seek. A seek counts as passing the index over only when
+  it left the next key after its equality prefix as a residual.
 
 Runtime:
 
