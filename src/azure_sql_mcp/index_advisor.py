@@ -561,6 +561,12 @@ def _rewrite_explanation(pattern: str) -> str:
             "Rewrite it so the column is bare (move the work to the parameter side) "
             "before expecting an index to seek."
         )
+    if pattern == "leading_wildcard":
+        return (
+            "LIKE with a leading wildcard has no prefix, so no index on the column can seek "
+            "it. Search by prefix if the requirement allows; for an ends-with search, index a "
+            "computed REVERSE() column; for a contains search, use full-text search."
+        )
     return (
         "The predicate wraps the column in an expression, so it cannot seek. Rewrite it "
         "with the bare column before adding an index for it."
@@ -964,6 +970,28 @@ def _key_eligible(columns: dict[str, ColumnInfo], column: str) -> bool:
     return info is None or info.key_eligible
 
 
+def _seek_missed_a_key(access, index: ExistingIndex, key_names: set[str]) -> bool:
+    """True when the seek left a candidate key as a residual that it could have sought.
+
+    A seek extends key by key while each key is matched by equality; the first range
+    key ends it. So only the key right after the equality prefix can be missed, and
+    only when that key is not itself range-sought. A residual on a later key, or one
+    that repeats a sought key, is the best plan this index allows.
+    """
+
+    index_keys = [_norm(column.name) for column in index.key_columns]
+    sought_eq = {_norm(column) for column in access.seek_eq_columns}
+    sought_range = {_norm(column) for column in access.seek_range_columns}
+    position = 0
+    while position < len(index_keys) and index_keys[position] in sought_eq:
+        position += 1
+    if position >= len(index_keys) or index_keys[position] in sought_range:
+        return False
+    next_key = index_keys[position]
+    residual = {_norm(column) for column in access.residual_eq_columns + access.residual_range_columns}
+    return next_key in residual and next_key in key_names
+
+
 def _clustering_keys(existing: list[ExistingIndex]) -> tuple[str, ...]:
     for index in existing:
         if index.index_type_code == 1 and not index.is_disabled:
@@ -1076,11 +1104,29 @@ def _reconcile_with_existing(
         _fit_key_width(candidate, columns, inputs.selectivity)
         if candidate.low_selectivity and len(candidate.supports) < 2:
             continue
-        covering = next(
-            (index for index in rowstore if _covers(index, candidate, clustering)),
-            None,
-        )
-        if covering is not None:
+        covering_all = [index for index in rowstore if _covers(index, candidate, clustering)]
+        if covering_all:
+            covering = covering_all[0]
+            covering_by_name = {_norm(index.name): index for index in covering_all}
+            key_names = {_norm(name) for name in candidate.key_names}
+            # A seek on any covering index uses it, unless it missed a key that index
+            # could have sought; only those accesses and the non-seeks are evidence
+            # that the plans passed the index over.
+            unused_by = [
+                item
+                for item in candidate.supports
+                if not (
+                    item.access.operation == "seek"
+                    and _norm(item.access.index_name or "") in covering_by_name
+                    and not _seek_missed_a_key(
+                        item.access,
+                        covering_by_name[_norm(item.access.index_name or "")],
+                        key_names,
+                    )
+                )
+            ]
+            if not unused_by:
+                continue
             recommendations.append(
                 _review_recommendation(
                     candidate.schema,
@@ -1093,7 +1139,7 @@ def _reconcile_with_existing(
                         "statistics, or implicit conversions with sql-optimizer before "
                         "adding anything."
                     ),
-                    supports=candidate.supports,
+                    supports=unused_by,
                     total=total,
                 )
             )

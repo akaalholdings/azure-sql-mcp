@@ -1149,3 +1149,32 @@ def test_scope_pattern_escapes_names_the_way_showplan_writes_them() -> None:
     assert _scope_plan_patterns("s&p", None) == ['Schema="[s&amp;p]"']
     assert _scope_plan_patterns("dbo", ['a"b<c']) == ['Schema="[dbo]" Table="[a&quot;b&lt;c]"']
     assert _scope_plan_patterns(None, None) == []
+
+
+# A seek on Orders.CustomerID with a residual LIKE N'%late%' on Comments: the seek
+# limits the rows, so the wildcard is no rewrite opportunity. Live Azure listed it.
+_SEEK_WILDCARD_PLAN = _showplan(
+    '<RelOp NodeId="0" PhysicalOp="Index Seek" LogicalOp="Index Seek" EstimatedTotalSubtreeCost="1"><IndexScan>'
+    f'<Object {_ORDERS} Index="[FK_Sales_Orders_CustomerID]" IndexKind="NonClustered"/>'
+    '<SeekPredicates><SeekPredicateNew><SeekKeys><Prefix ScanType="EQ"><RangeColumns>'
+    f'<ColumnReference {_ORDERS} Column="CustomerID"/></RangeColumns><RangeExpressions><ScalarOperator>'
+    '<Identifier><ColumnReference Column="@id"/></Identifier></ScalarOperator></RangeExpressions></Prefix>'
+    "</SeekKeys></SeekPredicateNew></SeekPredicates>"
+    '<Predicate><ScalarOperator><Intrinsic FunctionName="like"><ScalarOperator><Identifier>'
+    f'<ColumnReference {_ORDERS} Column="Comments"/></Identifier></ScalarOperator>'
+    "<ScalarOperator><Const ConstValue=\"N'%late%'\"/></ScalarOperator></Intrinsic></ScalarOperator></Predicate>"
+    "</IndexScan></RelOp>"
+)
+
+
+@pytest.mark.asyncio
+async def test_rewrite_opportunities_list_wildcards_only_where_the_access_scans(existing) -> None:
+    seek_row = {**_workload_row(3, "seek_residual_lookup_sort.xml", 500_000), "query_plan": _SEEK_WILDCARD_PLAN}
+    executor = RoutingExecutor(
+        workload=[_workload_row(2, "clustered_scan_residuals.xml", 2_000_000), seek_row]
+    )
+
+    report = await WorkloadIndexAdvisor(executor).review("appdb", lookback_days=7, now=NOW)
+
+    found = [(item["table"], item["column"], item["pattern"], item["query_ids"]) for item in report["rewrite_opportunities"]]
+    assert found == [("OrderLines", "Description", "leading_wildcard", [2])]

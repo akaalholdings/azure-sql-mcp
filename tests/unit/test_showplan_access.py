@@ -75,8 +75,9 @@ def test_scan_residuals_are_classified_by_how_they_can_seek() -> None:
     assert scan.residual["PickingCompletedWhen"] == "eq"  # IS NULL can seek
     assert scan.residual["PackageTypeID"] == "eq"  # an IN list is a multi-seek
     # Columns that only appear across an OR of different columns cannot seek.
-    assert scan.residual["Description"] == "other"
     assert scan.residual["UnitPrice"] == "other"
+    # LIKE N'%blue%' has no prefix to seek, inside the OR or not.
+    assert scan.nonsargable == {"Description": "leading_wildcard"}
     assert scan.output_columns == ("OrderLineID", "Quantity")
     assert scan.cost_share == pytest.approx(1.0)
 
@@ -247,3 +248,81 @@ def test_eager_index_spool_gives_its_keys_and_cost_to_the_feeding_scan() -> None
     assert feeder.cost_share == pytest.approx((4 + 6.5) / 12)
     assert feeder.as_dict()["eager_spool"] == {"node_id": 2, "eq_columns": ["OrderID"], "range_columns": []}
     assert feeder.residual == {}
+
+
+def _like(showplan, table: str, column: str, pattern: str, *, negate: bool = False, wrap: str | None = None) -> str:
+    operand = f"<Identifier>{showplan.column(table, column)}</Identifier>"
+    if wrap == "convert_implicit":
+        operand = (
+            f'<Convert DataType="nvarchar(50)" Implicit="1" Style="0"><ScalarOperator>{operand}</ScalarOperator></Convert>'
+        )
+    elif wrap is not None:
+        operand = f'<Intrinsic FunctionName="{wrap}"><ScalarOperator>{operand}</ScalarOperator></Intrinsic>'
+    like = (
+        f'<Intrinsic FunctionName="like"><ScalarOperator>{operand}'
+        f'</ScalarOperator><ScalarOperator><Const ConstValue="{pattern}" /></ScalarOperator></Intrinsic>'
+    )
+    if negate:
+        like = f'<Logical Operation="NOT"><ScalarOperator>{like}</ScalarOperator></Logical>'
+    return f"<Predicate><ScalarOperator>{like}</ScalarOperator></Predicate>"
+
+
+def test_leading_wildcard_residual_on_a_seek_is_not_a_rewrite_target(showplan) -> None:
+    # The seek on CustomerID limits the rows; the LIKE only filters what it returns,
+    # so the column is a residual (as before the wildcard check), not a non-sargable scan.
+    keys = f"<SeekPredicates>{showplan.seek_keys('Orders', 'CustomerID', '@id')}</SeekPredicates>"
+    plan = showplan.plan(
+        showplan.scan(0, "Orders", physical="Index Seek", body=keys + _like(showplan, "Orders", "Note", "N'%late%'"))
+    )
+
+    seek = _access(parse_plan_access(plan), table="Orders", operation="seek")
+
+    assert seek.nonsargable == {}
+    assert seek.residual == {"Note": "other"}
+    assert seek.residual_wildcard_columns == ("Note",)
+
+
+def test_not_like_is_a_plain_residual(showplan) -> None:
+    plan = showplan.plan(showplan.scan(0, "Orders", body=_like(showplan, "Orders", "Note", "N'%late%'", negate=True)))
+
+    scan = _access(parse_plan_access(plan), table="Orders", operation="scan")
+
+    assert scan.nonsargable == {}
+    assert scan.residual == {"Note": "other"}
+
+
+def test_not_like_on_a_converted_column_is_a_plain_residual(showplan) -> None:
+    # NOT LIKE cannot seek with any pattern or type, so the implicit conversion blocks nothing.
+    plan = showplan.plan(
+        showplan.scan(0, "Orders", body=_like(showplan, "Orders", "Note", "N'%late%'", negate=True, wrap="convert_implicit"))
+    )
+
+    scan = _access(parse_plan_access(plan), table="Orders", operation="scan")
+
+    assert scan.nonsargable == {}
+    assert scan.residual == {"Note": "other"}
+
+
+def test_leading_wildcard_under_a_function_names_the_wildcard(showplan) -> None:
+    # UPPER(Note) LIKE N'%LATE%': a bare Note still cannot seek a leading wildcard.
+    plan = showplan.plan(showplan.scan(0, "Orders", body=_like(showplan, "Orders", "Note", "N'%LATE%'", wrap="upper")))
+
+    scan = _access(parse_plan_access(plan), table="Orders", operation="scan")
+
+    assert scan.nonsargable == {"Note": "leading_wildcard"}
+
+
+def test_cursor_operation_cost_shares_count_the_cursor_once(showplan) -> None:
+    # A keyset cursor's populate and fetch plans share one StatementSubTreeCost (or
+    # none); each share against it alone counted the cursor's workload twice.
+    plan = showplan.batch(
+        showplan.cursor(
+            ("PopulateQuery", showplan.scan(0, "Orders", cost=1.0)),
+            ("FetchQuery", showplan.scan(0, "Orders", physical="Clustered Index Seek", cost=1.0)),
+            cursor_type="Keyset",
+        )
+    )
+
+    shares = [access.cost_share for access in parse_plan_access(plan).accesses]
+
+    assert shares == [pytest.approx(0.5), pytest.approx(0.5)]

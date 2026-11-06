@@ -129,6 +129,92 @@ def test_operator_that_waited_is_distinguished_from_one_that_worked(showplan) ->
     assert any("waited" in note for note in top["notes"])
 
 
+def test_parallel_operator_that_waited_on_every_thread_is_still_called_waited(showplan) -> None:
+    # Self CPU sums the threads (200 ms here) while self elapsed is one thread's
+    # wall clock (1,000 ms). Each worker burned 5% of its time, so it waited;
+    # comparing the sum with one thread's clock would hide that at DOP 4.
+    rt = showplan.runtime
+    scan = showplan.scan(
+        1,
+        runtime=rt((0, 0, 0, 0, 0), *((thread, 10, 1, 1000, 50) for thread in range(1, 5))),
+        attrs='Parallel="1"',
+    )
+    gather = showplan.relop(0, "Parallelism", "Gather Streams", scan, runtime=rt((0, 40, 1, 1005, 0)), attrs='Parallel="1"')
+
+    top = _statement(build_plan_digest(showplan.plan(gather, plan_attrs='DegreeOfParallelism="4"')))["top_operators"][0]
+
+    assert top["node_id"] == 1
+    assert top["self_cpu_ms"] == 200
+    assert any("waited" in note for note in top["notes"])
+
+
+def test_skewed_parallel_operator_that_worked_on_one_thread_is_not_called_waited(showplan) -> None:
+    # Review of PR #8: at DOP 16 one worker did all the work (1,000 ms elapsed,
+    # 990 ms CPU) and 15 sat idle. CPU averaged over 16 threads (62 ms) is below
+    # 10% of the slowest thread's clock, so the average called the busiest
+    # operator "waited". The thread that set the elapsed time burned 99% CPU.
+    rt = showplan.runtime
+    threads = [(0, 0, 0, 0, 0), (1, 1_000_000, 1, 1000, 990)] + [(thread, 0, 1, 1, 0) for thread in range(2, 17)]
+    scan = showplan.scan(1, runtime=rt(*threads), attrs='Parallel="1"')
+    gather = showplan.relop(0, "Parallelism", "Gather Streams", scan, runtime=rt((0, 1_000_000, 1, 1010, 0)), attrs='Parallel="1"')
+
+    top = _top_operator(_statement(build_plan_digest(showplan.plan(gather, plan_attrs='DegreeOfParallelism="16"'))), 1)
+
+    assert top["self_elapsed_ms"] == 1000
+    assert top["self_cpu_ms"] == 990  # still the sum over threads (B1)
+    assert not any("waited" in note for note in top.get("notes", []))
+
+
+def test_slowest_thread_waited_but_other_threads_worked_is_not_called_waited(showplan) -> None:
+    # Review of PR #8 round 2: on a DOP 4 scan, thread 1 stalled (1,000 ms elapsed,
+    # 20 ms CPU, e.g. cold pages) and threads 2-4 were CPU-bound (990 ms, 980 ms
+    # CPU each). Judging only the slowest thread called the busiest operator
+    # "waited" while its own row showed self CPU (2,960 ms) far above self elapsed.
+    rt = showplan.runtime
+    threads = [(1, 100, 1, 1000, 20)] + [(thread, 100, 1, 990, 980) for thread in (2, 3, 4)]
+    scan = showplan.scan(1, runtime=rt(*threads), attrs='Parallel="1"')
+    gather = showplan.relop(0, "Parallelism", "Gather Streams", scan, runtime=rt((0, 400, 1, 1010, 0)), attrs='Parallel="1"')
+
+    top = _top_operator(_statement(build_plan_digest(showplan.plan(gather, plan_attrs='DegreeOfParallelism="4"'))), 1)
+
+    assert top["self_elapsed_ms"] == 1000
+    assert top["self_cpu_ms"] == 2960
+    assert not any("waited" in note for note in top.get("notes", []))
+
+
+def test_one_stalled_thread_that_set_the_wall_clock_is_called_waited(showplan) -> None:
+    # Review of PR #8 round 3: thread 1 stalled for the whole 1,000 ms (20 ms CPU)
+    # and set the operator's wall clock; a short side thread ran 150 ms at about
+    # 15% CPU. The side thread did not set the time, so it must not hide the wait.
+    rt = showplan.runtime
+    threads = [(1, 100, 1, 1000, 20), (2, 10, 1, 150, 22)]
+    scan = showplan.scan(1, runtime=rt(*threads), attrs='Parallel="1"')
+    gather = showplan.relop(0, "Parallelism", "Gather Streams", scan, runtime=rt((0, 110, 1, 1010, 0)), attrs='Parallel="1"')
+
+    top = _top_operator(_statement(build_plan_digest(showplan.plan(gather, plan_attrs='DegreeOfParallelism="2"'))), 1)
+
+    assert top["self_elapsed_ms"] == 1000
+    assert any("waited" in note for note in top["notes"])
+
+
+def test_waited_compares_each_threads_own_self_time_not_its_cumulative_time(showplan) -> None:
+    # Thread 1 of the hash match is busy in its cumulative counters (1,000 ms, 990 ms
+    # CPU), but 950 ms and 985 ms of that is its child scan. Thread 2 spent 600 ms on
+    # the match itself and burned 20 ms CPU. The match's self elapsed (600 ms) is
+    # thread 2's, and thread 2 waited.
+    rt = showplan.runtime
+    scan = showplan.scan(2, runtime=rt((1, 10, 1, 950, 985), (2, 10, 1, 0, 0)), attrs='Parallel="1"')
+    match = showplan.relop(
+        1, "Hash Match", "Inner Join", scan, runtime=rt((1, 10, 1, 1000, 990), (2, 10, 1, 600, 20)), attrs='Parallel="1"'
+    )
+    gather = showplan.relop(0, "Parallelism", "Gather Streams", match, runtime=rt((0, 20, 1, 1010, 0)), attrs='Parallel="1"')
+
+    top = _top_operator(_statement(build_plan_digest(showplan.plan(gather, plan_attrs='DegreeOfParallelism="2"'))), 1)
+
+    assert top["self_elapsed_ms"] == 600
+    assert any("waited" in note for note in top["notes"])
+
+
 def test_rows_read_far_above_rows_returned_is_called_out(showplan) -> None:
     rt = showplan.runtime
     plan = showplan.plan(showplan.scan(0, runtime=rt((0, 10, 1, 400, 390, 2_000_000))))
@@ -137,6 +223,146 @@ def test_rows_read_far_above_rows_returned_is_called_out(showplan) -> None:
 
     assert top["rows_read"] == 2_000_000
     assert any("residual" in note for note in top["notes"])
+
+
+def _row_goal_seek_plan(showplan, *, end_of_scans: int | None) -> str:
+    # Ported from sqlserver-query-plans 1.5.5 (MIT): a Posts seek under a row
+    # goal stopped early on 5,718 of 5,829 executions and read 1.37 billion rows.
+    rt = showplan.runtime
+    seek = showplan.scan(
+        2,
+        "Posts",
+        physical="Index Seek",
+        attrs='EstimateRowsWithoutRowGoal="50000"',
+        runtime=rt((0, 5_718, 5_829, 9_000, 8_900, 1_370_000_000, end_of_scans)),
+    )
+    return showplan.plan(
+        showplan.relop(
+            0,
+            "Nested Loops",
+            "Inner Join",
+            showplan.scan(1, "Users", runtime=rt((0, 5_829, 1, 50, 40))),
+            seek,
+            runtime=rt((0, 5_718, 1, 9_100, 8_960)),
+        )
+    )
+
+
+def _top_operator(statement: dict, node_id: int) -> dict:
+    return next(item for item in statement["top_operators"] if item["node_id"] == node_id)
+
+
+def test_row_goal_does_not_hide_a_seek_that_read_billions(showplan) -> None:
+    plan = _row_goal_seek_plan(showplan, end_of_scans=111)
+
+    statement = _statement(build_plan_digest(plan))
+    seek = _top_operator(statement, 2)
+    cited = next(item for item in statement["cited_nodes"] if item["node_id"] == 2)
+
+    assert any("Reads far more rows" in note for note in seek["notes"])
+    assert any("5,718 of 5,829 executions stopped early" in note for note in seek["notes"])
+    assert "5,718 of 5,829 executions stopped early" in cited["row_goal"]
+    assert describe_plan_node(plan, 2)["actuals"]["end_of_scans"] == 111
+
+
+def test_row_goal_that_read_to_the_end_says_so(showplan) -> None:
+    # Ported from sqlserver-query-plans 1.5.5 (MIT): TOP (1000) over a scan whose
+    # residual filter only 613 rows pass. It never found 1000, so it read them all.
+    rt = showplan.runtime
+    scan = showplan.scan(
+        1, "Users", attrs='EstimateRowsWithoutRowGoal="2465713"', runtime=rt((0, 613, 1, 2_000, 1_900, 2_465_713, 1))
+    )
+    plan = showplan.plan(showplan.relop(0, "Top", None, scan, runtime=rt((0, 613, 1, 2_010, 1_905))))
+
+    top = _top_operator(_statement(build_plan_digest(plan)), 1)
+
+    assert any("Reads far more rows" in note for note in top["notes"])
+    assert any("every execution read to the end" in note for note in top["notes"])
+    assert not any("stopped early" in note for note in top["notes"])
+
+
+def test_row_goal_without_end_of_scans_still_shows_the_reads_flag(showplan) -> None:
+    # Older plans may not record ActualEndOfScans: hedge the row goal, never hide the reads.
+    seek = _top_operator(_statement(build_plan_digest(_row_goal_seek_plan(showplan, end_of_scans=None))), 2)
+
+    assert any("Reads far more rows" in note for note in seek["notes"])
+    assert any("may stop early" in note for note in seek["notes"])
+
+
+def test_cursor_statement_is_digested(showplan) -> None:
+    rt = showplan.runtime
+    plan = showplan.batch(showplan.cursor(("FetchQuery", showplan.scan(0, "Orders", runtime=rt((0, 10, 1, 500, 480))))))
+
+    statement = _statement(build_plan_digest(plan))
+
+    assert statement["statement_type"] == "DECLARE CURSOR"
+    assert statement["top_operators"][0]["node_id"] == 0
+
+
+def test_cursor_statements_name_their_operation_and_the_cursor_work_table(showplan) -> None:
+    # Live (query 172): populate and fetch plans were two "DECLARE CURSOR" entries
+    # with the same text, and the fetch seek on tempdb's CWT_PrimaryKey had no object.
+    rt = showplan.runtime
+    work_table = '<Object Database="[tempdb]" Index="[CWT_PrimaryKey]" Storage="RowStore" />'
+    fetch = showplan.relop(0, "Clustered Index Seek", wrapper="IndexScan", body=work_table, runtime=rt((0, 1, 1, 200, 190)))
+    plan = showplan.batch(
+        showplan.cursor(
+            ("PopulateQuery", showplan.scan(0, "Orders", runtime=rt((0, 10, 1, 500, 480)))),
+            ("FetchQuery", fetch),
+            cursor_type="FastForward",
+        )
+    )
+
+    populate_entry, fetch_entry = build_plan_digest(plan)["statements"]
+
+    assert populate_entry["cursor_operation"] == "PopulateQuery"
+    assert fetch_entry["cursor_operation"] == "FetchQuery"
+    assert fetch_entry["cursor_actual_type"] == "FastForward"
+    assert "cursor work table" in fetch_entry["top_operators"][0]["object"]
+    assert "CWT_PrimaryKey" in fetch_entry["top_operators"][0]["object"]
+    assert populate_entry["top_operators"][0]["object"] == "dbo.Orders.PK_T"
+    assert "cursor work table" in describe_plan_node(plan, 0, statement_index=1)["objects"][0]
+
+
+def test_plain_statement_has_no_cursor_fields(showplan) -> None:
+    statement = _statement(build_plan_digest(showplan.plan(showplan.scan(0))))
+
+    assert "cursor_operation" not in statement and "cursor_actual_type" not in statement
+
+
+def _gather_plan(showplan, *, dop: str, plan_attrs: str = "") -> str:
+    rt = showplan.runtime
+    scan = showplan.scan(1, runtime=rt((0, 100, 1, 300, 290)), attrs='Parallel="1"')
+    gather = showplan.relop(0, "Parallelism", "Gather Streams", scan, runtime=rt((0, 100, 1, 305, 290)), attrs='Parallel="1"')
+    return showplan.plan(
+        gather, plan_attrs=f'DegreeOfParallelism="{dop}" {plan_attrs}', plan_children='<ThreadStat Branches="2" />'
+    )
+
+
+def test_parallel_plan_that_ran_serially_says_so(showplan) -> None:
+    # Live (mcptest, workload group max_dop=1): a parallel plan ran at runtime DOP 0
+    # and the digest showed {dop: 0, branches: 2} with no note.
+    for dop in ("0", "1"):
+        parallelism = _statement(build_plan_digest(_gather_plan(showplan, dop=dop, plan_attrs='DOPFeedbackAdjusted="Yes: Adjusting"')))[
+            "parallelism"
+        ]
+
+        assert any("ran serially" in note for note in parallelism["notes"]), dop
+        assert parallelism["dop_feedback"] == "Yes: Adjusting"
+        # DOP feedback never lowers a query below DOP 2, so it cannot explain a
+        # serial run; the note must not send the reader to it.
+        assert not any("feedback" in note.lower() for note in parallelism["notes"]), dop
+
+
+def test_parallel_plan_at_its_dop_and_estimated_parallel_plan_get_no_serial_note(showplan) -> None:
+    parallel = _statement(build_plan_digest(_gather_plan(showplan, dop="4")))["parallelism"]
+    estimated = showplan.plan(
+        showplan.relop(0, "Parallelism", "Gather Streams", showplan.scan(1, attrs='Parallel="1"'), attrs='Parallel="1"'),
+        plan_attrs='DegreeOfParallelism="0"',
+    )
+
+    assert not any("ran serially" in note for note in parallel.get("notes", []))
+    assert not any("ran serially" in note for note in _statement(build_plan_digest(estimated))["parallelism"].get("notes", []))
 
 
 def test_statement_time_udf_share_and_waits(showplan) -> None:

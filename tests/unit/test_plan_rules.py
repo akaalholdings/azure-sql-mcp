@@ -217,7 +217,7 @@ def test_nested_loops_with_a_very_busy_inner_side_is_flagged() -> None:
 
 def test_statement_level_warnings() -> None:
     plan = _plan(
-        _scan(0),
+        _scan(0, cost=6.0),  # above the cost threshold for parallelism, so the reason matters
         stmt_attrs='StatementOptmEarlyAbortReason="TimeOut"',
         plan_attrs='NonParallelPlanReason="TSQLUserDefinedFunctionsNotParallelizable" CompileCPU="1500" CompileTime="1600"',
         plan_children=(
@@ -340,6 +340,54 @@ def _converted(table: str, column: str, *, implicit: str = "0") -> str:
         '<ScalarOperator><Identifier><ColumnReference Column="@Day" /></Identifier></ScalarOperator>'
         "</Compare></ScalarOperator></Predicate>"
     )
+
+
+def _like(table: str, column: str, pattern: str) -> str:
+    """A residual ``table.column LIKE pattern`` with a constant pattern."""
+
+    return (
+        '<Predicate><ScalarOperator ScalarString="like"><Intrinsic FunctionName="like"><ScalarOperator><Identifier>'
+        f'<ColumnReference Database="[db]" Schema="[dbo]" Table="[{table}]" Column="{column}" />'
+        f'</Identifier></ScalarOperator><ScalarOperator><Const ConstValue="{pattern}" /></ScalarOperator>'
+        "</Intrinsic></ScalarOperator></Predicate>"
+    )
+
+
+@pytest.mark.parametrize("pattern", ["N'%smith%'", "'_mith'"])
+def test_leading_wildcard_like_is_non_sargable(showplan, pattern: str) -> None:
+    # No prefix to seek: an index on LastName is read end to end, whatever its keys.
+    plan = showplan.plan(showplan.scan(0, "Customers", body=_like("Customers", "LastName", pattern)))
+
+    finding = _rules(analyze_plan(plan))["non_sargable_predicate"]
+
+    assert finding["severity"] == "high"
+    assert finding["evidence"]["column"] == "LastName"
+    assert finding["evidence"]["wrapper"] == "leading_wildcard"
+    assert "leading wildcard" in finding["message"]
+    assert "full-text" in finding["fix"]
+
+
+def test_prefix_like_is_not_called_non_sargable(showplan) -> None:
+    plan = showplan.plan(showplan.scan(0, "Customers", body=_like("Customers", "LastName", "N'smith%'")))
+
+    assert "non_sargable_predicate" not in _rules(analyze_plan(plan))
+
+
+def test_cursor_plans_are_analysed_and_findings_stay_on_their_statement(showplan) -> None:
+    # Rules and predicate access read the statements in two passes joined by
+    # position, so a cursor must count in both or a finding lands on the wrong one.
+    cursor = showplan.cursor(("FetchQuery", showplan.scan(0, "Orders", body=_converted("Orders", "OrderDate"))))
+    select = showplan.simple(showplan.scan(0, "Customers", body=_converted("Customers", "CreatedAt")))
+
+    result = analyze_plan(showplan.batch(cursor, select))
+    found = {
+        (finding["statement_index"], finding["evidence"]["column"])
+        for finding in result["findings"]
+        if finding["rule"] == "non_sargable_predicate"
+    }
+
+    assert found == {(0, "OrderDate"), (1, "CreatedAt")}
+    assert [statement["statement_type"] for statement in result["statements"]] == ["DECLARE CURSOR", "SELECT"]
 
 
 def _order_date_seek(showplan, start: tuple[str, str], end: tuple[str, str], residual: str) -> str:
@@ -765,3 +813,186 @@ def test_too_deep_plans_report_a_parse_error(showplan, monkeypatch) -> None:
 
     assert result["parse_error"] == "plan_too_deep"
     assert result["findings"] == []
+
+
+def _seek_with_residual(showplan, residual: str) -> str:
+    """An Index Seek on Orders.CustomerID = @id that tests ``residual`` on the rows it returns."""
+
+    keys = f"<SeekPredicates>{showplan.seek_keys('Orders', 'CustomerID', '@id')}</SeekPredicates>"
+    return showplan.plan(showplan.scan(0, "Orders", physical="Index Seek", index="IX_Cust", body=keys + residual))
+
+
+def test_leading_wildcard_residual_on_a_seek_of_another_column_is_low(showplan) -> None:
+    # Live Azure: a seek on ItemId <= 1000 with a residual LIKE N'%blue%' read 1,000 of
+    # 200,000 rows, yet got a high finding that said every row is read and tested.
+    plan = _seek_with_residual(showplan, _like("Orders", "Note", "N'%late%'"))
+
+    finding = _rules(analyze_plan(plan))["non_sargable_predicate"]
+
+    assert finding["severity"] == "low"
+    assert finding["evidence"]["operation"] == "seek"
+    assert finding["evidence"]["wrapper"] == "leading_wildcard"
+    assert "every row" not in finding["message"]
+    assert "seek" in finding["message"]
+    # The bare-column rewrite advice is for wrapped columns, not for a wildcard.
+    assert "column bare" not in finding["fix"]
+
+
+def test_leading_wildcard_on_a_scan_stays_every_row(showplan) -> None:
+    plan = showplan.plan(showplan.scan(0, "Customers", body=_like("Customers", "LastName", "N'%smith%'")))
+
+    finding = _rules(analyze_plan(plan))["non_sargable_predicate"]
+
+    assert finding["severity"] == "high"
+    assert "every row is read" in finding["message"]
+
+
+def _negated(predicate: str) -> str:
+    inner = predicate.removeprefix('<Predicate><ScalarOperator ScalarString="like">').removesuffix(
+        "</ScalarOperator></Predicate>"
+    )
+    return (
+        '<Predicate><ScalarOperator><Logical Operation="NOT"><ScalarOperator>'
+        f"{inner}</ScalarOperator></Logical></ScalarOperator></Predicate>"
+    )
+
+
+def test_not_like_gets_no_leading_wildcard_advice(showplan) -> None:
+    # NOT LIKE cannot seek with any pattern: prefix search or REVERSE() does not help it.
+    plan = showplan.plan(showplan.scan(0, "Customers", body=_negated(_like("Customers", "LastName", "N'%smith%'"))))
+
+    wrappers = [f["evidence"].get("wrapper") for f in analyze_plan(plan)["findings"]]
+
+    assert "leading_wildcard" not in wrappers
+
+
+def test_leading_wildcard_under_implicit_conversion_names_the_wildcard(showplan) -> None:
+    # A varchar column searched with N'%smith%': binding a parameter type does not
+    # make the predicate seekable (and there is no parameter); the wildcard blocks the seek.
+    predicate = (
+        '<Predicate><ScalarOperator><Intrinsic FunctionName="like"><ScalarOperator>'
+        '<Convert DataType="nvarchar(50)" Implicit="1" Style="0"><ScalarOperator><Identifier>'
+        f'{showplan.column("Customers", "LastName")}</Identifier></ScalarOperator></Convert></ScalarOperator>'
+        "<ScalarOperator><Const ConstValue=\"N'%smith%'\" /></ScalarOperator></Intrinsic></ScalarOperator></Predicate>"
+    )
+    plan = showplan.plan(showplan.scan(0, "Customers", body=predicate))
+
+    rules = _rules(analyze_plan(plan))
+
+    assert rules["non_sargable_predicate"]["evidence"]["wrapper"] == "leading_wildcard"
+    assert "implicit conversion" in rules["non_sargable_predicate"]["fix"]
+    assert "implicit_conversion_on_column" not in rules
+
+
+def test_leading_wildcard_residual_on_a_seek_that_reads_the_whole_table_is_not_benign(showplan) -> None:
+    # WHERE OrderID > 0 AND Note LIKE N'%late%': the seek range covers every row, so the
+    # LIKE runs on each one, as on a scan.
+    keys = f"<SeekPredicates>{showplan.seek_keys('Orders', 'OrderID', '0', scan_type='GT')}</SeekPredicates>"
+    plan = showplan.plan(
+        showplan.scan(
+            0, "Orders", physical="Clustered Index Seek", cost=100,
+            attrs='EstimatedRowsRead="1000000" TableCardinality="1000000"',
+            body=keys + _like("Orders", "Note", "N'%late%'"),
+        ),
+        cost=100,
+    )
+
+    finding = _rules(analyze_plan(plan))["non_sargable_predicate"]
+
+    assert finding["severity"] == "high"
+    assert "limits the rows" not in finding["message"]
+    assert "Usually acceptable" not in finding["fix"]
+
+
+def test_leading_wildcard_residual_on_a_key_lookup_suggests_include(showplan) -> None:
+    # The lookup fetches one row per outer row: the nonclustered seek limits the rows,
+    # and the LIKE can filter before the lookups only if the index carries Note.
+    seek = showplan.relop(
+        1, "Index Seek", wrapper="IndexScan", cost=0.003,
+        body='<Object Database="[db]" Schema="[dbo]" Table="[Orders]" Index="[IX_Cust]" IndexKind="NonClustered" />'
+        + "<SeekPredicates>" + showplan.seek_keys("Orders", "CustomerID", "@id") + "</SeekPredicates>",
+    )
+    lookup = showplan.relop(
+        2, "Key Lookup", wrapper="IndexScan", cost=0.003, attrs='Lookup="1"',
+        body='<Object Database="[db]" Schema="[dbo]" Table="[Orders]" Index="[PK_Orders]" IndexKind="Clustered" />'
+        + "<SeekPredicates>" + showplan.seek_keys("Orders", "OrderID", "@id") + "</SeekPredicates>"
+        + _like("Orders", "Note", "N'%late%'"),
+    )
+    plan = showplan.plan(showplan.relop(0, "Nested Loops", "Inner Join", seek, lookup, wrapper="NestedLoops", cost=0.006))
+
+    finding = _rules(analyze_plan(plan))["non_sargable_predicate"]
+
+    assert finding["evidence"]["operation"] == "lookup"
+    assert "seek on OrderID" not in finding["message"]
+    assert "IX_Cust" in finding["message"]
+    assert "INCLUDE" in finding["fix"] and "IX_Cust" in finding["fix"]
+    assert "more selective" not in finding["fix"]
+
+
+def test_not_like_on_a_converted_column_gets_no_bind_the_parameter_advice(showplan) -> None:
+    # NOT (CONVERT_IMPLICIT(nvarchar, Note) LIKE N'%late%'): no type makes NOT LIKE seekable.
+    predicate = _negated(
+        '<Predicate><ScalarOperator ScalarString="like"><Intrinsic FunctionName="like"><ScalarOperator>'
+        '<Convert DataType="nvarchar(50)" Implicit="1" Style="0"><ScalarOperator><Identifier>'
+        f'{showplan.column("Customers", "LastName")}</Identifier></ScalarOperator></Convert></ScalarOperator>'
+        "<ScalarOperator><Const ConstValue=\"N'%smith%'\" /></ScalarOperator></Intrinsic></ScalarOperator></Predicate>"
+    )
+    plan = showplan.plan(showplan.scan(0, "Customers", body=predicate))
+
+    rules = _rules(analyze_plan(plan))
+
+    assert "implicit_conversion_on_column" not in rules
+    assert "non_sargable_predicate" not in rules
+
+
+def test_leading_wildcard_under_a_function_names_the_wildcard(showplan) -> None:
+    # UPPER(LastName) LIKE N'%SMITH%': making the column bare or indexing UPPER(LastName)
+    # still leaves a leading wildcard that no index can seek.
+    predicate = (
+        '<Predicate><ScalarOperator><Intrinsic FunctionName="like"><ScalarOperator>'
+        '<Intrinsic FunctionName="upper"><ScalarOperator><Identifier>'
+        f'{showplan.column("Customers", "LastName")}</Identifier></ScalarOperator></Intrinsic></ScalarOperator>'
+        "<ScalarOperator><Const ConstValue=\"N'%SMITH%'\" /></ScalarOperator></Intrinsic></ScalarOperator></Predicate>"
+    )
+    plan = showplan.plan(showplan.scan(0, "Customers", body=predicate))
+
+    finding = _rules(analyze_plan(plan))["non_sargable_predicate"]
+
+    assert finding["evidence"]["wrapper"] == "leading_wildcard"
+    assert "leading wildcard" in finding["message"]
+    assert "column is bare" not in finding["fix"]
+
+
+def _fast_forward_cursor(showplan, populate_cost: float) -> str:
+    cursor = showplan.cursor(
+        ("PopulateQuery", showplan.scan(0, "Orders", cost=populate_cost)),
+        ("FetchQuery", showplan.scan(0, "Orders", physical="Clustered Index Seek", cost=0.0033)),
+        cursor_type="FastForward",
+    )
+    cursor = cursor.replace("<QueryPlan>", '<QueryPlan NonParallelPlanReason="NoParallelFastForwardCursor">', 1)
+    return cursor.replace("<QueryPlan>", '<QueryPlan NonParallelPlanReason="NonParallelizableIntrinsicFunction">', 1)
+
+
+def test_fast_forward_cursor_gets_cursor_specific_fix_and_trivial_plans_none(showplan) -> None:
+    # Live Azure: the populate query (cost 24) got UDF advice, and the 0.0033-cost
+    # fetch query got a finding although no plan that cheap is ever considered for parallelism.
+    result = analyze_plan(showplan.batch(_fast_forward_cursor(showplan, 24.0)))
+    found = [f for f in result["findings"] if f["rule"] == "non_parallel_plan_reason"]
+
+    assert [f["statement_index"] for f in found] == [0]
+    assert found[0]["evidence"]["non_parallel_plan_reason"] == "NoParallelFastForwardCursor"
+    assert "UDF" not in found[0]["fix"]
+    assert "set-based" in found[0]["fix"]
+    assert "STATIC" in found[0]["fix"]
+
+
+def test_statements_name_the_cursor_operation(showplan) -> None:
+    plan = showplan.batch(_fast_forward_cursor(showplan, 24.0), showplan.simple(showplan.scan(0, "Customers")))
+
+    result = analyze_plan(plan)
+
+    assert [(s["cursor_operation"], s["cursor_actual_type"]) for s in result["statements"]] == [
+        ("PopulateQuery", "FastForward"),
+        ("FetchQuery", "FastForward"),
+        (None, None),
+    ]

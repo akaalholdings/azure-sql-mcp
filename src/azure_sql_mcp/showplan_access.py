@@ -23,6 +23,7 @@ from typing import Iterator
 from .plan_tree import PlanParseError
 from .plan_tree import is_true
 from .plan_tree import parse_showplan
+from .plan_tree import statements
 from .plan_tree import unquote
 
 NS = "http://schemas.microsoft.com/sqlserver/2004/07/showplan"
@@ -94,6 +95,9 @@ class TableAccess:
     dynamic_seek_columns: tuple[str, ...] = ()
     residual: dict[str, str] = field(default_factory=dict)
     nonsargable: dict[str, str] = field(default_factory=dict)
+    # Leading-wildcard LIKE columns tested on the rows a seek or lookup returns (also
+    # in ``residual``): the seek limits the rows, so they are not non-sargable scans.
+    residual_wildcard_columns: tuple[str, ...] = ()
     implicit_conversion_columns: tuple[str, ...] = ()
     output_columns: tuple[str, ...] = ()
     order_columns: tuple[tuple[str, str], ...] = ()
@@ -133,6 +137,7 @@ class TableAccess:
             "seek_range_columns": list(self.seek_range_columns),
             "residual_predicates": dict(self.residual),
             "nonsargable_predicates": dict(self.nonsargable),
+            "residual_wildcard_columns": list(self.residual_wildcard_columns),
             "implicit_conversion_columns": list(self.implicit_conversion_columns),
             "output_columns": list(self.output_columns),
             "order_columns": [
@@ -210,19 +215,35 @@ def parse_plan_access(plan_xml: str) -> PlanAccessSummary:
     except PlanParseError as exc:
         return PlanAccessSummary(parse_error=str(exc))
     summary = PlanAccessSummary()
-    for statement in root.iter(f"{_Q}StmtSimple"):
-        summary.statements.append(_parse_statement(statement))
+    # The same statement list as plan_tree.statements: rules join the two by position.
+    for statement, query_plan in statements(root):
+        summary.statements.append(_parse_statement(statement, query_plan, _cursor_cost(statement)))
     return summary
 
 
-def _parse_statement(statement: ET.Element) -> StatementAccess:
+def _cursor_cost(statement: ET.Element) -> float | None:
+    """One cost for every plan of a cursor, so its operations' shares add up to at most 1.
+
+    Populate and fetch plans share one StmtCursor (often with no StatementSubTreeCost);
+    a share against each plan alone counted the cursor once per operation.
+    """
+
+    if statement.tag != f"{_Q}StmtCursor":
+        return None
+    roots = statement.findall(f"{_Q}CursorPlan/{_Q}Operation/{_Q}QueryPlan/{_Q}RelOp")
+    total = sum(_float(root.get("EstimatedTotalSubtreeCost")) for root in roots)
+    return max(_float(statement.get("StatementSubTreeCost")), total) or None
+
+
+def _parse_statement(
+    statement: ET.Element, query_plan: ET.Element | None, cursor_cost: float | None = None
+) -> StatementAccess:
     result = StatementAccess(
         statement_type=(statement.get("StatementType") or "").upper(),
         statement_cost=_float(statement.get("StatementSubTreeCost")),
         query_hash=statement.get("QueryHash"),
         plan_hash=statement.get("QueryPlanHash"),
     )
-    query_plan = statement.find(f"{_Q}QueryPlan")
     if query_plan is None:
         return result
     result.missing_indexes = _missing_indexes(query_plan)
@@ -233,7 +254,7 @@ def _parse_statement(statement: ET.Element) -> StatementAccess:
     for parent in root_op.iter():
         for child in parent:
             parents[child] = parent
-    statement_cost = result.statement_cost or _float(root_op.get("EstimatedTotalSubtreeCost"))
+    statement_cost = cursor_cost or result.statement_cost or _float(root_op.get("EstimatedTotalSubtreeCost"))
     for relop in root_op.iter(f"{_Q}RelOp"):
         access_element = _first_child(relop, _TABLE_ACCESS_ELEMENTS)
         if access_element is not None:
@@ -283,6 +304,13 @@ def _parse_access(
     for column in list(residual):
         if column in seek_columns and residual[column] == "eq":
             residual.pop(column)
+    residual_wildcards: list[str] = []
+    if operation not in {"scan", "heap_scan"}:
+        for column, kind in list(nonsargable.items()):
+            if kind == "leading_wildcard":
+                nonsargable.pop(column)
+                residual_wildcards.append(column)
+                _record(residual, column, "other")
 
     outputs = [
         ref.column
@@ -314,6 +342,7 @@ def _parse_access(
         dynamic_seek_columns=tuple(_dynamic_seek_columns(element)),
         residual=residual,
         nonsargable=nonsargable,
+        residual_wildcard_columns=tuple(residual_wildcards),
         implicit_conversion_columns=tuple(dict.fromkeys(implicit)),
         output_columns=tuple(dict.fromkeys(outputs)),
         estimated_rows=_float(relop.get("EstimateRows")),
@@ -414,7 +443,7 @@ def _classify_predicate(
     scalar = predicate.find(f"{_Q}ScalarOperator")
     if scalar is None:
         return
-    _classify_scalar(scalar, belongs, residual, nonsargable, implicit, under_or=False)
+    _classify_scalar(scalar, belongs, residual, nonsargable, implicit, under_or=False, negated=False)
 
 
 _KIND_RANK = {"eq": 3, "range": 2, "other": 1}
@@ -441,6 +470,7 @@ def _classify_scalar(
     implicit: list[str],
     *,
     under_or: bool,
+    negated: bool,
 ) -> None:
     for child in scalar:
         tag = _local(child.tag)
@@ -453,18 +483,34 @@ def _classify_scalar(
                     _record(residual, in_column, "eq")
                     continue
                 for operand in operands:
-                    _classify_scalar(operand, belongs, residual, nonsargable, implicit, under_or=True)
+                    _classify_scalar(
+                        operand, belongs, residual, nonsargable, implicit, under_or=True, negated=negated
+                    )
             else:
+                # NOT LIKE cannot seek with any pattern, so a leading wildcard under NOT is no blocker.
+                inner_negated = negated != (operation == "NOT")
                 for operand in operands:
-                    _classify_scalar(operand, belongs, residual, nonsargable, implicit, under_or=under_or)
+                    _classify_scalar(
+                        operand, belongs, residual, nonsargable, implicit, under_or=under_or, negated=inner_negated
+                    )
         elif tag == "Compare":
             _classify_compare(child, belongs, residual, nonsargable, implicit, under_or=under_or)
         elif tag == "Intrinsic" and (child.get("FunctionName") or "").lower() == "like":
+            operands = child.findall(f"{_Q}ScalarOperator")
+            leading_wildcard = not negated and len(operands) > 1 and _leading_wildcard(operands[1])
             for operand_column, wrapped in _operand_columns(child, belongs):
-                if wrapped is None:
+                if wrapped == "convert_implicit":
+                    implicit.append(operand_column)
+                if negated and wrapped != "udf":
+                    # NOT LIKE cannot seek with any pattern, so no wrapper blocks a seek.
                     _record(residual, operand_column, "other")
-                else:
+                # Under an implicit conversion or a function the wildcard still blocks the seek: name it.
+                elif leading_wildcard and wrapped != "udf":
+                    _record_wrapper(nonsargable, operand_column, "leading_wildcard")
+                elif wrapped is not None:
                     _record_wrapper(nonsargable, operand_column, wrapped)
+                else:
+                    _record(residual, operand_column, "other")
         else:
             for ref, wrapper in _wrapped_columns(child, belongs, wrapper=None):
                 if wrapper is not None:
@@ -540,6 +586,18 @@ def _direct_column(operand: ET.Element) -> ColumnRef | None:
 
 def _references_same_alias_column(operand: ET.Element, belongs) -> bool:
     return any(belongs(ref) for ref in _column_refs(operand))
+
+
+def _leading_wildcard(pattern: ET.Element) -> bool:
+    """A constant LIKE pattern that starts with % or _: there is no prefix to seek on.
+
+    A parameter pattern is left alone: the optimizer seeks it dynamically (LikeRangeStart).
+    """
+
+    const = pattern.find(f"{_Q}Const")
+    value = (const.get("ConstValue") or "") if const is not None else ""
+    literal = value.removeprefix("N")
+    return literal.startswith("'") and literal[1:2] in {"%", "_"}
 
 
 def _operand_columns(element: ET.Element, belongs) -> list[tuple[str, str | None]]:

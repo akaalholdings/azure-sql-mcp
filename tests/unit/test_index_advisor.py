@@ -328,12 +328,13 @@ def test_scan_with_residual_filters_creates_a_seekable_index() -> None:
     assert len(create) == 1
     rec = create[0]
     assert _keys(rec) == ["PickingCompletedWhen", "StockItemID", "PackageTypeID"]
-    # The clustered key (OrderLineID) is implicit in every nonclustered index.
-    assert rec["include_columns"] == ["Quantity", "Description", "UnitPrice"]
+    # The clustered key (OrderLineID) is implicit in every nonclustered index. Description
+    # (a leading-wildcard LIKE, evaluated as a residual) is included after UnitPrice.
+    assert rec["include_columns"] == ["Quantity", "UnitPrice", "Description"]
     assert rec["ddl"] == (
         "CREATE NONCLUSTERED INDEX [IX_OrderLines_PickingCompletedWhen_StockItemID_PackageTypeID] "
         "ON [Sales].[OrderLines] ([PickingCompletedWhen] ASC, [StockItemID] ASC, [PackageTypeID] ASC) "
-        "INCLUDE ([Quantity], [Description], [UnitPrice]) WITH (ONLINE = ON);"
+        "INCLUDE ([Quantity], [UnitPrice], [Description]) WITH (ONLINE = ON);"
     )
     assert rec["rollback_ddl"] == (
         "DROP INDEX [IX_OrderLines_PickingCompletedWhen_StockItemID_PackageTypeID] ON [Sales].[OrderLines];"
@@ -354,6 +355,21 @@ def test_non_sargable_predicates_route_to_the_optimizer_not_to_an_index() -> Non
     assert all(item["owner"] == "sql-optimizer" for item in report["rewrite_opportunities"])
     heap = _recs(report, "create_clustered_index", "EventLog")
     assert heap and "heap_scans_in_workload" in heap[0]["reason_codes"]
+
+
+def test_leading_wildcard_like_routes_to_the_optimizer_with_its_own_explanation() -> None:
+    # Description LIKE N'%blue%': the column is bare but the pattern has no prefix, so
+    # "make the column bare" would be wrong advice.
+    report = build_index_advice(
+        _inputs([_query(2, "clustered_scan_residuals.xml", cpu_us=2_000_000)], [], total_cpu=2_000_000)
+    )
+
+    opportunity = next(item for item in report["rewrite_opportunities"] if item["column"] == "Description")
+
+    assert opportunity["pattern"] == "leading_wildcard"
+    assert opportunity["owner"] == "sql-optimizer"
+    assert "leading wildcard" in opportunity["explanation"]
+    assert "bare column" not in opportunity["explanation"]
 
 
 def test_lookup_that_needs_a_lob_column_is_not_covered_and_heap_is_flagged() -> None:
@@ -395,6 +411,261 @@ def test_existing_index_that_already_covers_is_flagged_for_plan_investigation() 
     assert _recs(report, "create_index", "OrderLines") == []
     review = [r for r in _recs(report, "review_index", "OrderLines") if r["index_name"] == "IX_Covering"]
     assert review and review[0]["reason_codes"] == ["existing_index_already_covers_access"]
+
+
+def _orders_col(column: str) -> str:
+    return f'<ColumnReference Database="[appdb]" Schema="[Sales]" Table="[Orders]" Alias="[o]" Column="{column}" />'
+
+
+def _orders_seek_plan(index: str, kind: str, seek_keys: str | None, residual: str, outputs: tuple[str, ...]):
+    """One Index Seek (or, without seek_keys, a Clustered Index Scan) on Sales.Orders
+    with a residual Predicate, as a stored plan shows it."""
+
+    output = "".join(_orders_col(column) for column in outputs)
+    if seek_keys is None:
+        physical, logical, seek = "Clustered Index Scan", "Clustered Index Scan", ""
+    else:
+        physical = "Clustered Index Seek" if kind == "Clustered" else "Index Seek"
+        logical = "Clustered Index Seek" if kind == "Clustered" else "Index Seek"
+        seek = f"<SeekPredicates><SeekPredicateNew><SeekKeys>{seek_keys}</SeekKeys></SeekPredicateNew></SeekPredicates>"
+    xml = f"""<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan" Version="1.613">
+<BatchSequence><Batch><Statements>
+<StmtSimple StatementText="SELECT ..." StatementId="1" StatementCompId="1" StatementType="SELECT" StatementSubTreeCost="0.1" StatementEstRows="40">
+<QueryPlan>
+<RelOp NodeId="0" PhysicalOp="{physical}" LogicalOp="{logical}"
+ EstimateRows="40" EstimateIO="0.05" EstimateCPU="0.02" AvgRowSize="19" EstimatedTotalSubtreeCost="0.1"
+ TableCardinality="73595" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row">
+<OutputList>{output}</OutputList>
+<IndexScan Ordered="1" ScanDirection="FORWARD" ForcedIndex="0" ForceSeek="0" ForceScan="0" NoExpandHint="0" Storage="RowStore">
+<Object Database="[appdb]" Schema="[Sales]" Table="[Orders]" Index="[{index}]" Alias="[o]" IndexKind="{kind}" Storage="RowStore" />
+{seek}
+<Predicate><ScalarOperator ScalarString="residual">{residual}</ScalarOperator></Predicate>
+</IndexScan>
+</RelOp>
+</QueryPlan></StmtSimple></Statements></Batch></BatchSequence></ShowPlanXML>"""
+    return parse_plan_access(xml)
+
+
+def _compare(column: str, op: str, value: int) -> str:
+    return (
+        f'<Compare CompareOp="{op}"><ScalarOperator><Identifier>{_orders_col(column)}</Identifier></ScalarOperator>'
+        f'<ScalarOperator><Const ConstValue="({value})" /></ScalarOperator></Compare>'
+    )
+
+
+def _between(column: str, low: int, high: int) -> str:
+    return (
+        f'<Logical Operation="AND"><ScalarOperator>{_compare(column, "GE", low)}</ScalarOperator>'
+        f'<ScalarOperator>{_compare(column, "LE", high)}</ScalarOperator></Logical>'
+    )
+
+
+def _seek_eq(column: str) -> str:
+    return (
+        f'<Prefix ScanType="EQ"><RangeColumns>{_orders_col(column)}</RangeColumns><RangeExpressions>'
+        '<ScalarOperator ScalarString="[@p]"><Identifier><ColumnReference Column="@p" /></Identifier>'
+        "</ScalarOperator></RangeExpressions></Prefix>"
+    )
+
+
+def _seek_range(column: str, low: int, high: int) -> str:
+    def bound(tag: str, op: str, value: int) -> str:
+        return (
+            f'<{tag} ScanType="{op}"><RangeColumns>{_orders_col(column)}</RangeColumns><RangeExpressions>'
+            f'<ScalarOperator ScalarString="({value})"><Const ConstValue="({value})" /></ScalarOperator>'
+            f"</RangeExpressions></{tag}>"
+        )
+
+    return bound("StartRange", "GE", low) + bound("EndRange", "LE", high)
+
+
+@pytest.mark.parametrize(
+    "index_name, plan",
+    [
+        # Live shape 1: OrderID = @p seek on the clustered PK; the residual repeats the
+        # BETWEEN on the seek column, which no index can move into the seek.
+        (
+            "PK_Sales_Orders",
+            lambda: _orders_seek_plan(
+                "PK_Sales_Orders", "Clustered", _seek_eq("OrderID"), _between("OrderID", 1, 300), ("OrderID",)
+            ),
+        ),
+        # Live shape 2: range seek on CustomerID with a residual range on an included
+        # column; a second range column cannot join the seek, so the candidate is the
+        # very index the plan already seeks.
+        (
+            "IX_Orders_CustomerID",
+            lambda: _orders_seek_plan(
+                "IX_Orders_CustomerID",
+                "NonClustered",
+                _seek_range("CustomerID", 1, 300),
+                _compare("OrderDate", "LT", 400),
+                ("OrderID", "CustomerID", "OrderDate"),
+            ),
+        ),
+    ],
+)
+def test_seek_on_the_covering_index_is_not_flagged_as_unused(index_name: str, plan) -> None:
+    existing = [
+        _index("Sales", "Orders", "PK_Sales_Orders", ("OrderID",), index_id=1, type_code=1, primary_key=True),
+        _index("Sales", "Orders", "IX_Orders_CustomerID", ("CustomerID",), index_id=2, includes=("OrderDate",)),
+    ]
+    query = replace(_query(3, "seek_residual_lookup_sort.xml", cpu_us=900_000), plan=plan())
+    assert any(
+        access.operation == "seek" and access.index_name == index_name and access.residual
+        for statement in query.plan.statements
+        for access in statement.accesses
+    )
+
+    report = build_index_advice(_inputs([query], existing))
+
+    # The stored plan seeks on the index; "the stored plans did not use it" would be false.
+    assert [r for r in _recs(report, "review_index", "Orders") if r["index_name"] == index_name] == []
+    assert _recs(report, "create_index", "Orders") == []
+
+
+def test_covered_review_lists_only_the_queries_that_passed_the_index_over() -> None:
+    existing = [_index("Sales", "Orders", "PK_Sales_Orders", ("OrderID",), index_id=1, type_code=1, primary_key=True)]
+    seeks = replace(
+        _query(3, "seek_residual_lookup_sort.xml", cpu_us=900_000),
+        plan=_orders_seek_plan(
+            "PK_Sales_Orders", "Clustered", _seek_eq("OrderID"), _between("OrderID", 1, 300), ("OrderID",)
+        ),
+    )
+    scans = replace(
+        _query(4, "seek_residual_lookup_sort.xml", cpu_us=900_000),
+        plan=_orders_seek_plan("PK_Sales_Orders", "Clustered", None, _between("OrderID", 1, 300), ("OrderID",)),
+    )
+
+    report = build_index_advice(_inputs([seeks, scans], existing))
+
+    review = [r for r in _recs(report, "review_index", "Orders") if r["index_name"] == "PK_Sales_Orders"]
+    assert len(review) == 1
+    assert review[0]["reason_codes"] == ["existing_index_already_covers_access"]
+    assert [q["query_id"] for q in review[0]["supporting_queries"]] == [4]
+
+
+def test_partial_key_seek_on_the_covering_index_keeps_the_review() -> None:
+    existing = [
+        _index("Sales", "Orders", "PK_Sales_Orders", ("OrderID",), index_id=1, type_code=1, primary_key=True),
+        _index("Sales", "Orders", "IX_Cust_Date", ("CustomerID", "OrderDate"), index_id=2),
+    ]
+    # The seek uses only CustomerID; OrderDate = 400 stays a residual although it is
+    # the index's second key, so the plan did not use the whole index.
+    query = replace(
+        _query(3, "seek_residual_lookup_sort.xml", cpu_us=900_000),
+        plan=_orders_seek_plan(
+            "IX_Cust_Date",
+            "NonClustered",
+            _seek_eq("CustomerID"),
+            _compare("OrderDate", "EQ", 400),
+            ("OrderID", "CustomerID", "OrderDate"),
+        ),
+    )
+
+    report = build_index_advice(_inputs([query], existing))
+
+    review = [r for r in _recs(report, "review_index", "Orders") if r["index_name"] == "IX_Cust_Date"]
+    assert len(review) == 1
+    assert review[0]["reason_codes"] == ["existing_index_already_covers_access"]
+    assert [q["query_id"] for q in review[0]["supporting_queries"]] == [3]
+
+
+def test_range_seek_with_a_residual_on_the_next_key_is_not_flagged_as_unused() -> None:
+    # Review of PR #8 round 3: CustomerID BETWEEN a AND b AND OrderDate < c on
+    # IX(CustomerID, OrderDate) seeks a range on CustomerID; after a range seek the
+    # second key can never join the seek, so the OrderDate residual is the best plan
+    # this index allows. It is not evidence that the plans passed the index over.
+    existing = [
+        _index("Sales", "Orders", "PK_Sales_Orders", ("OrderID",), index_id=1, type_code=1, primary_key=True),
+        _index("Sales", "Orders", "IX_Cust_Date", ("CustomerID", "OrderDate"), index_id=2),
+    ]
+    range_first = replace(
+        _query(3, "seek_residual_lookup_sort.xml", cpu_us=900_000),
+        plan=_orders_seek_plan(
+            "IX_Cust_Date",
+            "NonClustered",
+            _seek_range("CustomerID", 1, 300),
+            _compare("OrderDate", "LT", 400),
+            ("OrderID", "CustomerID", "OrderDate"),
+        ),
+    )
+    # An equality-then-range query on the same index merges into the candidate and
+    # makes OrderDate a candidate key; it seeks both keys itself.
+    eq_then_range = replace(
+        _query(4, "seek_residual_lookup_sort.xml", cpu_us=900_000),
+        plan=_orders_seek_plan(
+            "IX_Cust_Date",
+            "NonClustered",
+            _seek_eq("CustomerID") + _seek_range("OrderDate", 1, 300),
+            _compare("OrderDate", "LT", 400),
+            ("OrderID", "CustomerID", "OrderDate"),
+        ),
+    )
+
+    report = build_index_advice(_inputs([range_first, eq_then_range], existing))
+
+    review = [r for r in _recs(report, "review_index", "Orders") if r["index_name"] == "IX_Cust_Date"]
+    assert review == []
+
+
+def test_seek_whose_residual_is_on_its_sought_key_is_not_flagged_when_merged_with_a_wider_access() -> None:
+    existing = [
+        _index("Sales", "Orders", "PK_Sales_Orders", ("OrderID",), index_id=1, type_code=1, primary_key=True),
+        _index("Sales", "Orders", "IX_Cust_Date", ("CustomerID", "OrderDate"), index_id=2),
+    ]
+    both_keys = replace(
+        _query(3, "seek_residual_lookup_sort.xml", cpu_us=900_000),
+        plan=_orders_seek_plan(
+            "IX_Cust_Date",
+            "NonClustered",
+            _seek_eq("CustomerID") + _seek_range("OrderDate", 1, 300),
+            _compare("OrderDate", "LT", 400),
+            ("OrderID", "CustomerID", "OrderDate"),
+        ),
+    )
+    # Live shape: CustomerID = i.ItemId seek; the residual repeats the outer BETWEEN on
+    # the sought key. Merged with the query above, the candidate keys are
+    # (CustomerID, OrderDate), but this access never filters OrderDate.
+    first_key = replace(
+        _query(4, "seek_residual_lookup_sort.xml", cpu_us=900_000),
+        plan=_orders_seek_plan(
+            "IX_Cust_Date",
+            "NonClustered",
+            _seek_eq("CustomerID"),
+            _between("CustomerID", 1, 300),
+            ("OrderID", "CustomerID"),
+        ),
+    )
+
+    report = build_index_advice(_inputs([both_keys, first_key], existing))
+
+    assert _recs(report, "review_index", "Orders") == []
+    assert _recs(report, "create_index", "Orders") == []
+
+
+def test_seek_on_a_later_covering_index_does_not_flag_the_earlier_one_as_unused() -> None:
+    existing = [
+        _index("Sales", "Orders", "PK_Sales_Orders", ("OrderID",), index_id=1, type_code=1, primary_key=True),
+        _index("Sales", "Orders", "IX_A", ("CustomerID",), index_id=2, includes=("OrderDate",)),
+        _index("Sales", "Orders", "IX_B", ("CustomerID", "OrderDate"), index_id=3),
+    ]
+    query = replace(
+        _query(3, "seek_residual_lookup_sort.xml", cpu_us=900_000),
+        plan=_orders_seek_plan(
+            "IX_B",
+            "NonClustered",
+            _seek_range("CustomerID", 1, 300),
+            _compare("OrderDate", "LT", 400),
+            ("OrderID", "CustomerID", "OrderDate"),
+        ),
+    )
+
+    report = build_index_advice(_inputs([query], existing))
+
+    # The plan seeks IX_B, which covers the access; the redundancy is consolidate_index's job.
+    assert _recs(report, "review_index", "Orders") == []
+    assert [r["target_index"] for r in _recs(report, "consolidate_index", "Orders")] == ["IX_A"]
 
 
 def test_exact_duplicate_index_is_consolidated_into_the_wider_twin() -> None:
