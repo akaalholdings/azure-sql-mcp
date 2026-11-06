@@ -17,10 +17,14 @@ from typing import Any
 
 from .plan_tree import PlanNode
 from .plan_tree import PlanParseError
+from .plan_tree import _batch_threads
+from .plan_tree import _child_threads
+from .plan_tree import _per_thread_self
 from .plan_tree import build_tree
 from .plan_tree import ce_guess_fraction
 from .plan_tree import clean_text
 from .plan_tree import cross_join_check
+from .plan_tree import cursor_operation
 from .plan_tree import estimate_check
 from .plan_tree import is_eager_index_spool
 from .plan_tree import is_true
@@ -53,6 +57,9 @@ SKEW_FACTOR = 10.0
 SKEW_ROW_FLOOR = 100.0
 WAITED_FLOOR_MS = 100.0
 WAITED_CPU_RATIO = 0.1
+# A worker that ran at least this share of the slowest thread time means the
+# wall clock did not come from the stall alone.
+WAITED_PEER_FRACTION = 0.5
 ROWS_READ_NOTE_RATIO = 2.0
 ROWS_READ_FLAG_RATIO = 100.0
 FINGERPRINT_TABLE_FLOOR = 10_000.0
@@ -201,6 +208,7 @@ def _statement_digest(
         "early_abort_reason": clean_text(statement.get("StatementOptmEarlyAbortReason"), 40),
         "operator_count": len(nodes),
     }
+    entry["cursor_operation"], entry["cursor_actual_type"] = cursor_operation(statement, query_plan)
     if query_plan is None or not nodes:
         entry["note"] = "No query plan operators on this statement."
         return _compact(entry)
@@ -256,7 +264,11 @@ def _statement_digest(
 def _parallelism(query_plan: ET.Element, nodes: list[PlanNode], runtime: bool) -> dict[str, Any]:
     dop = _int(query_plan.get("DegreeOfParallelism"))
     reason = clean_text(query_plan.get("NonParallelPlanReason"), 120)
-    section: dict[str, Any] = {"dop": dop, "non_parallel_reason": reason}
+    section: dict[str, Any] = {
+        "dop": dop,
+        "non_parallel_reason": reason,
+        "dop_feedback": clean_text(query_plan.get("DOPFeedbackAdjusted"), 60),
+    }
     notes: list[str] = []
     stats = query_plan.find(f"{_Q}ThreadStat")
     if stats is not None:
@@ -268,6 +280,11 @@ def _parallelism(query_plan: ET.Element, nodes: list[PlanNode], runtime: bool) -
             section["max_worker_threads_per_operator"] = widest
         if dop and dop > 1 and 0 < widest < dop:
             notes.append(f"Ran with {widest} worker thread(s) per operator at most, fewer than DOP {dop}.")
+        if (dop or 0) <= 1 and any(node.is_parallelism for node in nodes):
+            notes.append(
+                f"A parallel plan that ran serially (runtime DOP {dop or 0}): a worker shortage "
+                "(THREADPOOL waits) or the workload group's MAX_DOP limited it."
+            )
     if reason in {"TSQLUserDefinedFunctionsNotParallelizable", "CouldNotGenerateValidParallelPlan"}:
         notes.append("Often a scalar UDF forcing the whole plan serial; check time.udf_elapsed_ms.")
     elif reason == "TableVariableTransactionsDoNotSupportParallelNestedTransaction":
@@ -400,23 +417,34 @@ def _top_by_time(
     nodes: list[PlanNode], elapsed: float | None, top_n: int, cited: list[PlanNode]
 ) -> list[dict[str, Any]]:
     timed = sorted((node for node in nodes if (node.self_elapsed_ms or 0.0) > 0), key=lambda node: -(node.self_elapsed_ms or 0.0))
+    per_thread = _per_thread_self_times(nodes)
     rows: list[dict[str, Any]] = []
     for node in timed[:top_n]:
         cited.append(node)
         own = node.self_elapsed_ms or 0.0
         has_cpu = any(counter.cpu_ms is not None for counter in node.threads)
-        # Self CPU sums the threads and self elapsed is one thread's clock, so
-        # compare the CPU of an average worker thread with that clock.
-        cpu_per_thread = (node.self_cpu_ms or 0.0) / max(1, len(node.work_threads))
+        # Self elapsed is the slowest thread's clock, so judge that critical path:
+        # the operator waited when its slowest thread waited and no thread that
+        # worked ran nearly as long (else the time would be about the same without
+        # the stall). An average hides a skewed operator whose one busy thread did
+        # all the work; a short busy side thread must not hide a stall either.
+        elapsed_by_thread, cpu_by_thread = per_thread.get(node, ([own], [node.self_cpu_ms or 0.0]))
+        slowest = max(range(len(elapsed_by_thread)), key=elapsed_by_thread.__getitem__)
+        slowest_elapsed = elapsed_by_thread[slowest]
+        waited = cpu_by_thread[slowest] < slowest_elapsed * WAITED_CPU_RATIO and not any(
+            cpu >= thread_elapsed * WAITED_CPU_RATIO
+            for thread_elapsed, cpu in zip(elapsed_by_thread, cpu_by_thread)
+            if thread_elapsed >= max(WAITED_FLOOR_MS, slowest_elapsed * WAITED_PEER_FRACTION)
+        )
         notes: list[str] = []
         if node.is_exchange:
             notes.append("Exchange: its time includes waiting on other operators; do not call it slow.")
-        elif has_cpu and own >= WAITED_FLOOR_MS and cpu_per_thread < own * WAITED_CPU_RATIO:
+        elif has_cpu and own >= WAITED_FLOOR_MS and waited:
             notes.append("Elapsed far above CPU: it waited, it did not work. Find what it waited on.")
         item: dict[str, Any] = {
             "node_id": node.node_id,
             "operator": node.label,
-            "object": _first(node_objects(node)),
+            "object": _first(_objects(node)),
             "self_elapsed_ms": round(own, 1),
             "self_cpu_ms": round(node.self_cpu_ms or 0.0, 1) if has_cpu else None,
             "elapsed_share": round(min(1.0, own / elapsed), 4) if elapsed else None,
@@ -439,6 +467,35 @@ def _top_by_time(
             item["notes"] = notes
         rows.append(_compact(item))
     return rows
+
+
+def _per_thread_self_times(nodes: list[PlanNode]) -> dict[PlanNode, tuple[list[float], list[float]]]:
+    """(self elapsed, self CPU) of each worker thread of a parallel operator.
+
+    Row mode is rebuilt with plan_tree's own attribution, which keeps only the
+    totals; batch mode counters are already self times.
+    """
+
+    by_key: dict[str, dict[PlanNode, dict[int, float]]] = {}
+    for key in ("elapsed", "cpu"):
+        by_thread: dict[PlanNode, dict[int, float]] = {}
+        batch_by_thread: dict[PlanNode, dict[int, float]] = {}
+        for node in reversed(nodes):
+            batch_by_thread[node] = _batch_threads(node, key, by_thread, batch_by_thread)
+            by_thread[node] = _child_threads(node, key, by_thread, batch_by_thread)
+        by_key[key] = by_thread
+    found: dict[PlanNode, tuple[list[float], list[float]]] = {}
+    for node in nodes:
+        if len(node.threads) <= 1:
+            continue
+        if node.mode == "Batch":
+            found[node] = (
+                [counter.elapsed_ms or 0.0 for counter in node.work_threads],
+                [counter.cpu_ms or 0.0 for counter in node.work_threads],
+            )
+        else:
+            found[node] = (_per_thread_self(node, "elapsed", by_key["elapsed"]), _per_thread_self(node, "cpu", by_key["cpu"]))
+    return found
 
 
 def _row_goal_runtime(node: PlanNode) -> str | None:
@@ -471,7 +528,7 @@ def _top_by_cost(nodes: list[PlanNode], cost: float, top_n: int, cited: list[Pla
                 {
                     "node_id": node.node_id,
                     "operator": node.label,
-                    "object": _first(node_objects(node)),
+                    "object": _first(_objects(node)),
                     "estimated_self_cost": round(node.own_cost, 4),
                     "estimated_cost_share": round(node.own_cost / cost, 4) if cost else None,
                     "estimated_rows": node.estimate_rows,
@@ -520,7 +577,7 @@ def _cardinality_skew(nodes: list[PlanNode], top_n: int, cited: list[PlanNode]) 
                     {
                         "node_id": node.node_id,
                         "operator": node.label,
-                        "object": _first(node_objects(node)),
+                        "object": _first(_objects(node)),
                         "estimated_rows_per_execution": round(check.estimated_per_execution, 3),
                         "actual_rows_per_execution": round(check.actual_per_execution, 3),
                         "executions": check.executions,
@@ -580,7 +637,7 @@ def _fingerprints(nodes: list[PlanNode], top_n: int) -> list[dict[str, Any]]:
             {
                 "node_id": node.node_id,
                 "operator": node.label,
-                "object": _first(node_objects(node)),
+                "object": _first(_objects(node)),
                 "estimated_rows": node.estimate_rows,
                 "table_cardinality": node.table_cardinality,
                 "fraction": round(fraction, 4),
@@ -701,7 +758,7 @@ def _cited_details(nodes: list[PlanNode], cited: list[PlanNode]) -> list[dict[st
         item: dict[str, Any] = {
             "node_id": node.node_id,
             "operator": node.label,
-            "objects": node_objects(node),
+            "objects": _objects(node),
             "scan": scan_order(node),
             "seek": seek_predicates(node),
             "predicate": residual_predicate(node),
@@ -741,7 +798,7 @@ def _tree(nodes: list[PlanNode], runtime: bool, budget: int) -> tuple[list[str],
                 detail += f", self {node.self_elapsed_ms:,.0f} ms"
         else:
             detail = f"est {_rows(node.estimate_rows)} rows, self cost {node.own_cost:,.3f}"
-        obj = _first(node_objects(node))
+        obj = _first(_objects(node))
         lines.append(f"{indent}[{node.node_id}] {node.label} ({detail})" + (f" {obj}" if obj else ""))
     return lines, len(nodes) > budget
 
@@ -756,7 +813,7 @@ def _node_detail(index: int, node: PlanNode) -> dict[str, Any]:
         "operator": node.label,
         "execution_mode": node.mode or None,
         "parallel": node.parallel,
-        "objects": node_objects(node),
+        "objects": _objects(node),
         "scan": scan_order(node),
         "seek": seek_predicates(node, limit=32),
         "predicate": residual_predicate(node),
@@ -778,7 +835,7 @@ def _node_detail(index: int, node: PlanNode) -> dict[str, Any]:
         ),
         "parent": {"node_id": node.parent.node_id, "operator": node.parent.label} if node.parent else None,
         "children": [
-            _compact({"node_id": child.node_id, "operator": child.label, "object": _first(node_objects(child))})
+            _compact({"node_id": child.node_id, "operator": child.label, "object": _first(_objects(child))})
             for child in node.children
         ],
         "untrusted_text": UNTRUSTED_TEXT,
@@ -838,6 +895,19 @@ def _node_detail(index: int, node: PlanNode) -> dict[str, Any]:
             }
         )
     return _compact(detail)
+
+
+def _objects(node: PlanNode) -> list[str]:
+    """``node_objects``, or the cursor work table: a tempdb object with an index and no table."""
+
+    found = node_objects(node)
+    if found:
+        return found
+    for element in node.own_elements:
+        index = (unquote(element.get("Index")) or "") if element.tag == f"{_Q}Object" and not element.get("Table") else ""
+        if index.upper().startswith("CWT"):
+            return [clean_text(f"cursor work table ({unquote(element.get('Database')) or 'tempdb'}.{index})", 200) or ""]
+    return []
 
 
 def _tables(node: PlanNode) -> list[str]:
