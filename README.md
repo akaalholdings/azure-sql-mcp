@@ -759,9 +759,14 @@ the portfolio tools need a database policy entry with `allow_read=true`. The
 history-table contract stays at version `2.3.0` (the installed tables check
 it); the portfolio surface is:
 
-- `capture_index_review_snapshot(database_name, idempotency_key?)`
-- `review_index_portfolio(database_name, as_of_run_id?, prior_review_id?)`
-- `get_index_review(database_name, review_id)`
+- `capture_index_review_snapshot(database_name, idempotency_key?, include_snapshot?)`
+- `review_index_portfolio(database_name, as_of_run_id?, prior_review_id?, include_full_review?)`
+- `get_index_review(database_name, review_id, subject_ids?, subject_offset?, subject_limit?, include_full_review?)`
+
+The review tools return a compact review by default: state counts, the
+create, consolidate and drop candidates with inert DDL and rollback, and
+blockers by code. Use `get_index_review` with `subject_ids` for the full gate
+of a subject. Capture returns a summary of the stored run.
 
 Capture writes only to the manually installed `dbatools.IndexReviewRun` and
 `dbatools.IndexReviewSnapshot` tables. It uses a UTC-day idempotency key by

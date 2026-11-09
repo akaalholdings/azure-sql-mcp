@@ -246,7 +246,7 @@ async def troubleshoot_performance(database_name: str = "default") -> list[types
                     "1. Use analyze_db_health with health_type='all' for a full health assessment\n"
                     "2. Use get_top_queries with sort_by='resource_blend' to find resource-heavy queries\n"
                     "3. Use explain_query on the top 3 problem queries\n"
-                    "4. Use analyze_workload_indexes for workload-driven index recommendations\n"
+                    "4. Use review_workload_indexes for workload-driven index recommendations\n"
                     "5. Check active sessions with get_active_sessions for blocking or long-running queries\n"
                     "6. Provide a prioritized remediation plan"
                 ),
