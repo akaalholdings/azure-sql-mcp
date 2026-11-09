@@ -11,6 +11,7 @@ from .index_metadata import ExistingIndex
 from .index_metadata import coerce_existing_indexes
 from .index_metadata import collect_existing_indexes
 from .index_metadata import existing_index_covers_candidate
+from .index_metadata import existing_index_response
 from .index_recommendations import build_create_index_statement
 from .index_recommendations import split_index_columns
 from .incident_log import note_exception
@@ -22,6 +23,7 @@ from .plan_tree import describe_result_shape
 from .plan_tree import showplan_from_results
 from .query_text import strip_query_store_parameter_declarations
 from .safe_sql import SafeSqlValidator
+from .showplan_access import parse_plan_access
 
 SHOWPLAN_NAMESPACE = {"sp": "http://schemas.microsoft.com/sqlserver/2004/07/showplan"}
 _SELECT_START_PATTERN = re.compile(r"^\s*(SELECT|WITH)\b", re.IGNORECASE)
@@ -56,6 +58,7 @@ class QueryIndexAnalysisService:
         queries: list[str],
         *,
         execution_contracts: list[ParameterExecutionContract] | None = None,
+        include_all_existing_indexes: bool = False,
     ) -> dict[str, Any]:
         if len(queries) > 10:
             raise ValueError("Maximum 10 queries per analysis.")
@@ -72,6 +75,7 @@ class QueryIndexAnalysisService:
 
         all_recommendations: list[dict[str, Any]] = []
         query_details: list[dict[str, Any]] = []
+        touched_tables: set[tuple[str, str]] = set()
         existing_indexes = await self._get_existing_indexes(database_name)
 
         for ordinal, sql in enumerate(queries):
@@ -96,6 +100,7 @@ class QueryIndexAnalysisService:
                     validated.normalized_sql,
                 )
             missing = self._extract_missing_indexes(plan_xml)
+            touched_tables |= _plan_tables(plan_xml)
             detail = {
                 "sql": validated.normalized_sql,
                 "analysis_status": "available",
@@ -126,7 +131,11 @@ class QueryIndexAnalysisService:
                 0,
                 raw_hint_count - len(consolidated),
             ),
-            "existing_indexes": [index.as_dict() for index in existing_indexes],
+            **existing_index_response(
+                existing_indexes,
+                touched_tables | _named_tables(all_recommendations),
+                full=include_all_existing_indexes,
+            ),
             "recommendation_basis": MISSING_INDEX_RECOMMENDATION_BASIS,
             "zero_recommendations_mean": FILTERED_RECOMMENDATION_ZERO_MEANING,
             "missing_index_provenance": dict(MISSING_INDEX_PROVENANCE),
@@ -137,6 +146,8 @@ class QueryIndexAnalysisService:
         database_name: str,
         window_minutes: int = 60,
         top_n: int = 20,
+        *,
+        include_all_existing_indexes: bool = False,
     ) -> dict[str, Any]:
         """Pull top resource-heavy queries from Query Store and analyze for index recommendations."""
         top_queries = await self._get_top_workload_queries(
@@ -149,6 +160,7 @@ class QueryIndexAnalysisService:
 
         all_recommendations: list[dict[str, Any]] = []
         analyzed_queries: list[dict[str, Any]] = []
+        touched_tables: set[tuple[str, str]] = set()
 
         skipped_non_select = 0
         for row in top_queries:
@@ -170,6 +182,7 @@ class QueryIndexAnalysisService:
                 validated = self.validator.validate_read_only(normalized_sql)
                 plan_xml = await self._get_estimated_plan(database_name, validated.normalized_sql)
                 missing = self._extract_missing_indexes(plan_xml)
+                touched_tables |= _plan_tables(plan_xml)
                 for rec in missing:
                     rec["source_query"] = validated.normalized_sql
                     rec["query_id"] = row.get("query_id")
@@ -259,7 +272,11 @@ class QueryIndexAnalysisService:
                 raw_hint_count - len(consolidated),
             ),
             "dmv_recommendations": dmv_recommendations,
-            "existing_indexes": [index.as_dict() for index in existing_indexes],
+            **existing_index_response(
+                existing_indexes,
+                touched_tables | _named_tables(all_recommendations) | _named_tables(dmv_recommendations),
+                full=include_all_existing_indexes,
+            ),
             "recommendation_basis": MISSING_INDEX_RECOMMENDATION_BASIS,
             "zero_recommendations_mean": zero_recommendations_mean,
             "missing_index_provenance": dict(MISSING_INDEX_PROVENANCE),
@@ -583,3 +600,13 @@ class QueryIndexAnalysisService:
             return float(value)
         except (TypeError, ValueError):
             return 0.0
+
+
+def _plan_tables(plan_xml: str) -> set[tuple[str, str]]:
+    """Tables the plan reads; empty when the plan cannot be parsed."""
+
+    return {(access.schema, access.table) for access in parse_plan_access(plan_xml).accesses}
+
+
+def _named_tables(recommendations: list[dict[str, Any]]) -> set[tuple[str, str]]:
+    return {(str(rec.get("schema") or "dbo"), str(rec.get("table") or "")) for rec in recommendations}

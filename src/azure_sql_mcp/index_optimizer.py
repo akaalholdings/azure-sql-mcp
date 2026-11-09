@@ -21,6 +21,7 @@ from .index_metadata import ExistingIndex
 from .index_metadata import coerce_existing_indexes
 from .index_metadata import collect_existing_indexes
 from .index_metadata import existing_index_covers_candidate
+from .index_metadata import existing_index_response
 from .index_metadata import index_definition_fingerprint
 from .index_metadata import normalize_index_definition
 from .index_metadata import parse_candidate_key
@@ -30,6 +31,7 @@ from .param_binding import ParameterBindingService
 from .plan_tree import describe_result_shape
 from .plan_tree import showplan_from_results
 from .safe_sql import SafeSqlValidator
+from .showplan_access import parse_plan_access
 
 SHOWPLAN_NAMESPACE = {"sp": "http://schemas.microsoft.com/sqlserver/2004/07/showplan"}
 logger = logging.getLogger(__name__)
@@ -447,6 +449,8 @@ class OptimizationResult:
     budget_mb: float | None
     alpha: float
     beta: float
+    existing_indexes_omitted: int = 0
+    existing_indexes_note: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -478,6 +482,13 @@ class OptimizationResult:
             "total_estimated_size_mb": round(self.total_estimated_size_mb, 2),
             "existing_indexes_count": self.existing_indexes_count,
             "existing_indexes": self.existing_index_metadata,
+            "existing_indexes_total": self.existing_indexes_count,
+            "existing_indexes_omitted": self.existing_indexes_omitted,
+            **(
+                {"existing_indexes_note": self.existing_indexes_note}
+                if self.existing_indexes_note
+                else {}
+            ),
             "budget_mb": self.budget_mb,
             "scoring": {"alpha": self.alpha, "beta": self.beta},
         }
@@ -581,6 +592,8 @@ class IndexOptimizer:
         alpha: float = INDEX_SCORE_ALPHA,
         beta: float = INDEX_SCORE_BETA,
         min_improvement_pct: float = INDEX_CANDIDATE_IMPACT_FLOOR_PCT,
+        *,
+        include_all_existing_indexes: bool = False,
     ) -> OptimizationResult:
         # Step 1: collect workload + existing indexes
         workload = await self._collect_workload(database_name, window_minutes, top_n)
@@ -590,6 +603,13 @@ class IndexOptimizer:
         # Step 2: generate candidates
         raw = self._generate_candidates(workload, dmv_recs)
         candidates_generated = len(raw)
+        # The response lists the existing indexes of these tables only.
+        touched_tables = {(candidate.schema, candidate.table) for candidate in raw}
+        for query_row in workload:
+            touched_tables.update(
+                (access.schema, access.table)
+                for access in parse_plan_access(query_row.get("plan_xml") or "").accesses
+            )
 
         # Step 3: filter against existing indexes (including prefix)
         raw = self._filter_existing_indexes(raw, existing)
@@ -598,20 +618,24 @@ class IndexOptimizer:
         raw = self._detect_prefix_subsumption(raw)
         candidates_after = len(raw)
 
-        # Step 5: enrich with size + write ratio
+        # Step 5: enrich with size + write ratio. Candidates on one table share
+        # its row count, column widths and write ratio for this run.
+        lookups: dict[tuple[str, str, str], Any] = {}
         for candidate in raw:
             candidate_cols = candidate.key_columns + [
                 c for c in candidate.include_columns if c not in candidate.key_columns
             ]
             size = await self._estimate_index_size(
-                database_name, candidate.schema, candidate.table, candidate_cols,
+                database_name, candidate.schema, candidate.table, candidate_cols, lookups,
             )
             candidate.estimated_size_mb = size  # type: ignore[attr-defined]
 
-            wr = await self._get_table_write_ratio(
-                database_name, candidate.schema, candidate.table,
-            )
-            candidate.write_ratio = wr  # type: ignore[attr-defined]
+            ratio_key = ("write_ratio", candidate.schema, candidate.table)
+            if ratio_key not in lookups:
+                lookups[ratio_key] = await self._get_table_write_ratio(
+                    database_name, candidate.schema, candidate.table,
+                )
+            candidate.write_ratio = lookups[ratio_key]  # type: ignore[attr-defined]
 
         # Step 6: score
         scored = self._score_candidates(raw, alpha, beta)
@@ -620,6 +644,9 @@ class IndexOptimizer:
         selected = self._greedy_select(scored, budget_mb, min_improvement_pct)
 
         total_size = sum(s.estimated_size_mb for s in selected)
+        existing_response = existing_index_response(
+            existing, touched_tables, full=include_all_existing_indexes
+        )
 
         return OptimizationResult(
             database_name=database_name,
@@ -629,11 +656,13 @@ class IndexOptimizer:
             candidates_after_consolidation=candidates_after,
             selected_indexes=selected,
             total_estimated_size_mb=total_size,
-            existing_indexes_count=len(existing),
-            existing_index_metadata=[index.as_dict() for index in existing],
+            existing_indexes_count=existing_response["existing_indexes_total"],
+            existing_index_metadata=existing_response["existing_indexes"],
             budget_mb=budget_mb,
             alpha=alpha,
             beta=beta,
+            existing_indexes_omitted=existing_response["existing_indexes_omitted"],
+            existing_indexes_note=existing_response.get("existing_indexes_note"),
         )
 
     # ------------------------------------------------------------------
@@ -793,19 +822,35 @@ class IndexOptimizer:
         schema: str,
         table: str,
         columns: list[str],
+        lookups: dict[tuple[str, str, str], Any] | None = None,
     ) -> float | None:
-        """Estimate index size in MB using row count and column widths."""
-        row_count = await self._get_row_count(database_name, schema, table)
+        """Estimate index size in MB using row count and column widths.
+
+        ``lookups`` keeps a table's row count and column widths for one
+        optimize() run, so each is read once per table.
+        """
+        if lookups is None:
+            lookups = {}
+        count_key = ("row_count", schema, table)
+        if count_key not in lookups:
+            lookups[count_key] = await self._get_row_count(database_name, schema, table)
+        row_count = lookups[count_key]
         if row_count is None:
             return None
         if row_count == 0:
             return 0.0
 
-        col_widths = await self._get_column_widths(database_name, schema, table, columns)
-        if not col_widths or any(column not in col_widths for column in columns):
+        # None marks a column that was asked for and has no width.
+        known: dict[str, int | None] = lookups.setdefault(("column_widths", schema, table), {})
+        unread = [column for column in columns if column not in known]
+        if unread:
+            fetched = await self._get_column_widths(database_name, schema, table, unread)
+            known.update((column, fetched.get(column)) for column in unread)
+        col_widths = [width for column in columns if (width := known[column]) is not None]
+        if not col_widths or len(col_widths) != len(columns):
             return None
 
-        total_key_width = sum(col_widths.values()) + _INDEX_ROW_OVERHEAD
+        total_key_width = sum(col_widths) + _INDEX_ROW_OVERHEAD
         rows_per_page = max(1, _USABLE_PAGE_BYTES // (total_key_width + _SLOT_ARRAY_ENTRY))
         leaf_pages = math.ceil(row_count / rows_per_page)
         total_bytes = leaf_pages * _PAGE_SIZE_BYTES * _NON_LEAF_MULTIPLIER
