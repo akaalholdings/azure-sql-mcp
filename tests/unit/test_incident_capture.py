@@ -407,11 +407,14 @@ async def test_workload_index_review_source_failures_are_recorded(tmp_path: Path
     result = await app.mcp._tool_manager.call_tool("review_workload_indexes", {})
 
     assert result["result_status"] == "unavailable"
-    sites = [r["site"] for r in records(app) if r["kind"] == "swallowed_exception"]
-    assert sites == [
+    # The independent reads run together, so each one that fails is recorded,
+    # not only the two that ran before the old early return.
+    sites = {r["site"] for r in records(app) if r["kind"] == "swallowed_exception"}
+    assert {
         "workload_index_advisor.query_store_options",
         "workload_index_advisor.existing_indexes",
-    ]
+    } <= sites
+    assert all(site.startswith("workload_index_advisor.") for site in sites)
 
 
 @pytest.mark.asyncio
