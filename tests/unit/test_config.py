@@ -605,8 +605,12 @@ def test_optimizer_and_sandbox_profiles_gate_view_mutations() -> None:
     optimizer_tools = PROFILE_TOOL_ALLOWLISTS[McpProfile.OPTIMIZER]
     sandbox_tools = PROFILE_TOOL_ALLOWLISTS[McpProfile.SANDBOX]
 
-    assert "analyze_workload_indexes" in optimizer_tools
-    assert "analyze_workload_indexes" in sandbox_tools
+    # Deprecated: it recompiles every top query one at a time. Profiles offer
+    # review_workload_indexes, which reads the stored plans in one query.
+    for tools in (optimizer_tools, sandbox_tools):
+        assert "analyze_workload_indexes" not in tools
+        assert "review_workload_indexes" in tools
+    assert "analyze_workload_indexes" in TOOL_GROUPS
     assert "prepare_view_change" in optimizer_tools
     assert "apply_prepared_view_change" not in optimizer_tools
     assert {
