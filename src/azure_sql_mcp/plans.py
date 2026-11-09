@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -32,6 +33,19 @@ _NO_QUERY_STATEMENT_TYPES = frozenset({"select without query", "assign"})
 # Operators that pass every input row through; an actual-plan root of this kind
 # can lack counters when a parallel-shaped plan ran serially.
 _ROW_PRESERVING_OPERATORS = frozenset({"Parallelism", "Compute Scalar"})
+# Showplan elements an operator summary reads, and the list each one feeds.
+_OWNED_ELEMENT_GROUPS = {
+    "RunTimeCountersPerThread": "counters",
+    "Top": "top",
+    "Object": "object",
+    "IndexScan": "index_scan",
+    "SpillToTempDb": "spills",
+    "HashSpillDetails": "spills",
+    "SortSpillDetails": "spills",
+    "PlanAffectingConvert": "implicit_conversions",
+    "ConvertIssue": "implicit_conversions",
+    "Warnings": "warnings",
+}
 
 
 def _no_query_statement_types(raw_xml: str) -> list[str] | None:
@@ -66,6 +80,31 @@ def require_compiled_plan(raw_xml: str) -> str:
         f"{', '.join(sorted(set(statement_types))) or 'none'}. "
         "It has no operators, so it is not returned as a plan."
     )
+
+
+def compact_plan_summary(
+    summary: Mapping[str, Any],
+    *,
+    include_operator_summary: bool = False,
+) -> dict[str, Any]:
+    """The plan summary for a tool response; the stored summary is not changed.
+
+    The per-operator list grows about 1 KB per operator with no cap, and the
+    plan digest already carries the operators that matter, so it is opt-in.
+    Its cost-ranked top list is renamed: the digest's top_operators ranks by
+    self time, and two lists with one name read as two rankings of "slowest".
+    """
+    compact: dict[str, Any] = {}
+    for key, value in summary.items():
+        if key == "operators":
+            if include_operator_summary:
+                compact[key] = value
+        elif key == "top_operators":
+            if include_operator_summary:
+                compact["top_operators_by_estimated_cost"] = value
+        else:
+            compact[key] = value
+    return compact
 
 
 def parse_showplan_index_evidence(
@@ -677,11 +716,6 @@ class PlansService:
         root = ET.fromstring(raw_xml)
         statement_nodes = root.findall(".//sp:StmtSimple", SHOWPLAN_NAMESPACE)
         operator_nodes = root.findall(".//sp:RelOp", SHOWPLAN_NAMESPACE)
-        parent_map = {
-            child: parent
-            for parent in root.iter()
-            for child in parent
-        }
 
         statements = []
         for node in statement_nodes:
@@ -704,10 +738,7 @@ class PlansService:
                 }
             )
 
-        operators = [
-            self._summarize_operator(node, parent_map)
-            for node in operator_nodes
-        ]
+        operators = [self._summarize_operator(node) for node in operator_nodes]
         for operator, node in zip(operators, operator_nodes):
             # Subtree cost is cumulative, so ranking by it always crowns the
             # root. Self cost is still an estimate, in every plan.
@@ -789,19 +820,11 @@ class PlansService:
     ) -> dict[str, Any]:
         return summarize_statistics_io_samples(samples)
 
-    def _summarize_operator(
-        self,
-        node: ET.Element,
-        parent_map: dict[ET.Element, ET.Element],
-    ) -> dict[str, Any]:
+    def _summarize_operator(self, node: ET.Element) -> dict[str, Any]:
         estimated_rows = self._optional_float(node.attrib.get("EstimateRows"))
+        owned, seek_predicates, residual_predicates = self._owned_elements(node)
         counters = [
-            self._summarize_thread_counter(counter)
-            for counter in self._owned_descendants(
-                node,
-                parent_map,
-                "RunTimeCountersPerThread",
-            )
+            self._summarize_thread_counter(counter) for counter in owned["counters"]
         ]
         actual_rows = (
             sum(counter["actual_rows"] or 0.0 for counter in counters)
@@ -817,7 +840,7 @@ class PlansService:
             and estimated_rows is not None
             and estimated_without_row_goal > estimated_rows
         )
-        top_nodes = self._owned_descendants(node, parent_map, "Top")
+        top_nodes = owned["top"]
         row_goal_details = {
             "detected": row_goal,
             "estimated_rows_without_row_goal": estimated_without_row_goal,
@@ -827,22 +850,17 @@ class PlansService:
             "source": "showplan_row_goal_attributes" if row_goal else None,
         }
 
-        object_nodes = self._owned_descendants(node, parent_map, "Object")
+        object_nodes = owned["object"]
         object_node = object_nodes[0] if object_nodes else None
         object_payload = self._object_payload(object_node)
-        index_scan_nodes = self._owned_descendants(node, parent_map, "IndexScan")
+        index_scan_nodes = owned["index_scan"]
         lookup = (
             node.attrib.get("PhysicalOp", "").lower() in {"key lookup", "rid lookup"}
             or any(is_true(scan.attrib.get("Lookup")) for scan in index_scan_nodes)
         )
-        seek_predicates, residual_predicates = self._operator_predicates(node, parent_map)
-        spills = self._owned_diagnostic_elements(node, parent_map, {"SpillToTempDb", "HashSpillDetails", "SortSpillDetails"})
-        implicit_conversions = self._owned_diagnostic_elements(
-            node,
-            parent_map,
-            {"PlanAffectingConvert", "ConvertIssue"},
-        )
-        operator_warnings = self._owned_diagnostic_elements(node, parent_map, {"Warnings"})
+        spills = self._diagnostic_payloads(owned["spills"])
+        implicit_conversions = self._diagnostic_payloads(owned["implicit_conversions"])
+        operator_warnings = self._diagnostic_payloads(owned["warnings"])
         execution_modes = sorted(
             {
                 str(counter["execution_mode"])
@@ -897,70 +915,46 @@ class PlansService:
     def _local_name(tag: str) -> str:
         return tag.rsplit("}", 1)[-1]
 
-    def _owned_descendants(
+    def _owned_elements(
         self,
         node: ET.Element,
-        parent_map: dict[ET.Element, ET.Element],
-        tag_name: str,
-    ) -> list[ET.Element]:
-        result: list[ET.Element] = []
-        for child in node.iter():
-            if child is node or self._local_name(child.tag) != tag_name:
-                continue
-            parent = parent_map.get(child)
-            while parent is not None and parent is not node:
-                if self._local_name(parent.tag) == "RelOp":
-                    break
-                parent = parent_map.get(parent)
-            if parent is node:
-                result.append(child)
-        return result
+    ) -> tuple[dict[str, list[ET.Element]], list[str], list[str]]:
+        """Elements this operator owns, by group, plus its seek and residual predicates.
 
-    def _owned_diagnostic_elements(
-        self,
-        node: ET.Element,
-        parent_map: dict[ET.Element, ET.Element],
-        tag_names: set[str],
-    ) -> list[dict[str, Any]]:
-        diagnostics: list[dict[str, Any]] = []
-        for element in node.iter():
-            if element is node or self._local_name(element.tag) not in tag_names:
-                continue
-            parent = parent_map.get(element)
-            while parent is not None and parent is not node:
-                if self._local_name(parent.tag) == "RelOp":
-                    break
-                parent = parent_map.get(parent)
-            if parent is not node:
-                continue
-            diagnostics.append(
-                {
-                    "element": self._local_name(element.tag),
-                    **{key: value for key, value in element.attrib.items() if value != ""},
-                }
-            )
-        return diagnostics
-
-    def _operator_predicates(
-        self,
-        node: ET.Element,
-        parent_map: dict[ET.Element, ET.Element],
-    ) -> tuple[list[str], list[str]]:
+        One pre-order walk that stops at child RelOps, so each element is
+        visited once for the operator that owns it. Document order is kept.
+        """
+        owned: dict[str, list[ET.Element]] = {
+            group: [] for group in set(_OWNED_ELEMENT_GROUPS.values())
+        }
         seek: list[str] = []
         residual: list[str] = []
-        for element in self._owned_descendants(node, parent_map, "ScalarOperator"):
-            text = element.attrib.get("ScalarString")
-            if not text:
+        stack = [(child, False) for child in reversed(node)]
+        while stack:
+            element, in_seek_predicates = stack.pop()
+            name = self._local_name(element.tag)
+            if name == "RelOp":
                 continue
-            ancestors: list[str] = []
-            parent = parent_map.get(element)
-            while parent is not None and parent is not node:
-                ancestors.append(self._local_name(parent.tag))
-                parent = parent_map.get(parent)
-            destination = seek if "SeekPredicates" in ancestors else residual
-            if text not in destination:
-                destination.append(text)
-        return seek, residual
+            group = _OWNED_ELEMENT_GROUPS.get(name)
+            if group is not None:
+                owned[group].append(element)
+            elif name == "ScalarOperator":
+                text = element.attrib.get("ScalarString")
+                destination = seek if in_seek_predicates else residual
+                if text and text not in destination:
+                    destination.append(text)
+            in_seek_predicates = in_seek_predicates or name == "SeekPredicates"
+            stack.extend((child, in_seek_predicates) for child in reversed(element))
+        return owned, seek, residual
+
+    def _diagnostic_payloads(self, elements: list[ET.Element]) -> list[dict[str, Any]]:
+        return [
+            {
+                "element": self._local_name(element.tag),
+                **{key: value for key, value in element.attrib.items() if value != ""},
+            }
+            for element in elements
+        ]
 
     def _object_payload(self, node: ET.Element | None) -> dict[str, Any] | None:
         if node is None:
