@@ -72,7 +72,7 @@ def test_blocking_regressions_and_dominant_queries_become_findings() -> None:
             {
                 "sessions": {
                     "blocking_chains": [
-                        {"head_blocker_session_id": 61, "blocked_sessions": [{}, {}, {}, {}, {}, {}]}
+                        {"head_blocker_session_id": 61, "blocked_session_ids": [62, 63, 64, 65, 66, 67]}
                     ]
                 },
                 "top_queries": [
@@ -90,6 +90,7 @@ def test_blocking_regressions_and_dominant_queries_become_findings() -> None:
     )
 
     assert findings["active_blocking"]["severity"] == "high"
+    assert findings["active_blocking"]["evidence"]["blocked_sessions"] == 6
     assert "head blocker session 61" in findings["active_blocking"]["message"]
     assert findings["dominant_query"]["next_tools"][0] == {"tool": "analyze_query_plan", "arguments": {"query_id": 9}}
     assert findings["query_regression"]["severity"] == "high"
