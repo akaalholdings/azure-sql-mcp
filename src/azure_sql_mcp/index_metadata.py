@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -11,13 +12,19 @@ from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
 from typing import Any, Iterable
+from typing import cast
 
 from .azure_tier import classify_service_tier
 from .connection import AzureSqlExecutor
 from .incident_log import note_exception
 
 
-EXISTING_INDEX_METADATA_SQL = """
+# One row per index column and one row per index partition (column fields NULL
+# on a partition row, partition fields NULL on a column row). Joining both to
+# the index in one FROM gave columns x partitions rows per index: 36,500 for a
+# 100-column columnstore index on 365 partitions. The NULLs are untyped so
+# that each takes the type and collation of the other branch.
+_EXISTING_INDEX_METADATA_SQL_TEMPLATE = """
 SELECT
     o.object_id,
     o.type AS parent_object_type_code,
@@ -45,21 +52,21 @@ SELECT
     i.fill_factor,
     kc.name AS constraint_name,
     kc.type_desc AS constraint_type,
-    ic.index_column_id,
-    ic.key_ordinal,
-    ic.is_included_column,
-    ic.is_descending_key,
-    ic.partition_ordinal,
-    c.name AS column_name,
+    d.index_column_id,
+    d.key_ordinal,
+    d.is_included_column,
+    d.is_descending_key,
+    d.partition_ordinal,
+    d.column_name,
     ds.name AS data_space_name,
     ds.type_desc AS data_space_type,
     ps.name AS partition_scheme_name,
     pf.name AS partition_function_name,
-    p.partition_number,
-    p.rows AS partition_row_count,
-    pss.reserved_page_count AS partition_page_count,
-    p.data_compression_desc,
-    p.xml_compression_desc,
+    d.partition_number,
+    d.partition_row_count,
+    d.partition_page_count,
+    d.data_compression_desc,
+    d.xml_compression_desc,
     st.no_recompute AS statistics_no_recompute,
     st.is_incremental AS statistics_incremental,
     CONVERT(varchar(33), STATS_DATE(i.object_id, i.index_id), 127) AS statistics_updated_utc,
@@ -73,12 +80,6 @@ INNER JOIN sys.objects AS o
     ON i.object_id = o.object_id
 INNER JOIN sys.schemas AS s
     ON o.schema_id = s.schema_id
-LEFT JOIN sys.index_columns AS ic
-    ON i.object_id = ic.object_id
-    AND i.index_id = ic.index_id
-LEFT JOIN sys.columns AS c
-    ON ic.object_id = c.object_id
-    AND ic.column_id = c.column_id
 LEFT JOIN sys.data_spaces AS ds
     ON i.data_space_id = ds.data_space_id
 LEFT JOIN sys.partition_schemes AS ps
@@ -91,26 +92,90 @@ LEFT JOIN sys.key_constraints AS kc
 LEFT JOIN sys.stats AS st
     ON st.object_id = i.object_id
     AND st.stats_id = i.index_id
-LEFT JOIN sys.partitions AS p
-    ON i.object_id = p.object_id
-    AND i.index_id = p.index_id
-LEFT JOIN sys.dm_db_partition_stats AS pss
-    ON pss.object_id = p.object_id
-    AND pss.index_id = p.index_id
-    AND pss.partition_number = p.partition_number
 LEFT JOIN sys.dm_db_index_usage_stats AS us
     ON i.object_id = us.object_id
     AND i.index_id = us.index_id
     AND us.database_id = DB_ID()
+LEFT JOIN (
+    SELECT
+        ic.object_id,
+        ic.index_id,
+        ic.index_column_id,
+        ic.key_ordinal,
+        ic.is_included_column,
+        ic.is_descending_key,
+        ic.partition_ordinal,
+        c.name AS column_name,
+        NULL AS partition_number,
+        NULL AS partition_row_count,
+        NULL AS partition_page_count,
+        NULL AS data_compression_desc,
+        NULL AS xml_compression_desc
+    FROM sys.index_columns AS ic
+    LEFT JOIN sys.columns AS c
+        ON ic.object_id = c.object_id
+        AND ic.column_id = c.column_id{column_filter}
+    UNION ALL
+    SELECT
+        p.object_id,
+        p.index_id,
+        NULL AS index_column_id,
+        NULL AS key_ordinal,
+        NULL AS is_included_column,
+        NULL AS is_descending_key,
+        NULL AS partition_ordinal,
+        NULL AS column_name,
+        p.partition_number,
+        p.rows AS partition_row_count,
+        pss.reserved_page_count AS partition_page_count,
+        p.data_compression_desc,
+        p.xml_compression_desc
+    FROM sys.partitions AS p
+    LEFT JOIN sys.dm_db_partition_stats AS pss
+        ON pss.object_id = p.object_id
+        AND pss.index_id = p.index_id
+        AND pss.partition_number = p.partition_number{partition_filter}
+) AS d
+    ON d.object_id = i.object_id
+    AND d.index_id = i.index_id
 WHERE i.index_id > 0
-  AND o.type IN ('U', 'V')
+  AND o.type IN ('U', 'V'){object_filter}
 ORDER BY
     s.name,
     o.name,
     i.index_id,
-    ic.key_ordinal,
-    ic.index_column_id,
-    p.partition_number
+    d.key_ordinal,
+    d.index_column_id,
+    d.partition_number
+"""
+
+# Limits a catalog read to one table or view; the parameter is its quoted
+# two-part name.
+_OBJECT_FILTER = "\n  AND i.object_id = OBJECT_ID(?)"
+# The scoped query takes the name three times: once per detail branch and once
+# for the index, so no branch depends on the optimizer to push the filter down.
+EXISTING_INDEX_METADATA_SCOPE_PARAMETERS = 3
+
+
+def existing_index_metadata_sql(*, scoped: bool = False) -> str:
+    if not scoped:
+        return _EXISTING_INDEX_METADATA_SQL_TEMPLATE.format(
+            column_filter="", partition_filter="", object_filter=""
+        )
+    return _EXISTING_INDEX_METADATA_SQL_TEMPLATE.format(
+        column_filter="\n    WHERE ic.object_id = OBJECT_ID(?)",
+        partition_filter="\n    WHERE p.object_id = OBJECT_ID(?)",
+        object_filter=_OBJECT_FILTER,
+    )
+
+
+EXISTING_INDEX_METADATA_SQL = existing_index_metadata_sql()
+
+INDEX_EXISTS_SQL = """
+SELECT 1 AS index_exists
+FROM sys.indexes
+WHERE object_id = OBJECT_ID(?)
+  AND name = ?
 """
 
 ENGINE_START_TIME_SQL = """
@@ -195,7 +260,7 @@ async def collect_readable_replica_status(
 # that count alternative FK support must skip them.
 # referenced_foreign_key_ids lists the foreign keys that use this index as
 # their referenced key.
-INDEX_PROTECTION_METADATA_SQL = """
+_INDEX_PROTECTION_METADATA_SQL_TEMPLATE = """
 SELECT
     TOP (100000)
     i.object_id,
@@ -261,9 +326,16 @@ OUTER APPLY (
       AND fk.key_index_id = i.index_id
 ) AS referenced
 WHERE i.index_id > 0
-  AND o.type IN ('U', 'V')
+  AND o.type IN ('U', 'V'){object_filter}
 ORDER BY i.object_id, i.index_id
 """
+
+
+def index_protection_metadata_sql(*, scoped: bool = False) -> str:
+    return _INDEX_PROTECTION_METADATA_SQL_TEMPLATE.format(object_filter=_OBJECT_FILTER if scoped else "")
+
+
+INDEX_PROTECTION_METADATA_SQL = index_protection_metadata_sql()
 
 _DIRECTION_PATTERN = re.compile(
     r"^(?:\[(?P<bracketed>(?:[^\]\r\n]|\]\])+)\]|"
@@ -550,16 +622,47 @@ async def collect_existing_indexes(
     database_name: str,
     *,
     observation_window_minutes: int | None = None,
+    schema_name: str | None = None,
+    table_name: str | None = None,
 ) -> list[ExistingIndex]:
-    rows = await executor.fetch_all(database_name, EXISTING_INDEX_METADATA_SQL)
-    usage_context = await _collect_usage_context(
-        executor,
-        database_name,
-        observation_window_minutes=observation_window_minutes,
+    """Read every index in the database, or with ``schema_name`` and
+    ``table_name`` the indexes of that one table or view."""
+
+    if (schema_name is None) != (table_name is None):
+        raise ValueError("schema_name and table_name must be given together")
+    object_name = (
+        _quoted_object_name(schema_name, table_name)
+        if schema_name is not None and table_name is not None
+        else None
     )
-    protection_evidence = await _collect_protection_evidence(
-        executor,
-        database_name,
+    # The three reads need nothing from each other, so they run together.
+    outcomes = await asyncio.gather(
+        _fetch_scoped(
+            executor,
+            database_name,
+            existing_index_metadata_sql(scoped=object_name is not None),
+            object_name,
+            EXISTING_INDEX_METADATA_SCOPE_PARAMETERS,
+        ),
+        _collect_usage_context(
+            executor,
+            database_name,
+            observation_window_minutes=observation_window_minutes,
+        ),
+        _collect_protection_evidence(
+            executor,
+            database_name,
+            object_name=object_name,
+        ),
+        return_exceptions=True,
+    )
+    # The first failure in read order is raised, as when the reads ran in sequence.
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            raise outcome
+    rows, usage_context, protection_evidence = cast(
+        tuple[list[dict[str, Any]], dict[str, Any], dict[tuple[int, int], dict[str, Any]]],
+        outcomes,
     )
     return parse_existing_index_rows(
         rows,
@@ -567,6 +670,40 @@ async def collect_existing_indexes(
         usage_context=usage_context,
         protection_evidence=protection_evidence,
     )
+
+
+async def index_exists(
+    executor: AzureSqlExecutor,
+    database_name: str,
+    *,
+    schema_name: str,
+    table_name: str,
+    index_name: str,
+) -> bool:
+    """Whether the table or view has an index of that name: one catalog seek."""
+
+    rows = await executor.fetch_all(
+        database_name,
+        INDEX_EXISTS_SQL,
+        params=[_quoted_object_name(schema_name, table_name), index_name],
+    )
+    return bool(rows)
+
+
+def _quoted_object_name(schema_name: str, table_name: str) -> str:
+    return ".".join("[" + str(part).replace("]", "]]") + "]" for part in (schema_name, table_name))
+
+
+async def _fetch_scoped(
+    executor: AzureSqlExecutor,
+    database_name: str,
+    query: str,
+    object_name: str | None,
+    parameter_count: int = 1,
+) -> list[dict[str, Any]]:
+    if object_name is None:
+        return await executor.fetch_all(database_name, query)
+    return await executor.fetch_all(database_name, query, params=[object_name] * parameter_count)
 
 
 def parse_existing_index_rows(
@@ -787,6 +924,73 @@ def parse_existing_index_rows(
         indexes,
         key=lambda index: (index.schema, index.table, index.index_id),
     )
+
+
+_EXISTING_INDEXES_NOTE = (
+    "Only the indexes of tables that the recommendations or the analysed plans name are "
+    "listed, in compact form. For one table's full index metadata call "
+    "get_object_index_diagnostics."
+)
+
+
+def existing_index_response(
+    indexes: Iterable[ExistingIndex],
+    tables: Iterable[tuple[str, str]],
+    *,
+    full: bool = False,
+) -> dict[str, Any]:
+    """The existing-index part of a tool response.
+
+    A database can hold thousands of indexes, so only those on ``tables``
+    (schema, table) are listed, each in compact form. ``full`` lists every
+    index with its complete metadata.
+    """
+
+    indexes = list(indexes)
+    if full:
+        return {
+            "existing_indexes": [index.as_dict() for index in indexes],
+            "existing_indexes_total": len(indexes),
+            "existing_indexes_omitted": 0,
+        }
+    wanted = {(str(schema).casefold(), str(table).casefold()) for schema, table in tables}
+    listed = [
+        _compact_existing_index(index)
+        for index in indexes
+        if (index.schema.casefold(), index.table.casefold()) in wanted
+    ]
+    return {
+        "existing_indexes": listed,
+        "existing_indexes_total": len(indexes),
+        "existing_indexes_omitted": len(indexes) - len(listed),
+        "existing_indexes_note": _EXISTING_INDEXES_NOTE,
+    }
+
+
+def _compact_existing_index(index: ExistingIndex) -> dict[str, Any]:
+    return {
+        "schema": index.schema,
+        "table": index.table,
+        "name": index.name,
+        "index_type": index.index_type,
+        "key_columns": [column.as_dict() for column in index.key_columns],
+        "include_columns": list(index.include_columns),
+        "filter_definition": index.filter_definition,
+        "is_unique": index.is_unique,
+        "is_disabled": index.is_disabled,
+        "usage": dict(index.usage),
+        "partition_count": max(len(index.partition_compression), len(index.partition_row_counts)),
+        "compression": _compression_summary(index.partition_compression),
+    }
+
+
+def _compression_summary(partition_compression: Iterable[tuple[int, str]]) -> str | None:
+    counts: dict[str, int] = {}
+    for _number, compression in partition_compression:
+        counts[compression] = counts.get(compression, 0) + 1
+    if len(counts) <= 1:
+        return next(iter(counts), None)
+    return "mixed: " + ", ".join(f"{name} x{count}" for name, count in sorted(counts.items()))
 
 
 def coerce_existing_indexes(
@@ -1312,10 +1516,17 @@ async def _collect_usage_context(
 async def _collect_protection_evidence(
     executor: AzureSqlExecutor,
     database_name: str,
+    *,
+    object_name: str | None = None,
 ) -> dict[tuple[int, int], dict[str, Any]]:
     """Collect relationship and catalog protection evidence fail-closed."""
 
-    rows = await executor.fetch_all(database_name, INDEX_PROTECTION_METADATA_SQL)
+    rows = await _fetch_scoped(
+        executor,
+        database_name,
+        index_protection_metadata_sql(scoped=object_name is not None),
+        object_name,
+    )
 
     return parse_protection_evidence(rows)
 
@@ -1636,16 +1847,21 @@ __all__ = [
     "DATABASE_INCARNATION_SQL",
     "ENGINE_START_TIME_SQL",
     "EXISTING_INDEX_METADATA_SQL",
+    "INDEX_EXISTS_SQL",
     "INDEX_PROTECTION_METADATA_SQL",
     "ExistingIndex",
     "IndexKeyColumn",
     "collect_existing_indexes",
     "coerce_existing_indexes",
     "existing_index_covers_candidate",
+    "existing_index_metadata_sql",
+    "existing_index_response",
     "index_definition_fingerprint",
     "index_definition_matches",
     "index_definition_payload",
+    "index_exists",
     "index_ownership_fingerprint",
+    "index_protection_metadata_sql",
     "normalize_index_definition",
     "parse_candidate_key",
     "parse_existing_index_rows",
