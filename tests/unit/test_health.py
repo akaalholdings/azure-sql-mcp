@@ -357,7 +357,7 @@ async def test_threshold_evaluation_for_connection_check():
                     }
                 ],
             ),
-            ("max_sessions", [{"max_sessions": 100, "primary_group_max_workers": 50}]),
+            (GOVERNANCE_DMV, [{"max_sessions": 100, "primary_group_max_workers": 50}]),
         ]
     )
 
@@ -701,7 +701,7 @@ async def test_connection_session_limit_from_max_sessions():
     service, _, _ = build_service(
         responses=[
             ("AS idle_with_open_transaction", [{"total_sessions": 300, "active_requests": 4, "idle_sessions": 290}]),
-            ("max_sessions", [{"max_sessions": 30000, "primary_group_max_workers": 200}]),
+            (GOVERNANCE_DMV, [{"max_sessions": 30000, "primary_group_max_workers": 200}]),
             ("sys.dm_db_resource_stats", resource_rows()),
         ]
     )
@@ -720,7 +720,7 @@ async def test_connection_worker_pressure_comes_from_resource_stats():
     service, _, _ = build_service(
         responses=[
             ("AS idle_with_open_transaction", [{"total_sessions": 40}]),
-            ("max_sessions", [{"max_sessions": 30000, "primary_group_max_workers": 200}]),
+            (GOVERNANCE_DMV, [{"max_sessions": 30000, "primary_group_max_workers": 200}]),
             ("sys.dm_db_resource_stats", resource_rows(max_worker_percent=97.0)),
         ]
     )
@@ -738,7 +738,7 @@ async def test_connection_limits_permission_failure_keeps_the_check_with_a_hint(
             ("AS idle_with_open_transaction", [{"total_sessions": 40}]),
             ("sys.dm_db_resource_stats", resource_rows()),
         ],
-        errors=[("max_sessions", PermissionError("VIEW SERVER STATE permission denied"))],
+        errors=[(GOVERNANCE_DMV, PermissionError("VIEW SERVER STATE permission denied"))],
     )
 
     check = (await service.analyze("appdb", "connection"))["checks"]["connection"]
@@ -754,7 +754,7 @@ async def test_connection_with_no_readable_limit_source_is_not_a_pass():
     service, _, _ = build_service(
         responses=[("AS idle_with_open_transaction", [{"total_sessions": 40}])],
         errors=[
-            ("max_sessions", PermissionError("denied")),
+            (GOVERNANCE_DMV, PermissionError("denied")),
             ("sys.dm_db_resource_stats", PermissionError("denied")),
         ],
     )
@@ -773,7 +773,7 @@ async def test_connection_with_unreadable_pressure_is_not_a_pass():
     service, _, _ = build_service(
         responses=[
             ("AS idle_with_open_transaction", [{"total_sessions": 40}]),
-            ("max_sessions", [{"max_sessions": 30000, "primary_group_max_workers": 200}]),
+            (GOVERNANCE_DMV, [{"max_sessions": 30000, "primary_group_max_workers": 200}]),
         ],
         errors=[("sys.dm_db_resource_stats", TimeoutError("Query timeout expired"))],
     )
