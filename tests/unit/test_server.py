@@ -1172,7 +1172,7 @@ async def test_registered_analyze_query_indexes_forwards_queries_array(
 
     assert payload == {"queries_analyzed": 1, "result_status": "ok"}
     app._analyze_query_indexes.assert_awaited_once_with(
-        "appdb", ["SELECT 1"], False, None, None
+        "appdb", ["SELECT 1"], False, None, None, include_all_existing_indexes=False
     )
 
 
@@ -3616,6 +3616,7 @@ async def test_review_workload_indexes_forwards_arguments_and_is_read_only(
         min_table_rows=0,
         max_recommendations_per_table=3,
         include_existing_index_review=False,
+        query_ids=None,
     )
 
 

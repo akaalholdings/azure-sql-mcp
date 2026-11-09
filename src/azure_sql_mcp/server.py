@@ -2314,6 +2314,13 @@ class AzureSqlMcpApplication:
                     "across the supplied queries."
                 ),
             ),
+            include_all_existing_indexes: bool = Field(
+                default=False,
+                description=(
+                    "When true, returns the full metadata of every index in the "
+                    "database. The default lists the indexes of the analysed tables."
+                ),
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -2328,6 +2335,7 @@ class AzureSqlMcpApplication:
                     auto_bind_params,
                     parameter_values,
                     parameter_types,
+                    include_all_existing_indexes=include_all_existing_indexes,
                 ),
             )
 
@@ -2350,6 +2358,13 @@ class AzureSqlMcpApplication:
                 default=20,
                 description="Number of top queries to analyze.",
             ),
+            include_all_existing_indexes: bool = Field(
+                default=False,
+                description=(
+                    "When true, returns the full metadata of every index in the "
+                    "database. The default lists the indexes of the analysed tables."
+                ),
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -2362,6 +2377,7 @@ class AzureSqlMcpApplication:
                     resolved_database,
                     window_minutes,
                     top_n,
+                    include_all_existing_indexes=include_all_existing_indexes,
                 ),
             )
 
@@ -2427,6 +2443,13 @@ class AzureSqlMcpApplication:
                 default=5.0,
                 description="Minimum impact percentage to include a candidate.",
             ),
+            include_all_existing_indexes: bool = Field(
+                default=False,
+                description=(
+                    "When true, returns the full metadata of every index in the "
+                    "database. The default lists the indexes of the analysed tables."
+                ),
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -2436,7 +2459,14 @@ class AzureSqlMcpApplication:
                 "optimize_indexes",
                 database_name,
                 lambda db: self.index_optimizer.optimize(
-                    db, window_minutes, top_n, budget_mb, alpha, beta, min_improvement_pct,
+                    db,
+                    window_minutes,
+                    top_n,
+                    budget_mb,
+                    alpha,
+                    beta,
+                    min_improvement_pct,
+                    include_all_existing_indexes=include_all_existing_indexes,
                 ),
             )
 
@@ -2517,6 +2547,15 @@ class AzureSqlMcpApplication:
                     "unused indexes, heaps, and unindexed foreign keys."
                 ),
             ),
+            query_ids: list[int] | None = Field(
+                default=None,
+                max_length=50,
+                description=(
+                    "Query Store query ids that must be analysed whatever their rank "
+                    "or table scope. Pass the query being tuned so its access paths "
+                    "shape the advice."
+                ),
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -2537,6 +2576,7 @@ class AzureSqlMcpApplication:
                     min_table_rows=min_table_rows,
                     max_recommendations_per_table=max_recommendations_per_table,
                     include_existing_index_review=include_existing_index_review,
+                    query_ids=query_ids,
                 ),
             )
 
@@ -7090,7 +7130,9 @@ class AzureSqlMcpApplication:
             )
 
         self._require_tuning_session_time(session_id)
-        existing_indexes = await collect_existing_indexes(self.executor, database_name)
+        existing_indexes = await collect_existing_indexes(
+            self.executor, database_name, schema_name=schema, table_name=table
+        )
         name_conflict = next(
             (
                 existing
@@ -7422,7 +7464,9 @@ class AzureSqlMcpApplication:
                     expected_index_id=observed_index.index_id,
                 )
                 if find_created_index(
-                    await collect_existing_indexes(self.executor, database_name)
+                    await collect_existing_indexes(
+                        self.executor, database_name, schema_name=schema, table_name=table
+                    )
                 ) is not None:
                     raise RuntimeError("Temporary index removal was not verified.")
                 lease = self.performance_store.update_index_lease(
@@ -7480,7 +7524,9 @@ class AzureSqlMcpApplication:
             cancelled_during_probe = False
             try:
                 observed_index = find_created_index(
-                    await collect_existing_indexes(self.executor, database_name)
+                    await collect_existing_indexes(
+                        self.executor, database_name, schema_name=schema, table_name=table
+                    )
                 )
                 if await record_observed_index(
                     observed_index,
@@ -7568,6 +7614,8 @@ class AzureSqlMcpApplication:
             observed_indexes = await collect_existing_indexes(
                 self.executor,
                 database_name,
+                schema_name=schema,
+                table_name=table,
             )
             observed_index = next(
                 (
@@ -7678,6 +7726,8 @@ class AzureSqlMcpApplication:
                     current_indexes = await collect_existing_indexes(
                         self.executor,
                         database_name,
+                        schema_name=schema,
+                        table_name=table,
                     )
                     current_index = next(
                         (
@@ -7730,6 +7780,8 @@ class AzureSqlMcpApplication:
                     remaining_indexes = await collect_existing_indexes(
                         self.executor,
                         database_name,
+                        schema_name=schema,
+                        table_name=table,
                     )
                     if any(
                         existing.schema == schema
@@ -9639,6 +9691,8 @@ class AzureSqlMcpApplication:
         auto_bind_params: bool = False,
         parameter_values: dict[str, Any] | None = None,
         parameter_types: dict[str, str] | None = None,
+        *,
+        include_all_existing_indexes: bool = False,
     ) -> dict[str, Any]:
         normalized_values: dict[str, Any] = {}
         for raw_name, value in (parameter_values or {}).items():
@@ -9739,6 +9793,7 @@ class AzureSqlMcpApplication:
             database_name,
             queries,
             execution_contracts=contracts,
+            include_all_existing_indexes=include_all_existing_indexes,
         )
         result["parameter_binding"] = binding_summaries
         return result
@@ -10041,6 +10096,8 @@ class AzureSqlMcpApplication:
                 current_indexes = await collect_existing_indexes(
                     self.executor,
                     database_name,
+                    schema_name=schema_name,
+                    table_name=table_name,
                 )
                 current_index = next(
                     (

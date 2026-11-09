@@ -76,6 +76,8 @@ class IndexRecommendationService:
         database_name: str,
         window_minutes: int = 60,
         top_n: int = 20,
+        *,
+        include_all_existing_indexes: bool = False,
     ) -> dict[str, Any]:
         from .query_index_analysis import QueryIndexAnalysisService
 
@@ -84,6 +86,7 @@ class IndexRecommendationService:
             database_name=database_name,
             window_minutes=window_minutes,
             top_n=top_n,
+            include_all_existing_indexes=include_all_existing_indexes,
         )
 
     async def _get_missing_indexes(self, database_name: str) -> list[dict[str, Any]]:

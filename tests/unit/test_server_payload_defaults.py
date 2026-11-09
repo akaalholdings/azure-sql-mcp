@@ -167,3 +167,62 @@ def test_capture_gets_time_for_its_catalog_and_query_store_reads(
     assert app._timeout_for_tool("capture_index_review_snapshot") >= (
         app.config.query_timeout_seconds * 6
     )
+
+
+@pytest.mark.asyncio
+async def test_review_workload_indexes_passes_the_tuned_query_ids(
+    app: AzureSqlMcpApplication,
+) -> None:
+    # The optimizer reviews indexes for one query. Without its id the review
+    # only sees the top queries, so a query ranked below them got advice
+    # designed for other queries.
+    app.workload_index_advisor.review = AsyncMock(return_value={"recommendations": []})  # type: ignore[method-assign]
+
+    await app.mcp._tool_manager.call_tool(
+        "review_workload_indexes", {"database_name": "appdb", "query_ids": [140, 141]}
+    )
+
+    assert app.workload_index_advisor.review.await_args.kwargs["query_ids"] == [140, 141]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool", "target", "arguments"),
+    [
+        ("analyze_workload_indexes", "recommendations.analyze_workload_indexes", {}),
+        ("optimize_indexes", "index_optimizer.optimize", {}),
+    ],
+)
+async def test_index_tools_return_every_index_only_on_request(
+    app: AzureSqlMcpApplication,
+    tool: str,
+    target: str,
+    arguments: dict,
+) -> None:
+    owner_name, method = target.split(".")
+    owner = getattr(app, owner_name)
+    setattr(owner, method, AsyncMock(return_value={"existing_indexes": []}))
+
+    await app.mcp._tool_manager.call_tool(tool, {"database_name": "appdb", **arguments})
+    assert getattr(owner, method).await_args.kwargs["include_all_existing_indexes"] is False
+
+    await app.mcp._tool_manager.call_tool(
+        tool, {"database_name": "appdb", "include_all_existing_indexes": True, **arguments}
+    )
+    assert getattr(owner, method).await_args.kwargs["include_all_existing_indexes"] is True
+
+
+@pytest.mark.asyncio
+async def test_analyze_query_indexes_passes_the_full_list_switch(
+    app: AzureSqlMcpApplication,
+) -> None:
+    app.query_index_analysis.analyze_queries = AsyncMock(return_value={})  # type: ignore[method-assign]
+
+    await app._analyze_query_indexes(
+        "appdb", ["SELECT 1"], False, None, None, include_all_existing_indexes=True
+    )
+
+    assert (
+        app.query_index_analysis.analyze_queries.await_args.kwargs["include_all_existing_indexes"]
+        is True
+    )
