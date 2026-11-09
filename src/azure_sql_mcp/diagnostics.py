@@ -349,57 +349,81 @@ class DiagnosticQueryService:
     ) -> dict[str, Any]:
         bounded_limit = self._clamp_limit(limit)
         order_by = self._cached_query_sort(sort_by)
+        # TOP is taken in the CTE, after the database filter, so
+        # dm_exec_query_plan builds showplan XML for the returned rows only and
+        # not for every cached statement.
         rows = await self._section(
             database_name,
             f"""
-            SELECT TOP ({bounded_limit})
-                CONVERT(varchar(130), qs.query_hash, 1) AS query_hash,
-                CONVERT(varchar(130), qs.query_plan_hash, 1) AS query_plan_hash,
-                qs.execution_count,
-                qs.total_worker_time,
-                qs.total_worker_time / NULLIF(qs.execution_count, 0) AS avg_worker_time,
-                qs.total_elapsed_time,
-                qs.total_elapsed_time / NULLIF(qs.execution_count, 0) AS avg_elapsed_time,
-                qs.total_logical_reads,
-                qs.total_logical_reads / NULLIF(qs.execution_count, 0)
-                    AS avg_logical_reads,
-                qs.total_physical_reads,
-                qs.total_logical_writes,
-                qs.creation_time,
-                qs.last_execution_time,
+            WITH top_stats AS (
+                SELECT TOP ({bounded_limit})
+                    qs.plan_handle,
+                    {order_by} AS sort_key,
+                    CONVERT(varchar(130), qs.query_hash, 1) AS query_hash,
+                    CONVERT(varchar(130), qs.query_plan_hash, 1) AS query_plan_hash,
+                    qs.execution_count,
+                    qs.total_worker_time,
+                    qs.total_worker_time / NULLIF(qs.execution_count, 0) AS avg_worker_time,
+                    qs.total_elapsed_time,
+                    qs.total_elapsed_time / NULLIF(qs.execution_count, 0) AS avg_elapsed_time,
+                    qs.total_logical_reads,
+                    qs.total_logical_reads / NULLIF(qs.execution_count, 0)
+                        AS avg_logical_reads,
+                    qs.total_physical_reads,
+                    qs.total_logical_writes,
+                    qs.creation_time,
+                    qs.last_execution_time,
+                    REPLACE(
+                        REPLACE(
+                            LEFT(
+                                SUBSTRING(
+                                    st.text,
+                                    (qs.statement_start_offset / 2) + 1,
+                                    (
+                                        (
+                                            CASE qs.statement_end_offset
+                                                WHEN -1 THEN DATALENGTH(st.text)
+                                                ELSE qs.statement_end_offset
+                                            END
+                                        ) - qs.statement_start_offset
+                                    ) / 2 + 1
+                                ),
+                                500
+                            ),
+                            CHAR(13),
+                            ' '
+                        ),
+                        CHAR(10),
+                        ' '
+                    ) AS query_text_preview
+                FROM sys.dm_exec_query_stats AS qs
+                CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
+                WHERE st.dbid IS NULL OR st.dbid = DB_ID()
+                ORDER BY {order_by} DESC
+            )
+            SELECT
+                ts.query_hash,
+                ts.query_plan_hash,
+                ts.execution_count,
+                ts.total_worker_time,
+                ts.avg_worker_time,
+                ts.total_elapsed_time,
+                ts.avg_elapsed_time,
+                ts.total_logical_reads,
+                ts.avg_logical_reads,
+                ts.total_physical_reads,
+                ts.total_logical_writes,
+                ts.creation_time,
+                ts.last_execution_time,
                 CASE
                     WHEN CONVERT(nvarchar(max), qp.query_plan) LIKE N'%<MissingIndexes>%'
                     THEN CAST(1 AS bit)
                     ELSE CAST(0 AS bit)
                 END AS has_missing_index,
-                REPLACE(
-                    REPLACE(
-                        LEFT(
-                            SUBSTRING(
-                                st.text,
-                                (qs.statement_start_offset / 2) + 1,
-                                (
-                                    (
-                                        CASE qs.statement_end_offset
-                                            WHEN -1 THEN DATALENGTH(st.text)
-                                            ELSE qs.statement_end_offset
-                                        END
-                                    ) - qs.statement_start_offset
-                                ) / 2 + 1
-                            ),
-                            500
-                        ),
-                        CHAR(13),
-                        ' '
-                    ),
-                    CHAR(10),
-                    ' '
-                ) AS query_text_preview
-            FROM sys.dm_exec_query_stats AS qs
-            CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
-            OUTER APPLY sys.dm_exec_query_plan(qs.plan_handle) AS qp
-            WHERE st.dbid IS NULL OR st.dbid = DB_ID()
-            ORDER BY {order_by} DESC
+                ts.query_text_preview
+            FROM top_stats AS ts
+            OUTER APPLY sys.dm_exec_query_plan(ts.plan_handle) AS qp
+            ORDER BY ts.sort_key DESC
             """,
         )
         return self._with_coverage({
@@ -428,37 +452,59 @@ class DiagnosticQueryService:
             procedures = await self._section(
                 database_name,
                 f"""
-                SELECT TOP ({bounded_limit})
-                    SCHEMA_NAME(p.schema_id) AS schema_name,
-                    p.name AS routine_name,
-                    'PROCEDURE' AS routine_type,
-                    qs.execution_count,
-                    qs.total_worker_time,
-                    qs.total_worker_time / NULLIF(qs.execution_count, 0)
-                        AS avg_worker_time,
-                    qs.total_elapsed_time,
-                    qs.total_elapsed_time / NULLIF(qs.execution_count, 0)
-                        AS avg_elapsed_time,
-                    qs.total_logical_reads,
-                    qs.total_logical_reads / NULLIF(qs.execution_count, 0)
-                        AS avg_logical_reads,
-                    qs.total_physical_reads,
-                    qs.total_logical_writes,
-                    ISNULL(qs.execution_count / NULLIF(DATEDIFF(MINUTE, qs.cached_time, GETDATE()), 0), 0)
-                        AS calls_per_minute,
-                    qs.cached_time,
-                    qs.last_execution_time,
+                WITH top_stats AS (
+                    SELECT TOP ({bounded_limit})
+                        qs.plan_handle,
+                        {order_by} AS sort_key,
+                        SCHEMA_NAME(p.schema_id) AS schema_name,
+                        p.name AS routine_name,
+                        'PROCEDURE' AS routine_type,
+                        qs.execution_count,
+                        qs.total_worker_time,
+                        qs.total_worker_time / NULLIF(qs.execution_count, 0)
+                            AS avg_worker_time,
+                        qs.total_elapsed_time,
+                        qs.total_elapsed_time / NULLIF(qs.execution_count, 0)
+                            AS avg_elapsed_time,
+                        qs.total_logical_reads,
+                        qs.total_logical_reads / NULLIF(qs.execution_count, 0)
+                            AS avg_logical_reads,
+                        qs.total_physical_reads,
+                        qs.total_logical_writes,
+                        ISNULL(qs.execution_count / NULLIF(DATEDIFF(MINUTE, qs.cached_time, GETDATE()), 0), 0)
+                            AS calls_per_minute,
+                        qs.cached_time,
+                        qs.last_execution_time
+                    FROM sys.procedures AS p
+                    INNER JOIN sys.dm_exec_procedure_stats AS qs
+                        ON p.object_id = qs.object_id
+                    WHERE qs.database_id = DB_ID()
+                    ORDER BY {order_by} DESC
+                )
+                SELECT
+                    ts.schema_name,
+                    ts.routine_name,
+                    ts.routine_type,
+                    ts.execution_count,
+                    ts.total_worker_time,
+                    ts.avg_worker_time,
+                    ts.total_elapsed_time,
+                    ts.avg_elapsed_time,
+                    ts.total_logical_reads,
+                    ts.avg_logical_reads,
+                    ts.total_physical_reads,
+                    ts.total_logical_writes,
+                    ts.calls_per_minute,
+                    ts.cached_time,
+                    ts.last_execution_time,
                     CASE
                         WHEN CONVERT(nvarchar(max), qp.query_plan) LIKE N'%<MissingIndexes>%'
                         THEN CAST(1 AS bit)
                         ELSE CAST(0 AS bit)
                     END AS has_missing_index
-                FROM sys.procedures AS p
-                INNER JOIN sys.dm_exec_procedure_stats AS qs
-                    ON p.object_id = qs.object_id
-                OUTER APPLY sys.dm_exec_query_plan(qs.plan_handle) AS qp
-                WHERE qs.database_id = DB_ID()
-                ORDER BY {order_by} DESC
+                FROM top_stats AS ts
+                OUTER APPLY sys.dm_exec_query_plan(ts.plan_handle) AS qp
+                ORDER BY ts.sort_key DESC
                 """,
             )
         else:
@@ -468,35 +514,56 @@ class DiagnosticQueryService:
             functions = await self._section(
                 database_name,
                 f"""
-                SELECT TOP ({bounded_limit})
-                    SCHEMA_NAME(o.schema_id) AS schema_name,
-                    OBJECT_NAME(fs.object_id) AS routine_name,
-                    fs.type_desc AS routine_type,
-                    fs.execution_count,
-                    fs.total_worker_time,
-                    fs.total_worker_time / NULLIF(fs.execution_count, 0)
-                        AS avg_worker_time,
-                    fs.total_elapsed_time,
-                    fs.total_elapsed_time / NULLIF(fs.execution_count, 0)
-                        AS avg_elapsed_time,
-                    fs.total_logical_reads,
-                    fs.total_logical_reads / NULLIF(fs.execution_count, 0)
-                        AS avg_logical_reads,
-                    fs.total_physical_reads,
-                    fs.total_logical_writes,
-                    fs.cached_time,
-                    fs.last_execution_time,
+                WITH top_stats AS (
+                    SELECT TOP ({bounded_limit})
+                        fs.plan_handle,
+                        {order_by} AS sort_key,
+                        SCHEMA_NAME(o.schema_id) AS schema_name,
+                        OBJECT_NAME(fs.object_id) AS routine_name,
+                        fs.type_desc AS routine_type,
+                        fs.execution_count,
+                        fs.total_worker_time,
+                        fs.total_worker_time / NULLIF(fs.execution_count, 0)
+                            AS avg_worker_time,
+                        fs.total_elapsed_time,
+                        fs.total_elapsed_time / NULLIF(fs.execution_count, 0)
+                            AS avg_elapsed_time,
+                        fs.total_logical_reads,
+                        fs.total_logical_reads / NULLIF(fs.execution_count, 0)
+                            AS avg_logical_reads,
+                        fs.total_physical_reads,
+                        fs.total_logical_writes,
+                        fs.cached_time,
+                        fs.last_execution_time
+                    FROM sys.dm_exec_function_stats AS fs
+                    INNER JOIN sys.objects AS o
+                        ON fs.object_id = o.object_id
+                    WHERE fs.database_id = DB_ID()
+                    ORDER BY {order_by} DESC
+                )
+                SELECT
+                    ts.schema_name,
+                    ts.routine_name,
+                    ts.routine_type,
+                    ts.execution_count,
+                    ts.total_worker_time,
+                    ts.avg_worker_time,
+                    ts.total_elapsed_time,
+                    ts.avg_elapsed_time,
+                    ts.total_logical_reads,
+                    ts.avg_logical_reads,
+                    ts.total_physical_reads,
+                    ts.total_logical_writes,
+                    ts.cached_time,
+                    ts.last_execution_time,
                     CASE
                         WHEN CONVERT(nvarchar(max), qp.query_plan) LIKE N'%<MissingIndexes>%'
                         THEN CAST(1 AS bit)
                         ELSE CAST(0 AS bit)
                     END AS has_missing_index
-                FROM sys.dm_exec_function_stats AS fs
-                INNER JOIN sys.objects AS o
-                    ON fs.object_id = o.object_id
-                OUTER APPLY sys.dm_exec_query_plan(fs.plan_handle) AS qp
-                WHERE fs.database_id = DB_ID()
-                ORDER BY {order_by} DESC
+                FROM top_stats AS ts
+                OUTER APPLY sys.dm_exec_query_plan(ts.plan_handle) AS qp
+                ORDER BY ts.sort_key DESC
                 """,
             )
         else:
@@ -517,6 +584,7 @@ class DiagnosticQueryService:
         schema_name: str | None = None,
         table_name: str | None = None,
         limit: int = 25,
+        include_buffer_usage: bool = False,
     ) -> dict[str, Any]:
         bounded_limit = self._clamp_limit(limit)
         params = [schema_name, schema_name, table_name, table_name]
@@ -657,33 +725,41 @@ class DiagnosticQueryService:
             """,
             params=params,
         )
-        buffer_usage = await self._section(
-            database_name,
-            f"""
-            SELECT TOP ({bounded_limit})
-                SCHEMA_NAME(o.schema_id) AS schema_name,
-                OBJECT_NAME(p.object_id) AS object_name,
-                i.name AS index_name,
-                i.type_desc,
-                COUNT(*) * 8.0 / 1024 AS buffer_mb
-            FROM sys.dm_os_buffer_descriptors AS bd
-            INNER JOIN sys.allocation_units AS au
-                ON bd.allocation_unit_id = au.allocation_unit_id
-            INNER JOIN sys.partitions AS p
-                ON au.container_id = p.hobt_id
-            INNER JOIN sys.objects AS o
-                ON p.object_id = o.object_id
-            INNER JOIN sys.indexes AS i
-                ON p.object_id = i.object_id
-               AND p.index_id = i.index_id
-            WHERE bd.database_id = DB_ID()
-              AND o.is_ms_shipped = 0
-              {object_filter}
-            GROUP BY o.schema_id, p.object_id, i.name, i.type_desc
-            ORDER BY buffer_mb DESC
-            """,
-            params=params,
-        )
+        # sys.dm_os_buffer_descriptors has no predicate pushdown: the table
+        # filter is applied after every buffer of the instance is read.
+        if include_buffer_usage:
+            buffer_usage = await self._section(
+                database_name,
+                f"""
+                SELECT TOP ({bounded_limit})
+                    SCHEMA_NAME(o.schema_id) AS schema_name,
+                    OBJECT_NAME(p.object_id) AS object_name,
+                    i.name AS index_name,
+                    i.type_desc,
+                    COUNT(*) * 8.0 / 1024 AS buffer_mb
+                FROM sys.dm_os_buffer_descriptors AS bd
+                INNER JOIN sys.allocation_units AS au
+                    ON bd.allocation_unit_id = au.allocation_unit_id
+                INNER JOIN sys.partitions AS p
+                    ON au.container_id = p.hobt_id
+                INNER JOIN sys.objects AS o
+                    ON p.object_id = o.object_id
+                INNER JOIN sys.indexes AS i
+                    ON p.object_id = i.object_id
+                   AND p.index_id = i.index_id
+                WHERE bd.database_id = DB_ID()
+                  AND o.is_ms_shipped = 0
+                  {object_filter}
+                GROUP BY o.schema_id, p.object_id, i.name, i.type_desc
+                ORDER BY buffer_mb DESC
+                """,
+                params=params,
+            )
+        else:
+            buffer_usage = self._skipped(
+                "Opt-in: reading sys.dm_os_buffer_descriptors walks the whole "
+                "buffer pool. Set include_buffer_usage=true to read it."
+            )
         volatile_statistics = await self._section(
             database_name,
             f"""

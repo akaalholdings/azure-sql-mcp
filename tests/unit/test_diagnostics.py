@@ -241,6 +241,7 @@ async def test_get_object_index_diagnostics_collects_sections_and_handles_option
         schema_name="dbo",
         table_name="Orders",
         limit=25,
+        include_buffer_usage=True,
     )
 
     assert result["table_properties"]["rows"][0]["table_name"] == "Orders"
