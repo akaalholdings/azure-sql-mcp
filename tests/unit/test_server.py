@@ -177,7 +177,9 @@ async def test_review_index_portfolio_returns_direct_artifacts_without_local_wri
         return_value=review
     )
 
-    result = await app._review_index_portfolio("appdb", None, None)
+    result = await app._review_index_portfolio(
+        "appdb", None, None, include_full_review=True
+    )
 
     assert result == {
         "review_id": "review-1",
@@ -197,7 +199,7 @@ async def test_get_index_review_returns_direct_artifacts_without_local_writes(
     review, artifacts, renderer = _stub_index_review_read_stores(app, monkeypatch)
     app.index_review.get_review = AsyncMock(return_value=review)  # type: ignore[method-assign]
 
-    result = await app._get_index_review("appdb", "review-1")
+    result = await app._get_index_review("appdb", "review-1", include_full_review=True)
 
     assert result == {
         "review_id": "review-1",
