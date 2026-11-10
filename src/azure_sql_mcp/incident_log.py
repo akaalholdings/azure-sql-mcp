@@ -42,7 +42,7 @@ from .config import IncidentSettings
 from .config import ServerConfig
 from .config import build_arg_parser
 from .config import parse_incident_settings
-from .observability import extract_sql_error_info, sanitize_error_message
+from .observability import extract_sql_error_info, sanitize_error_message, sql_origin
 from .retry import TRANSIENT_ERROR_CODES
 from .safe_sql import BLOCKED_FUNCTIONS, LOCKING_HINTS, STATEMENT_KEYWORDS
 
@@ -569,7 +569,11 @@ def _classify_driver(
     if native in _ENVIRONMENT_CODES or sqlstate in _ENVIRONMENT_SQLSTATES:
         return "environment", "P3"
     # Caller-supplied SQL that the engine rejects is the caller's error; a
-    # server-built query that fails is ours.
+    # server-built query that fails is ours. The executor's tag names the
+    # statement that failed; without one, the tool's arguments decide.
+    origin = sql_origin(root)
+    if origin is not None:
+        sql_arguments = origin == "caller_supplied"
     if sql_arguments:
         return "caller_error", "P4"
     return "product_bug", "P2"

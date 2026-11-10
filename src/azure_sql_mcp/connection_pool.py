@@ -7,6 +7,8 @@ import traceback
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
+from typing import Hashable
+from typing import Mapping
 from typing import cast
 
 from .auth import AzureSqlAuthenticator
@@ -87,18 +89,29 @@ class ConnectionPool:
         self,
         config: ServerConfig,
         authenticator: AzureSqlAuthenticator,
+        *,
+        application_intents: Mapping[str, str] | None = None,
     ):
+        """``application_intents`` maps a database name to ``read_only`` when
+        its connections must ask for a readable replica."""
+
         self.config = config
         self.authenticator = authenticator
+        self._application_intents = {
+            name.casefold(): intent for name, intent in (application_intents or {}).items()
+        }
+        # Which pool each open connection belongs to; a replica connection and
+        # a primary connection to the same database never share one.
+        self._connection_keys: dict[int, Hashable] = {}
         # A statement may run for the whole query timeout: that is use, not a leak.
         self._lease_timeout_seconds = max(
             LEASE_TIMEOUT_SECONDS,
             config.query_timeout_seconds + LEASE_TIMEOUT_MARGIN_SECONDS,
         )
-        self._pools: dict[str, asyncio.Queue] = defaultdict(
+        self._pools: dict[Hashable, asyncio.Queue] = defaultdict(
             lambda: asyncio.Queue(maxsize=config.pool_size)
         )
-        self._pool_sizes: dict[str, int] = defaultdict(int)
+        self._pool_sizes: dict[Hashable, int] = defaultdict(int)
         self._lock = asyncio.Lock()
         self._closed = False
         self._metrics: dict[str, PoolMetrics] = defaultdict(PoolMetrics)
@@ -109,9 +122,24 @@ class ConnectionPool:
         self._noted_leaks: set[int] = set()
         self._idle_since: dict[int, float] = {}  # conn_id -> release time
 
-    def _create_connection(self, database_name: str):
+    def application_intent(self, database_name: str) -> str:
+        """The application intent of this database's connections by policy."""
+
+        return self._application_intents.get(database_name.casefold(), "read_write")
+
+    def _pool_key(self, database_name: str, application_intent: str | None) -> Hashable:
+        intent = application_intent or self.application_intent(database_name)
+        return database_name if intent == "read_write" else (database_name, intent)
+
+    def _create_connection(self, database_name: str, application_intent: str = "read_write"):
         driver = cast(Any, _import_mssql_python())
-        connect_args = self.authenticator.build_connection_arguments(database_name)
+        connect_args = (
+            self.authenticator.build_connection_arguments(database_name)
+            if application_intent == "read_write"
+            else self.authenticator.build_connection_arguments(
+                database_name, application_intent=application_intent
+            )
+        )
         attrs_before: dict[int, int | str | bytes] = dict(connect_args.attrs_before or {})
         connection = driver.connect(
             connect_args.connection_string,
@@ -229,8 +257,12 @@ class ConnectionPool:
             if original_timeout is not None:
                 connection.timeout = original_timeout
 
-    async def acquire(self, database_name: str):
-        """Acquire a connection from the pool, creating one if needed."""
+    async def acquire(self, database_name: str, *, application_intent: str | None = None):
+        """Acquire a connection from the pool, creating one if needed.
+
+        ``application_intent`` overrides the database's policy intent for
+        this one connection.
+        """
         if self._closed:
             raise RuntimeError("Connection pool is closed.")
 
@@ -239,7 +271,8 @@ class ConnectionPool:
         metrics = self._metrics[database_name]
         metrics.acquire_count += 1
         wait_start = time.monotonic()
-        pool = self._pools[database_name]
+        key = self._pool_key(database_name, application_intent)
+        pool = self._pools[key]
 
         while True:
             # First, try to reuse an idle connection immediately.
@@ -266,8 +299,8 @@ class ConnectionPool:
 
             create_new = False
             async with self._lock:
-                if self._pool_sizes[database_name] < self.config.pool_size:
-                    self._pool_sizes[database_name] += 1
+                if self._pool_sizes[key] < self.config.pool_size:
+                    self._pool_sizes[key] += 1
                     create_new = True
 
             if create_new:
@@ -277,8 +310,13 @@ class ConnectionPool:
                 )
                 try:
                     conn = await asyncio.to_thread(
-                        self._create_connection, database_name
+                        self._create_connection,
+                        database_name,
+                        # A primary connection is created exactly as before.
+                        *(() if key == database_name else (cast(tuple[str, str], key)[1],)),
                     )
+                    if key != database_name:
+                        self._connection_keys[id(conn)] = key
                     self._record_success(database_name)
                     metrics.create_count += 1
                     metrics.active_connections += 1
@@ -288,7 +326,7 @@ class ConnectionPool:
                     return conn
                 except Exception:
                     async with self._lock:
-                        self._pool_sizes[database_name] -= 1
+                        self._pool_sizes[key] -= 1
                     self._record_failure(database_name)
                     raise
 
@@ -339,7 +377,7 @@ class ConnectionPool:
             await self.discard(database_name, connection)
             return
 
-        pool = self._pools[database_name]
+        pool = self._pools[self._connection_keys.get(id(connection), database_name)]
         try:
             pool.put_nowait(connection)
         except asyncio.QueueFull:
@@ -355,15 +393,17 @@ class ConnectionPool:
         metrics.discard_count += 1
         if was_leased:
             metrics.active_connections = max(0, metrics.active_connections - 1)
+        key = self._connection_keys.pop(id(connection), database_name)
         await asyncio.to_thread(self._close_connection, connection)
         async with self._lock:
-            if self._pool_sizes[database_name] > 0:
-                self._pool_sizes[database_name] -= 1
+            if self._pool_sizes[key] > 0:
+                self._pool_sizes[key] -= 1
 
     async def close_all(self) -> None:
         """Drain all pools and close all connections."""
         self._closed = True
-        for database_name, pool in self._pools.items():
+        for key, pool in self._pools.items():
+            database_name = key if isinstance(key, str) else cast(tuple[str, str], key)[0]
             while not pool.empty():
                 try:
                     connection = pool.get_nowait()

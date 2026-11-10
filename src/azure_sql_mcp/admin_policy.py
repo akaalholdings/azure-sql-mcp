@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from datetime import timezone
 from pathlib import Path
 from typing import Any
+from typing import Callable
 
 from .config import ServerConfig
 from .config import WritePolicy
@@ -282,6 +286,127 @@ class AdminPolicy:
         if result is not None:
             payload["result_sets"] = result
         return payload
+
+
+CONFIRMATION_ACTIONS = ("apply", "rollback")
+_CONFIRMATION_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O, 1/I
+
+
+class ConfirmationError(PermissionError):
+    """A production change was not confirmed with its one-time token."""
+
+
+@dataclass
+class _PendingConfirmation:
+    digest: str
+    expires_at: float
+    attempts: int = 0
+
+
+class ConfirmationTokens:
+    """One-time confirmation tokens for production plan apply and rollback.
+
+    ``issue`` returns a short token when an intent is prepared. ``verify``
+    accepts it once, for the same intent id, fingerprint and action, before it
+    expires. Only a digest is kept. Tokens live in this process: a restart
+    cancels them, and the intent must be prepared again.
+    """
+
+    def __init__(
+        self,
+        *,
+        ttl_seconds: int = 900,
+        max_attempts: int = 5,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        if ttl_seconds <= 0 or max_attempts <= 0:
+            raise ValueError("ttl_seconds and max_attempts must be positive.")
+        self._ttl_seconds = ttl_seconds
+        self._max_attempts = max_attempts
+        self._clock = clock
+        self._pending: dict[tuple[str, str], _PendingConfirmation] = {}
+
+    @staticmethod
+    def required(policy: Any) -> bool:
+        """True unless the policy environment is a known non-production one."""
+
+        return bool(policy.is_production)
+
+    def issue(self, *, intent_id: str, fingerprint: str, action: str = "apply") -> dict[str, Any]:
+        """Issue the token for one prepared intent; an earlier one is cancelled."""
+
+        self._check_binding(intent_id, fingerprint, action)
+        token = "-".join(
+            "".join(secrets.choice(_CONFIRMATION_ALPHABET) for _ in range(4)) for _ in range(3)
+        )
+        now = self._clock()
+        self._pending = {
+            key: pending for key, pending in self._pending.items() if pending.expires_at > now
+        }
+        self._pending[(intent_id, action)] = _PendingConfirmation(
+            digest=self._digest(intent_id, fingerprint, action, token),
+            expires_at=now + self._ttl_seconds,
+        )
+        return {
+            "confirmation_token": token,
+            "action": action,
+            "expires_in_seconds": self._ttl_seconds,
+            "single_use": True,
+        }
+
+    def verify(self, *, intent_id: str, fingerprint: str, action: str, token: str | None) -> None:
+        """Consume the token or raise ``ConfirmationError``. Nothing is changed
+        on the database by this call."""
+
+        self._check_binding(intent_id, fingerprint, action)
+        key = (intent_id, action)
+        pending = self._pending.get(key)
+        if pending is None:
+            raise ConfirmationError(
+                f"No confirmation token is pending for this {action}. Prepare the intent "
+                "again and have a person pass back the token it returns."
+            )
+        if pending.expires_at <= self._clock():
+            del self._pending[key]
+            raise ConfirmationError(
+                "The confirmation token has expired. Prepare the intent again."
+            )
+        supplied = self._digest(intent_id, fingerprint, action, (token or "").strip().upper())
+        if not hmac.compare_digest(supplied, pending.digest):
+            pending.attempts += 1
+            if pending.attempts >= self._max_attempts:
+                del self._pending[key]
+            raise ConfirmationError(
+                "The confirmation token does not match this intent, its current "
+                f"fingerprint and the {action} action."
+            )
+        del self._pending[key]
+
+    def verify_for_policy(
+        self,
+        policy: Any,
+        *,
+        intent_id: str,
+        fingerprint: str,
+        action: str,
+        token: str | None,
+    ) -> None:
+        """Verify the token when the database policy calls for one."""
+
+        if self.required(policy):
+            self.verify(intent_id=intent_id, fingerprint=fingerprint, action=action, token=token)
+
+    @staticmethod
+    def _check_binding(intent_id: str, fingerprint: str, action: str) -> None:
+        if action not in CONFIRMATION_ACTIONS:
+            raise ValueError(f"action must be one of: {', '.join(CONFIRMATION_ACTIONS)}.")
+        if not intent_id or not fingerprint:
+            raise ValueError("intent_id and fingerprint are required.")
+
+    @staticmethod
+    def _digest(intent_id: str, fingerprint: str, action: str, token: str) -> str:
+        bound = "\x1f".join((intent_id, fingerprint, action, token))
+        return hashlib.sha256(bound.encode("utf-8")).hexdigest()
 
 
 class AdminAuditLog:

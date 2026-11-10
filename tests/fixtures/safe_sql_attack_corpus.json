@@ -229,7 +229,7 @@
   },
   {
    "sql": "SELECT * FROM dbo.t OPTION (USE HINT('DISABLE_OPTIMIZER_ROWGOAL'))",
-   "admitted": false
+   "admitted": true
   },
   {
    "sql": "SELECT * FROM dbo.t OPTION (QUERYTRACEON 9481)",
@@ -589,7 +589,7 @@
   },
   {
    "sql": "SELECT * FROM dbo.t OPTION (USE HINT('FORCE_LEGACY_CARDINALITY_ESTIMATION'))",
-   "admitted": false
+   "admitted": true
   },
   {
    "sql": "USE master; SELECT 1",
@@ -1145,7 +1145,7 @@
   },
   {
    "sql": "SELECT 1 OPTION (USE HINT('FORCE_LEGACY_CARDINALITY_ESTIMATION'))",
-   "admitted": false
+   "admitted": true
   },
   {
    "sql": "SELECT 1 OPTION (USE PLAN N'<plan/>')",
@@ -3989,7 +3989,7 @@
   },
   {
    "sql": "SELECT * FROM t OPTION (USE HINT('DISABLE_OPTIMIZER_ROWGOAL'))",
-   "admitted": false
+   "admitted": true
   },
   {
    "sql": "SELECT * FROM t OPTION (USE PLAN N'<ShowPlanXML/>')",
@@ -5201,7 +5201,7 @@
   },
   {
    "sql": "SELECT 1 OPTION (USE HINT('DISABLE_OPTIMIZER_ROWGOAL'))",
-   "admitted": false
+   "admitted": true
   },
   {
    "sql": "SELECT * FROM ＯＰＥＮＱＵＥＲＹ(srv,'SELECT 1')",
@@ -5381,7 +5381,7 @@
   },
   {
    "sql": "SELECT * FROM t OPTION (USE HINT('FORCE_LEGACY_CARDINALITY_ESTIMATION'))",
-   "admitted": false
+   "admitted": true
   },
   {
    "sql": "MERGE \"JOIN\" USING s ON 1=1 WHEN MATCHED THEN DELETE",

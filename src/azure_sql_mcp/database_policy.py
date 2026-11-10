@@ -18,6 +18,7 @@ Version 1 documents a small, database-scoped allowlist::
           "allow_view_apply": false,
           "allow_plan_apply": false,
           "allow_index_history_write": false,
+          "application_intent": "read_write",
           "business_cycle_extension_days": 0,
           "max_benchmark_executions": 0,
           "max_tuning_candidates": 0,
@@ -27,6 +28,10 @@ Version 1 documents a small, database-scoped allowlist::
       }
     }
 
+``application_intent`` is optional. ``read_only`` connects with
+ApplicationIntent=ReadOnly, so a read scale-out replica is the diagnosis
+target; the server then refuses to send a write to that database.
+
 Missing database entries are denied by default.  The dangerous capabilities
 also default to denied in the typed model, so an integration mistake cannot
 turn a missing or partial policy into an apply permission.
@@ -35,6 +40,7 @@ turn a missing or partial policy into an apply permission.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
@@ -54,6 +60,7 @@ _DATABASE_FIELDS = frozenset(
         "allow_view_apply",
         "allow_plan_apply",
         "allow_index_history_write",
+        "application_intent",
         "business_cycle_extension_days",
         "max_benchmark_executions",
         "max_tuning_candidates",
@@ -61,8 +68,43 @@ _DATABASE_FIELDS = frozenset(
         "max_tuning_session_minutes",
     }
 )
+APPLICATION_INTENTS = ("read_write", "read_only")
 _REQUIRED_DATABASE_FIELDS = frozenset({"environment", "allow_read"})
 _UNKNOWN_ENVIRONMENTS = frozenset({"", "none", "null", "unknown"})
+
+# The environment label of a policy entry is the only source of truth for
+# "is this production". A label counts as non-production only when it names a
+# known non-production environment and no production word.
+_PRODUCTION_WORDS = frozenset({"production", "prod", "prd", "live"})
+_NON_PRODUCTION_WORDS = frozenset(
+    {
+        "development", "dev", "test", "testing", "qa", "uat", "sandbox", "staging",
+        "stage", "preprod", "preproduction", "nonprod", "nonproduction", "integration",
+        "ci", "local", "lab", "bench", "benchmark", "demo",
+    }
+)
+_PRE_OR_NON_PRODUCTION = re.compile(r"\b(pre|non)[-_ ]?(prod|production)\b")
+ENVIRONMENT_CLASSES = ("production", "non_production", "unrecognized")
+
+
+def classify_environment(environment: str) -> str:
+    """Classify a policy environment label.
+
+    Returns ``production``, ``non_production`` or ``unrecognized``. The label
+    is split into words ("prod-eu", "test_2"). Any production word makes it
+    production, so "test-prod-copy" is production. A label with no known word
+    is unrecognized; the gates treat it as production.
+    """
+
+    label = _PRE_OR_NON_PRODUCTION.sub(r"\1\2", environment.strip().casefold())
+    words = {word for word in re.split(r"[^a-z0-9]+", label) if word}
+    # A trailing number names an instance: "test2", "prod01".
+    words |= {word.rstrip("0123456789") for word in words}
+    if words & _PRODUCTION_WORDS:
+        return "production"
+    if words & _NON_PRODUCTION_WORDS:
+        return "non_production"
+    return "unrecognized"
 
 
 class DatabasePolicyError(ValueError):
@@ -95,11 +137,19 @@ class DatabasePolicy:
     max_tuning_session_executions: int = 0
     max_tuning_session_minutes: int = 0
     configured: bool = True
+    application_intent: str = "read_write"
 
     def __post_init__(self) -> None:
         _validate_database_name(self.database_name, field_name="database_name")
         if not isinstance(self.configured, bool):
             raise DatabasePolicyValidationError("configured must be a boolean.")
+        if (
+            not isinstance(self.application_intent, str)
+            or self.application_intent not in APPLICATION_INTENTS
+        ):
+            raise DatabasePolicyValidationError(
+                f"application_intent must be one of: {', '.join(APPLICATION_INTENTS)}."
+            )
         if self.configured:
             _validate_environment(self.environment)
         elif self.environment != "unknown":
@@ -172,6 +222,7 @@ class DatabasePolicy:
                 20 if allow_benchmark and per_request_limit > 0 else 0,
             ),
             business_cycle_extension_days=value.get("business_cycle_extension_days", 0),
+            application_intent=value.get("application_intent", "read_write"),
         )
 
     @classmethod
@@ -235,12 +286,21 @@ class DatabasePolicy:
         )
 
     @property
+    def environment_class(self) -> str:
+        return classify_environment(self.environment)
+
+    @property
     def is_non_production(self) -> bool:
-        return self.environment.strip().casefold() not in {
-            "production",
-            "prod",
-            "live",
-        }
+        """True only for a label that names a known non-production environment."""
+
+        return self.environment_class == "non_production"
+
+    @property
+    def is_production(self) -> bool:
+        """True for a production label and for any label that is not known to
+        be non-production: production safeguards apply unless proven otherwise."""
+
+        return not self.is_non_production
 
     def can_apply_view(self) -> bool:
         """Whether reviewed view DDL may target this database."""
@@ -353,6 +413,15 @@ class DatabasePolicySet:
 
     def allows_read(self, database_name: str) -> bool:
         return self.policy_for(database_name).allow_read
+
+    def application_intents(self) -> dict[str, str]:
+        """The databases whose connections use a non-default application intent."""
+
+        return {
+            name: policy.application_intent
+            for name, policy in self.databases.items()
+            if policy.application_intent != "read_write"
+        }
 
     def allows_benchmark(self, database_name: str, executions: int) -> bool:
         return self.policy_for(database_name).can_benchmark(executions)
@@ -476,12 +545,14 @@ def _validate_environment(value: object) -> None:
 
 
 __all__ = [
+    "ENVIRONMENT_CLASSES",
     "POLICY_VERSION",
     "DatabasePolicy",
     "DatabasePolicyError",
     "DatabasePolicyLoadError",
     "DatabasePolicySet",
     "DatabasePolicyValidationError",
+    "classify_environment",
     "load_database_policy",
     "load_database_policy_or_deny",
 ]

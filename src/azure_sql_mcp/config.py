@@ -6,7 +6,10 @@ import json
 import os
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 from typing import Mapping
+
+from .observability import normalize_data_detail
 
 
 class AuthMode(str, Enum):
@@ -101,6 +104,8 @@ TOOL_GROUPS: dict[str, ToolGroup] = {
     "review_index_portfolio": ToolGroup.CORE,
     "get_index_review": ToolGroup.CORE,
     "review_workload_indexes": ToolGroup.CORE,
+    "get_tool_guide": ToolGroup.CORE,
+    "get_column_statistics": ToolGroup.CORE,
     **{tool_name: ToolGroup.CORE for tool_name in LEARNING_TOOL_NAMES},
     # performance: deep diagnostics & tuning
     "analyze_query_indexes": ToolGroup.PERFORMANCE,
@@ -142,6 +147,10 @@ TOOL_GROUPS: dict[str, ToolGroup] = {
     "review_plan_enforcement": ToolGroup.PERFORMANCE,
     "dry_run_plan_action": ToolGroup.PERFORMANCE,
     "get_active_sessions": ToolGroup.PERFORMANCE,
+    "get_memory_pressure": ToolGroup.PERFORMANCE,
+    "get_elastic_pool_pressure": ToolGroup.PERFORMANCE,
+    "get_columnstore_health": ToolGroup.PERFORMANCE,
+    "get_failed_executions": ToolGroup.PERFORMANCE,
     # schema: schema comparison & migration
     "capture_schema_snapshot": ToolGroup.SCHEMA,
     "compare_schemas": ToolGroup.SCHEMA,
@@ -204,6 +213,12 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "get_query_compilation_stats",
             "explain_query",
             "review_workload_indexes",
+            "get_tool_guide",
+            "get_column_statistics",
+            "get_memory_pressure",
+            "get_elastic_pool_pressure",
+            "get_columnstore_health",
+            "get_failed_executions",
         }
     )
     | frozenset(
@@ -255,6 +270,8 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "get_top_cached_queries",
             "get_cached_routine_stats",
             "get_object_index_diagnostics",
+            "get_tool_guide",
+            "get_column_statistics",
         }
     ) | LEARNING_TOOL_NAMES,
     McpProfile.SANDBOX: frozenset(
@@ -301,6 +318,8 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "get_top_cached_queries",
             "get_cached_routine_stats",
             "get_object_index_diagnostics",
+            "get_tool_guide",
+            "get_column_statistics",
         }
     ) | LEARNING_TOOL_NAMES,
     McpProfile.ENFORCER_REVIEW: frozenset(
@@ -330,6 +349,7 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "get_top_cached_queries",
             "get_cached_routine_stats",
             "get_object_index_diagnostics",
+            "get_tool_guide",
         }
     ) | LEARNING_TOOL_NAMES,
     McpProfile.ENFORCER_APPLY: frozenset(
@@ -362,6 +382,7 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "get_top_cached_queries",
             "get_cached_routine_stats",
             "get_object_index_diagnostics",
+            "get_tool_guide",
         }
     ) | LEARNING_TOOL_NAMES,
     McpProfile.INDEX_REVIEW: frozenset(
@@ -376,6 +397,8 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "check_statistics_health",
             "get_top_queries",
             "get_query_store_trend",
+            "get_tool_guide",
+            "get_columnstore_health",
         }
     ) | INDEX_REVIEW_LEARNING_TOOL_NAMES,
 }
@@ -445,6 +468,9 @@ class ServerConfig:
     legacy_state_server_binding: str | None = None
     schema_profile: str = "portable"
     incident: IncidentSettings = IncidentSettings()
+    # How much customer data a tool response may carry: full, mask_literals
+    # or metadata_only (observability.apply_data_detail).
+    data_detail: str = "full"
 
     def validate_database_name(self, database_name: str | None) -> str:
         """Resolve a database against the allowlist, case-insensitively.
@@ -492,11 +518,26 @@ class ServerConfig:
             return True
         return group in self.tool_groups
 
+    def sanitized_config(self) -> dict[str, Any]:
+        """The configuration without credential values, for status reports."""
+
+        return {**self._identity_config(), "data_detail": self.data_detail}
+
     def sanitized_config_fingerprint(self) -> str:
         """Return a stable identity hash without embedding credential values."""
 
-        # Incident settings stay out: toggling the log must not rotate learning scopes.
-        sanitized = {
+        encoded = json.dumps(
+            self._identity_config(),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _identity_config(self) -> dict[str, Any]:
+        # Incident settings and the data-detail level stay out: changing them
+        # must not rotate the learning scopes keyed on the fingerprint.
+        return {
             "server": self.server,
             "default_database": self.default_database,
             "allowed_databases": self.allowed_databases,
@@ -543,13 +584,6 @@ class ServerConfig:
                 "mcp_bearer_token": self.mcp_bearer_token is not None,
             },
         }
-        encoded = json.dumps(
-            sanitized,
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
 
 
 def parse_csv(value: str | None) -> tuple[str, ...]:
@@ -714,6 +748,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="azure_sql_schema_profile",
         help="portable (default): strict-client tool schemas; full: raw Pydantic schemas.",
     )
+    parser.add_argument(
+        "--azure-sql-data-detail",
+        dest="azure_sql_data_detail",
+        help="full (default), mask_literals or metadata_only: customer data in tool responses.",
+    )
     parser.add_argument("--azure-sql-incident-log", dest="azure_sql_incident_log")
     parser.add_argument("--azure-sql-incident-dir", dest="azure_sql_incident_dir")
     parser.add_argument(
@@ -827,6 +866,10 @@ def load_server_config(argv: list[str] | None = None) -> ServerConfig:
     schema_profile = (env_or_arg(args, "azure_sql_schema_profile") or "portable").strip().lower()
     if schema_profile not in {"portable", "full"}:
         raise ValueError("AZURE_SQL_SCHEMA_PROFILE must be 'portable' or 'full'.")
+    try:
+        data_detail = normalize_data_detail(env_or_arg(args, "azure_sql_data_detail"))
+    except ValueError as exc:
+        raise ValueError(f"AZURE_SQL_DATA_DETAIL is not valid: {exc}") from exc
 
     tool_groups_raw = env_or_arg(args, "azure_sql_tool_groups") or "all"
     tool_groups = frozenset(
@@ -958,4 +1001,5 @@ def load_server_config(argv: list[str] | None = None) -> ServerConfig:
         legacy_state_server_binding=legacy_state_server_binding,
         schema_profile=schema_profile,
         incident=incident,
+        data_detail=data_detail,
     )

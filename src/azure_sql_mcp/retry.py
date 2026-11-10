@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-import re
 from typing import cast
 from typing import Awaitable, Callable, TypeVar
+
+from .observability import is_transient_error
+from .observability import sanitize_error_message
 
 logger = logging.getLogger(__name__)
 
@@ -37,37 +39,18 @@ TRANSIENT_ERROR_CODES = frozenset(
 
 T = TypeVar("T")
 
-# Digit boundaries so e.g. code 233 does not match "12330 rows" or error 12335.
-_TRANSIENT_CODE_PATTERN = re.compile(
-    r"(?<!\d)(?:" + "|".join(str(code) for code in sorted(TRANSIENT_ERROR_CODES)) + r")(?!\d)"
-)
 
+def _is_transient(exc: BaseException) -> bool:
+    """True when the driver reported a transient Azure SQL error number.
 
-def _message_has_transient_code(message: str) -> bool:
-    return _TRANSIENT_CODE_PATTERN.search(message) is not None
+    Only a number in a position where the driver reports the engine error
+    counts. A number in the message text (a row value, an object name, a row
+    count) does not: that error is deterministic and a retry runs the same
+    statement again for the same result. A query timeout reports no transient
+    number, so it is never retried here.
+    """
 
-
-def _is_transient(exc: Exception) -> bool:
-    """Check whether a database-driver exception carries a transient error code."""
-    current: BaseException | None = exc
-    seen: set[int] = set()
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        args = getattr(current, "args", ())
-        for arg in args:
-            if isinstance(arg, str):
-                if _message_has_transient_code(arg):
-                    return True
-            elif isinstance(arg, int) and arg in TRANSIENT_ERROR_CODES:
-                return True
-            elif isinstance(arg, tuple):
-                for nested in arg:
-                    if isinstance(nested, int) and nested in TRANSIENT_ERROR_CODES:
-                        return True
-                    if isinstance(nested, str) and _message_has_transient_code(nested):
-                        return True
-        current = current.__cause__ or current.__context__
-    return False
+    return is_transient_error(exc, TRANSIENT_ERROR_CODES)
 
 
 async def with_retry(
@@ -116,7 +99,7 @@ async def with_retry(
                 attempt + 1,
                 1 + max_retries,
                 sleep_time,
-                extra={"error": str(exc), "attempt": attempt + 1},
+                extra={"error": sanitize_error_message(str(exc)), "attempt": attempt + 1},
             )
             await asyncio.sleep(sleep_time)
 

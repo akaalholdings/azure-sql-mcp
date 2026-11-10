@@ -552,10 +552,9 @@ def test_agent_text_drops_identifier_shaped_names_but_keeps_tool_names() -> None
 
 def test_parse_failure_on_construct_keyword_is_product_gap_without_sql() -> None:
     sql = "SELECT SENTINEL_COL FROM SENTINEL_TABLE OPTION (USE HINT ('SENTINEL_HINT'))"
-    for root in (
-        raised(SafeSqlValidator().validate_read_only, sql),
-        raised(analyze_equivalence_preflight, sql),
-    ):
+    # The equivalence preflight reads hints without the parser since 3.0 and
+    # no longer fails here; the validator still refuses an unlisted hint name.
+    for root in (raised(SafeSqlValidator().validate_read_only, sql),):
         described = describe_exception(tool_error_chain(root), sql_arguments=True)
         assert (described["category"], described["priority"]) == ("product_gap", "P2")
         assert described["error"]["parse"]["keyword"] == "HINT"

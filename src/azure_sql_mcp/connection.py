@@ -23,6 +23,8 @@ from typing import TypeVar
 from .auth import AzureSqlAuthenticator
 from .config import ServerConfig
 from .connection_pool import ConnectionPool
+from .observability import SQL_ORIGINS
+from .observability import tag_sql_origin
 from .retry import with_retry
 
 logger = logging.getLogger(__name__)
@@ -32,6 +34,12 @@ logger = logging.getLogger(__name__)
 _STATEMENT_DEADLINE: ContextVar[float | None] = ContextVar(
     "azure_sql_mcp_statement_deadline", default=None
 )
+
+
+_DRIVER_CANCEL_METHODS = ("cancel", "interrupt")
+# A statement's driver timeout is set this long after the deadline, so the
+# caller's own timeout is reported first and not a driver error.
+_DEADLINE_GRACE_SECONDS = 1
 
 
 @contextlib.contextmanager
@@ -53,6 +61,40 @@ def statement_deadline(seconds: float | None) -> Iterator[None]:
         yield
     finally:
         _STATEMENT_DEADLINE.reset(token)
+
+
+def _validated_origin(origin: str | None) -> str | None:
+    if origin is not None and origin not in SQL_ORIGINS:
+        raise ValueError(f"sql_origin must be one of: {', '.join(SQL_ORIGINS)}.")
+    return origin
+
+
+@contextlib.contextmanager
+def _statement_origin(origin: str | None) -> Iterator[None]:
+    """Tag an error raised inside with who built the failing statement."""
+
+    try:
+        yield
+    except Exception as exc:
+        if origin is not None:
+            tag_sql_origin(exc, origin)
+        raise
+
+
+def driver_cancel_supported() -> bool:
+    """True when the installed driver can cancel a statement from another thread.
+
+    Reads the driver class only; no connection is opened. mssql-python 1.10
+    has no such call.
+    """
+
+    try:
+        from mssql_python.connection import Connection
+    except Exception:
+        return False
+    return any(
+        callable(getattr(Connection, name, None)) for name in _DRIVER_CANCEL_METHODS
+    )
 
 
 @dataclass(frozen=True)
@@ -144,6 +186,14 @@ _REUSABLE_ERROR_NUMBERS = frozenset({207, 208, 229, 297, 300, 4104, 8134})
 _SPECIFIC_STATEMENT_SQLSTATES = ("42S02", "42S22", "22012")
 _GENERIC_STATEMENT_SQLSTATE = "42000"
 _ERROR_NUMBER_SUFFIX = re.compile(r"\((\d{1,6})\)\s*$")
+# A session-level SET that outlives the statements of one call. The pool does
+# not reset a session, so the executor puts the default back before release.
+_ISOLATION_LEVEL_SET = re.compile(
+    r"\bSET\s+TRANSACTION\s+ISOLATION\s+LEVEL\s+"
+    r"(READ\s+UNCOMMITTED|READ\s+COMMITTED|REPEATABLE\s+READ|SNAPSHOT|SERIALIZABLE)\b",
+    re.IGNORECASE,
+)
+_DEFAULT_ISOLATION_LEVEL = "READ COMMITTED"
 # mssql-python 1.10 returns permission errors (229, 297, 300) in the catch-all
 # class with no number, so the server text is the only thing that names them.
 _PERMISSION_DENIED_TEXT = re.compile(
@@ -211,6 +261,21 @@ class StatementDispatchPrevented(RuntimeError):
         self.cause = cause
 
 
+class ReadOnlyEnvelopeViolation(RuntimeError):
+    """A batch run in the read-only envelope ended or committed its transaction."""
+
+
+_ENVELOPE_END = (
+    "DECLARE @mcp_trancount int = @@TRANCOUNT; "
+    "IF @mcp_trancount > 0 ROLLBACK TRANSACTION; "
+    "SELECT @mcp_trancount AS trancount;"
+)
+
+
+class ReadOnlyIntentError(PermissionError):
+    """A write was not sent: this database is connected with read intent."""
+
+
 class StatementDispatchStopped(TimeoutError):
     """A statement was not sent: the caller was cancelled or the deadline passed."""
 
@@ -229,18 +294,23 @@ class TransactionRollbackError(RuntimeError):
 class SqlTransactionSession:
     """Synchronous operations over the one connection owned by a transaction."""
 
-    def __init__(self, connection: Any, executor: "AzureSqlExecutor") -> None:
+    def __init__(
+        self,
+        connection: Any,
+        executor: "AzureSqlExecutor",
+        cancel_event: threading.Event | None = None,
+    ) -> None:
         self._connection = connection
         self._executor = executor
+        self._cancel_event = cancel_event
 
     def execute(
         self,
         statement: str,
         params: Sequence[Any] | None = None,
     ) -> int | None:
-        cursor = self._connection.cursor()
+        cursor = self._executor._open_cursor(self._connection, self._cancel_event)
         try:
-            self._executor._configure_cursor(cursor)
             self._executor._execute_statement(cursor, statement, params)
             return cursor.rowcount
         finally:
@@ -252,9 +322,8 @@ class SqlTransactionSession:
         statement: str,
         params: Sequence[Any] | None = None,
     ) -> list[dict[str, Any]]:
-        cursor = self._connection.cursor()
+        cursor = self._executor._open_cursor(self._connection, self._cancel_event)
         try:
-            self._executor._configure_cursor(cursor)
             self._executor._execute_statement(cursor, statement, params)
             if not cursor.description:
                 return []
@@ -290,14 +359,28 @@ class AzureSqlExecutor:
         params: Sequence[Any] | None = None,
         *,
         max_rows: int | None = None,
+        sql_origin: str | None = None,
+        read_only_envelope: bool = False,
     ) -> list[dict[str, Any]]:
-        results = await self.execute_batches(
-            database_name,
-            query,
-            params=params,
-            max_rows=max_rows,
-            execution_mode=BatchExecutionMode.READ,
-        )
+        if sql_origin is None and not read_only_envelope:
+            # Unchanged call for a plain read.
+            results = await self.execute_batches(
+                database_name,
+                query,
+                params=params,
+                max_rows=max_rows,
+                execution_mode=BatchExecutionMode.READ,
+            )
+        else:
+            results = await self.execute_batches(
+                database_name,
+                query,
+                params=params,
+                max_rows=max_rows,
+                execution_mode=BatchExecutionMode.READ,
+                sql_origin=sql_origin,
+                read_only_envelope=read_only_envelope,
+            )
         for result in results:
             if result.columns:
                 return result.rows
@@ -311,11 +394,28 @@ class AzureSqlExecutor:
         *,
         max_rows: int | None = None,
         execution_mode: BatchExecutionMode = BatchExecutionMode.DEFAULT,
+        sql_origin: str | None = None,
+        read_only_envelope: bool = False,
     ) -> list[QueryResult]:
+        """Run one batch. ``sql_origin`` ("server_built" or "caller_supplied")
+        is recorded on a driver error so the incident log can tell a server
+        defect from a caller error.
+
+        ``read_only_envelope`` runs the batch, text unchanged, inside a
+        transaction that is always rolled back, and raises
+        ``ReadOnlyEnvelopeViolation`` when the batch ended or committed it.
+        It undoes an uncommitted write; it cannot undo a COMMIT in the batch.
+        """
+
         validated_database = self.config.validate_database_name(database_name)
+        sql_origin = _validated_origin(sql_origin)
         execution_mode = BatchExecutionMode(execution_mode)
         is_admin_batch = execution_mode is BatchExecutionMode.ADMIN
         is_read = execution_mode is BatchExecutionMode.READ
+        if is_admin_batch:
+            if read_only_envelope:
+                raise ValueError("An admin batch cannot run in the read-only envelope.")
+            self._refuse_write_on_read_intent(validated_database)
 
         async def _attempt() -> list[QueryResult]:
             connection = await self.pool.acquire(validated_database)
@@ -336,7 +436,9 @@ class AzureSqlExecutor:
                         drain_all_result_sets=is_admin_batch,
                         outcome_unknown_after_dispatch=is_admin_batch,
                         cancel_event=cancel_event,
-                        lock_timeout_in_batch=is_read,
+                        lock_timeout_in_batch=is_read and not read_only_envelope,
+                        sql_origin=sql_origin,
+                        read_only_envelope=read_only_envelope,
                     )
                 )
                 result = await asyncio.shield(execution_task)
@@ -356,8 +458,11 @@ class AzureSqlExecutor:
                     )
                 raise
             except Exception as exc:
-                keep_after_error = is_read and self._connection_survives_error(
-                    connection, query, exc
+                # A failed batch in the envelope may leave its transaction open.
+                keep_after_error = (
+                    is_read
+                    and not read_only_envelope
+                    and self._connection_survives_error(connection, query, exc)
                 )
                 raise
             finally:
@@ -387,14 +492,18 @@ class AzureSqlExecutor:
         max_rows: int | None = None,
         statement_params: Sequence[Sequence[Any] | None] | None = None,
         statement_input_sizes: Sequence[Sequence[Any] | None] | None = None,
+        sql_origin: str | None = None,
+        read_only_envelope: bool = False,
     ) -> list[list[QueryResult]]:
         """Execute several statements on the SAME pooled connection.
 
         Required for session-scoped SET options (e.g. SET SHOWPLAN_XML ON)
         which must be in their own batch but must persist across the
         subsequent statements run on the same session.
+        ``read_only_envelope`` wraps the whole sequence as in execute_batches.
         """
         validated_database = self.config.validate_database_name(database_name)
+        sql_origin = _validated_origin(sql_origin)
         if statement_params is not None and len(statement_params) != len(statements):
             raise ValueError("statement_params must match the statement count.")
         if statement_input_sizes is not None and len(statement_input_sizes) != len(statements):
@@ -429,6 +538,8 @@ class AzureSqlExecutor:
                         statement_params=normalized_params,
                         statement_input_sizes=normalized_input_sizes,
                         cancel_event=cancel_event,
+                        sql_origin=sql_origin,
+                        read_only_envelope=read_only_envelope,
                     )
                 )
                 result = await asyncio.shield(execution_task)
@@ -464,6 +575,8 @@ class AzureSqlExecutor:
         statement_params: Sequence[Sequence[Any] | None] | None = None,
         statement_input_sizes: Sequence[Sequence[Any] | None] | None = None,
         before_statement_dispatch: Callable[[int], Any] | None = None,
+        statement_timeout_seconds: int | None = None,
+        sql_origin: str | None = None,
     ) -> list[list[QueryResult]]:
         """Execute one same-connection sequence without automatic retry.
 
@@ -472,9 +585,12 @@ class AzureSqlExecutor:
         ``before_statement_dispatch`` runs synchronously in the worker thread
         immediately before the selected statement's driver dispatch. If it
         raises, that statement is not dispatched.
+        ``statement_timeout_seconds`` replaces the configured query timeout
+        for each statement; the tool's statement deadline still bounds it.
         """
 
         validated_database = self.config.validate_database_name(database_name)
+        sql_origin = _validated_origin(sql_origin)
         if statement_params is not None and len(statement_params) != len(statements):
             raise ValueError("statement_params must match the statement count.")
         if statement_input_sizes is not None and len(statement_input_sizes) != len(statements):
@@ -509,6 +625,8 @@ class AzureSqlExecutor:
                     before_statement_dispatch=before_statement_dispatch,
                     statement_input_sizes=normalized_input_sizes,
                     cancel_event=cancel_event,
+                    statement_timeout_seconds=statement_timeout_seconds,
+                    sql_origin=sql_origin,
                 )
             )
             result = await asyncio.shield(execution_task)
@@ -547,9 +665,11 @@ class AzureSqlExecutor:
         """
 
         validated_database = self.config.validate_database_name(database_name)
+        self._refuse_write_on_read_intent(validated_database)
         connection = await self.pool.acquire(validated_database)
         deferred_cleanup = False
         execution_task: asyncio.Task[TransactionResultT] | None = None
+        cancel_event = threading.Event()
         try:
             execution_task = asyncio.create_task(
                 asyncio.to_thread(
@@ -557,12 +677,14 @@ class AzureSqlExecutor:
                     connection,
                     validated_database,
                     callback,
+                    cancel_event,
                 )
             )
             result = await asyncio.shield(execution_task)
             return result
         except asyncio.CancelledError:
             if execution_task is not None:
+                cancel_event.set()
                 self._request_cancel(connection)
                 deferred_cleanup = True
                 asyncio.create_task(
@@ -584,15 +706,15 @@ class AzureSqlExecutor:
         connection: Any,
         database_name: str,
         callback: Callable[[SqlTransactionSession], TransactionResultT],
+        cancel_event: threading.Event | None = None,
     ) -> TransactionResultT:
         del database_name
         original_autocommit = getattr(connection, "autocommit", None)
         try:
             if original_autocommit is not None:
                 connection.autocommit = False
-            setup_cursor = connection.cursor()
+            setup_cursor = self._open_cursor(connection, cancel_event)
             try:
-                self._configure_cursor(setup_cursor)
                 setup_cursor.execute("SET XACT_ABORT ON")
                 setup_cursor.execute(
                     "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
@@ -604,12 +726,16 @@ class AzureSqlExecutor:
                 with contextlib.suppress(Exception):
                     setup_cursor.close()
 
-            session = SqlTransactionSession(connection, self)
+            session = SqlTransactionSession(connection, self, cancel_event)
             result = callback(session)
             if inspect.isawaitable(result):
                 raise TypeError(
                     "execute_transaction_exactly_once requires a synchronous callback."
                 )
+            # COMMIT is a statement too. The caller of a cancelled or timed-out
+            # call has stopped waiting, so the work rolls back.
+            self._raise_if_cancelled(cancel_event)
+            self._raise_if_deadline_passed()
         except BaseException:
             try:
                 connection.rollback()
@@ -636,6 +762,7 @@ class AzureSqlExecutor:
         params: Sequence[Any] | None = None,
     ) -> int:
         validated_database = self.config.validate_database_name(database_name)
+        self._refuse_write_on_read_intent(validated_database)
 
         async def _attempt() -> int:
             connection = await self.pool.acquire(validated_database)
@@ -686,21 +813,26 @@ class AzureSqlExecutor:
         *,
         max_rows: int | None = None,
         input_sizes: Sequence[Any] | None = None,
+        statement_timeout_seconds: int | None = None,
     ) -> ProfiledExecution:
         """Execute a measured user query exactly once on one connection.
 
         Setup/teardown SET statements are not user-query executions. Measured
         calls deliberately do not use automatic retry because a retry would make
         the requested sample execute more than once.
+        ``statement_timeout_seconds`` replaces the configured query timeout
+        for the measured statement; the tool's statement deadline still bounds it.
         """
 
         validated_database = self.config.validate_database_name(database_name)
         connection = await self.pool.acquire(validated_database)
-        execution_kwargs = (
+        execution_kwargs: dict[str, Any] = (
             {"input_sizes": tuple(input_sizes)}
             if input_sizes is not None
             else {}
         )
+        if statement_timeout_seconds is not None:
+            execution_kwargs["statement_timeout_seconds"] = statement_timeout_seconds
         succeeded = False
         deferred_cleanup = False
         execution_task: asyncio.Task[ProfiledExecution] | None = None
@@ -740,6 +872,21 @@ class AzureSqlExecutor:
             elif not deferred_cleanup:
                 await self.pool.discard(validated_database, connection)
 
+    def _refuse_write_on_read_intent(self, database_name: str) -> None:
+        """Raise before a write is sent to a database connected with read intent.
+
+        Covers the write lanes: non-query, transaction and admin batch. Any
+        other statement that writes is refused by the replica itself.
+        """
+
+        intent_of = getattr(self.pool, "application_intent", None)
+        if callable(intent_of) and intent_of(database_name) == "read_only":
+            raise ReadOnlyIntentError(
+                f"Database '{database_name}' is connected with read intent "
+                "(application_intent=read_only in the database policy). "
+                "The write was not sent."
+            )
+
     async def _discard_connection_when_task_finishes(
         self,
         database_name: str,
@@ -771,6 +918,8 @@ class AzureSqlExecutor:
         outcome_unknown_after_dispatch: bool = False,
         cancel_event: threading.Event | None = None,
         lock_timeout_in_batch: bool = False,
+        sql_origin: str | None = None,
+        read_only_envelope: bool = False,
     ) -> list[QueryResult]:
         logger.debug(
             "Executing query",
@@ -779,6 +928,19 @@ class AzureSqlExecutor:
                 "server": self.config.server,
             },
         )
+        if read_only_envelope:
+            self._begin_read_only_envelope(connection, cancel_event)
+            cursor = self._open_cursor(connection, cancel_event)
+            try:
+                with _statement_origin(sql_origin):
+                    cursor.execute(query, params)
+                    # Rows past the cap are dropped when the cursor closes.
+                    results = self._consume_batches(cursor, max_rows=max_rows)
+            finally:
+                with contextlib.suppress(Exception):
+                    cursor.close()
+            self._end_read_only_envelope(connection, database_name)
+            return results
         cursor = self._open_cursor(connection, cancel_event)
         try:
             if (
@@ -794,12 +956,13 @@ class AzureSqlExecutor:
             else:
                 self._set_lock_timeout(cursor)
             try:
-                cursor.execute(query, params)
-                return self._consume_batches(
-                    cursor,
-                    max_rows=max_rows,
-                    stop_on_cap=not drain_all_result_sets,
-                )
+                with _statement_origin(sql_origin):
+                    cursor.execute(query, params)
+                    return self._consume_batches(
+                        cursor,
+                        max_rows=max_rows,
+                        stop_on_cap=not drain_all_result_sets,
+                    )
             except Exception as exc:
                 if outcome_unknown_after_dispatch:
                     raise AdminBatchOutcomeUnknownError(str(exc)) from exc
@@ -818,6 +981,9 @@ class AzureSqlExecutor:
         before_statement_dispatch: Callable[[int], Any] | None = None,
         statement_input_sizes: Sequence[Sequence[Any] | None] | None = None,
         cancel_event: threading.Event | None = None,
+        statement_timeout_seconds: int | None = None,
+        sql_origin: str | None = None,
+        read_only_envelope: bool = False,
     ) -> list[list[QueryResult]]:
         logger.debug(
             "Executing session",
@@ -829,10 +995,17 @@ class AzureSqlExecutor:
         )
         per_statement_results: list[list[QueryResult]] = []
         for index, statement in enumerate(statements):
-            cursor = self._open_cursor(connection, cancel_event)
+            cursor = self._open_cursor(
+                connection,
+                cancel_event,
+                statement_timeout_seconds=statement_timeout_seconds,
+            )
             try:
                 if index == 0:
-                    self._set_lock_timeout(cursor)
+                    if read_only_envelope:
+                        self._begin_read_only_envelope(connection, cancel_event)
+                    else:
+                        self._set_lock_timeout(cursor)
                 params = statement_params[index] if statement_params is not None else ()
                 input_sizes = (
                     statement_input_sizes[index]
@@ -845,18 +1018,88 @@ class AzureSqlExecutor:
                     except Exception as exc:
                         raise StatementDispatchPrevented(index, exc) from exc
                 self._raise_if_cancelled(cancel_event)
-                self._execute_statement(
-                    cursor,
-                    statement,
-                    params if params else None,
-                    input_sizes=input_sizes,
-                )
-                per_statement_results.append(
-                    self._consume_batches(cursor, max_rows=max_rows, stop_on_cap=False)
-                )
+                with _statement_origin(sql_origin):
+                    self._execute_statement(
+                        cursor,
+                        statement,
+                        params if params else None,
+                        input_sizes=input_sizes,
+                    )
+                    per_statement_results.append(
+                        self._consume_batches(cursor, max_rows=max_rows, stop_on_cap=False)
+                    )
             finally:
                 cursor.close()
+        if read_only_envelope and statements:
+            self._end_read_only_envelope(connection, database_name)
+        self._restore_default_isolation_level(connection, statements)
         return per_statement_results
+
+    def _begin_read_only_envelope(
+        self, connection, cancel_event: threading.Event | None
+    ) -> None:
+        cursor = self._open_cursor(connection, cancel_event)
+        try:
+            with _statement_origin("server_built"):
+                cursor.execute(f"{self._lock_timeout_statement()}; BEGIN TRANSACTION", ())
+        finally:
+            with contextlib.suppress(Exception):
+                cursor.close()
+
+    @staticmethod
+    def _end_read_only_envelope(connection, database_name: str) -> None:
+        """Roll the envelope back and check that the batch left it open.
+
+        Any other transaction count means the batch committed, rolled back or
+        nested the transaction: what it wrote may be durable.
+        """
+
+        # Not _open_cursor: the rollback must run after a cancel or a passed deadline.
+        cursor = connection.cursor()
+        try:
+            with _statement_origin("server_built"):
+                cursor.execute(_ENVELOPE_END, ())
+                row = cursor.fetchone()
+        finally:
+            with contextlib.suppress(Exception):
+                cursor.close()
+        trancount = row[0] if row else None
+        if trancount != 1:
+            logger.error(
+                "Read-only envelope violated",
+                extra={"database_name": database_name},
+            )
+            raise ReadOnlyEnvelopeViolation(
+                "The batch ended or committed the read-only transaction; its "
+                "changes may be durable. The connection was discarded."
+            )
+
+    @staticmethod
+    def _restore_default_isolation_level(connection, statements: Sequence[str]) -> None:
+        """Put READ COMMITTED back when the session left another level set.
+
+        Runs only after every statement succeeded; a failed session's
+        connection is discarded. A failure here fails the call, so the
+        connection is discarded and never reused at the wrong level.
+        """
+
+        levels = [
+            " ".join(match.group(1).upper().split())
+            for statement in statements
+            for match in _ISOLATION_LEVEL_SET.finditer(statement)
+        ]
+        if not levels or levels[-1] == _DEFAULT_ISOLATION_LEVEL:
+            return
+        # Not _open_cursor: the reset must run even after the deadline passed.
+        cursor = connection.cursor()
+        try:
+            with _statement_origin("server_built"):
+                cursor.execute(
+                    f"SET TRANSACTION ISOLATION LEVEL {_DEFAULT_ISOLATION_LEVEL}", ()
+                )
+        finally:
+            with contextlib.suppress(Exception):
+                cursor.close()
 
     def _execute_non_query_with_connection(
         self,
@@ -872,9 +1115,8 @@ class AzureSqlExecutor:
                 "server": self.config.server,
             },
         )
-        cursor = connection.cursor()
+        cursor = self._open_cursor(connection)
         try:
-            self._configure_cursor(cursor)
             self._set_lock_timeout(cursor)
             try:
                 cursor.execute(query, params)
@@ -900,6 +1142,7 @@ class AzureSqlExecutor:
         max_rows: int | None,
         input_sizes: Sequence[Any] | None = None,
         cancel_event: threading.Event | None = None,
+        statement_timeout_seconds: int | None = None,
     ) -> ProfiledExecution:
         logger.debug(
             "Executing one profiled query sample",
@@ -910,31 +1153,38 @@ class AzureSqlExecutor:
         try:
             # One batch. STATISTICS XML goes on last (and off first below) so
             # that no setup or teardown statement runs with it on.
-            setup_cursor.execute(
-                f"{self._lock_timeout_statement()}; "
-                "SET STATISTICS IO ON; SET STATISTICS XML ON;",
-                (),
-            )
+            with _statement_origin("server_built"):
+                setup_cursor.execute(
+                    f"{self._lock_timeout_statement()}; "
+                    "SET STATISTICS IO ON; SET STATISTICS XML ON;",
+                    (),
+                )
         finally:
             with contextlib.suppress(Exception):
                 setup_cursor.close()
 
-        query_cursor = self._open_cursor(connection, cancel_event)
+        query_cursor = self._open_cursor(
+            connection,
+            cancel_event,
+            statement_timeout_seconds=statement_timeout_seconds,
+        )
         try:
-            started = time.perf_counter()
-            self._execute_statement(
-                query_cursor,
-                query,
-                params,
-                input_sizes=input_sizes,
-            )
             statistics_io_messages: list[Any] = []
-            result_sets = self._consume_batches(
-                query_cursor,
-                max_rows=max_rows,
-                stop_on_cap=False,
-                message_sink=statistics_io_messages,
-            )
+            started = time.perf_counter()
+            # The measured statement is the caller's query, never server text.
+            with _statement_origin("caller_supplied"):
+                self._execute_statement(
+                    query_cursor,
+                    query,
+                    params,
+                    input_sizes=input_sizes,
+                )
+                result_sets = self._consume_batches(
+                    query_cursor,
+                    max_rows=max_rows,
+                    stop_on_cap=False,
+                    message_sink=statistics_io_messages,
+                )
             elapsed_wall_ms = (time.perf_counter() - started) * 1000.0
             return ProfiledExecution(
                 result_sets=result_sets,
@@ -950,9 +1200,10 @@ class AzureSqlExecutor:
             active_error = sys.exc_info()[0] is not None
             with contextlib.suppress(Exception):
                 query_cursor.close()
+            # Not _open_cursor: the session options must go off even after a
+            # cancel or a passed deadline.
             teardown_cursor = connection.cursor()
             try:
-                self._configure_cursor(teardown_cursor)
                 teardown_cursor.execute(
                     "SET STATISTICS XML OFF; SET STATISTICS IO OFF;", ()
                 )
@@ -963,22 +1214,26 @@ class AzureSqlExecutor:
                 with contextlib.suppress(Exception):
                     teardown_cursor.close()
 
-    def _configure_cursor(self, cursor) -> None:
-        with contextlib.suppress(Exception):
-            cursor.timeout = self.config.query_timeout_seconds
-
-    def _open_cursor(self, connection, cancel_event: threading.Event | None = None):
+    def _open_cursor(
+        self,
+        connection,
+        cancel_event: threading.Event | None = None,
+        *,
+        statement_timeout_seconds: int | None = None,
+    ):
         """Open a cursor whose timeout fits the time left for this call.
 
         mssql-python has no SQLCancel, and closing a cursor that runs on
         another thread is not safe. So a cancelled call cannot stop the
         statement in flight. Instead, no later statement is dispatched, and
-        each statement gets min(query timeout, time left + about 1 s) so the
-        driver itself sends the attention soon after the budget runs out.
+        each statement gets min(statement timeout, time left + about 1 s) so
+        the driver itself sends the attention soon after the budget runs out.
+        ``statement_timeout_seconds`` replaces the configured query timeout
+        for this cursor; the time left still bounds it.
         """
 
         self._raise_if_cancelled(cancel_event)
-        timeout = self.config.query_timeout_seconds
+        timeout = statement_timeout_seconds or self.config.query_timeout_seconds
         deadline = _STATEMENT_DEADLINE.get()
         if deadline is not None:
             remaining = deadline - time.monotonic()
@@ -988,26 +1243,31 @@ class AzureSqlExecutor:
                 )
             # Fire just after the deadline, not before it, so the caller's
             # wait_for still reports a timeout and not a driver error.
-            timeout = max(1, min(timeout, math.ceil(remaining) + 1))
-        # mssql-python copies connection.timeout into each new cursor.
+            timeout = max(1, min(timeout, math.ceil(remaining) + _DEADLINE_GRACE_SECONDS))
+        # mssql-python copies connection.timeout into each new cursor; a
+        # cursor has no timeout of its own to set.
         original_timeout = getattr(connection, "timeout", None)
         if original_timeout is None or original_timeout == timeout:
-            cursor = connection.cursor()
-        else:
-            connection.timeout = timeout
-            try:
-                cursor = connection.cursor()
-            finally:
-                connection.timeout = original_timeout
-        with contextlib.suppress(Exception):
-            cursor.timeout = timeout
-        return cursor
+            return connection.cursor()
+        connection.timeout = timeout
+        try:
+            return connection.cursor()
+        finally:
+            connection.timeout = original_timeout
 
     @staticmethod
     def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
         if cancel_event is not None and cancel_event.is_set():
             raise StatementDispatchStopped(
                 "The call was cancelled; no further statements were sent."
+            )
+
+    @staticmethod
+    def _raise_if_deadline_passed() -> None:
+        deadline = _STATEMENT_DEADLINE.get()
+        if deadline is not None and deadline <= time.monotonic():
+            raise StatementDispatchStopped(
+                "The statement deadline has passed; the statement was not sent."
             )
 
     @staticmethod
@@ -1052,7 +1312,8 @@ class AzureSqlExecutor:
         return f"SET LOCK_TIMEOUT {lock_timeout_ms}"
 
     def _set_lock_timeout(self, cursor) -> None:
-        cursor.execute(self._lock_timeout_statement(), ())
+        with _statement_origin("server_built"):
+            cursor.execute(self._lock_timeout_statement(), ())
 
     @staticmethod
     def _connection_survives_error(connection, query: str, exc: Exception) -> bool:
@@ -1071,19 +1332,46 @@ class AzureSqlExecutor:
             return False
         return usable and _is_reusable_statement_error(exc)
 
-    def _request_cancel(self, connection) -> None:
-        for method_name in ("cancel", "interrupt"):
+    def _request_cancel(self, connection) -> bool:
+        """Ask the driver to cancel the statement in flight; False when it cannot."""
+
+        for method_name in _DRIVER_CANCEL_METHODS:
             method = getattr(connection, method_name, None)
             if callable(method):
                 with contextlib.suppress(Exception):
                     method()
-                return
+                return True
         if not self._cancel_unsupported_logged:
             self._cancel_unsupported_logged = True
             logger.warning(
                 "The database driver has no cancel call. A cancelled statement "
                 "runs until its own timeout; later statements are not sent."
             )
+        return False
+
+    def cancellation_report(self) -> dict[str, Any]:
+        """What a tool timeout or a client cancel leaves running on the server."""
+
+        supported = driver_cancel_supported()
+        return {
+            "driver_cancel_supported": supported,
+            "later_statements_sent_after_cancel": False,
+            "cancelled_transaction_commits": False,
+            "in_flight_statement_stopped_by": (
+                "driver_cancel" if supported else "statement_timeout"
+            ),
+            # ceil(time left) + grace: under two seconds past the tool deadline.
+            "max_in_flight_seconds_after_tool_timeout": (
+                0 if supported else 1 + _DEADLINE_GRACE_SECONDS
+            ),
+            "max_in_flight_seconds_after_client_cancel": (
+                0 if supported else self.config.query_timeout_seconds
+            ),
+            "not_stopped": [
+                "one multi-statement batch sent as a single text runs to its end "
+                "or to its statement timeout",
+            ],
+        }
 
     def _consume_batches(
         self,

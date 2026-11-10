@@ -84,8 +84,8 @@ async def test_execute_batches_discards_failed_connections_across_retries(
         executor,
         "_execute_with_connection",
         side_effect=[
-            Exception("40501 transient one"),
-            Exception("40501 transient two"),
+            Exception("transient one (Error 40501)"),
+            Exception("transient two (Error 40501)"),
             [QueryResult(columns=("value",), rows=[{"value": 1}])],
         ],
     ) as execute_mock:
@@ -132,6 +132,8 @@ async def test_execute_batches_admin_mode_does_not_replay_transient_failure(
         "drain_all_result_sets": True,
         "outcome_unknown_after_dispatch": True,
         "lock_timeout_in_batch": False,
+        "sql_origin": None,
+        "read_only_envelope": False,
     }
     pool.discard.assert_awaited_once_with("appdb", connection)
     pool.release.assert_not_awaited()
@@ -1025,7 +1027,6 @@ def test_execute_with_connection_closes_cursor(sample_server_config) -> None:
     rows = executor._execute_with_connection(connection, "appdb", "SELECT 1", (), max_rows=None)
 
     assert rows == [QueryResult(columns=("id",), rows=[{"id": 1}])]
-    assert cursor.timeout == sample_server_config.query_timeout_seconds
     assert cursor.execute.call_args_list[0] == call("SET LOCK_TIMEOUT 30000", ())
     assert cursor.execute.call_args_list[1] == call("SELECT 1", ())
     cursor.close.assert_called_once()
@@ -1125,7 +1126,6 @@ def test_execute_non_query_with_connection_closes_cursor(sample_server_config) -
     )
 
     assert rowcount == 1
-    assert cursor.timeout == sample_server_config.query_timeout_seconds
     cursor.close.assert_called_once()
 
 

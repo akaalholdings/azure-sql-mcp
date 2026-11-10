@@ -12,7 +12,7 @@ from azure_sql_mcp.retry import with_retry
 
 @pytest.mark.asyncio
 async def test_with_retry_retries_transient_errors_until_success() -> None:
-    transient_error = Exception("Azure SQL transient error 40501")
+    transient_error = Exception("The service is currently busy. (Error 40501)")
     func = AsyncMock(side_effect=[transient_error, "ok"])
 
     with (
@@ -40,7 +40,7 @@ async def test_with_retry_does_not_retry_non_transient_errors() -> None:
 
 @pytest.mark.asyncio
 async def test_with_retry_respects_zero_retries() -> None:
-    transient_error = Exception("40501 busy")
+    transient_error = Exception("The service is currently busy. (Error 40501)")
     func = AsyncMock(side_effect=transient_error)
 
     with patch("azure_sql_mcp.retry.asyncio.sleep", new=AsyncMock()) as sleep_mock:
@@ -55,8 +55,8 @@ async def test_with_retry_respects_zero_retries() -> None:
 async def test_with_retry_applies_exponential_backoff_and_jitter() -> None:
     func = AsyncMock(
         side_effect=[
-            Exception("40501 first"),
-            Exception("40613 second"),
+            Exception("Msg 40501, Level 20, State 1: The service is currently busy."),
+            Exception("Database is not currently available. (40613)"),
             "ok",
         ]
     )
@@ -79,7 +79,7 @@ async def test_with_retry_applies_exponential_backoff_and_jitter() -> None:
 
 @pytest.mark.asyncio
 async def test_with_retry_detects_transient_codes_in_exception_chain() -> None:
-    root_cause = RuntimeError("40197 service error")
+    root_cause = RuntimeError("The service has encountered an error. (40197) (SQLExecDirectW)")
     error = RuntimeError("wrapper")
     error.__cause__ = root_cause
     func = AsyncMock(side_effect=[error, "ok"])
@@ -121,10 +121,11 @@ def test_is_transient_handles_cycle_in_exception_chain() -> None:
     assert _is_transient(exc) is False
 
 
-def test_is_transient_requires_digit_boundaries() -> None:
-    """Code 233 must not fire on messages containing 12330 or 2331 — substring
-    matches previously caused retries of non-transient failures."""
+def test_is_transient_reads_only_reported_error_positions() -> None:
+    # A transient code inside the message text is a value, a name or a count.
     assert _is_transient(Exception("12330 rows affected")) is False
     assert _is_transient(Exception("native error 2331")) is False
-    assert _is_transient(Exception("SQL Server error 40613: database unavailable")) is True
-    assert _is_transient(Exception("(233) connection closed during login")) is True
+    assert _is_transient(Exception("Conversion failed for value '40613'. (245)")) is False
+    assert _is_transient(Exception("Database is not currently available. (Error 40613)")) is True
+    assert _is_transient(Exception("Connection closed during login. (233)")) is True
+    assert _is_transient(Exception("08S01", 10054)) is True

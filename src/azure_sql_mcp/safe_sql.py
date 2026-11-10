@@ -21,8 +21,9 @@ TEMP_TABLE_PATTERN = re.compile(r"#[A-Za-z0-9_]+")
 WAITFOR_PATTERN = re.compile(r"\bWAITFOR\b", re.IGNORECASE)
 EXECUTE_AS_PATTERN = re.compile(r"\bEXECUTE\s+AS\b", re.IGNORECASE)
 SP_EXECUTESQL_PATTERN = re.compile(r"\bsp_executesql\b", re.IGNORECASE)
+# Zero however it is written: 0, 00, 0.0, 0e0, 0x0.
 MAXRECURSION_ZERO_PATTERN = re.compile(
-    r"\bMAXRECURSION\s+0\b",
+    r"\bMAXRECURSION\s+(?:0+(?![0-9])|0[xX])",
     re.IGNORECASE,
 )
 _READ_ONLY_PREFIX_PATTERN = re.compile(
@@ -101,8 +102,15 @@ BLOCKED_FUNCTIONS = frozenset(
         # Dangerous metadata / filesystem helpers
         "fn_get_sql",
         "fn_servershareddrives",
+        # External storage readers: they take a URL, so the engine would
+        # contact a host or path built from database content.
+        "fn_xe_file_target_read_file",
+        "fn_xe_telemetry_blob_target_read_file",
+        "fn_get_audit_file",
+        "fn_get_audit_file_v2",
     }
 )
+_BLOCKED_FUNCTION_WORDS = frozenset(name.upper() for name in BLOCKED_FUNCTIONS)
 
 
 @dataclass(frozen=True)
@@ -110,6 +118,8 @@ class _LexedSql:
     code: str  # comments -> " ", string literals -> "?", quoted identifiers kept
     words: str  # as code, but quoted identifiers blanked for keyword scans
     terminated: bool
+    pieces: tuple[str, ...] = ()  # the parts of code, in order
+    spans: tuple[tuple[int, int], ...] = ()  # where each part is in the input
 
 
 def _lex(sql: str) -> _LexedSql:
@@ -121,6 +131,7 @@ def _lex(sql: str) -> _LexedSql:
     """
     code: list[str] = []
     words: list[str] = []
+    spans: list[tuple[int, int]] = []
     terminated = True
     i, n = 0, len(sql)
     while i < n:
@@ -132,6 +143,7 @@ def _lex(sql: str) -> _LexedSql:
                 end += 1
             code.append(" ")
             words.append(" ")
+            spans.append((i, end))
         elif sql.startswith("/*", i):
             depth, end = 1, i + 2
             while end < n and depth:
@@ -144,6 +156,7 @@ def _lex(sql: str) -> _LexedSql:
             terminated = terminated and depth == 0
             code.append(" ")
             words.append(" ")
+            spans.append((i, end))
         elif sql[i] in "'[\"":
             close = "]" if sql[i] == "[" else sql[i]
             end = i + 1
@@ -153,6 +166,7 @@ def _lex(sql: str) -> _LexedSql:
                 terminated, end = False, n
             else:
                 end += 1
+            start = i
             if sql[i] == "'":
                 # N'...' is one literal: drop a standalone N prefix.
                 if code and code[-1] in ("N", "n") and not (
@@ -160,17 +174,20 @@ def _lex(sql: str) -> _LexedSql:
                 ):
                     code.pop()
                     words.pop()
+                    start = spans.pop()[0]
                 code.append("?")
                 words.append("?")
             else:
                 code.append(sql[i:end])
                 words.append(" ")
+            spans.append((start, end))
         else:
             end = i + 1
             code.append(sql[i])
             words.append(sql[i])
+            spans.append((i, end))
         i = end
-    return _LexedSql("".join(code), "".join(words), terminated)
+    return _LexedSql("".join(code), "".join(words), terminated, tuple(code), tuple(spans))
 
 
 def strip_literals_and_comments(sql: str) -> str:
@@ -195,13 +212,452 @@ def _code_words(sql: str, *, include_quoted: bool = False) -> list[str]:
 
 
 @dataclass(frozen=True)
+class _Token:
+    kind: str  # "word", "quoted", "string" or "punct"
+    text: str  # a word upper-cased and NFKC-folded; a quoted name without its delimiters
+    start: int  # offsets in the input text
+    end: int
+
+
+def _tokenize(lexed: _LexedSql) -> list[_Token]:
+    """Tokens of the code that ``_lex`` found, with their place in the input."""
+
+    tokens: list[_Token] = []
+    word: list[str] = []
+    word_start = word_end = 0
+
+    def flush() -> None:
+        if word:
+            text = unicodedata.normalize("NFKC", "".join(word)).upper()
+            tokens.append(_Token("word", text, word_start, word_end))
+            word.clear()
+
+    for piece, (start, end) in zip(lexed.pieces, lexed.spans):
+        length = end - start
+        if length == 1 and (piece.isalnum() or piece in "_@#$"):
+            if not word:
+                word_start = start
+            word.append(piece)
+            word_end = end
+            continue
+        flush()
+        if length == 1:
+            if not piece.isspace():
+                tokens.append(_Token("punct", piece, start, end))
+        elif piece == "?":
+            tokens.append(_Token("string", piece, start, end))
+        elif piece != " ":  # a comment is " "
+            name = unicodedata.normalize("NFKC", piece[1:-1]).upper()
+            tokens.append(_Token("quoted", name, start, end))
+    flush()
+    return tokens
+
+
+# Table hints that change what a read sees or which locks it takes.
+ISOLATION_TABLE_HINTS = frozenset(
+    {
+        "NOLOCK", "READUNCOMMITTED", "READPAST", "READCOMMITTED", "READCOMMITTEDLOCK",
+        "REPEATABLEREAD", "SERIALIZABLE", "HOLDLOCK", "SNAPSHOT", "UPDLOCK", "XLOCK",
+        "TABLOCK", "TABLOCKX",
+    }
+)
+# Table hints that force an access path or a lock granularity.
+PLAN_FORCING_TABLE_HINTS = frozenset(
+    {
+        "INDEX", "FORCESEEK", "FORCESCAN", "NOEXPAND", "ROWLOCK", "PAGLOCK", "NOWAIT",
+        "SPATIAL_WINDOW_MAX_CELLS",
+    }
+)
+# Query hints that change when a plan is compiled, not which plan shape is
+# allowed. A candidate that only carries these is not "hinted".
+COMPILE_QUERY_HINTS = frozenset({"RECOMPILE", "OPTIMIZE FOR"})
+PLAN_FORCING_QUERY_HINTS = frozenset(
+    {
+        "MAXDOP", "FORCE ORDER", "LOOP JOIN", "HASH JOIN", "MERGE JOIN", "CONCAT UNION",
+        "HASH UNION", "MERGE UNION", "HASH GROUP", "ORDER GROUP", "FAST", "USE HINT",
+        "USE PLAN", "TABLE HINT", "QUERYTRACEON", "MAX_GRANT_PERCENT", "MIN_GRANT_PERCENT",
+        "NO_PERFORMANCE_SPOOL", "EXPAND VIEWS", "IGNORE_NONCLUSTERED_COLUMNSTORE_INDEX",
+        "ROBUST PLAN", "KEEP PLAN", "KEEPFIXED PLAN", "MAXRECURSION", "PARAMETERIZATION",
+        "DISABLE_OPTIMIZED_PLAN_FORCING", "FORCE EXTERNALPUSHDOWN",
+        "DISABLE EXTERNALPUSHDOWN", "FORCE SCALEOUTEXECUTION", "DISABLE SCALEOUTEXECUTION",
+    }
+)
+_JOIN_HINT_WORDS = frozenset({"LOOP", "HASH", "MERGE", "REMOTE"})
+UNRECOGNIZED_QUERY_HINT = "UNRECOGNIZED QUERY HINT"
+UNRECOGNIZED_TABLE_HINT = "UNRECOGNIZED TABLE HINT"
+
+# USE HINT names a statement may carry through the read-only gate. Each one
+# changes an optimizer choice only. This list is the statement-admission list;
+# the Query Store hint list in query_hints.py is separate and may be narrower.
+STATEMENT_USE_HINT_NAMES = frozenset(
+    {
+        "ASSUME_JOIN_PREDICATE_DEPENDS_ON_FILTERS",
+        "ASSUME_MIN_SELECTIVITY_FOR_FILTER_ESTIMATES",
+        "ASSUME_FULL_INDEPENDENCE_FOR_FILTER_ESTIMATES",
+        "ASSUME_PARTIAL_CORRELATION_FOR_FILTER_ESTIMATES",
+        "DISABLE_BATCH_MODE_ADAPTIVE_JOINS",
+        "DISABLE_BATCH_MODE_MEMORY_GRANT_FEEDBACK",
+        "DISABLE_DEFERRED_COMPILATION_TV",
+        "DISABLE_INTERLEAVED_EXECUTION_TVF",
+        "DISABLE_OPTIMIZED_NESTED_LOOP",
+        "DISABLE_OPTIMIZER_ROWGOAL",
+        "DISABLE_PARAMETER_SNIFFING",
+        "DISABLE_ROW_MODE_MEMORY_GRANT_FEEDBACK",
+        "DISABLE_TSQL_SCALAR_UDF_INLINING",
+        "DISALLOW_BATCH_MODE",
+        "ENABLE_HIST_AMENDMENT_FOR_ASC_KEYS",
+        "ENABLE_QUERY_OPTIMIZER_HOTFIXES",
+        "FORCE_DEFAULT_CARDINALITY_ESTIMATION",
+        "FORCE_LEGACY_CARDINALITY_ESTIMATION",
+        "QUERY_PLAN_PROFILE",
+    }
+)
+_COMPATIBILITY_LEVEL_HINT = re.compile(r"QUERY_OPTIMIZER_COMPATIBILITY_LEVEL_\d{3}")
+_USE_HINT_NAME = re.compile(r"[A-Za-z0-9_]+")
+_OPTIMIZE_FOR_VARIABLE = re.compile(r"@[A-Z_#][A-Z0-9_@#$]*")
+_UNSIGNED_INTEGER = re.compile(r"\d+")
+_HEX_LITERAL = re.compile(r"0X[0-9A-F]*")
+
+
+@dataclass(frozen=True)
+class HintInventory:
+    """The hints one statement carries, as keywords only.
+
+    No object, index or variable name and no literal value is kept, so the
+    inventory can be stored. ``trailing_option`` is the (start, end) offset of
+    the OPTION clause that ends the statement, or None.
+    """
+
+    isolation: tuple[str, ...] = ()
+    plan_forcing: tuple[str, ...] = ()
+    compile: tuple[str, ...] = ()
+    unknown: tuple[str, ...] = ()
+    query_hints: tuple[str, ...] = ()  # the OPTION items, in the order written
+    use_hint_names: tuple[str, ...] = ()
+    trailing_option: tuple[int, int] | None = None
+
+    @property
+    def hinted(self) -> bool:
+        """True when a hint forces a plan shape. A hint this scanner does not
+        know counts: a hinted candidate is never a plain deployable winner."""
+
+        return bool(self.plan_forcing or self.unknown)
+
+    def as_profile(self) -> dict[str, Any]:
+        return {
+            "hinted": self.hinted,
+            "plan_forcing_hints": sorted({*self.plan_forcing, *self.unknown}),
+            "isolation_table_hints": list(self.isolation),
+            "compile_options": list(self.compile),
+        }
+
+
+def _is_punct(token: _Token, text: str) -> bool:
+    return token.kind == "punct" and token.text == text
+
+
+def _matching_close(tokens: list[_Token], opening: int) -> int | None:
+    depth = 0
+    for index in range(opening, len(tokens)):
+        if _is_punct(tokens[index], "("):
+            depth += 1
+        elif _is_punct(tokens[index], ")"):
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _split_items(tokens: list[_Token]) -> list[list[_Token]]:
+    """Split the tokens of one parenthesized list on its top-level commas."""
+
+    items: list[list[_Token]] = [[]]
+    depth = 0
+    for token in tokens:
+        if _is_punct(token, "("):
+            depth += 1
+        elif _is_punct(token, ")"):
+            depth -= 1
+        elif depth == 0 and _is_punct(token, ","):
+            items.append([])
+            continue
+        items[-1].append(token)
+    return items
+
+
+def _table_hint_words(tokens: list[_Token]) -> list[str]:
+    """Words at the top level of a table-hint list. A name after ``=`` and
+    anything in nested parentheses (index and column names) is left out."""
+
+    words: list[str] = []
+    depth = 0
+    value_next = False
+    for token in tokens:
+        if _is_punct(token, "("):
+            depth += 1
+        elif _is_punct(token, ")"):
+            depth -= 1
+        elif depth:
+            continue
+        elif _is_punct(token, "="):
+            value_next = True
+        elif token.kind in ("word", "quoted"):
+            if not value_next:
+                words.append(token.text)
+            value_next = False
+    return words
+
+
+def _trailing_option(tokens: list[_Token]) -> tuple[int, int] | None:
+    """Token indexes (OPTION, closing parenthesis) of the clause that ends the text."""
+
+    end = len(tokens)
+    while end and _is_punct(tokens[end - 1], ";"):
+        end -= 1
+    if not end or not _is_punct(tokens[end - 1], ")"):
+        return None
+    depth = 0
+    for index, token in enumerate(tokens[:end]):
+        if _is_punct(token, "("):
+            if (
+                depth == 0
+                and index
+                and tokens[index - 1].kind == "word"
+                and tokens[index - 1].text == "OPTION"
+                and _matching_close(tokens, index) == end - 1
+            ):
+                return index - 1, end - 1
+            depth += 1
+        elif _is_punct(token, ")"):
+            depth -= 1
+            if depth < 0:
+                return None
+    return None
+
+
+def extract_hint_inventory(sql: str) -> HintInventory:
+    """Inventory the table hints, join hints and query hints of a statement.
+
+    Built on the validator's own lexer, so a hint word inside a string, a
+    comment or a nested comment is never counted and one in code never missed.
+    Used to mark a candidate as hinted and to find the trailing OPTION clause.
+    """
+
+    lexed = _lex(sql)
+    tokens = _tokenize(lexed)
+    isolation: set[str] = set()
+    plan_forcing: set[str] = set()
+    compile_options: set[str] = set()
+    unknown: set[str] = set()
+    query_hints: list[str] = []
+    use_hint_names: list[str] = []
+
+    def add_table_hints(words: list[str], *, strict: bool) -> None:
+        for word in words:
+            if word in ISOLATION_TABLE_HINTS:
+                isolation.add(word)
+            elif word in PLAN_FORCING_TABLE_HINTS:
+                plan_forcing.add(word)
+            elif strict:
+                unknown.add(UNRECOGNIZED_TABLE_HINT)
+
+    def add_query_hint(item: list[_Token]) -> None:
+        leading: list[str] = []
+        for token in item:
+            if token.kind != "word":
+                break
+            leading.append(token.text)
+        name = next(
+            (
+                candidate
+                for candidate in (" ".join(leading[:2]), " ".join(leading[:1]))
+                if candidate in COMPILE_QUERY_HINTS or candidate in PLAN_FORCING_QUERY_HINTS
+            ),
+            UNRECOGNIZED_QUERY_HINT,
+        )
+        if name in COMPILE_QUERY_HINTS:
+            compile_options.add(name)
+        elif name in PLAN_FORCING_QUERY_HINTS:
+            plan_forcing.add(name)
+        else:
+            unknown.add(name)
+        if name not in query_hints:
+            query_hints.append(name)
+        if name == "USE HINT":
+            for token in item:
+                if token.kind == "string":
+                    hint_name = _string_literal_value(sql, token)
+                    if _USE_HINT_NAME.fullmatch(hint_name) and hint_name.upper() not in use_hint_names:
+                        use_hint_names.append(hint_name.upper())
+        elif name == "TABLE HINT":
+            arguments = _split_items(item[3:-1]) if len(item) > 3 else []
+            for argument in arguments[1:]:  # the first names the table
+                add_table_hints(_table_hint_words(argument), strict=True)
+
+    for index, token in enumerate(tokens):
+        if token.kind == "word" and token.text in _JOIN_HINT_WORDS:
+            following = tokens[index + 1] if index + 1 < len(tokens) else None
+            if following is not None and following.kind == "word" and following.text == "JOIN":
+                plan_forcing.add(f"{token.text} JOIN")
+        if not _is_punct(token, "("):
+            continue
+        close = _matching_close(tokens, index)
+        if close is None:
+            continue
+        inner = tokens[index + 1 : close]
+        previous = tokens[index - 1] if index else None
+        keyword = previous.text if previous is not None and previous.kind == "word" else None
+        if keyword == "OPTION":
+            for item in _split_items(inner):
+                if item:
+                    add_query_hint(item)
+        elif keyword == "WITH":
+            # OPENJSON(...) WITH (...) declares columns; a table reference
+            # WITH (...) lists hints. Known hint words count in both.
+            declares_columns = index >= 2 and _is_punct(tokens[index - 2], ")")
+            add_table_hints(_table_hint_words(inner), strict=not declares_columns)
+        else:
+            # The old syntax without WITH: FROM dbo.t (NOLOCK).
+            words = _table_hint_words(inner)
+            if words and all(
+                word in ISOLATION_TABLE_HINTS or word in PLAN_FORCING_TABLE_HINTS
+                for word in words
+            ):
+                add_table_hints(words, strict=False)
+
+    trailing = _trailing_option(tokens)
+    return HintInventory(
+        isolation=tuple(sorted(isolation)),
+        plan_forcing=tuple(sorted(plan_forcing)),
+        compile=tuple(sorted(compile_options)),
+        unknown=tuple(sorted(unknown)),
+        query_hints=tuple(query_hints),
+        use_hint_names=tuple(use_hint_names),
+        trailing_option=(
+            None if trailing is None else (tokens[trailing[0]].start, tokens[trailing[1]].end)
+        ),
+    )
+
+
+def _string_literal_value(sql: str, token: _Token) -> str:
+    text = sql[token.start : token.end]
+    if text[:1] in ("N", "n"):
+        text = text[1:]
+    return text[1:-1].replace("''", "'")
+
+
+def _is_plain_literal(tokens: list[_Token]) -> bool:
+    """One string, NULL, or a number with an optional sign. No expression."""
+
+    if len(tokens) == 1 and tokens[0].kind == "string":
+        return True
+    if tokens and tokens[0].kind == "punct" and tokens[0].text in "+-":
+        tokens = tokens[1:]
+    texts = [token.text for token in tokens]
+    if any(token.kind != "word" for token in tokens[::2]):
+        return False
+    if len(texts) == 1:
+        return (
+            texts[0] == "NULL"
+            or _UNSIGNED_INTEGER.fullmatch(texts[0]) is not None
+            or _HEX_LITERAL.fullmatch(texts[0]) is not None
+        )
+    return (
+        len(texts) == 3
+        and _is_punct(tokens[1], ".")
+        and _UNSIGNED_INTEGER.fullmatch(texts[0]) is not None
+        and _UNSIGNED_INTEGER.fullmatch(texts[2]) is not None
+    )
+
+
+def _is_admitted_query_hint(sql: str, item: list[_Token]) -> bool:
+    """True for one query hint the read-only gate admits in a trailing OPTION.
+
+    The list is closed: RECOMPILE, OPTIMIZE FOR, MAXDOP, FORCE ORDER, the
+    LOOP/MERGE/HASH JOIN hints and USE HINT with listed names. None of them
+    can write or change the rows a SELECT returns. A delimited name, a
+    non-ASCII word or any token outside the shapes below is refused.
+    """
+
+    for token in item:
+        if token.kind == "quoted":
+            return False
+        if token.kind == "word" and not sql[token.start : token.end].isascii():
+            return False
+    shape = tuple("'" if token.kind == "string" else token.text for token in item)
+    kinds = tuple(token.kind for token in item)
+    if shape in (("RECOMPILE",), ("FORCE", "ORDER"), ("OPTIMIZE", "FOR", "UNKNOWN")):
+        return kinds == ("word",) * len(shape)
+    if len(shape) == 2 and kinds == ("word", "word"):
+        if shape[0] in ("LOOP", "MERGE", "HASH") and shape[1] == "JOIN":
+            return True
+        return shape[0] == "MAXDOP" and re.fullmatch(r"\d{1,5}", shape[1]) is not None
+    if len(item) < 5 or not _is_punct(item[2], "(") or not _is_punct(item[-1], ")"):
+        return False
+    arguments = item[3:-1]
+    if any(_is_punct(token, "(") or _is_punct(token, ")") for token in arguments):
+        return False
+    if shape[:2] == ("USE", "HINT") and kinds[:2] == ("word", "word"):
+        for argument in _split_items(arguments):
+            if len(argument) != 1 or argument[0].kind != "string":
+                return False
+            name = _string_literal_value(sql, argument[0])
+            if _USE_HINT_NAME.fullmatch(name) is None or not (
+                name.upper() in STATEMENT_USE_HINT_NAMES
+                or _COMPATIBILITY_LEVEL_HINT.fullmatch(name.upper())
+            ):
+                return False
+        return True
+    if shape[:2] == ("OPTIMIZE", "FOR") and kinds[:2] == ("word", "word"):
+        for argument in _split_items(arguments):
+            if (
+                len(argument) < 2
+                or argument[0].kind != "word"
+                or _OPTIMIZE_FOR_VARIABLE.fullmatch(argument[0].text) is None
+            ):
+                return False
+            value = argument[1:]
+            if len(value) == 1 and value[0].kind == "word" and value[0].text == "UNKNOWN":
+                continue
+            if not (_is_punct(value[0], "=") and _is_plain_literal(value[1:])):
+                return False
+        return True
+    return False
+
+
+def _admitted_option_body(sql: str) -> str | None:
+    """The statement text in front of an admitted trailing OPTION clause.
+
+    None when the text does not end with one OPTION clause whose every hint
+    is admitted.
+    """
+
+    lexed = _lex(sql)
+    tokens = _tokenize(lexed)
+    trailing = _trailing_option(tokens)
+    if trailing is None:
+        return None
+    option_index, close_index = trailing
+    items = _split_items(tokens[option_index + 2 : close_index])
+    if not all(item and _is_admitted_query_hint(sql, item) for item in items):
+        return None
+    # A second OPTION in front of the clause is not T-SQL the gate understands.
+    if any(token.kind == "word" and token.text == "OPTION" for token in tokens[:option_index]):
+        return None
+    return sql[: tokens[option_index].start]
+
+
+@dataclass(frozen=True)
 class ValidatedQuery:
     """A read-only query with both exact and compatibility SQL spellings.
 
     ``execution_sql`` is the text that must be sent to the driver.  It is
     intentionally not generated by sqlglot.  ``normalized_sql`` remains for
     callers using the original API and is now the trimmed exact text rather
-    than a parser re-emission.  ``analysis_sql`` is only a parser artifact.
+    than a parser re-emission.  ``analysis_sql`` is only a parser artifact;
+    for a statement admitted with a trailing OPTION clause the parser could
+    not read, it is the statement without that clause.  ``statement_hints``
+    names the query hints of the OPTION clause, without their values.
     """
 
     normalized_sql: str
@@ -210,6 +666,7 @@ class ValidatedQuery:
     analysis_sql: str = ""
     analysis_status: str = "supported"
     admission_status: str = "admitted"
+    statement_hints: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         submitted = self.submitted_sql or self.normalized_sql
@@ -271,12 +728,16 @@ class SafeSqlValidator:
             statements = parse(candidate, read="tsql")
         except ParseError as exc:
             self._check_statement_keywords(candidate)
-            if _READ_ONLY_PREFIX_PATTERN.match(candidate):
-                raise UnsupportedSqlError(
-                    "T-SQL could not be statically analyzed; admission is not allowed.",
-                    submitted_sql=sql,
-                ) from exc
-            raise ValueError(f"Invalid T-SQL: {exc}") from exc
+            under_option = self._parse_under_trailing_option(candidate)
+            if under_option is None:
+                if _READ_ONLY_PREFIX_PATTERN.match(candidate):
+                    raise UnsupportedSqlError(
+                        "T-SQL could not be statically analyzed; admission is not allowed.",
+                        submitted_sql=sql,
+                    ) from exc
+                raise ValueError(f"Invalid T-SQL: {exc}") from exc
+            # The same checks as for any other statement follow.
+            statements = under_option
 
         if not statements:
             raise ValueError("Invalid T-SQL: parser returned no statements.")
@@ -299,7 +760,26 @@ class SafeSqlValidator:
             submitted_sql=sql,
             execution_sql=sql,
             analysis_sql=analysis_sql,
+            statement_hints=extract_hint_inventory(candidate).query_hints,
         )
+
+    @staticmethod
+    def _parse_under_trailing_option(candidate: str) -> list[Any] | None:
+        """Parse the statement in front of an admitted trailing OPTION clause.
+
+        The parser cannot read OPTIMIZE FOR (@p = value) or USE HINT(...).
+        When the text ends with one OPTION clause whose every hint is on the
+        admitted list, the text in front of it is parsed and checked like any
+        other statement. None means the text is not of that form.
+        """
+
+        body = _admitted_option_body(candidate)
+        if body is None or not body.strip():
+            return None
+        try:
+            return parse(body, read="tsql")
+        except ParseError:
+            return None
 
     def analyze_read_only(self, sql: str) -> StaticAnalysisOutcome:
         """Return a distinct admission outcome without admitting SQL.
@@ -335,11 +815,13 @@ class SafeSqlValidator:
     def extract_table_references(self, sql: str) -> list[dict[str, str | None]]:
         """Return base table references from a validated read-only statement."""
         validated = self.validate_read_only(sql)
-        statements = [
-            statement
-            for statement in parse(validated.execution_sql.strip(), read="tsql")
-            if statement is not None
-        ]
+        execution_sql = validated.execution_sql.strip()
+        try:
+            parsed = parse(execution_sql, read="tsql")
+        except ParseError:
+            # Admitted above, so this is the trailing-OPTION form.
+            parsed = self._parse_under_trailing_option(execution_sql) or []
+        statements = [statement for statement in parsed if statement is not None]
         if not statements:
             raise ValueError("Invalid T-SQL: parser returned an empty statement.")
         cte_names = {
@@ -406,7 +888,15 @@ class SafeSqlValidator:
         if SP_EXECUTESQL_PATTERN.search(candidate):
             raise ValueError("sp_executesql is not allowed in restricted mode (dynamic SQL risk).")
         # Quoted hint names ([UPDLOCK], "TABLOCK") count too: fail closed.
-        hints = sorted(LOCKING_HINTS.intersection(_code_words(sql, include_quoted=True)))
+        code_words = _code_words(sql, include_quoted=True)
+        # The parse-tree check below does not see a delimited function name
+        # such as [sys].[fn_get_sql](...), so the name itself is refused.
+        blocked = sorted(_BLOCKED_FUNCTION_WORDS.intersection(code_words))
+        if blocked:
+            raise ValueError(
+                f"Function '{blocked[0].lower()}' is not allowed in restricted mode."
+            )
+        hints = sorted(LOCKING_HINTS.intersection(code_words))
         if hints:
             raise ValueError(
                 f"Locking hints ({', '.join(hints)}) are not allowed in restricted mode."

@@ -13,6 +13,7 @@ from .config import ServerConfig
 
 AZURE_SQL_SCOPE = "https://database.windows.net/.default"
 SQL_ACCESS_TOKEN_ATTRIBUTE = 1256
+APPLICATION_INTENTS = ("read_write", "read_only")
 
 
 @dataclass(frozen=True)
@@ -29,23 +30,53 @@ def obfuscate_secret(value: str | None) -> str | None:
     return redacted
 
 
+def _odbc_value(value: str) -> str:
+    """Quote a connection-string value that ODBC would otherwise split.
+
+    A ';' ends an attribute and a leading '{' starts a quoted value, so such a
+    value goes in braces with each '}' doubled. Other values are unchanged.
+    """
+
+    if not any(character in value for character in ";{}") and value == value.strip():
+        return value
+    return "{" + value.replace("}", "}}") + "}"
+
+
 class AzureSqlAuthenticator:
     def __init__(self, config: ServerConfig):
         self.config = config
         self._credential = None
 
-    def build_connection_arguments(self, database_name: str) -> ConnectionArguments:
+    def build_connection_arguments(
+        self,
+        database_name: str,
+        *,
+        application_intent: str | None = None,
+    ) -> ConnectionArguments:
+        """Build the connection string and token for one database.
+
+        ``application_intent="read_only"`` asks Azure SQL for a readable
+        replica (read scale-out). A database with no readable replica answers
+        on its primary.
+        """
+
+        if application_intent is not None and application_intent not in APPLICATION_INTENTS:
+            raise ValueError(
+                f"application_intent must be one of: {', '.join(APPLICATION_INTENTS)}."
+            )
         connection_string = (
             f"SERVER=tcp:{self.config.server},1433;"
             f"DATABASE={database_name};"
             "Encrypt=yes;"
             f"TrustServerCertificate={'yes' if self.config.trust_server_certificate else 'no'};"
         )
+        if application_intent == "read_only":
+            connection_string += "ApplicationIntent=ReadOnly;"
 
         if self.config.auth_mode == AuthMode.SQL_PASSWORD:
             connection_string += (
-                f"UID={self.config.username};"
-                f"PWD={self.config.password};"
+                f"UID={_odbc_value(self.config.username or '')};"
+                f"PWD={_odbc_value(self.config.password or '')};"
             )
             return ConnectionArguments(connection_string=connection_string)
 
