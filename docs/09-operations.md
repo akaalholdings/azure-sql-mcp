@@ -24,7 +24,7 @@ The optional companion skills remain in the
 [`akaalholdings/sql-skills`](https://github.com/akaalholdings/sql-skills) repository:
 
 ```bash
-cd /absolute/path/to/SQL
+cd /absolute/path/to/sql-skills
 python3 skills/install_all.py --dest "$HOME/.copilot/skills"
 python3 skills/check_installed_parity.py --dest "$HOME/.copilot/skills"
 ```
