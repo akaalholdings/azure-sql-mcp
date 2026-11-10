@@ -88,7 +88,6 @@ ORDER BY ep.name
 """
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_@$#]*$")
-_PRODUCTION_ENVIRONMENTS = frozenset({"production", "prod", "live"})
 _MARKER_NAME_PREFIX = "AzureSqlMcp_View_v1_"
 _MARKER_VALUE_PATTERN = re.compile(r"^[0-9a-f]{48}$")
 _IDEMPOTENCY_DIGEST_PATTERN = re.compile(r"^idempotency-v1:[0-9a-f]{64}$")
@@ -2327,7 +2326,7 @@ class ViewWorkflowService:
         policy = self._database_policy(database_name)
         if policy is None or not policy.configured:
             return "database is not configured in the local policy"
-        if policy.environment.strip().casefold() in _PRODUCTION_ENVIRONMENTS:
+        if not policy.is_non_production:
             return "view DDL is restricted to non-production environments"
         if not policy.allow_read:
             return "view apply requires policy allow_read=True for verification"

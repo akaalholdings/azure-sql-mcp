@@ -554,9 +554,9 @@ async def test_volatile_index_screening_reports_performance_only(
     )
 
     assert result["classification"] == "promising"
-    assert result["decision_basis"] == "observed_range_separation_v1"
+    assert result["decision_basis"] == "per_bucket_median_shift_v2"
     assert result["parameter_results"][0]["decision_basis"] == (
-        "observed_range_separation_v1"
+        "per_bucket_median_shift_v2"
     )
     assert result["durable_state"] == "screening"
     assert result["proof_scope"] == "performance_only"
@@ -566,7 +566,7 @@ async def test_volatile_index_screening_reports_performance_only(
         result["evidence_id"]
     ).metrics
     assert evidence_metrics["performance_classification"] == "promising"
-    assert evidence_metrics["decision_basis"] == "observed_range_separation_v1"
+    assert evidence_metrics["decision_basis"] == "per_bucket_median_shift_v2"
     stored_candidate = app.tuning_sessions.get_candidate(candidate_id)
     assert stored_candidate.state == "screening"
     assert stored_candidate.failure_code is None
@@ -593,7 +593,7 @@ async def test_volatile_index_screening_reports_performance_only(
 
     assert replay["classification"] == "promising"
     assert replay["performance_classification"] == "promising"
-    assert replay["decision_basis"] == "observed_range_separation_v1"
+    assert replay["decision_basis"] == "per_bucket_median_shift_v2"
     assert replay["durable_state"] == "screening"
     assert replay["evidence_id"] == result["evidence_id"]
     assert replay["recovered_from_durable_evidence"] is True
@@ -872,7 +872,7 @@ async def test_index_retry_recovers_post_evidence_crash_without_query_or_ddl(
     app._create_test_index.assert_awaited_once()
     app._drop_test_index.assert_awaited_once()
 
-    orphaned = await app._get_tuning_session("appdb", session_id)
+    orphaned = await app._get_tuning_session("appdb", session_id, view="full")
     assert [item["evidence_id"] for item in orphaned["evidence"]] == [
         app.performance_store.list_evidence_for_session(session_id)[0].evidence_id
     ]
@@ -917,7 +917,7 @@ async def test_index_retry_recovers_post_evidence_crash_without_query_or_ddl(
     assert catalog.await_count == 4
     app._create_test_index.assert_awaited_once()
     app._drop_test_index.assert_awaited_once()
-    attached = await app._get_tuning_session("appdb", session_id)
+    attached = await app._get_tuning_session("appdb", session_id, view="full")
     assert [item["evidence_id"] for item in attached["evidence"]] == [
         recovered["evidence_id"]
     ]

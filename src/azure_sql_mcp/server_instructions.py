@@ -8,10 +8,12 @@ Database (PaaS). It reads live DMVs and Query Store, and it can run gated, rever
 experiments. It never assumes SQL Server features that Azure SQL Database lacks.
 
 ## Start every session
-1. check_runtime_status: package version, active profile, tool groups, fingerprints.
+1. check_runtime_status: package version, active profile (null means unprofiled: every
+   tool group), tool counts, data_detail, fingerprints. include_tool_names=true lists names.
 2. list_databases: only these allowlisted databases can be used. Let the user choose.
-3. check_capabilities(database_name): platform, Query Store state, mcp_contract flags,
-   and the local policy (what benchmarks or writes are allowed).
+3. check_capabilities(database_name): platform, Query Store state and replicas,
+   mcp_contract flags, and the local policy (what benchmarks or writes are allowed).
+get_tool_guide(name) explains one tool or topic; without a name it lists the guides.
 
 ## Read result_status before the data
 Every tool result has result_status:
@@ -26,25 +28,40 @@ Every tool result has result_status:
   never run it yourself.
 
 ## Pick the workflow
-- Incident or broad slowness: diagnose_database first (one call, ranked findings with
-  next tool calls), then drill in with get_resource_stats_history (window_minutes up to 14 days;
-  over 60 minutes needs master allowlisted), get_resource_limits, get_wait_stats
-  (sample_seconds=15 during a live incident), get_currently_waiting_tasks,
-  get_active_sessions, get_lock_details, get_open_transactions, get_deadlock_history,
-  get_top_queries, detect_regressed_queries, then start_performance_case and
-  collect_performance_evidence for a durable case.
+- Incident or broad slowness: diagnose_database first (one call: conclusion, stories,
+  scored facts and next tool calls), then drill in with get_resource_stats_history
+  (window_minutes up to 14 days; over 60 minutes needs master allowlisted),
+  get_resource_limits, get_wait_stats (sample_seconds=15 during a live incident),
+  get_currently_waiting_tasks, get_active_sessions, get_lock_details,
+  get_open_transactions, get_memory_pressure, get_elastic_pool_pressure,
+  get_top_queries (group_by=query_hash folds literal variants), get_failed_executions
+  (timeouts and aborted runs), detect_regressed_queries. Is it normal, and is the tier
+  right: get_database_baseline, assess_capacity, analyze_application_patterns. A past
+  incident: get_diagnostic_history reads the recorders the database has
+  (category=coverage lists them); get_deadlock_history(source=auto) does the same for
+  deadlocks. Then start_performance_case and collect_performance_evidence (a summary;
+  detail=full returns the rows).
 - Index design and review: review_workload_indexes. It reads Query Store workload and
   stored plans, finds the queries that hit each table, and returns create, extend,
-  widen, consolidate, drop, and heap recommendations with inert DDL and rollback.
-  Prove a candidate with benchmark_index_candidate (sandbox profile, non-production
-  copy) before any production change.
+  widen, consolidate, drop, and heap recommendations with inert DDL and rollback;
+  include_change_plan=true orders them into steps. get_columnstore_health and
+  get_object_details (included columns, filters, declared types) give the detail.
+  Prove a candidate with benchmark_index_candidate (sandbox profile, a policy
+  environment that is a known non-production label) before any production change.
 - One slow query: analyze_query_plan (Query Store plan_id or query_id) or explain_query
   (both return a plan digest and rule findings), get_query_store_trend for its history,
+  get_column_statistics for skew and parameter values to test,
   check_equivalence_preflight, start_performance_case,
   start_tuning_session, add_tuning_candidate, benchmark_tuning_candidate,
-  finalize_tuning_session. Measured claims come only from these results.
-- Plan stability: plan_health_review, review_plan_enforcement, prepare_plan_action.
-  Applying a plan action is a separate, explicitly authorized step.
+  finalize_tuning_session. Measured claims come only from these results. Benchmark
+  results are compact (detail=full adds spread and digests); get_tuning_session is a
+  summary (view=full adds evidence). A rewrite is deployment_ready only when
+  finalize_tuning_session verified its logical_preconditions in the catalog.
+  Parameter values use one shape everywhere: {name, values, types, weight}.
+- Plan stability: plan_health_review, review_plan_enforcement, prepare_plan_action
+  (returns force_precheck and guardrails). Applying a plan action is a separate,
+  explicitly authorized step; on a production database it needs the confirmation_token
+  that prepare returned, passed back by the person who approves.
 
 ## Reading a plan
 - The plan kind decides what you may conclude. An estimated plan (Query Store, or

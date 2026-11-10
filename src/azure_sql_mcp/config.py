@@ -151,6 +151,10 @@ TOOL_GROUPS: dict[str, ToolGroup] = {
     "get_elastic_pool_pressure": ToolGroup.PERFORMANCE,
     "get_columnstore_health": ToolGroup.PERFORMANCE,
     "get_failed_executions": ToolGroup.PERFORMANCE,
+    "get_database_baseline": ToolGroup.PERFORMANCE,
+    "assess_capacity": ToolGroup.PERFORMANCE,
+    "analyze_application_patterns": ToolGroup.PERFORMANCE,
+    "get_diagnostic_history": ToolGroup.PERFORMANCE,
     # schema: schema comparison & migration
     "capture_schema_snapshot": ToolGroup.SCHEMA,
     "compare_schemas": ToolGroup.SCHEMA,
@@ -219,6 +223,10 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "get_elastic_pool_pressure",
             "get_columnstore_health",
             "get_failed_executions",
+            "get_database_baseline",
+            "assess_capacity",
+            "analyze_application_patterns",
+            "get_diagnostic_history",
         }
     )
     | frozenset(

@@ -42,6 +42,7 @@ RESULT_STATUS_VALUES = frozenset(status.value for status in ResultStatus)
 # Tool name -> top-level keys that hold the tool's primary rows. A result is
 # ``empty`` only when every declared key is present and empty.
 PRIMARY_ROW_KEYS: dict[str, tuple[str, ...]] = {
+    "execute_sql": ("rows",),
     "get_active_sessions": ("sessions",),
     "get_top_queries": ("rows",),
     "analyze_index_recommendations": (
@@ -71,6 +72,7 @@ PRIMARY_ROW_KEYS: dict[str, tuple[str, ...]] = {
     "get_query_store_regressions": ("regressions",),
     "analyze_query_plan": ("findings",),
     "export_incident_backlog": ("items",),
+    "get_failed_executions": ("rising", "top_failing_queries"),
 }
 
 _DEFAULT_EMPTY_REASON = (

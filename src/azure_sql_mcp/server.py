@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
 import sqlite3
 import time
@@ -33,11 +34,16 @@ from pydantic import ValidationError
 
 from .admin_policy import AdminAction
 from .admin_policy import AdminPolicy
+from .admin_policy import ConfirmationTokens
+from .application_patterns import ApplicationPatternService
 from .artifact_store import ArtifactStore
 from .artifacts import ErrorPayload
 from .artifacts import ExplainPlanArtifact
 from .auth import AzureSqlAuthenticator
 from .capabilities import CapabilityService
+from .column_statistics import ColumnStatisticsService
+from .capacity_assessment import CapacityAssessmentService
+from .columnstore_health import ColumnstoreHealthService
 from .candidate_lineage import combined_parent_id
 from .candidate_lineage import validate_combined_parent
 from .config import AccessMode
@@ -49,25 +55,46 @@ from .config import load_server_config
 from .connection import AzureSqlExecutor
 from .connection import statement_deadline
 from .connection_pool import ConnectionPool
+from .database_baseline import DatabaseBaselineService
 from .database_diagnosis import DatabaseDiagnosisService
 from .database_policy import load_database_policy_or_deny
 from .diagnostics import DiagnosticQueryService
+from .elastic_pool import ElasticPoolService
 from .equivalence_contract import effective_compare_order
 from .equivalence_preflight import EquivalencePreflightService
 from .health import HealthService
+from .history_azure_monitor import ARM_SCOPE
+from .history_azure_monitor import LOG_ANALYTICS_SCOPE
+from .history_azure_monitor import AzureMonitorMetricsSource
+from .history_azure_monitor import LogAnalyticsHistorySource
+from .history_database_watcher import KUSTO_SCOPE
+from .history_database_watcher import DatabaseWatcherHistorySource
+from .history_extended_events import ExtendedEventsHistorySource
+from .history_loki import LokiHistorySource
+from .history_loki import parse_loki_settings
+from .history_sources import EntraTokenProvider
+from .history_sources import HistoryCategory
+from .history_sources import HistoryResolver
+from .history_sources import TimeWindow
+from .history_sources import UrllibTransport
+from .history_sources import credential_for
 from .incident_log import IncidentLog
 from .incident_log import native_codes
 from .incident_log import note_exception
 from .incident_log import record_startup_failure
 from .incident_log import summarize_backlog
 from .incident_log import tool_failure_code
+from .index_advisor import build_index_change_plan
 from .index_optimizer import IndexCandidate
 from .index_optimizer import IndexOptimizer
-from .index_optimizer import build_index_candidate_statement
+from .index_optimizer import bounded_table_lock_probe_sql
+from .index_optimizer import build_test_index_statement
+from .index_optimizer import classify_create_index_failure
 from .index_optimizer import expected_index_definition_matches
 from .index_optimizer import verify_plan_uses_index
 from .index_metadata import collect_existing_indexes
 from .index_metadata import existing_index_covers_candidate
+from .index_metadata import is_test_index_name
 from .index_recommendations import IndexRecommendationService
 from .index_review import IndexReviewService
 from .index_review import IndexReviewSetupError
@@ -79,6 +106,7 @@ from .index_review import index_review_subjects
 from .index_review import render_index_review_artifacts
 from .introspection import IntrospectionService
 from .lock_diagnostics import LockDiagnosticsService
+from .memory_pressure import MemoryPressureService
 from .learning_contracts import DecisionRecordV1
 from .learning_contracts import HandoffV1
 from .learning_contracts import OutcomeReviewV1
@@ -86,7 +114,9 @@ from .learning_service import LearningService
 from .learning_store import LearningStore
 from .learning_store import LearningStoreError
 from .logging_config import configure_logging
+from .observability import apply_data_detail
 from .observability import extract_failure_diagnostic
+from .observability import not_found_details
 from .observability import sanitize_error_message
 from .param_binding import detect_parameters
 from .param_binding import ParameterExecutionContract
@@ -111,23 +141,30 @@ from .performance_workflows import extract_profile_metrics
 from .performance_workflows import fingerprint_json
 from .performance_workflows import fingerprint_text
 from .performance_workflows import fingerprint_text_matches
+from .performance_workflows import mark_benchmark_sql
 from .performance_workflows import parameter_case_fingerprint
 from .performance_workflows import parameter_case_mismatch
 from .performance_workflows import parameter_case_receipt
+from .performance_workflows import plan_delta_from_profiles
 from .performance_workflows import profile_result_fingerprint
 from .performance_workflows import scope_case_regressions
 from .plan_action_service import PlanActionService
 from .plan_cache import PlanCacheService
 from .plan_enforcement import PlanEnforcementService
-from .plan_digest import build_plan_digest
+from .plan_digest import build_plan_digest  # noqa: F401  (kept for callers that patch it)
 from .plan_digest import describe_plan_node
-from .plan_rules import analyze_plan
+from .plan_rules import analyze_plan  # noqa: F401  (kept for callers that patch it)
+from .plan_rules import read_plan
 from .plan_sources import PlanSource
 from .plan_sources import PlanSourceService
+from .plan_tree import ParsedPlan
 from .plan_tree import PlanParseError
+from .plan_tree import parse_plan
+from .plan_tree import partition_access
 from .plans import PlansService
 from .plans import compact_plan_summary
 from .platform_capabilities import PlatformCapabilitiesService
+from .platform_capabilities import unsupported_platform_reason
 from .prompts import register_prompts
 from .query_index_analysis import QueryIndexAnalysisService
 from .query_hints import validate_query_hints
@@ -142,6 +179,7 @@ from .result_status import status_payload
 from .retry import _is_transient
 from .safe_sql import SafeSqlValidator
 from .schema_compat import portable_input_schema
+from .showplan_access import parse_plan_access
 from .server_instructions import SERVER_INSTRUCTIONS
 from .schema_compare import SchemaCompareService
 from .sessions import SessionsService
@@ -149,7 +187,11 @@ from .tempdb_memory import TempdbMemoryService
 from .time_windows import AS_OF_DESCRIPTION
 from .time_windows import iso_z
 from .time_windows import parse_as_of
+from .time_windows import window_bounds
 from .tool_contracts import add_tool_headline
+from .tool_guides import get_tool_guide as read_tool_guide
+from .tool_guides import list_tool_guides
+from .tool_contracts import annotate_next_tools
 from .tool_contracts import BenchmarkPhase
 from .tool_contracts import BenchmarkToolOutput
 from .tool_contracts import CaseToolOutput
@@ -162,6 +204,7 @@ from .tool_contracts import TuningObjective
 from .tool_contracts import TuningStrategy
 from .tuning_sessions import InvalidTransitionError
 from .tuning_sessions import TuningSessionStateMachine
+from .tuning_sessions import session_failure_diagnostic
 from .transport_auth import StaticBearerTokenVerifier
 from .version_store import VersionStoreService
 from .wait_stats import WaitStatsService
@@ -260,6 +303,7 @@ _CATALOG_READ_TOOLS = frozenset(
         "list_objects",
         "search_objects",
         "get_object_details",
+        "get_column_statistics",
         "get_dependencies",
         "get_table_stats",
         "capture_schema_snapshot",
@@ -345,6 +389,8 @@ class _SanitizingToolManager(ToolManager):
         self.incidents = incidents or IncidentLog(None, disabled_reason="disabled_by_config")
         # Package tool names, including ones this profile or access mode hides.
         self.known_tool_names: frozenset[str] = frozenset()
+        # Applied to every tool result: the one place no tool can bypass.
+        self.finish_response: Callable[[Any], Any] = lambda payload: payload
 
     async def call_tool(
         self,
@@ -409,7 +455,7 @@ class _SanitizingToolManager(ToolManager):
                     separators=(",", ":"),
                 )
             ) from None
-        return apply_result_status(name, result)
+        return self.finish_response(apply_result_status(name, result))
 
     def _convert(self, name: str, result: Any) -> Any:
         tool = self.get_tool(name)
@@ -485,17 +531,284 @@ def _auth_settings(config: ServerConfig) -> AuthSettings:
 
 
 MAX_ANALYZED_PLAN_XML_CHARS = 8_000_000
+# Above this size the parse and the rules run in a worker thread, so one
+# large plan does not stall every other tool call on the event loop.
+LARGE_PLAN_XML_CHARS = 500_000
+MAX_PARTITION_COLUMN_LOOKUPS = 5
+_PARTITION_COLUMN_SQL = """
+SELECT s.name AS schema_name, t.name AS table_name, c.name AS partitioning_column
+FROM sys.tables AS t
+JOIN sys.schemas AS s ON s.schema_id = t.schema_id
+JOIN sys.indexes AS i ON i.object_id = t.object_id AND i.index_id IN (0, 1)
+JOIN sys.partition_schemes AS ps ON ps.data_space_id = i.data_space_id
+JOIN sys.index_columns AS ic
+  ON ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.partition_ordinal = 1
+JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+WHERE t.object_id = OBJECT_ID(QUOTENAME(?) + N'.' + QUOTENAME(?));
+"""
 
 
 def _compact_plan_findings(analysis: dict[str, Any], *, limit: int = 15) -> dict[str, Any]:
     findings = analysis.get("findings") or []
-    return {
+    compact = {
         "plan_kind": analysis.get("plan_kind"),
         "finding_counts": analysis.get("finding_counts", {}),
         "families": analysis.get("families", {}),
         "findings": findings[:limit],
         "truncated": bool(analysis.get("truncated")) or len(findings) > limit,
     }
+    # How the list is ordered, and what a partial (running) plan cannot show.
+    for key in ("ranking_basis", "note", "in_flight", "in_flight_note"):
+        if analysis.get(key) is not None:
+            compact[key] = analysis[key]
+    return compact
+
+
+def _one_parameter_shape(
+    parameter_case: ParameterCaseInput | Mapping[str, Any] | None,
+    parameter_values: dict[str, Any] | None,
+    parameter_types: dict[str, str] | None,
+) -> dict[str, Any] | None:
+    """One parameter case from either spelling: parameter_case, or values and types."""
+
+    case = _parameter_case_payload(parameter_case)
+    if case is not None and (parameter_values or parameter_types):
+        raise ValueError(
+            "Pass parameter_case or parameter_values with parameter_types, not both."
+        )
+    if case is not None:
+        return case
+    if not parameter_values and not parameter_types:
+        return None
+    return {
+        "name": "default",
+        "values": dict(parameter_values or {}),
+        "types": dict(parameter_types or {}),
+        "weight": 1.0,
+    }
+
+
+_AGGREGATE_DECISION_KEYS = (
+    "sample_count",
+    "elapsed_ms",
+    "cpu_ms",
+    "logical_reads",
+    "lob_logical_reads",
+    "physical_reads",
+    "actual_rows",
+    "client_elapsed_ms",
+    "noise_ratio",
+    "plan_stable",
+)
+_PREFLIGHT_DECISION_KEYS = (
+    "classification",
+    "direct_snapshot_supported",
+    "risk_codes",
+    "total_order_gaps",
+)
+_LEASE_DECISION_KEYS = ("lease_id", "status", "index_name", "expires_at_utc")
+
+
+def _compact_aggregate(aggregate: Any) -> Any:
+    if not isinstance(aggregate, Mapping) or "sample_count" not in aggregate:
+        return aggregate
+    return {
+        key: aggregate[key]
+        for key in _AGGREGATE_DECISION_KEYS
+        if aggregate.get(key) is not None
+    }
+
+
+def _compact_benchmark_payload(payload: Any) -> Any:
+    """A benchmark result with the numbers a decision needs.
+
+    Left out: per-run values, spread, metric coverage, result digests, the
+    full preflight and the duplicate ``metrics`` block. ``detail="full"`` on
+    the tool returns them; get_tuning_session(view="full") holds them too.
+    """
+
+    if not isinstance(payload, Mapping):
+        return payload
+    compact = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"metrics", "parameter_case_receipts"}
+    }
+    results = payload.get("parameter_results")
+    if isinstance(results, list):
+        slim_results = []
+        for item in results:
+            if not isinstance(item, Mapping):
+                slim_results.append(item)
+                continue
+            slim = {key: _compact_aggregate(value) for key, value in item.items()}
+            after = slim.get("baseline_after_plan_delta")
+            if isinstance(after, Mapping):
+                slim["baseline_after_plan_delta"] = {"plan_changed": after.get("plan_changed")}
+            uses = slim.get("plan_use")
+            if isinstance(uses, list):
+                slim["plan_use"] = {
+                    "runs": len(uses),
+                    "runs_using_index": sum(
+                        1 for use in uses if isinstance(use, Mapping) and use.get("used") is True
+                    ),
+                }
+            slim_results.append(slim)
+        compact["parameter_results"] = slim_results
+    equivalence = payload.get("equivalence")
+    if isinstance(equivalence, list):
+        compact["equivalence"] = [
+            {key: value for key, value in item.items() if key != "result_evidence"}
+            if isinstance(item, Mapping)
+            else item
+            for item in equivalence
+        ]
+    preflight = payload.get("equivalence_preflight")
+    if isinstance(preflight, Mapping):
+        compact["equivalence_preflight"] = {
+            key: preflight[key]
+            for key in _PREFLIGHT_DECISION_KEYS
+            if key in preflight and (preflight[key] or key != "total_order_gaps")
+        }
+    lease = payload.get("lease")
+    if isinstance(lease, Mapping):
+        compact["lease"] = {key: lease[key] for key in _LEASE_DECISION_KEYS if key in lease}
+    return compact
+
+
+def _summarize_evidence_section(section: Any) -> Any:
+    """Status, gaps and row counts of one evidence section, without its rows."""
+
+    if not isinstance(section, Mapping):
+        return section
+    summary: dict[str, Any] = {
+        key: value
+        for key, value in section.items()
+        if not isinstance(value, (Mapping, list)) or key == "gaps"
+    }
+    nested = section.get("data")
+    data: Mapping[str, Any] = nested if isinstance(nested, Mapping) else section
+    row_counts = {
+        key: len(value) for key, value in data.items() if isinstance(value, list) and key != "gaps"
+    }
+    if row_counts:
+        summary["row_counts"] = row_counts
+    identity = data.get("identity")
+    if isinstance(identity, Mapping):
+        summary["identity"] = {
+            key: value for key, value in identity.items() if not isinstance(value, (Mapping, list))
+        }
+    return summary
+
+
+def _compact_evidence_payload(payload: Any) -> Any:
+    if not isinstance(payload, Mapping):
+        return payload
+    compact = dict(payload)
+    evidence = payload.get("evidence")
+    if isinstance(evidence, Mapping):
+        compact["evidence"] = {
+            key: value for key, value in evidence.items() if not isinstance(value, (Mapping, list))
+        }
+    sections = payload.get("sections")
+    if isinstance(sections, Mapping):
+        compact["sections"] = {
+            name: _summarize_evidence_section(section) for name, section in sections.items()
+        }
+    compact["detail"] = "summary"
+    compact["detail_note"] = (
+        "Sections show status, gaps and row counts. The rows are stored with the "
+        "evidence: call again with detail=full, or read get_performance_case."
+    )
+    return compact
+
+
+_CHARACTER_TYPES = frozenset({"char", "varchar", "binary", "varbinary"})
+_UNICODE_TYPES = frozenset({"nchar", "nvarchar"})
+_PRECISION_SCALE_TYPES = frozenset({"decimal", "numeric"})
+_SCALE_TYPES = frozenset({"datetime2", "datetimeoffset", "time"})
+
+
+def _declared_column_type(column: Mapping[str, Any]) -> dict[str, Any]:
+    """The type as DDL declares it. sys.columns.max_length is bytes: 80 for nvarchar(40)."""
+
+    data_type = str(column.get("data_type") or "").casefold()
+    max_length = column.get("max_length")
+    if data_type in _CHARACTER_TYPES | _UNICODE_TYPES and isinstance(max_length, int):
+        if max_length == -1:
+            return {"declared_type": f"{data_type}(max)"}
+        length = max_length // 2 if data_type in _UNICODE_TYPES else max_length
+        return {"length_chars": length, "declared_type": f"{data_type}({length})"}
+    if data_type in _PRECISION_SCALE_TYPES:
+        return {"declared_type": f"{data_type}({column.get('precision')},{column.get('scale')})"}
+    if data_type in _SCALE_TYPES:
+        return {"declared_type": f"{data_type}({column.get('scale')})"}
+    return {}
+
+
+def _plan_logical_reads(parsed: ParsedPlan | None) -> float | None:
+    """Logical reads the actual plan's operators report; None when it reports none."""
+
+    if parsed is None:
+        return None
+    reads = [
+        node.logical_reads
+        for statement in parsed.statements
+        for node in statement.nodes
+        if node.logical_reads is not None
+    ]
+    return sum(reads) if reads else None
+
+
+_DIGEST_HELD_SUMMARY_KEYS = frozenset({"statements", "parameters"})
+_DIGEST_HELD_METRIC_KEYS = frozenset(
+    {
+        "statement_metrics",
+        "root_operator_metrics",
+        "runtime_counter_count",
+        "statement_metric_count",
+        "user_select_count",
+        # Reported once, at the top level, as execution_ms with its provenance.
+        "measured_wall_elapsed_ms",
+        "measured_wall_elapsed_source",
+    }
+)
+
+
+def _drop_zero_counters(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _drop_zero_counters(child)
+            for key, child in value.items()
+            if not (isinstance(child, (int, float)) and not isinstance(child, bool) and child == 0)
+        }
+    if isinstance(value, list):
+        return [_drop_zero_counters(item) for item in value]
+    return value
+
+
+def _slim_explain_summary(summary: Mapping[str, Any], *, digest_present: bool) -> dict[str, Any]:
+    """The default explain summary: nothing the digest already holds, nothing empty."""
+
+    slim: dict[str, Any] = {}
+    for key, value in summary.items():
+        if digest_present and key in _DIGEST_HELD_SUMMARY_KEYS:
+            continue
+        if value is None or (isinstance(value, (list, dict)) and not value):
+            continue
+        if key == "actual_metrics" and isinstance(value, Mapping):
+            value = {
+                name: metric
+                for name, metric in value.items()
+                if metric is not None
+                and not (digest_present and name in _DIGEST_HELD_METRIC_KEYS)
+                # A read counter of zero says nothing; zero rows or zero ms does.
+                and not (name.endswith("reads") and metric == 0)
+            }
+        elif key == "statistics_io":
+            value = _drop_zero_counters(value)
+        slim[key] = value
+    return slim
 
 
 class AzureSqlMcpApplication:
@@ -537,9 +850,17 @@ class AzureSqlMcpApplication:
             incidents=self.incidents,
         )
         self.mcp._tool_manager = tool_manager
+        tool_manager.finish_response = self._finish_response
 
+        self.database_policy = load_database_policy_or_deny(
+            config.database_policy_file
+        )
         authenticator = AzureSqlAuthenticator(config)
-        pool = ConnectionPool(config, authenticator)
+        pool = ConnectionPool(
+            config,
+            authenticator,
+            application_intents=self.database_policy.application_intents(),
+        )
         executor = AzureSqlExecutor(config, authenticator, pool)
         validator = SafeSqlValidator()
 
@@ -577,9 +898,6 @@ class AzureSqlMcpApplication:
             self.admin_policy,
         )
         self.param_binding = ParameterBindingService(executor)
-        self.database_policy = load_database_policy_or_deny(
-            config.database_policy_file
-        )
         self.performance_store = (
             PerformanceStore(db_path=":memory:")
             if config.performance_state_dir == ":memory:"
@@ -655,6 +973,17 @@ class AzureSqlMcpApplication:
             self.recommendations,
         )
 
+        self.column_statistics = ColumnStatisticsService(executor)
+        self.memory_pressure = MemoryPressureService(executor)
+        self.elastic_pool = ElasticPoolService(executor)
+        self.columnstore_health = ColumnstoreHealthService(executor)
+        self.database_baseline = DatabaseBaselineService(executor, self.query_store)
+        self.capacity_assessment = CapacityAssessmentService(
+            executor, memory_pressure=self.memory_pressure
+        )
+        self.application_patterns = ApplicationPatternService(
+            query_store=self.query_store, sessions=self.sessions
+        )
         self.database_diagnosis = DatabaseDiagnosisService(
             resource_governance=self.resource_governance,
             wait_stats=self.wait_stats,
@@ -662,7 +991,20 @@ class AzureSqlMcpApplication:
             query_store=self.query_store,
             query_store_trends=self.query_store_trends,
             version_store=self.version_store,
+            memory_pressure=self.memory_pressure,
+            tempdb_memory=self.tempdb_memory,
+            elastic_pool=self.elastic_pool,
+            columnstore_health=self.columnstore_health,
+            plan_cache=self.plan_cache,
+            baseline=self.database_baseline,
+            executor=executor,
+            # One slow source must not hold the whole diagnosis.
+            source_timeout_seconds=config.query_timeout_seconds,
         )
+        # One per process: a restart cancels pending confirmations.
+        self.confirmation_tokens = ConfirmationTokens()
+        self._loki_settings = parse_loki_settings(os.environ)
+        self._history_tokens: dict[str, EntraTokenProvider] = {}
         self._register_tools()
         if self.learning_service is not None:
             self._register_learning_tools()
@@ -727,8 +1069,84 @@ class AzureSqlMcpApplication:
                 openWorldHint=False,
             ),
         )
-        async def check_runtime_status() -> ResponseType:
-            return self._format_response(self._runtime_status())
+        async def check_runtime_status(
+            include_tool_names: bool = Field(
+                default=False,
+                description=(
+                    "Also list every registered tool name. Default false: the "
+                    "counts per tool group are returned."
+                ),
+            ),
+        ) -> ResponseType:
+            return self._format_response(
+                self._runtime_status(include_tool_names=include_tool_names)
+            )
+
+        @self.mcp.tool(
+            description=(
+                "How to use one tool or topic well: when to call it, the arguments that "
+                "matter, how to read the result and what to call next. Without a name "
+                "it lists the guides. Reads no database."
+            ),
+            annotations=ToolAnnotations(
+                title="Get Tool Guide",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )
+        async def get_tool_guide(
+            name: str | None = Field(
+                default=None,
+                description="A tool name or a topic name. Omit it to list the guides.",
+            ),
+        ) -> ResponseType:
+            if name is None or not name.strip():
+                return self._format_response({"guides": list_tool_guides()})
+            return self._format_response(read_tool_guide(name))
+
+        @self.mcp.tool(
+            description=(
+                "Column statistics for tuning: the statistic that leads on each column, "
+                "its age and sample, skew, heavy hitters, value picks for parameter "
+                "cases (common, rare, NULL, boundary) and a bounded histogram. Values "
+                "of masked or classified columns are withheld in the database; no table "
+                "row is read."
+            ),
+            annotations=ToolAnnotations(
+                title="Get Column Statistics",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
+        async def get_column_statistics(
+            schema_name: str = Field(description="Schema of the table."),
+            table_name: str = Field(description="Table name."),
+            columns: list[str] | None = Field(
+                default=None,
+                description="Up to 20 columns. Default: the columns that lead a statistic.",
+            ),
+            include_histogram: bool = Field(default=True),
+            max_steps: int = Field(default=40, ge=1, le=200),
+            top_values: int = Field(default=5, ge=1, le=20),
+            database_name: str | None = Field(default=None),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "get_column_statistics",
+                database_name,
+                lambda db: self.column_statistics.get_column_statistics(
+                    db,
+                    schema_name,
+                    table_name,
+                    columns,
+                    include_histogram=include_histogram,
+                    max_steps=max_steps,
+                    top_values=top_values,
+                ),
+            )
 
         @self.mcp.tool(
             description="List the configured Azure SQL databases available to this MCP server.",
@@ -882,7 +1300,7 @@ class AzureSqlMcpApplication:
             return await self._run_tool(
                 "get_object_details",
                 database_name,
-                lambda resolved_database: self.introspection.get_object_details(
+                lambda resolved_database: self._get_object_details(
                     resolved_database,
                     schema_name,
                     object_name,
@@ -1141,22 +1559,31 @@ class AzureSqlMcpApplication:
             auto_bind_params: bool = Field(
                 default=False,
                 description=(
-                    "When true, automatically detects @param placeholders and binds "
-                    "them using column statistics or type-based fallback values."
+                    "When true, detects @param placeholders and binds each from the "
+                    "statistics of the column it is compared with. A parameter with "
+                    "no such statistic is reported as unbound, never given an "
+                    "invented value."
+                ),
+            ),
+            parameter_case: ParameterCaseInput | None = Field(
+                default=None,
+                description=(
+                    "Parameter values in the one shape every tool takes: {name, "
+                    "values, types, weight}. Values are passed as driver parameters "
+                    "and are not returned in the response."
                 ),
             ),
             parameter_values: dict[str, Any] | None = Field(
                 default=None,
                 description=(
-                    "Optional JSON parameter values keyed by name (for example "
-                    "{'CustomerId': 42}). Values are passed as driver parameters "
-                    "and are not returned in the response."
+                    "Short form of parameter_case.values, for example "
+                    "{'CustomerId': 42}. Do not pass both."
                 ),
             ),
             parameter_types: dict[str, str] | None = Field(
                 default=None,
                 description=(
-                    "Optional declared SQL types keyed by parameter name, for example "
+                    "Short form of parameter_case.types, for example "
                     "{'CustomerId': 'bigint'}. Supply exact types for faithful compilation."
                 ),
             ),
@@ -1170,9 +1597,12 @@ class AzureSqlMcpApplication:
             include_operator_summary: bool = Field(
                 default=False,
                 description=(
-                    "When true, adds summary.operators (every operator, about 1 KB "
-                    "each) and summary.top_operators_by_estimated_cost. The default "
-                    "response has plan_digest, which ranks operators by self time."
+                    "The full form. Default false: plan_digest and plan_findings carry "
+                    "the plan, and summary holds only what they do not (actual_metrics "
+                    "totals, compile metrics, warnings). True returns the whole "
+                    "summary: statements, parameters, per-statement metrics, "
+                    "summary.operators (about 1 KB each) and "
+                    "summary.top_operators_by_estimated_cost."
                 ),
             ),
             database_name: str | None = Field(
@@ -1185,13 +1615,14 @@ class AzureSqlMcpApplication:
                 await self._run_tool(
                     "explain_query",
                     database_name,
-                    lambda resolved_database: self._explain_query(
+                    lambda resolved_database: self._explain_query_one_shape(
                         resolved_database,
                         sql,
                         analyze,
                         hypothetical_indexes,
                         auto_bind_params,
                         include_raw_xml,
+                        parameter_case,
                         parameter_values,
                         parameter_types,
                         include_operator_summary,
@@ -1346,7 +1777,9 @@ class AzureSqlMcpApplication:
             description=(
                 "Benchmark a baseline query against a proposed rewrite using the same "
                 "typed read-only execution path, interleaved actual-plan samples, and "
-                "complete bounded snapshot equivalence."
+                "complete bounded snapshot equivalence. It opens its own performance "
+                "case and tuning session and returns their ids; where the database "
+                "policy permits no session it measures nothing and says why."
             ),
             annotations=ToolAnnotations(
                 title="Benchmark Query Rewrite",
@@ -1395,29 +1828,37 @@ class AzureSqlMcpApplication:
                     "cannot masquerade as a win. The workflow does not clear Azure SQL caches."
                 ),
             ),
+            detail: Literal["summary", "full"] = Field(
+                default="summary",
+                description=(
+                    "summary: the verdict and, per parameter case, the medians a "
+                    "decision needs. full: adds per-run values, spread, metric "
+                    "coverage, result digests and the whole preflight."
+                ),
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
             ),
         ) -> BenchmarkToolOutput:
+            async def benchmark(resolved_database: str) -> Any:
+                payload = await self._benchmark_query_rewrite(
+                    resolved_database,
+                    baseline_sql,
+                    rewrite_sql,
+                    analyze,
+                    auto_bind_params,
+                    include_raw_xml,
+                    runs,
+                    parameter_values,
+                    compare_order,
+                    parameter_types,
+                )
+                return payload if detail == "full" else _compact_benchmark_payload(payload)
+
             return cast(
                 BenchmarkToolOutput,
-                await self._run_tool(
-                    "benchmark_query_rewrite",
-                    database_name,
-                    lambda resolved_database: self._benchmark_query_rewrite(
-                        resolved_database,
-                        baseline_sql,
-                        rewrite_sql,
-                        analyze,
-                        auto_bind_params,
-                        include_raw_xml,
-                        runs,
-                        parameter_values,
-                        compare_order,
-                        parameter_types,
-                    ),
-                ),
+                await self._run_tool("benchmark_query_rewrite", database_name, benchmark),
             )
 
         @self.mcp.tool(
@@ -1550,14 +1991,19 @@ class AzureSqlMcpApplication:
                     "already stored on the performance case."
                 ),
             ),
+            detail: Literal["summary", "full"] = Field(
+                default="summary",
+                description=(
+                    "summary: the evidence id, the outcome and, per section, status, "
+                    "gaps and row counts. full: every collected row (can exceed 200 KB)."
+                ),
+            ),
             idempotency_key: str | None = Field(default=None),
             decision_id: str | None = Field(default=None),
             database_name: str | None = Field(default=None),
         ) -> ResponseType:
-            return await self._run_tool(
-                "collect_performance_evidence",
-                database_name,
-                lambda db: self._collect_performance_evidence(
+            async def collect(db: str) -> Any:
+                payload = await self._collect_performance_evidence(
                     db,
                     case_id,
                     sql,
@@ -1566,7 +2012,13 @@ class AzureSqlMcpApplication:
                     idempotency_key,
                     _parameter_case_payload(parameter_case),
                     query_store_query_id,
-                ),
+                )
+                return payload if detail == "full" else _compact_evidence_payload(payload)
+
+            return await self._run_tool(
+                "collect_performance_evidence",
+                database_name,
+                collect,
                 decision_id=decision_id,
             )
 
@@ -1595,9 +2047,10 @@ class AzureSqlMcpApplication:
 
         @self.mcp.tool(
             description=(
-                "Start a durable iterative tuning session. Defaults are 10 candidates, "
-                "80 executions, and 20 minutes; explicit multi-hour budgets are accepted "
-                "when the local database policy permits them."
+                "Start a durable iterative tuning session. A limit you leave out takes "
+                "its default (10 candidates, 120 executions or what the case's parameter "
+                "cases need, 20 minutes), capped by the local database policy. A limit "
+                "you state is checked as given: over the policy it is refused."
             ),
             annotations=ToolAnnotations(
                 title="Start Tuning Session",
@@ -1609,20 +2062,26 @@ class AzureSqlMcpApplication:
         )
         async def start_tuning_session(
             case_id: str = Field(description="Performance case identifier."),
-            max_candidates: int = Field(
-                default=10,
+            max_candidates: int | None = Field(
+                default=None,
                 ge=1,
-                description="Maximum candidate experiments for this session.",
+                description="Maximum candidate experiments. Default 10, capped by policy.",
             ),
-            execution_limit: int = Field(
-                default=80,
+            execution_limit: int | None = Field(
+                default=None,
                 ge=1,
-                description="Maximum measured query executions across the session.",
+                description=(
+                    "Maximum measured query executions across the session. Default 120, "
+                    "or more when the case's parameter cases need it; capped by policy."
+                ),
             ),
-            time_limit_minutes: int = Field(
-                default=20,
+            time_limit_minutes: int | None = Field(
+                default=None,
                 ge=1,
-                description="Wall-clock session budget in minutes; may span hours.",
+                description=(
+                    "Wall-clock session budget in minutes; may span hours. Default 20, "
+                    "capped by policy."
+                ),
             ),
             idempotency_key: str | None = Field(default=None),
             database_name: str | None = Field(default=None),
@@ -1645,8 +2104,9 @@ class AzureSqlMcpApplication:
 
         @self.mcp.tool(
             description=(
-                "Resume a durable tuning session with its complete redacted leaderboard, "
-                "evidence, events, and remaining budgets. Raw SQL is never persisted."
+                "Read a durable tuning session: status, remaining budgets and one compact "
+                "row per candidate (view=summary, the default). view=full adds every "
+                "evidence record and event. Raw SQL is never persisted."
             ),
             annotations=ToolAnnotations(
                 title="Get Tuning Session",
@@ -1658,6 +2118,13 @@ class AzureSqlMcpApplication:
         )
         async def get_tuning_session(
             session_id: str = Field(description="Tuning session identifier."),
+            view: Literal["summary", "full"] = Field(
+                default="summary",
+                description=(
+                    "summary: the latest result of each candidate. full: every "
+                    "evidence record and event; use it once, not after each benchmark."
+                ),
+            ),
             database_name: str | None = Field(default=None),
         ) -> SessionToolOutput:
             return cast(
@@ -1665,7 +2132,7 @@ class AzureSqlMcpApplication:
                 await self._run_tool(
                     "get_tuning_session",
                     database_name,
-                    lambda db: self._get_tuning_session(db, session_id),
+                    lambda db: self._get_tuning_session(db, session_id, view=view),
                 ),
             )
 
@@ -1739,7 +2206,17 @@ class AzureSqlMcpApplication:
             parameter_cases: list[ParameterCaseInput] | None = Field(
                 default=None,
                 description=(
-                    "Exact unchanged subset of the performance-case parameter inputs."
+                    "Exact unchanged subset of the performance-case parameter inputs. "
+                    "Omit it to use every case of the performance case, or name cases "
+                    "with [{\"name\": ...}] when the case was registered in this process."
+                ),
+            ),
+            cross_case: dict[str, str] | None = Field(
+                default=None,
+                description=(
+                    "Parameter-sensitivity test: {\"compile_case\": A, \"run_case\": B} "
+                    "compiles the plan with the values of case A and measures case B on "
+                    "it. A candidate that regresses there is rejected."
                 ),
             ),
             compare_order: bool | None = Field(
@@ -1766,28 +2243,41 @@ class AzureSqlMcpApplication:
                     "Finalists cannot disable full snapshot equivalence."
                 ),
             ),
+            detail: Literal["summary", "full"] = Field(
+                default="summary",
+                description=(
+                    "summary: the verdict and, per parameter case, the medians a "
+                    "decision needs. full: adds per-run values, spread, metric "
+                    "coverage, result digests and the whole preflight."
+                ),
+            ),
             idempotency_key: str | None = Field(default=None),
             decision_id: str | None = Field(default=None),
             database_name: str | None = Field(default=None),
         ) -> BenchmarkToolOutput:
+            async def benchmark(db: str) -> Any:
+                payload = await self.performance_workflows.benchmark_candidate(
+                    session_id,
+                    candidate_id,
+                    db,
+                    baseline_sql,
+                    candidate_sql,
+                    phase=phase,
+                    parameter_cases=_parameter_case_payloads(parameter_cases),
+                    compare_order=compare_order,
+                    runs_override=runs,
+                    prove_equivalence=prove_equivalence,
+                    idempotency_key=idempotency_key,
+                    cross_case=cross_case,
+                )
+                return payload if detail == "full" else _compact_benchmark_payload(payload)
+
             return cast(
                 BenchmarkToolOutput,
                 await self._run_tool(
                     "benchmark_tuning_candidate",
                     database_name,
-                    lambda db: self.performance_workflows.benchmark_candidate(
-                        session_id,
-                        candidate_id,
-                        db,
-                        baseline_sql,
-                        candidate_sql,
-                        phase=phase,
-                        parameter_cases=_parameter_case_payloads(parameter_cases),
-                        compare_order=compare_order,
-                        runs_override=runs,
-                        prove_equivalence=prove_equivalence,
-                        idempotency_key=idempotency_key,
-                    ),
+                    benchmark,
                     deadline_provider=lambda: self.tuning_sessions.get_session(
                         session_id
                     ).deadline_at_utc,
@@ -1841,32 +2331,44 @@ class AzureSqlMcpApplication:
             idempotency_key: str = Field(
                 description="Caller-generated key used to fence retries and cleanup."
             ),
+            detail: Literal["summary", "full"] = Field(
+                default="summary",
+                description=(
+                    "summary: the verdict and, per parameter case, the medians a "
+                    "decision needs. full: adds per-run values, spread, metric "
+                    "coverage, result digests and the whole preflight."
+                ),
+            ),
             decision_id: str | None = Field(default=None),
             database_name: str | None = Field(default=None),
         ) -> BenchmarkToolOutput:
+            async def benchmark(db: str) -> Any:
+                payload = await self._benchmark_index_candidate(
+                    db,
+                    session_id,
+                    candidate_id,
+                    sql,
+                    schema_name,
+                    table_name,
+                    key_columns,
+                    include_columns,
+                    filter_definition,
+                    is_unique,
+                    phase,
+                    online,
+                    compare_order,
+                    lease_minutes,
+                    idempotency_key,
+                    _parameter_case_payloads(parameter_cases),
+                )
+                return payload if detail == "full" else _compact_benchmark_payload(payload)
+
             return cast(
                 BenchmarkToolOutput,
                 await self._run_tool(
                     "benchmark_index_candidate",
                     database_name,
-                    lambda db: self._benchmark_index_candidate(
-                        db,
-                        session_id,
-                        candidate_id,
-                        sql,
-                        schema_name,
-                        table_name,
-                        key_columns,
-                        include_columns,
-                        filter_definition,
-                        is_unique,
-                        phase,
-                        online,
-                        compare_order,
-                        lease_minutes,
-                        idempotency_key,
-                        _parameter_case_payloads(parameter_cases),
-                    ),
+                    benchmark,
                     deadline_provider=lambda: self.tuning_sessions.get_session(
                         session_id
                     ).deadline_at_utc,
@@ -1902,6 +2404,17 @@ class AzureSqlMcpApplication:
                 max_length=STOPPING_REASON_MAX_LENGTH,
                 description="Why the optimizer stopped.",
             ),
+            logical_preconditions: list[dict[str, Any]] | None = Field(
+                default=None,
+                description=(
+                    "Data properties the selected rewrite depends on, each verified in "
+                    "the catalog before the session completes: {kind: not_null | "
+                    "unique_key | trusted_foreign_key | trusted_check, schema_name, "
+                    "table_name, ...}. A rewrite is deployment_ready only when its "
+                    "preconditions are catalog-verified. One the catalog refutes "
+                    "raises and leaves the session open."
+                ),
+            ),
             idempotency_key: str | None = Field(default=None),
             decision_id: str | None = Field(default=None),
             database_name: str | None = Field(default=None),
@@ -1918,6 +2431,7 @@ class AzureSqlMcpApplication:
                         stopping_reason,
                         idempotency_key,
                         selection_scope=selection_scope,
+                        logical_preconditions=logical_preconditions,
                     ),
                     decision_id=decision_id,
                 ),
@@ -1943,23 +2457,33 @@ class AzureSqlMcpApplication:
             parameter_case: ParameterCaseInput | None = Field(
                 default=None,
                 description=(
-                    "Required for parameterized SQL: one named case with exact values "
-                    "and declared SQL types for every parameter."
+                    "Required for parameterized SQL: one named case {name, values, "
+                    "types, weight} with exact values and declared SQL types for "
+                    "every parameter."
                 ),
+            ),
+            parameter_values: dict[str, Any] | None = Field(
+                default=None,
+                description="Short form of parameter_case.values. Do not pass both.",
+            ),
+            parameter_types: dict[str, str] | None = Field(
+                default=None,
+                description="Short form of parameter_case.types.",
             ),
             database_name: str | None = Field(default=None),
         ) -> ResponseType:
-            return await self._run_tool(
-                "compare_query_results",
-                database_name,
-                lambda db: self.performance_workflows.compare_query_results(
+            async def compare(db: str) -> dict[str, Any]:
+                return await self.performance_workflows.compare_query_results(
                     db,
                     baseline_sql,
                     candidate_sql,
                     compare_order=compare_order,
-                    parameter_case=_parameter_case_payload(parameter_case),
-                ),
-            )
+                    parameter_case=_one_parameter_shape(
+                        parameter_case, parameter_values, parameter_types
+                    ),
+                )
+
+            return await self._run_tool("compare_query_results", database_name, compare)
 
         @self.mcp.tool(
             description="Compare arbitrary redacted execution-plan summaries and sourced metrics.",
@@ -2117,7 +2641,12 @@ class AzureSqlMcpApplication:
 
         @self.mcp.tool(
             name="get_top_queries",
-            description="List top queries from Query Store.",
+            description=(
+                "List top queries from Query Store, one row per plan, per query or per "
+                "query_hash. Rows carry query_text_preview (300 characters), "
+                "query_text_id and query_hash; read the full text of one query with "
+                "analyze_query_plan(query_id=...)."
+            ),
             annotations=ToolAnnotations(
                 title="Get Top Queries",
                 readOnlyHint=True,
@@ -2140,6 +2669,24 @@ class AzureSqlMcpApplication:
             ),
             limit: int = Field(default=10, description="Maximum number of rows to return."),
             as_of_utc: str | None = Field(default=None, description=AS_OF_DESCRIPTION),
+            group_by: Literal["plan", "query", "query_hash"] = Field(
+                default="plan",
+                description=(
+                    "plan: one row per plan. query: one row per query_id. query_hash: "
+                    "folds the literal variants of one statement into one row; use it "
+                    "for ad hoc workloads, where each query_id is small and the family "
+                    "is large."
+                ),
+            ),
+            replica_role: Literal["primary", "secondary", "geo_secondary", "geo_ha_secondary"]
+            | None = Field(
+                default=None,
+                description=(
+                    "Only runs recorded on this replica role. Default: every replica "
+                    "blended. Needs Query Store for secondary replicas "
+                    "(check_capabilities.query_store_replicas)."
+                ),
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -2154,6 +2701,46 @@ class AzureSqlMcpApplication:
                     window_minutes,
                     limit,
                     as_of_utc=as_of_utc,
+                    group_by=group_by,
+                    replica_role=replica_role,
+                ),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Query Store runs that ended Aborted (timeout or client cancel) or with "
+                "an Exception, in the recent window against the baseline rate. rising "
+                "lists queries failing at least 2x their baseline rate with at least 3 "
+                "failed runs; top_failing_queries ranks by count. These runs are not in "
+                "the averages get_top_queries shows."
+            ),
+            annotations=ToolAnnotations(
+                title="Get Failed Executions",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=False,
+                openWorldHint=True,
+            ),
+        )
+        async def get_failed_executions(
+            recent_minutes: int = Field(default=1440, ge=1, le=43200),
+            baseline_minutes: int = Field(default=20160, ge=1, le=129600),
+            as_of_utc: str | None = Field(default=None, description=AS_OF_DESCRIPTION),
+            top: int = Field(default=20, ge=1, le=100),
+            replica_role: Literal["primary", "secondary", "geo_secondary", "geo_ha_secondary"]
+            | None = Field(default=None, description="Only runs recorded on this replica role."),
+            database_name: str | None = Field(default=None),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "get_failed_executions",
+                database_name,
+                lambda db: self.query_store_trends.failed_executions(
+                    db,
+                    recent_minutes=recent_minutes,
+                    baseline_minutes=baseline_minutes,
+                    as_of_utc=as_of_utc,
+                    top=top,
+                    replica_role=replica_role,
                 ),
             )
 
@@ -2556,15 +3143,27 @@ class AzureSqlMcpApplication:
                     "shape the advice."
                 ),
             ),
+            include_change_plan: bool = Field(
+                default=False,
+                description=(
+                    "Also return change_plan: the recommendations ordered into steps a "
+                    "client can schedule (create, change, observe, remove), with what "
+                    "was not planned and why. Every statement is inert text."
+                ),
+            ),
+            soak_days: int = Field(
+                default=7,
+                ge=1,
+                le=90,
+                description="Days to observe between the changes and the removals in change_plan.",
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
             ),
         ) -> ResponseType:
-            return await self._run_tool(
-                "review_workload_indexes",
-                database_name,
-                lambda db: self.workload_index_advisor.review(
+            async def review(db: str) -> dict[str, Any]:
+                report = await self.workload_index_advisor.review(
                     db,
                     schema_name=schema_name,
                     table_names=table_names,
@@ -2577,8 +3176,15 @@ class AzureSqlMcpApplication:
                     max_recommendations_per_table=max_recommendations_per_table,
                     include_existing_index_review=include_existing_index_review,
                     query_ids=query_ids,
-                ),
-            )
+                )
+                if include_change_plan:
+                    report = {
+                        **report,
+                        "change_plan": build_index_change_plan(report, soak_days=soak_days),
+                    }
+                return report
+
+            return await self._run_tool("review_workload_indexes", database_name, review)
 
         # --- Phase 9: Wait Statistics ---
 
@@ -2760,13 +3366,38 @@ class AzureSqlMcpApplication:
             ),
             include_graph_xml: bool = Field(
                 default=False,
-                description="Also return each raw deadlock graph XML (bounded).",
+                description="Also return each raw deadlock graph XML (bounded). source=live only.",
             ),
+            source: Literal[
+                "live", "auto", "extended_events", "log_analytics", "database_watcher", "loki"
+            ] = Field(
+                default="live",
+                description=(
+                    "live: the database's own ring buffers and Azure telemetry (minutes "
+                    "to hours). auto: every recorder mapped for this database, merged "
+                    "(days to weeks); a recorder name reads that one only."
+                ),
+            ),
+            window_minutes: int = Field(
+                default=1440,
+                ge=1,
+                le=129600,
+                description="How far back to read a recorder. Not used with source=live.",
+            ),
+            as_of_utc: str | None = Field(default=None, description=AS_OF_DESCRIPTION),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
             ),
         ) -> ResponseType:
+            if source != "live":
+                return await self._run_tool(
+                    "get_deadlock_history",
+                    database_name,
+                    lambda db: self._get_recorded_deadlocks(
+                        db, source, as_of_utc, window_minutes, max_events
+                    ),
+                )
             return await self._run_tool(
                 "get_deadlock_history",
                 database_name,
@@ -2775,6 +3406,227 @@ class AzureSqlMcpApplication:
                     max_events,
                     master_available=self._master_allowlisted(),
                     include_graph_xml=include_graph_xml,
+                ),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Read past events from the recorders a database already has: Extended "
+                "Events sessions, Log Analytics diagnostic settings, database watcher, "
+                "or Loki. category picks the question (blocking, timeout, deadlock, "
+                "error, wait_stats, resource_metric, long_statement, audit_statement); "
+                "category=coverage lists the recorders and what each covers. A window "
+                "no recorder covers is precondition or unavailable with remediation, "
+                "never empty."
+            ),
+            annotations=ToolAnnotations(
+                title="Get Diagnostic History",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
+        async def get_diagnostic_history(
+            category: Literal[
+                "coverage",
+                "blocking",
+                "timeout",
+                "deadlock",
+                "error",
+                "wait_stats",
+                "session_snapshot",
+                "resource_metric",
+                "long_statement",
+                "audit_statement",
+            ] = Field(description="The history question, or coverage."),
+            as_of_utc: str | None = Field(default=None, description=AS_OF_DESCRIPTION),
+            window_minutes: int = Field(default=60, ge=1, le=129600),
+            max_events: int = Field(default=200, ge=1, le=1000),
+            database_name: str | None = Field(default=None),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "get_diagnostic_history",
+                database_name,
+                lambda db: self._get_diagnostic_history(
+                    db, category, as_of_utc, window_minutes, max_events
+                ),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Memory grant pressure now: grant waiters, timeouts and forced grants "
+                "(cumulative since engine start), the largest memory clerks and the "
+                "security token cache size."
+            ),
+            annotations=ToolAnnotations(
+                title="Get Memory Pressure",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
+        async def get_memory_pressure(
+            top_clerks: int = Field(default=10, ge=1, le=50),
+            database_name: str | None = Field(default=None),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "get_memory_pressure",
+                database_name,
+                lambda db: self.memory_pressure.get_memory_pressure(db, top_clerks=top_clerks),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Elastic pool resource use over a recent window, to tell a pool limit "
+                "from a database limit. A single database returns not_supported."
+            ),
+            annotations=ToolAnnotations(
+                title="Get Elastic Pool Pressure",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
+        async def get_elastic_pool_pressure(
+            window_minutes: int = Field(default=30, ge=1, le=1440),
+            database_name: str | None = Field(default=None),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "get_elastic_pool_pressure",
+                database_name,
+                lambda db: self.elastic_pool.get_pool_pressure(db, window_minutes=window_minutes),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Columnstore row group health: open and closed delta stores, deleted "
+                "rows, undersized compressed row groups and why they were cut short. "
+                "Optionally one table."
+            ),
+            annotations=ToolAnnotations(
+                title="Get Columnstore Health",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
+        async def get_columnstore_health(
+            worst_n: int = Field(default=10, ge=1, le=100),
+            schema_name: str | None = Field(default=None),
+            table_name: str | None = Field(default=None),
+            database_name: str | None = Field(default=None),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "get_columnstore_health",
+                database_name,
+                lambda db: self.columnstore_health.get_columnstore_health(
+                    db, worst_n=worst_n, schema_name=schema_name, table_name=table_name
+                ),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Is this window normal for this database? scope=resources compares the "
+                "window's CPU, IO, log and memory with the band for the same hour "
+                "(needs master allowlisted for more than the last hour of history). "
+                "scope=queries compares queries with their own Query Store history. "
+                "Too little history returns insufficient_history with what is missing."
+            ),
+            annotations=ToolAnnotations(
+                title="Get Database Baseline",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
+        async def get_database_baseline(
+            scope: Literal["resources", "queries"] = Field(default="resources"),
+            window_minutes: int = Field(default=60, ge=1, le=10080),
+            as_of_utc: str | None = Field(
+                default=None, description=AS_OF_DESCRIPTION + " scope=resources only."
+            ),
+            query_ids: list[int] | None = Field(
+                default=None,
+                description="scope=queries: these query_ids. Default: the top queries by CPU.",
+            ),
+            top: int = Field(default=5, ge=1, le=20, description="scope=queries without query_ids."),
+            database_name: str | None = Field(default=None),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "get_database_baseline",
+                database_name,
+                lambda db: (
+                    self.database_baseline.query_bands(
+                        db, window_minutes=window_minutes, query_ids=query_ids, top=top
+                    )
+                    if scope == "queries"
+                    else self.database_baseline.resource_bands(
+                        db,
+                        window_minutes=window_minutes,
+                        as_of_utc=as_of_utc,
+                        master_available=self._master_allowlisted(),
+                    )
+                ),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Capacity verdict for the current service objective from up to 14 days "
+                "of resource history: under_provisioned, right_sized, over_provisioned "
+                "or insufficient_history, with the measurements behind it. Needs master "
+                "allowlisted. No price is read or stated."
+            ),
+            annotations=ToolAnnotations(
+                title="Assess Capacity",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
+        async def assess_capacity(
+            window_days: int = Field(default=14, ge=1, le=14),
+            database_name: str | None = Field(default=None),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "assess_capacity",
+                database_name,
+                lambda db: self.capacity_assessment.assess(
+                    db,
+                    window_days=window_days,
+                    master_available=self._master_allowlisted(),
+                ),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Find application patterns that no single query shows: row-by-row "
+                "callers (one statement shape run thousands of times) and chatty "
+                "callers, from Query Store and the running sessions."
+            ),
+            annotations=ToolAnnotations(
+                title="Analyze Application Patterns",
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
+        async def analyze_application_patterns(
+            window_minutes: int = Field(default=60, ge=1, le=10080),
+            top: int = Field(default=20, ge=1, le=100),
+            database_name: str | None = Field(default=None),
+        ) -> ResponseType:
+            return await self._run_tool(
+                "analyze_application_patterns",
+                database_name,
+                lambda db: self.application_patterns.analyze(
+                    db, window_minutes=window_minutes, top=top
                 ),
             )
 
@@ -3708,7 +4560,7 @@ class AzureSqlMcpApplication:
             return await self._run_tool(
                 "prepare_plan_action",
                 database_name,
-                lambda db: self.plan_actions.prepare(
+                lambda db: self._prepare_plan_action(
                     db,
                     session_id=session_id,
                     candidate_id=candidate_id,
@@ -3741,15 +4593,25 @@ class AzureSqlMcpApplication:
             authorization_reference: str = Field(
                 description="Explicit per-action authorization or change reference."
             ),
+            confirmation_token: str | None = Field(
+                default=None,
+                description=(
+                    "Required when the database policy environment is production or not "
+                    "a known non-production label: the single-use token "
+                    "prepare_plan_action returned as confirmation.confirmation_token. "
+                    "A person must pass it back; it expires after 15 minutes."
+                ),
+            ),
             database_name: str | None = Field(default=None),
         ) -> ResponseType:
             return await self._run_tool(
                 "apply_prepared_plan_action",
                 database_name,
-                lambda db: self.plan_actions.apply(
+                lambda db: self._apply_prepared_plan_action(
                     db,
                     intent_id,
-                    authorization_reference=authorization_reference,
+                    authorization_reference,
+                    confirmation_token,
                 ),
             )
 
@@ -3812,17 +4674,26 @@ class AzureSqlMcpApplication:
                 description="Explicit rollback authorization or change reference."
             ),
             reason: str = Field(default="explicit rollback requested"),
+            confirmation_token: str | None = Field(
+                default=None,
+                description=(
+                    "For a production database: call once without it to receive a "
+                    "single-use rollback token (nothing is changed), then call again "
+                    "with that token."
+                ),
+            ),
             decision_id: str | None = Field(default=None),
             database_name: str | None = Field(default=None),
         ) -> ResponseType:
             return await self._run_tool(
                 "rollback_plan_action",
                 database_name,
-                lambda db: self.plan_actions.rollback(
+                lambda db: self._rollback_plan_action(
                     db,
                     intent_id,
-                    authorization_reference=authorization_reference,
-                    reason=reason,
+                    authorization_reference,
+                    reason,
+                    confirmation_token,
                 ),
                 decision_id=decision_id,
             )
@@ -4641,13 +5512,18 @@ class AzureSqlMcpApplication:
                 default_factory=list,
                 description="Prior review identifiers supporting this decision.",
             ),
-            tactic: str = Field(description="Concise redacted tactic summary."),
-            expected_result: dict[str, Any] = Field(
-                description="Structured redacted prediction summary."
+            tactic: str = Field(
+                description=(
+                    "What was done, in words (index, join, table and the like are "
+                    "fine). No SQL statement: statement text carries literals."
+                )
+            ),
+            expected_result: dict[str, Any] | str = Field(
+                description="The prediction: one sentence, or a structured summary object."
             ),
             confidence: float = Field(ge=0.0, le=1.0),
-            uncertainty: dict[str, Any] = Field(
-                description="Structured redacted uncertainty summary."
+            uncertainty: dict[str, Any] | str = Field(
+                description="What could make it wrong: one sentence, or a structured summary object."
             ),
             evaluator_fingerprint: str = Field(
                 description="Redacted evaluator/model fingerprint."
@@ -4707,9 +5583,16 @@ class AzureSqlMcpApplication:
                 based_on_review_ids=tuple(based_on_review_ids),
                 query_fingerprint=query_fingerprint,
                 tactic=tactic,
-                expected_result=expected_result,
+                # A plain sentence is accepted and stored as {"summary": ...}.
+                expected_result=(
+                    {"summary": expected_result}
+                    if isinstance(expected_result, str)
+                    else expected_result
+                ),
                 confidence=confidence,
-                uncertainty=uncertainty,
+                uncertainty=(
+                    {"summary": uncertainty} if isinstance(uncertainty, str) else uncertainty
+                ),
                 applied_lesson_ids=tuple(applied_lesson_ids or ()),
                 evaluator_fingerprint=evaluator_fingerprint,
                 runtime_fingerprint=runtime_fingerprint,
@@ -5395,12 +6278,26 @@ class AzureSqlMcpApplication:
             decision_id=decision_id,
         )
 
-    def _runtime_status(self) -> dict[str, Any]:
+    def _finish_response(self, payload: Any) -> Any:
+        """Drop next_tools this server cannot call, then apply the data-detail level."""
+
+        manager = self.mcp._tool_manager
+        return apply_data_detail(
+            annotate_next_tools(payload, lambda name: manager.get_tool(name) is not None),
+            self.config.data_detail,
+        )
+
+    def _runtime_status(self, *, include_tool_names: bool = False) -> dict[str, Any]:
         tools = sorted(
             self.mcp._tool_manager.list_tools(),
             key=lambda tool: tool.name,
         )
         tool_names = [tool.name for tool in tools]
+        counts_by_group: dict[str, int] = {}
+        for name in tool_names:
+            group = TOOL_GROUPS.get(name)
+            label = group.value if group is not None else "ungrouped"
+            counts_by_group[label] = counts_by_group.get(label, 0) + 1
         schema_material = [
             {
                 "name": tool.name,
@@ -5459,7 +6356,10 @@ class AzureSqlMcpApplication:
             "transport": self.config.transport.mode.value,
             "tool_groups": sorted(group.value for group in self.config.tool_groups),
             "tool_count": len(tool_names),
-            "tool_names": tool_names,
+            "tool_counts_by_group": dict(sorted(counts_by_group.items())),
+            **({"tool_names": tool_names} if include_tool_names else {}),
+            "data_detail": self.config.data_detail,
+            "query_cancellation": self.executor.cancellation_report(),
             "contracts": contracts,
             "strict_argument_models": contracts["strict_arguments"],
             "mcp_tool_errors": contracts["mcp_errors"],
@@ -5538,9 +6438,48 @@ class AzureSqlMcpApplication:
             ),
         )
         policy = self.database_policy.policy_for(database_name)
+        probes = checks.get("checks")
+        query_store_probe = probes.get("query_store") if isinstance(probes, dict) else None
+        query_store_detail = (
+            query_store_probe.get("detail") if isinstance(query_store_probe, dict) else None
+        )
+        if isinstance(query_store_detail, dict) and query_store_detail.get("enabled"):
+            replicas = await self._optional_payload(
+                lambda: self.query_store.get_replica_dimension(database_name)
+            )
+        else:
+            # Query Store holds the replica dimension; with it off there is none to read.
+            replicas = {"ok": False, "error": "Query Store is not readable or is off."}
+        if isinstance(probes, dict):
+            # The probe proves the SHOWPLAN permission; its operators describe
+            # a catalog probe, not the caller's query.
+            compact_probes = dict(probes)
+            for name in ("estimated_plan", "actual_plan"):
+                probe = probes.get(name)
+                if isinstance(probe, dict) and isinstance(probe.get("detail"), dict):
+                    compact_probes[name] = {
+                        **probe,
+                        "detail": {
+                            "probe": "plan_returned",
+                            "statement_count": probe["detail"].get("statement_count"),
+                        },
+                    }
+            checks = {**checks, "checks": compact_probes}
+        summary = platform.get("data")
+        unsupported = (
+            unsupported_platform_reason(summary)
+            if isinstance(summary, dict) and "platform_supported" in summary
+            else None
+        )
         return {
             **checks,
+            **(
+                status_payload(ResultStatus.NOT_SUPPORTED, unsupported)
+                if unsupported
+                else {}
+            ),
             "azure_sql_database": platform,
+            "query_store_replicas": replicas,
             "mcp_contract": {
                 "contract_version": "2.6.3",
                 "performance_tuning": 1,
@@ -5646,6 +6585,281 @@ class AzureSqlMcpApplication:
             review, include_json=False, actionable_only=True
         )
         return payload
+
+    def _plan_intent_fingerprint(self, intent_id: str) -> str:
+        """What a confirmation token is bound to: the intent's evidence hash."""
+
+        intent = self.performance_store.get_plan_action_intent(intent_id)
+        evidence_hash = intent.metadata.get("evidence_hash")
+        if not isinstance(evidence_hash, str) or not evidence_hash:
+            raise PermissionError(
+                "The prepared intent has no evidence hash; prepare it again."
+            )
+        return evidence_hash
+
+    async def _prepare_plan_action(self, database_name: str, **request: Any) -> dict[str, Any]:
+        result = await self.plan_actions.prepare(database_name, **request)
+        policy = self.database_policy.policy_for(database_name)
+        intent = result.get("intent")
+        if (
+            result.get("prepared")
+            and isinstance(intent, Mapping)
+            and self.confirmation_tokens.required(policy)
+        ):
+            metadata = intent.get("metadata")
+            fingerprint = metadata.get("evidence_hash") if isinstance(metadata, Mapping) else None
+            if isinstance(fingerprint, str) and fingerprint:
+                result = {
+                    **result,
+                    "confirmation": {
+                        **self.confirmation_tokens.issue(
+                            intent_id=str(intent["intent_id"]),
+                            fingerprint=fingerprint,
+                            action="apply",
+                        ),
+                        "instruction": (
+                            "Show this token to the person who approves the change. "
+                            "apply_prepared_plan_action needs it as confirmation_token. "
+                            "Do not pass it back without that person's approval."
+                        ),
+                    },
+                }
+        return result
+
+    async def _apply_prepared_plan_action(
+        self,
+        database_name: str,
+        intent_id: str,
+        authorization_reference: str,
+        confirmation_token: str | None,
+    ) -> dict[str, Any]:
+        policy = self.database_policy.policy_for(database_name)
+        if self.confirmation_tokens.required(policy):
+            # Before any gate that changes state: a refused token changes nothing.
+            self.confirmation_tokens.verify(
+                intent_id=intent_id,
+                fingerprint=self._plan_intent_fingerprint(intent_id),
+                action="apply",
+                token=confirmation_token,
+            )
+        return await self.plan_actions.apply(
+            database_name,
+            intent_id,
+            authorization_reference=authorization_reference,
+        )
+
+    async def _rollback_plan_action(
+        self,
+        database_name: str,
+        intent_id: str,
+        authorization_reference: str,
+        reason: str,
+        confirmation_token: str | None,
+    ) -> dict[str, Any]:
+        policy = self.database_policy.policy_for(database_name)
+        if self.confirmation_tokens.required(policy):
+            fingerprint = self._plan_intent_fingerprint(intent_id)
+            if confirmation_token is None:
+                return {
+                    "confirmed": False,
+                    "rolled_back": False,
+                    "confirmation": {
+                        **self.confirmation_tokens.issue(
+                            intent_id=intent_id,
+                            fingerprint=fingerprint,
+                            action="rollback",
+                        ),
+                        "instruction": (
+                            "Nothing was changed. Show this token to the person who "
+                            "approves the rollback, then call rollback_plan_action "
+                            "again with it as confirmation_token."
+                        ),
+                    },
+                }
+            self.confirmation_tokens.verify(
+                intent_id=intent_id,
+                fingerprint=fingerprint,
+                action="rollback",
+                token=confirmation_token,
+            )
+        return await self.plan_actions.rollback(
+            database_name,
+            intent_id,
+            authorization_reference=authorization_reference,
+            reason=reason,
+        )
+
+    def _history_resolver(self, database_name: str) -> HistoryResolver:
+        """The recorders that can answer history questions for one database.
+
+        Extended Events needs no configuration. The others read the binding in
+        the policy's history_sources; without one they answer ``precondition``
+        with the policy text, never ``empty``.
+        """
+
+        bindings = self.database_policy.policy_for(database_name).history_sources
+
+        def tokens(scope: str) -> EntraTokenProvider:
+            if scope not in self._history_tokens:
+                self._history_tokens[scope] = EntraTokenProvider(
+                    credential_for(self.config), scope
+                )
+            return self._history_tokens[scope]
+
+        transport = UrllibTransport()
+        watcher = bindings.get("database_watcher")
+        settings = self._loki_settings
+        return HistoryResolver(
+            [
+                ExtendedEventsHistorySource(database_name, self.executor),
+                DatabaseWatcherHistorySource(
+                    database_name,
+                    watcher,
+                    transport=transport,
+                    tokens=tokens(watcher.token_scope if watcher is not None else KUSTO_SCOPE),
+                ),
+                LogAnalyticsHistorySource(
+                    database_name,
+                    bindings.get("log_analytics"),
+                    transport=transport,
+                    tokens=tokens(LOG_ANALYTICS_SCOPE),
+                ),
+                LokiHistorySource(
+                    database_name,
+                    settings,
+                    bindings.get("loki"),
+                    transport=UrllibTransport(ca_bundle=settings.ca_bundle),
+                    tokens=tokens(settings.token_scope),
+                ),
+                AzureMonitorMetricsSource(
+                    database_name,
+                    bindings.get("azure_monitor_metrics"),
+                    transport=transport,
+                    tokens=tokens(ARM_SCOPE),
+                ),
+            ],
+            database_name=database_name,
+        )
+
+    async def _get_recorded_deadlocks(
+        self,
+        database_name: str,
+        source: str,
+        as_of_utc: str | None,
+        window_minutes: int,
+        max_events: int,
+    ) -> dict[str, Any]:
+        resolver = self._history_resolver(database_name)
+        if source != "auto":
+            resolver = HistoryResolver(
+                [item for item in resolver._sources if item.name == source],
+                database_name=database_name,
+            )
+        start, end = window_bounds(window_minutes, as_of_utc)
+        result = await resolver.read(
+            HistoryCategory.DEADLOCK, TimeWindow(start, end), limit=max_events
+        )
+        return result.to_payload(
+            "mask_literals" if self.config.data_detail == "full" else self.config.data_detail
+        )
+
+    async def _get_diagnostic_history(
+        self,
+        database_name: str,
+        category: str,
+        as_of_utc: str | None,
+        window_minutes: int,
+        max_events: int,
+    ) -> dict[str, Any]:
+        resolver = self._history_resolver(database_name)
+        if category == "coverage":
+            sources = [description.to_dict() for description in await resolver.describe()]
+            return {
+                "database_name": database_name,
+                "sources": sources,
+                **status_payload(
+                    ResultStatus.OK,
+                    "Recorders and what each one covers. configured=false means no "
+                    "binding in the policy's history_sources (or, for Extended Events, "
+                    "no capture session).",
+                ),
+            }
+        start, end = window_bounds(window_minutes, as_of_utc)
+        result = await resolver.read(
+            HistoryCategory(category),
+            TimeWindow(start, end),
+            limit=max_events,
+        )
+        # At least mask_literals: history holds statements of other sessions.
+        return result.to_payload(
+            "mask_literals" if self.config.data_detail == "full" else self.config.data_detail
+        )
+
+    async def _get_object_details(
+        self,
+        database_name: str,
+        schema_name: str,
+        object_name: str,
+        object_type: str,
+    ) -> dict[str, Any]:
+        """Object details with what index advice needs: includes, filters, lengths."""
+
+        details = await self.introspection.get_object_details(
+            database_name, schema_name, object_name, object_type
+        )
+        columns = details.get("columns")
+        if isinstance(columns, list):
+            details = {
+                **details,
+                "columns": [
+                    {**column, **_declared_column_type(column)}
+                    if isinstance(column, Mapping)
+                    else column
+                    for column in columns
+                ],
+            }
+        indexes = details.get("indexes")
+        if not isinstance(indexes, list) or not indexes:
+            return details
+        try:
+            catalog = await collect_existing_indexes(
+                self.executor,
+                database_name,
+                schema_name=schema_name,
+                table_name=object_name,
+            )
+        except Exception as exc:
+            note_exception(exc, "server.object_index_detail")
+            return {
+                **details,
+                "index_detail_note": (
+                    "Included columns, filters and key directions could not be read; "
+                    "the index list shows key columns only."
+                ),
+            }
+        by_name = {index.name.casefold(): index for index in catalog if index.name}
+        enriched = []
+        for entry in indexes:
+            found = (
+                by_name.get(str(entry.get("index_name") or "").casefold())
+                if isinstance(entry, Mapping)
+                else None
+            )
+            if found is None:
+                enriched.append(entry)
+                continue
+            enriched.append(
+                {
+                    **entry,
+                    "is_unique": found.is_unique,
+                    "key_columns_ordered": [column.as_dict() for column in found.key_columns],
+                    "include_columns": list(found.include_columns),
+                    "filter_definition": found.filter_definition,
+                    "is_unique_constraint": found.is_unique_constraint,
+                    "is_disabled": found.is_disabled,
+                }
+            )
+        return {**details, "indexes": enriched}
 
     async def _start_performance_case(
         self,
@@ -5953,9 +7167,9 @@ class AzureSqlMcpApplication:
         self,
         database_name: str,
         case_id: str,
-        max_candidates: int,
-        execution_limit: int,
-        time_limit_minutes: int,
+        max_candidates: int | None,
+        execution_limit: int | None,
+        time_limit_minutes: int | None,
         idempotency_key: str | None,
     ) -> dict[str, Any]:
         case = self.performance_store.get_performance_case(case_id)
@@ -5979,8 +7193,10 @@ class AzureSqlMcpApplication:
         self,
         database_name: str,
         session_id: str,
+        *,
+        view: str = "summary",
     ) -> dict[str, Any]:
-        payload = self.performance_workflows.get_session(session_id)
+        payload = self.performance_workflows.get_session(session_id, view=view)
         session = payload["session"]
         if not database_fingerprint_matches(
             str(
@@ -6028,6 +7244,7 @@ class AzureSqlMcpApplication:
         stopping_reason: str,
         idempotency_key: str | None,
         selection_scope: SelectionScope = "proven",
+        logical_preconditions: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         session = self.tuning_sessions.get_session(session_id)
         case = self.performance_store.get_performance_case(session.performance_case_id)
@@ -6038,12 +7255,25 @@ class AzureSqlMcpApplication:
             allow_legacy=bool(self.config.legacy_state_server_binding),
         ):
             raise PermissionError("Tuning session belongs to another database.")
+        # Read the catalog before the session completes: a refuted
+        # precondition raises here and leaves the session open.
+        verification = (
+            await self.performance_workflows.verify_logical_preconditions(
+                database_name,
+                session_id,
+                selected_candidate_id,
+                logical_preconditions,
+            )
+            if selected_candidate_id is not None
+            else None
+        )
         return self.performance_workflows.finalize_session(
             session_id,
             selected_candidate_id=selected_candidate_id,
             selection_scope=selection_scope,
             stopping_reason=stopping_reason,
             idempotency_key=idempotency_key,
+            precondition_verification=verification,
         )
 
     async def _compare_plan_summaries(
@@ -6800,8 +8030,12 @@ class AzureSqlMcpApplication:
         if self.config.profile != McpProfile.SANDBOX:
             raise PermissionError("Index benchmarking requires the sandbox MCP profile.")
         policy = self.database_policy.require(database_name)
-        if policy.environment.casefold() in {"production", "prod", "live"}:
-            raise PermissionError("Temporary indexes are prohibited in production policy entries.")
+        if not policy.is_non_production:
+            raise PermissionError(
+                "Temporary indexes need a policy environment that is a known "
+                "non-production label (test, dev, sandbox, staging, bench, ...); "
+                f"this entry is classed {policy.environment_class}."
+            )
         if not policy.allow_test_indexes:
             raise PermissionError("Database policy does not permit temporary indexes.")
         if phase not in {"screening", "finalist"}:
@@ -6821,25 +8055,29 @@ class AzureSqlMcpApplication:
                 f"{exc} Retrieve committed results with get_tuning_session; "
                 "terminal sessions cannot benchmark or replay."
             ) from None
-        cleanup = await self._cleanup_expired_index_leases()
+        normalized_sql = self.validator.validate_read_only(sql).execution_sql
+        compare_order = effective_compare_order(normalized_sql, compare_order)
+        candidate = self.tuning_sessions.get_candidate(candidate_id)
+        case = self.performance_store.get_performance_case(session.performance_case_id)
+        # Only this database's leases gate its work: an unresolved cleanup in
+        # another database must not stop index tests here.
+        cleanup = await self._cleanup_expired_index_leases(
+            database_fingerprint=case.database_fingerprint
+        )
         if cleanup["cleanup_required"]:
             return {
                 "session_id": session_id,
                 "candidate_id": candidate_id,
                 "classification": "cleanup_required",
                 "reason": (
-                    "Expired temporary-index cleanup is unresolved; no new DDL "
-                    "or benchmark query was dispatched."
+                    "Expired temporary-index cleanup is unresolved in this database; "
+                    "no new DDL or benchmark query was dispatched."
                 ),
                 "failure_code": "expired_index_cleanup_required",
                 "executions": 0,
                 "cleanup": cleanup,
                 "session_continues": False,
             }
-        normalized_sql = self.validator.validate_read_only(sql).execution_sql
-        compare_order = effective_compare_order(normalized_sql, compare_order)
-        candidate = self.tuning_sessions.get_candidate(candidate_id)
-        case = self.performance_store.get_performance_case(session.performance_case_id)
         if candidate.session_id != session_id:
             raise ValueError("Candidate does not belong to the tuning session.")
         legacy_combined_lineage = bool(
@@ -6914,7 +8152,11 @@ class AzureSqlMcpApplication:
         performance_only_scope = (
             not direct_snapshot_supported or parent_equivalence_unproven
         )
-        cases = self.performance_workflows._normalize_parameter_cases(parameter_cases)
+        # Cases may be left out or named: the values this process registered are used.
+        cases = self.performance_workflows._resolve_parameter_cases(
+            case.case_id,
+            parameter_cases,
+        )
         if len(cases) > session.parameter_case_limit:
             raise ValueError(
                 f"parameter_cases exceeds the session limit of {session.parameter_case_limit}."
@@ -7037,9 +8279,17 @@ class AzureSqlMcpApplication:
                     parameter_case
                 ),
                 "weight": parameter_case["weight"],
+                # The marker gives the benchmark its own plan cache and Query
+                # Store entry: it never reuses or replaces the application's plan.
                 "execution_contract": await self.performance_workflows._bind_case(
                     database_name,
-                    normalized_sql,
+                    mark_benchmark_sql(
+                        normalized_sql,
+                        session_id,
+                        "index",
+                        candidate_id,
+                        str(parameter_case["name"]),
+                    ),
                     parameter_case,
                 ),
             }
@@ -7062,7 +8312,7 @@ class AzureSqlMcpApplication:
         index_name = f"{TEST_INDEX_PREFIX}{provisional_index.definition_fingerprint[:16]}"
         index_candidate = replace(provisional_index, index_name=index_name)
         object_fingerprint = index_candidate.definition_fingerprint
-        index_ddl = build_index_candidate_statement(index_candidate, online=online)
+        index_ddl = build_test_index_statement(index_candidate, online=online)
         rollback_ddl = f"DROP INDEX [{index_name}] ON [{schema}].[{table}];"
         self._require_tuning_session_time(session_id)
         self.performance_store.bind_index_benchmark_request(
@@ -7166,6 +8416,37 @@ class AzureSqlMcpApplication:
                 ),
                 "failure_code": "name_conflict",
                 "existing_index": name_conflict.as_dict(),
+                "executions": 0,
+                "index_ddl": index_ddl,
+                "rollback_ddl": rollback_ddl,
+                "session_continues": True,
+            }
+        leftover_test_indexes = sorted(
+            existing.name
+            for existing in existing_indexes
+            if existing.schema == schema
+            and existing.table == table
+            and existing.name != index_name
+            and is_test_index_name(existing.name)
+        )
+        if leftover_test_indexes:
+            # No lease of this database is open here, so these belong to a lost
+            # run. They change the baseline plan; measuring against them is wrong.
+            # Nothing durable is recorded: the same request works after cleanup.
+            return {
+                "session_id": session_id,
+                "candidate_id": candidate_id,
+                "classification": "cleanup_required",
+                "reason": (
+                    "The target table holds test indexes that no open lease owns; "
+                    "no DDL or benchmark query was dispatched."
+                ),
+                "failure_code": "leftover_test_index",
+                "leftover_test_indexes": leftover_test_indexes,
+                "remediation": "\n".join(
+                    f"DROP INDEX [{name}] ON [{schema}].[{table}];"
+                    for name in leftover_test_indexes
+                ),
                 "executions": 0,
                 "index_ddl": index_ddl,
                 "rollback_ddl": rollback_ddl,
@@ -7366,11 +8647,15 @@ class AzureSqlMcpApplication:
                 "baseline_before_plan": {},
                 "baseline_after_plan": {},
                 "candidate_plan": {},
+                "baseline_before_profile": None,
+                "baseline_after_profile": None,
+                "candidate_profile": None,
                 "plan_use": [],
             }
             for bound_case in bound_cases
         ]
         cleanup_error: str | None = None
+        create_failure: dict[str, Any] | None = None
         create_attempted = False
         ownership_recorded = False
         # True once an unverified create was dropped or recorded through its owner
@@ -7580,6 +8865,7 @@ class AzureSqlMcpApplication:
                         )
                     )
                     measurement["baseline_before_plan"] = profiled.plan.summary
+                    measurement["baseline_before_profile"] = profiled
             self._require_tuning_session_time(session_id)
             if lease is None:
                 raise RuntimeError("Temporary index lease was not created.")
@@ -7596,21 +8882,29 @@ class AzureSqlMcpApplication:
                 expected_version=lease["version"],
             )
             create_attempted = True
-            await self._create_test_index(
-                database_name,
-                schema,
-                table,
-                index_name,
-                key_columns,
-                include_columns,
-                online,
-                dry_run=False,
-                workflow_managed=True,
-                filter_definition=filter_definition,
-                is_unique=is_unique,
-                idempotency_key=create_operation_key,
-                ownership_proof=lease_owner,
-            )
+            try:
+                await self._create_test_index(
+                    database_name,
+                    schema,
+                    table,
+                    index_name,
+                    key_columns,
+                    include_columns,
+                    online,
+                    dry_run=False,
+                    workflow_managed=True,
+                    filter_definition=filter_definition,
+                    is_unique=is_unique,
+                    idempotency_key=create_operation_key,
+                    ownership_proof=lease_owner,
+                )
+            except Exception as create_error:
+                create_failure = classify_create_index_failure(create_error)
+                if create_failure["outcome"] == "definite_rollback":
+                    # The engine reported the error and XACT_ABORT rolled the
+                    # CREATE transaction back: no index exists, nothing to clean.
+                    create_outcome_settled = True
+                raise
             observed_indexes = await collect_existing_indexes(
                 self.executor,
                 database_name,
@@ -7659,6 +8953,7 @@ class AzureSqlMcpApplication:
                         )
                     )
                     measurement["candidate_plan"] = profiled.plan.summary
+                    measurement["candidate_profile"] = profiled
                     measurement["plan_use"].append(
                         verify_plan_uses_index(
                             profiled.plan.raw_xml,
@@ -7862,6 +9157,7 @@ class AzureSqlMcpApplication:
                             )
                         )
                         measurement["baseline_after_plan"] = profiled.plan.summary
+                        measurement["baseline_after_profile"] = profiled
             except asyncio.CancelledError:
                 benchmark_error = "timeout"
                 benchmark_failure_diagnostic = {
@@ -7942,13 +9238,13 @@ class AzureSqlMcpApplication:
                     ]
                 ),
                 "candidate": aggregate_samples(measurement["candidate_samples"]),
-                "plan_delta": compare_plan_summaries_payload(
-                    measurement["baseline_before_plan"],
-                    measurement["candidate_plan"],
+                "plan_delta": plan_delta_from_profiles(
+                    measurement["baseline_before_profile"],
+                    measurement["candidate_profile"],
                 ),
-                "baseline_after_plan_delta": compare_plan_summaries_payload(
-                    measurement["baseline_before_plan"],
-                    measurement["baseline_after_plan"],
+                "baseline_after_plan_delta": plan_delta_from_profiles(
+                    measurement["baseline_before_profile"],
+                    measurement["baseline_after_profile"],
                 ),
                 "plan_use": measurement["plan_use"],
             }
@@ -8142,6 +9438,11 @@ class AzureSqlMcpApplication:
         }
         if benchmark_failure_diagnostic is not None:
             result["failure_diagnostic"] = benchmark_failure_diagnostic
+        if create_failure is not None:
+            result["create_failure"] = create_failure
+        # A forced plan or Query Store hint on the application's query does
+        # not apply to the marked benchmark text.
+        result["plan_controls_not_applied"] = True
         if cancelled:
             raise asyncio.CancelledError
         return result
@@ -8346,7 +9647,11 @@ class AzureSqlMcpApplication:
                 )
             else:
                 logger.info("Tool completed", extra=log_extra)
-            return self._format_response(add_tool_headline(tool_name, payload))
+            payload = add_tool_headline(tool_name, payload)
+            if isinstance(payload, dict) and "headline" in payload:
+                # The verdict and its numbers first; the detail follows.
+                payload = {"headline": payload["headline"], **payload}
+            return self._format_response(payload)
         except ToolError:
             raise
         except asyncio.TimeoutError:
@@ -8379,9 +9684,35 @@ class AzureSqlMcpApplication:
                     "error": sanitized_error,
                 },
             )
+            # The log stays fully redacted; the caller may see the identifier
+            # an engine compile error names, never a row value.
+            client_error = sanitize_error_message(str(exc), keep_identifiers=True)
+            not_found = not_found_details(exc)
+            session_failure = session_failure_diagnostic(exc)
+            if not_found is not None:
+                self._raise_tool_error(
+                    "not_found",
+                    not_found["message"],
+                    details={
+                        "failure_diagnostic": {
+                            "diagnostic_code": "not_found",
+                            "id_kind": not_found["id_kind"],
+                            "retryable": False,
+                        }
+                    },
+                )
+            if session_failure is not None:
+                self._raise_tool_error(
+                    session_failure["diagnostic_code"],
+                    client_error,
+                    details={
+                        "failure_diagnostic": {**failure_diagnostic, "retryable": False},
+                        "next_action": session_failure["message"],
+                    },
+                )
             self._raise_tool_error(
                 "tool_error",
-                sanitized_error,
+                client_error,
                 details={"failure_diagnostic": failure_diagnostic},
             )
 
@@ -8502,6 +9833,7 @@ class AzureSqlMcpApplication:
             """,
             params=[schema_name, table_name],
             max_rows=2,
+            sql_origin="server_built",
         )
         if len(rows) != 1:
             raise ValueError(
@@ -8592,7 +9924,7 @@ class AzureSqlMcpApplication:
             )
             self._raise_tool_error(
                 "tool_error",
-                sanitized_error,
+                sanitize_error_message(str(exc), keep_identifiers=True),
                 details={"failure_diagnostic": _tool_failure_diagnostic(exc)},
             )
 
@@ -8601,7 +9933,11 @@ class AzureSqlMcpApplication:
         # Fetch at most row_limit + 1 rows to detect truncation without loading entire result
         fetch_limit = self.config.row_limit + 1
         rows = await self.executor.fetch_all(
-            database_name, validated.execution_sql, max_rows=fetch_limit,
+            database_name,
+            validated.execution_sql,
+            max_rows=fetch_limit,
+            sql_origin="caller_supplied",
+            read_only_envelope=True,
         )
         return self._truncate_rows(
             {
@@ -8871,7 +10207,9 @@ class AzureSqlMcpApplication:
             is_unique=is_unique,
             index_name=index,
         )
-        sql = build_index_candidate_statement(candidate, online=online)
+        # Online builds wait at low priority and abort themselves; an offline
+        # build is refused (no policy field allows one).
+        sql = build_test_index_statement(candidate, online=online)
         rollback_sql = f"DROP INDEX [{index}] ON [{schema}].[{table}];"
         if workflow_managed and not idempotency_key:
             raise ValueError("Workflow-managed index creation requires an idempotency key.")
@@ -9020,8 +10358,12 @@ class AzureSqlMcpApplication:
         policy = self.database_policy.require(database_name)
         if not policy.allow_test_indexes:
             raise PermissionError("Database policy does not permit temporary indexes.")
-        if policy.environment.casefold() in {"production", "prod", "live"}:
-            raise PermissionError("Temporary indexes are prohibited in production.")
+        if not policy.is_non_production:
+            raise PermissionError(
+                "Temporary indexes need a policy environment that is a known "
+                "non-production label; this entry is classed "
+                f"{policy.environment_class}."
+            )
 
     @staticmethod
     def _build_guarded_index_drop_sql(
@@ -9038,7 +10380,11 @@ class AzureSqlMcpApplication:
             "    IF @object_id IS NULL\n"
             "        THROW 50002, 'Temporary index target table is missing.', 1;\n"
             "    DECLARE @table_lock_probe bit;\n"
-            f"    SELECT TOP (1) @table_lock_probe = 1 FROM [{schema}].[{table}] WITH (TABLOCK, HOLDLOCK);\n"
+            + "".join(
+                f"    {line}\n"
+                for line in bounded_table_lock_probe_sql(schema, table).splitlines()
+            )
+            + ""
             "    DECLARE @owner_marker nvarchar(4000) = ?;\n"
             "    DECLARE @expected_definition nvarchar(4000) = ?;\n"
             "    DECLARE @expected_index_id int = ?;\n"
@@ -9188,7 +10534,8 @@ class AzureSqlMcpApplication:
             None,
             parameter_case,
         )
-        session = self.performance_workflows.start_session(
+        # A read-only policy is an answer, not an error: the evidence stands.
+        session = self.performance_workflows.start_session_if_permitted(
             performance_case.case_id,
             database_name,
         )
@@ -9206,6 +10553,12 @@ class AzureSqlMcpApplication:
             "next_step": (
                 "Produce concrete rewrites, add each with add_tuning_candidate, then "
                 "benchmark them. Missing plan evidence does not block static rewrites."
+                if session["session_id"] is not None
+                else (
+                    "No tuning session was opened: the local database policy does not "
+                    "permit one here. Use the evidence for static advice, or benchmark "
+                    "on a database whose policy allows it."
+                )
             ),
             "raw_xml_included": False,
             "raw_xml_note": (
@@ -9259,10 +10612,12 @@ class AzureSqlMcpApplication:
                 "compatibility_tool": "benchmark_query_rewrite",
             },
         )
-        session = self.performance_workflows.start_session(
+        session = self.performance_workflows.start_session_if_permitted(
             performance_case.case_id,
             database_name,
         )
+        if session["session_id"] is None:
+            raise PermissionError(session["policy_reason"])
         candidate = self.performance_workflows.add_candidate(
             session["session_id"],
             rewrite_sql,
@@ -9409,9 +10764,11 @@ class AzureSqlMcpApplication:
             if isinstance(first, dict):
                 query_hash = first.get("query_hash")
 
+        # The plan's hash finds a parameterized statement that text alone misses.
         identity = await self.query_store.resolve_query_identity(
             database_name,
             original_sql,
+            query_hash=query_hash if isinstance(query_hash, str) and query_hash else None,
         )
         if identity.get("status") != "resolved":
             return {
@@ -9464,10 +10821,21 @@ class AzureSqlMcpApplication:
             str(name).lstrip("@").casefold()
             for name in (parameter_values or {})
         }
+        unreferenced = sorted(supplied_names - detected_names)
+        if unreferenced:
+            # Parameter names are identifiers, not data.
+            raise ValueError(
+                "parameter_values names parameters that are not referenced in the SQL: "
+                + ", ".join(f"@{name}" for name in unreferenced)
+                + ". Remove them, or check the spelling against the SQL."
+            )
         if detected and not auto_bind_params and supplied_names != detected_names:
+            missing = sorted(detected_names - supplied_names)
             raise ValueError(
                 "Parameterized execution with auto_bind_params=false requires "
-                "one explicit value for every query parameter."
+                "one explicit value for every query parameter. Missing: "
+                + ", ".join(f"@{name}" for name in missing)
+                + "."
             )
         if not detected and not parameter_values and not parameter_types:
             return None, None
@@ -9586,7 +10954,21 @@ class AzureSqlMcpApplication:
                     **status_payload(ResultStatus.EMPTY, f"No operator with node_id {node_id} in this plan."),
                 }
             return {**base, "node": node, **status_payload(ResultStatus.OK, "Operator detail returned.")}
-        result = {**base, **analyze_plan(found.xml)}
+        pin = (
+            found.source.get("query_plan_hash")
+            if found.source.get("source") == "last_actual_plan"
+            else None
+        )
+        reading = await self._read_plan(
+            database_name,
+            found.xml,
+            include_digest=include_digest,
+            # A running request's counts are partial.
+            in_flight=found.source.get("source") == "live_session",
+            pin_plan_hash=pin,
+        )
+        parsed = reading["parsed"]
+        result = {**base, **reading["analysis"]}
         # A cached batch plan holds sibling statements; tag which findings belong
         # to the statement that was asked about.
         requested = found.source.get("requested_statement_indexes")
@@ -9596,25 +10978,125 @@ class AzureSqlMcpApplication:
                     finding.get("statement_index") in requested
                 )
         if include_digest:
-            pin = (
-                found.source.get("query_plan_hash")
-                if found.source.get("source") == "last_actual_plan"
-                else None
-            )
-            result["digest"] = build_plan_digest(found.xml, pin_plan_hash=pin)
+            result["digest"] = reading["digest"]
         if found.source.get("source") == "query_store" and found.source.get("plan_id"):
             result["query_store_runtime"] = await self.plan_sources.query_store_runtime(
-                database_name, int(found.source["plan_id"]), found.xml
+                database_name,
+                int(found.source["plan_id"]),
+                parsed if parsed is not None else found.xml,
             )
         if result.get("parse_error"):
             result.update(
                 status_payload(ResultStatus.UNAVAILABLE, f"The plan could not be analysed: {result['parse_error']}.")
+            )
+        elif parsed is not None and not any(statement.nodes for statement in parsed.statements):
+            result.update(
+                status_payload(
+                    ResultStatus.EMPTY,
+                    "The plan has no operators (a SET, DECLARE or other statement "
+                    "without a query plan): there is nothing for a rule to judge. "
+                    "This is not a clean bill for a query.",
+                )
             )
         elif include_digest:
             result.update(
                 status_payload(ResultStatus.OK, "Digest and findings returned; no findings means no rule fired.")
             )
         return result
+
+    async def _partition_columns_for_plan(
+        self,
+        database_name: str,
+        parsed: ParsedPlan,
+    ) -> dict[str, str]:
+        """The partitioning column of each partitioned table the plan reads.
+
+        The plan does not name it; without it the partition rule can only say
+        "if". A refused or failed catalog read leaves the rule at that lead.
+        """
+
+        tables: dict[tuple[str, str], None] = {}
+        access_summary = parse_plan_access(parsed)
+        for statement, access_statement in zip(parsed.statements, access_summary.statements):
+            nodes = {node.node_id: node for node in statement.nodes}
+            for access in access_statement.accesses:
+                node = nodes.get(access.node_id)
+                if node is not None and partition_access(node) is not None:
+                    tables[(access.schema, access.table)] = None
+        columns: dict[str, str] = {}
+        for schema, table in list(tables)[:MAX_PARTITION_COLUMN_LOOKUPS]:
+            try:
+                rows = await self.executor.fetch_all(
+                    database_name,
+                    _PARTITION_COLUMN_SQL,
+                    params=[schema, table],
+                    max_rows=1,
+                    sql_origin="server_built",
+                )
+            except Exception as exc:
+                note_exception(exc, "server.partition_columns")
+                continue
+            if rows and rows[0].get("partitioning_column"):
+                columns[f"{schema}.{table}"] = str(rows[0]["partitioning_column"])
+        return columns
+
+    async def _read_plan(
+        self,
+        database_name: str,
+        plan_xml: str,
+        **options: Any,
+    ) -> dict[str, Any]:
+        """Parse a showplan once, then run the rules and the digest on that parse."""
+
+        def parse() -> ParsedPlan | None:
+            try:
+                return parse_plan(plan_xml)
+            except PlanParseError:
+                return None
+
+        large = len(plan_xml) > LARGE_PLAN_XML_CHARS
+        parsed = await asyncio.to_thread(parse) if large else parse()
+        partition_columns = (
+            await self._partition_columns_for_plan(database_name, parsed)
+            if parsed is not None
+            else {}
+        )
+
+        def read() -> dict[str, Any]:
+            # read_plan takes the ParsedPlan as it is (parse_plan returns it unchanged).
+            return read_plan(
+                cast(str, parsed) if parsed is not None else plan_xml,
+                partition_columns=partition_columns,
+                **options,
+            )
+
+        return await asyncio.to_thread(read) if large else read()
+
+    async def _explain_query_one_shape(
+        self,
+        database_name: str,
+        sql: str,
+        analyze: bool,
+        hypothetical_indexes: list[dict[str, Any]] | None,
+        auto_bind_params: bool,
+        include_raw_xml: bool,
+        parameter_case: ParameterCaseInput | None,
+        parameter_values: dict[str, Any] | None,
+        parameter_types: dict[str, str] | None,
+        include_operator_summary: bool,
+    ) -> dict[str, Any]:
+        case = _one_parameter_shape(parameter_case, parameter_values, parameter_types)
+        return await self._explain_query(
+            database_name,
+            sql,
+            analyze,
+            hypothetical_indexes,
+            auto_bind_params,
+            include_raw_xml,
+            case["values"] if case is not None else None,
+            (case["types"] or None) if case is not None else None,
+            include_operator_summary,
+        )
 
     async def _explain_query(
         self,
@@ -9663,15 +11145,57 @@ class AzureSqlMcpApplication:
                 hypothetical_indexes=hypothetical_indexes,
             )
         result = self._artifact_to_dict(artifact, include_raw_xml=include_raw_xml)
+        reading = (
+            await self._read_plan(database_name, artifact.raw_xml, top_n=5, tree_budget=40)
+            if artifact.raw_xml
+            else None
+        )
         # The response only: in-process readers use artifact.summary in full.
-        result["summary"] = compact_plan_summary(
+        summary = compact_plan_summary(
             result["summary"], include_operator_summary=include_operator_summary
         )
+        actual_metrics = summary.get("actual_metrics")
+        if artifact.analyze and isinstance(actual_metrics, Mapping):
+            actual_metrics = dict(actual_metrics)
+            if actual_metrics.get("actual_logical_reads") is None:
+                statistics_io = summary.get("statistics_io")
+                io_totals = (
+                    statistics_io.get("query_totals")
+                    if isinstance(statistics_io, Mapping)
+                    else None
+                )
+                plan_reads = _plan_logical_reads(reading["parsed"]) if reading else None
+                if isinstance(io_totals, Mapping) and io_totals.get("logical_reads") is not None:
+                    actual_metrics["actual_logical_reads"] = io_totals["logical_reads"]
+                    actual_metrics["read_metric_source"] = "statistics_io_table_messages"
+                elif plan_reads is not None:
+                    # The sum over the plan's operators; worktable reads are not in it.
+                    actual_metrics["actual_logical_reads"] = plan_reads
+                    actual_metrics["read_metric_source"] = "showplan_operator_runtime_counters"
+            summary = {**summary, "actual_metrics": actual_metrics}
+            server_elapsed = actual_metrics.get("actual_elapsed_ms")
+            provenance = dict(result.get("metric_provenance") or {})
+            if server_elapsed is not None:
+                result["server_elapsed_ms"] = server_elapsed
+                result["server_cpu_ms"] = actual_metrics.get("actual_cpu_ms")
+                provenance["server_elapsed_ms"] = str(
+                    actual_metrics.get("query_metric_source") or "showplan_query_time_stats"
+                )
+            if provenance.get("execution_ms") == "client_wall_clock":
+                provenance["note"] = (
+                    "execution_ms is the client wall clock: it includes the network "
+                    "round trip and the row fetch. server_elapsed_ms is what the engine "
+                    "measured; judge the query by it."
+                )
+            result["metric_provenance"] = provenance
+        if not include_operator_summary:
+            summary = _slim_explain_summary(summary, digest_present=reading is not None)
+        result["summary"] = summary
         if binding_info is not None:
             result["parameter_binding"] = binding_info
-        if artifact.raw_xml:
-            result["plan_findings"] = _compact_plan_findings(analyze_plan(artifact.raw_xml))
-            result["plan_digest"] = build_plan_digest(artifact.raw_xml, top_n=5, tree_budget=40)
+        if reading is not None:
+            result["plan_findings"] = _compact_plan_findings(reading["analysis"])
+            result["plan_digest"] = reading["digest"]
             basis = artifact.summary.get("estimated_plan_basis")
             if basis:
                 _label_unknown_parameters(result["plan_digest"], basis["unknown_parameters"])
@@ -9806,6 +11330,8 @@ class AzureSqlMcpApplication:
         limit: int,
         *,
         as_of_utc: str | None = None,
+        group_by: str = "plan",
+        replica_role: str | None = None,
     ) -> dict[str, Any]:
         if limit <= 0:
             raise ValueError("limit must be greater than 0.")
@@ -9820,11 +11346,15 @@ class AzureSqlMcpApplication:
             window_minutes,
             limit,
             window_end=window_end,
+            group_by=group_by,
+            replica_role=replica_role,
         )
         payload: dict[str, Any] = {
             "database_name": database_name,
             "query_store_status": status,
             "sort_by": sort_by,
+            "group_by": group_by,
+            "replica_role": replica_role or "all",
             "window_minutes": window_minutes,
             "rows": rows,
         }
@@ -10018,6 +11548,7 @@ class AzureSqlMcpApplication:
                 table_name,
                 index_name,
             ),
+            sql_origin="server_built",
         )
         if len(rows) != 1:
             return False
@@ -10033,14 +11564,23 @@ class AzureSqlMcpApplication:
             and row.get("definition_marker") == definition_fingerprint
         )
 
-    async def _cleanup_expired_index_leases(self) -> dict[str, int]:
-        """Retry expired temporary-index cleanup before a sandbox accepts work."""
+    async def _cleanup_expired_index_leases(
+        self,
+        *,
+        database_fingerprint: str | None = None,
+    ) -> dict[str, int]:
+        """Retry expired temporary-index cleanup before a sandbox accepts work.
+
+        ``database_fingerprint`` limits the pass to one database's leases.
+        """
 
         summary = {"examined": 0, "cleaned": 0, "cleanup_required": 0}
         if self.config.profile != McpProfile.SANDBOX:
             return summary
         now = datetime.now(timezone.utc)
-        for lease in self.performance_store.list_open_index_leases():
+        for lease in self.performance_store.list_open_index_leases(
+            database_fingerprint=database_fingerprint
+        ):
             try:
                 expires_at = datetime.fromisoformat(
                     str(lease["expires_at_utc"]).replace("Z", "+00:00")
@@ -10260,6 +11800,7 @@ class AzureSqlMcpApplication:
             WHERE i.name = ? AND s.name = ? AND t.name = ?
             """,
             (index_name, schema_name, table_name),
+            sql_origin="server_built",
         )
         return bool(rows)
 

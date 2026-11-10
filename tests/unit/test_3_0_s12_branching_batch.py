@@ -231,16 +231,12 @@ def test_nesting_and_branch_count_are_bounded() -> None:
         SafeSqlValidator().validate_read_only_candidate(deep)
 
 
-CORPUS = Path(
-    "/Users/balwinder/Development/AkaalHoldings/output/sql-optimizer-review/"
-    "validator-attack-corpus.json"
-)
+CORPUS = Path(__file__).resolve().parents[1] / "fixtures" / "safe_sql_attack_corpus.json"
 
 
-@pytest.mark.skipif(not CORPUS.exists(), reason="attack corpus is not on this machine")
 def test_attack_corpus_admits_nothing_new_outside_the_grammar() -> None:
     validator = SafeSqlValidator()
-    inputs = json.loads(CORPUS.read_text())["inputs"]
+    inputs = [case["sql"] for case in json.loads(CORPUS.read_text(encoding="utf-8"))["cases"]]
     newly_admitted: list[str] = []
     changed_verdict: list[str] = []
     for sql in inputs:

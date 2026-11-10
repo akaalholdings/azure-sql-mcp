@@ -75,7 +75,9 @@ async def test_stdio_publishes_and_executes_optimizer_contracts(
             ]
 
             runtime = _payload(
-                await session.call_tool("check_runtime_status", {})
+                await session.call_tool(
+                    "check_runtime_status", {"include_tool_names": True}
+                )
             )
             assert runtime["package_version"] == "2.6.3"
             assert runtime["tool_groups"] == ["core", "performance"]

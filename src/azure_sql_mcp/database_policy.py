@@ -62,6 +62,7 @@ _DATABASE_FIELDS = frozenset(
         "allow_index_history_write",
         "application_intent",
         "business_cycle_extension_days",
+        "history_sources",
         "max_benchmark_executions",
         "max_tuning_candidates",
         "max_tuning_session_executions",
@@ -119,6 +120,45 @@ class DatabasePolicyValidationError(DatabasePolicyError):
     """Raised when a decoded policy does not satisfy schema version 1."""
 
 
+def _parse_history_sources(database_name: str, value: Any) -> Mapping[str, Any]:
+    """Validate the optional ``history_sources`` object, one binding per recorder.
+
+    Strict: an unknown recorder or a bad field stops the policy from loading. A
+    recorder silently turned off would let "no events" read as a clean history.
+    """
+
+    if value is None:
+        return MappingProxyType({})
+    where = f"database {database_name!r} history_sources"
+    if not isinstance(value, Mapping):
+        raise DatabasePolicyValidationError(f"{where} must be an object.")
+    # Imported here: the adapters import the server configuration.
+    from .history_azure_monitor import AzureMetricsBinding
+    from .history_azure_monitor import LogAnalyticsBinding
+    from .history_database_watcher import DatabaseWatcherBinding
+    from .history_loki import LokiBinding
+
+    parsers = {
+        "log_analytics": LogAnalyticsBinding.from_mapping,
+        "azure_monitor_metrics": AzureMetricsBinding.from_mapping,
+        "database_watcher": DatabaseWatcherBinding.from_mapping,
+        "loki": LokiBinding.from_mapping,
+    }
+    unknown = sorted(str(key) for key in value if key not in parsers)
+    if unknown:
+        raise DatabasePolicyValidationError(
+            f"{where} has unknown recorder(s): {', '.join(unknown)}. "
+            f"Known: {', '.join(sorted(parsers))}."
+        )
+    bindings: dict[str, Any] = {}
+    for name, binding in value.items():
+        try:
+            bindings[name] = parsers[name](database_name, binding)
+        except ValueError as exc:
+            raise DatabasePolicyValidationError(f"{where}.{name}: {exc}") from exc
+    return MappingProxyType(bindings)
+
+
 @dataclass(frozen=True)
 class DatabasePolicy:
     """Capabilities granted to one named database."""
@@ -138,6 +178,11 @@ class DatabasePolicy:
     max_tuning_session_minutes: int = 0
     configured: bool = True
     application_intent: str = "read_write"
+    # Recorders this database's history can be read from: source name -> its
+    # validated binding (history_sources.py). Empty when none is mapped.
+    history_sources: Mapping[str, Any] = field(
+        default_factory=lambda: MappingProxyType({}), compare=False, hash=False
+    )
 
     def __post_init__(self) -> None:
         _validate_database_name(self.database_name, field_name="database_name")
@@ -223,6 +268,9 @@ class DatabasePolicy:
             ),
             business_cycle_extension_days=value.get("business_cycle_extension_days", 0),
             application_intent=value.get("application_intent", "read_write"),
+            history_sources=_parse_history_sources(
+                database_name, value.get("history_sources")
+            ),
         )
 
     @classmethod

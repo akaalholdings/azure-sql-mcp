@@ -28,6 +28,27 @@ _SQL_PATTERN = re.compile(
     r"\b(?:SELECT|WITH|INSERT|UPDATE|DELETE|MERGE|EXEC(?:UTE)?|DECLARE|CREATE|ALTER|DROP)\b",
     re.IGNORECASE,
 )
+# Free text (a tactic, a summary) may use the words a DBA writes with: index,
+# join, table, with, create, update, drop. It may not hold a SQL statement,
+# because statement text carries literals. Fingerprints keep the keyword rule.
+_SQL_STATEMENT_PATTERN = re.compile(
+    r"\bSELECT\s+(?:TOP\b|DISTINCT\b|ALL\b|\*|@|\d|N?'|\(|\[)"
+    r"|\bSELECT\b[\s\S]{0,400}?\bFROM\b"
+    r"|\bINSERT\s+(?:INTO\b|[\[\w.#]+\s*\()"
+    r"|\bUPDATE\b[\s\S]{0,200}?\bSET\b"
+    r"|\bDELETE\s+(?:TOP\b|FROM\b)"
+    r"|\bMERGE\b[\s\S]{0,200}?\bUSING\b"
+    r"|\bEXEC(?:UTE)?\s+(?:\(|@|\[|\w+\.|sp_|xp_)"
+    r"|\bDECLARE\s+@"
+    r"|\b(?:CREATE|ALTER|DROP)\s+(?:OR\s+ALTER\s+)?"
+    r"(?:(?:UNIQUE|CLUSTERED|NONCLUSTERED|COLUMNSTORE|EXTERNAL|MATERIALIZED)\s+)*"
+    r"(?:TABLE|VIEW|PROC(?:EDURE)?|FUNCTION|TRIGGER|DATABASE|SCHEMA|LOGIN|USER|ROLE|"
+    r"STATISTICS|SEQUENCE|TYPE|SYNONYM)\b"
+    r"|\b(?:CREATE|ALTER|DROP)\s+(?:(?:UNIQUE|CLUSTERED|NONCLUSTERED|COLUMNSTORE)\s+)*"
+    r"INDEX\s+(?!ON\b)[\[\w]+\]?\s+ON\b"
+    r"|\bWITH\s+[\[\w]+\]?\s*(?:\([^)]*\)\s*)?AS\s*\(",
+    re.IGNORECASE,
+)
 _CONTROL_PATTERN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _CREDENTIAL_VALUE_PATTERN = re.compile(
     r"\b(?:password|pwd|secret|token|client_secret|connection_string)\s*=",
@@ -183,9 +204,14 @@ def _safe_text(value: str, field_name: str, *, required: bool = False, limit: in
         raise ContractValidationError(f"{field_name} must not be empty.")
     if len(value) > limit:
         raise ContractValidationError(f"{field_name} must be at most {limit} characters.")
-    if _CONTROL_PATTERN.search(value) or _SQL_PATTERN.search(value) or _CREDENTIAL_VALUE_PATTERN.search(value):
+    if (
+        _CONTROL_PATTERN.search(value)
+        or _SQL_STATEMENT_PATTERN.search(value)
+        or _CREDENTIAL_VALUE_PATTERN.search(value)
+    ):
         raise ContractValidationError(
-            f"{field_name} must not contain SQL-shaped or control-character content."
+            f"{field_name} must not contain a SQL statement or control characters. "
+            "Describe the change in words; statement text carries literals."
         )
     return value
 
@@ -238,7 +264,7 @@ def _json_safe(value: Any, *, key: str | None = None, redact: bool) -> Any:
         raise ContractValidationError(f"Sensitive field {key!r} is not allowed.")
     if value is None or isinstance(value, (bool, int, str)):
         if isinstance(value, str) and (
-            _SQL_PATTERN.search(value)
+            _SQL_STATEMENT_PATTERN.search(value)
             or _CONTROL_PATTERN.search(value)
             or _CREDENTIAL_VALUE_PATTERN.search(value)
         ):

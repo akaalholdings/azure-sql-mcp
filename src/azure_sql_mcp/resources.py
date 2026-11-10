@@ -7,6 +7,7 @@ from .artifacts import json_text
 from .config import ServerConfig
 from .database_policy import DatabasePolicySet
 from .introspection import IntrospectionService
+from .observability import apply_data_detail
 
 
 def register_resources(
@@ -24,6 +25,10 @@ def register_resources(
         database_policy.require_read(resolved)
         return resolved
 
+    def response_text(result: object) -> str:
+        # The data-detail level binds resources exactly as it binds tools.
+        return json_text(apply_data_detail(result, config.data_detail))
+
     @mcp.resource(
         "azuresql://{database}/schemas",
         description="List all schemas in a database.",
@@ -33,7 +38,7 @@ def register_resources(
         """List all schemas in the given database."""
         resolved = readable_database(database)
         result = await introspection.list_schemas(resolved)
-        return json_text(result)
+        return response_text(result)
 
     @mcp.resource(
         "azuresql://{database}/{schema}/tables",
@@ -44,7 +49,7 @@ def register_resources(
         """List all tables in a schema."""
         resolved = readable_database(database)
         result = await introspection.list_objects(resolved, schema, "table")
-        return json_text(result)
+        return response_text(result)
 
     @mcp.resource(
         "azuresql://{database}/{schema}/views",
@@ -55,7 +60,7 @@ def register_resources(
         """List all views in a schema."""
         resolved = readable_database(database)
         result = await introspection.list_objects(resolved, schema, "view")
-        return json_text(result)
+        return response_text(result)
 
     @mcp.resource(
         "azuresql://{database}/{schema}/procedures",
@@ -66,7 +71,7 @@ def register_resources(
         """List all stored procedures in a schema."""
         resolved = readable_database(database)
         result = await introspection.list_objects(resolved, schema, "procedure")
-        return json_text(result)
+        return response_text(result)
 
     # Register the catch-all table-details resource last so more specific
     # "/views" and "/procedures" templates win during URI template matching.
@@ -79,7 +84,7 @@ def register_resources(
         """Get detailed information about a table."""
         resolved = readable_database(database)
         result = await introspection.get_object_details(resolved, schema, table, "table")
-        return json_text(result)
+        return response_text(result)
 
     if artifact_store is not None:
 
@@ -90,4 +95,10 @@ def register_resources(
         )
         async def artifact_text(artifact_id: str) -> str:
             """Read an artifact captured by a tool response."""
-            return artifact_store.get(artifact_id).text
+            artifact = artifact_store.get(artifact_id)
+            if artifact.kind == "showplan-xml":
+                # Plan XML holds statement text and parameter values.
+                return str(
+                    apply_data_detail({"plan_xml": artifact.text}, config.data_detail)["plan_xml"]
+                )
+            return artifact.text

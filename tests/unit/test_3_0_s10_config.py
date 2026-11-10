@@ -44,14 +44,14 @@ def test_an_unknown_data_detail_stops_startup(base_env, monkeypatch) -> None:
 
 def test_sanitized_config_reports_data_detail_and_no_secret(server_config_factory) -> None:
     config = replace(
-        server_config_factory(username="reader", password="s3cret-value"),
+        server_config_factory(username="reader", password="dummy-s3cret-value"),
         data_detail="metadata_only",
     )
 
     sanitized = config.sanitized_config()
 
     assert sanitized["data_detail"] == "metadata_only"
-    assert "s3cret-value" not in repr(sanitized)
+    assert "dummy-s3cret-value" not in repr(sanitized)
     assert sanitized["credentials_configured"]["password"] is True
 
 

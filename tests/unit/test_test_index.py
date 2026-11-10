@@ -94,7 +94,7 @@ async def test_create_dry_run_builds_ddl_with_rollback(tmp_path: Path) -> None:
     assert "CREATE NONCLUSTERED INDEX" in sql
     assert "[ShipDate] ASC, [StatusCode] DESC" in sql
     assert "INCLUDE ([CustomerID], [TotalDue])" in sql
-    assert "WITH (ONLINE = ON)" in sql
+    assert "WITH (ONLINE = ON (WAIT_AT_LOW_PRIORITY (MAX_DURATION = 1 MINUTES, ABORT_AFTER_WAIT = SELF)))" in sql
     assert payload["rollback_sql"] == (
         f"DROP INDEX [{TEST_INDEX_PREFIX}Shipments_ShipDate_a1b2] "
         "ON [dbo].[Shipments];"
@@ -102,16 +102,25 @@ async def test_create_dry_run_builds_ddl_with_rollback(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_without_online_and_includes(tmp_path: Path) -> None:
+async def test_create_offline_is_refused_and_no_includes_emits_no_include(tmp_path: Path) -> None:
+    # An offline build blocks every writer of the table; no policy field allows it.
+    with pytest.raises(PermissionError, match="offline"):
+        await unrestricted_app(tmp_path)._create_test_index(
+            "appdb", "dbo", "Orders",
+            f"{TEST_INDEX_PREFIX}Orders_Status",
+            key_columns=["Status"],
+            include_columns=None,
+            online=False,
+            dry_run=True,
+        )
     payload = await unrestricted_app(tmp_path)._create_test_index(
         "appdb", "dbo", "Orders",
         f"{TEST_INDEX_PREFIX}Orders_Status",
         key_columns=["Status"],
         include_columns=None,
-        online=False,
+        online=True,
         dry_run=True,
     )
-    assert "ONLINE" not in payload["sql_preview"]
     assert "INCLUDE" not in payload["sql_preview"]
 
 

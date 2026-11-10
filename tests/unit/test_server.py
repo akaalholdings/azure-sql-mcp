@@ -132,6 +132,29 @@ def stub_case_preflight(
     return preflight
 
 
+def allow_tuning_sessions(app: AzureSqlMcpApplication) -> None:
+    """tune_query and benchmark_query_rewrite open a session only where policy allows."""
+
+    policy = DatabasePolicySet.from_mapping(
+        {
+            "version": 1,
+            "databases": {
+                "appdb": {
+                    "environment": "test",
+                    "allow_read": True,
+                    "allow_benchmark": True,
+                    "max_benchmark_executions": 80,
+                    "max_tuning_candidates": 20,
+                    "max_tuning_session_executions": 400,
+                    "max_tuning_session_minutes": 120,
+                }
+            },
+        }
+    )
+    app.database_policy = policy
+    app.performance_workflows.database_policy = policy
+
+
 def _stub_index_review_read_stores(
     app: AzureSqlMcpApplication,
     monkeypatch: pytest.MonkeyPatch,
@@ -235,6 +258,16 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
 
     assert set(tools) == {
         "check_runtime_status",
+        "get_tool_guide",
+        "get_column_statistics",
+        "get_memory_pressure",
+        "get_elastic_pool_pressure",
+        "get_columnstore_health",
+        "get_failed_executions",
+        "get_database_baseline",
+        "assess_capacity",
+        "analyze_application_patterns",
+        "get_diagnostic_history",
         "list_databases",
         "check_capabilities",
         "list_schemas",
@@ -361,9 +394,10 @@ def test_registers_expected_tools(app: AzureSqlMcpApplication) -> None:
         assert schema["properties"]["database_name"]["type"] == "string"
         assert "decision_id" not in schema["properties"]
     tuning_parameters = tools["start_tuning_session"].parameters["properties"]
-    assert tuning_parameters["max_candidates"]["default"] == 10
-    assert tuning_parameters["execution_limit"]["default"] == 80
-    assert tuning_parameters["time_limit_minutes"]["default"] == 20
+    # Left out, each limit takes the module default capped by policy.
+    assert tuning_parameters["max_candidates"]["default"] is None
+    assert tuning_parameters["execution_limit"]["default"] is None
+    assert tuning_parameters["time_limit_minutes"]["default"] is None
     decision_properties = tools["record_decision"].parameters["properties"]
     assert {
         "subject_kind",
@@ -452,6 +486,8 @@ def test_index_review_tool_list_is_recall_only(
 
     assert set(tools) == {
         "check_runtime_status",
+        "get_tool_guide",
+        "get_columnstore_health",
         "list_databases",
         "check_capabilities",
         "capture_index_review_snapshot",
@@ -629,8 +665,8 @@ async def test_runtime_status_is_db_free_stable_and_sanitized(
     assert first["profile"] is None
     assert first["transport"] == "stdio"
     assert first["tool_groups"] == ["all"]
-    assert first["tool_count"] == len(first["tool_names"])
-    assert first["tool_names"] == sorted(first["tool_names"])
+    assert "tool_names" not in first
+    assert first["tool_count"] == sum(first["tool_counts_by_group"].values())
     assert first["contracts"] == {
         "strict_arguments": True,
         "mcp_errors": True,
@@ -1475,7 +1511,7 @@ async def test_refused_index_filter_does_not_bind_candidate_to_refused_request(
             filter_definition,
             False,
             "screening",
-            False,
+            True,
             None,
             30,
             key,
@@ -1493,7 +1529,7 @@ async def test_refused_index_filter_does_not_bind_candidate_to_refused_request(
     # being refused as a replay of the refused CAST request.
     app.plans.profile_query.assert_awaited()
     assert result["lease"]["metadata"]["filter_definition"] == "[id] > 0"
-    assert result["index_ddl"].endswith("WHERE [id] > 0;")
+    assert " WHERE [id] > 0 WITH (ONLINE = ON (WAIT_AT_LOW_PRIORITY" in result["index_ddl"]
 
 
 @pytest.mark.asyncio
@@ -1529,7 +1565,7 @@ async def test_unresolved_index_table_does_not_bind_candidate_to_refused_request
             None,
             False,
             "screening",
-            False,
+            True,
             None,
             30,
             key,
@@ -1587,7 +1623,7 @@ async def test_budget_refused_index_request_does_not_bind_candidate(
             None,
             False,
             "screening",
-            False,
+            True,
             None,
             30,
             key,
@@ -1636,7 +1672,7 @@ async def test_budget_refusal_on_a_replayed_binding_still_frees_the_candidate(
     async def benchmark(parameter_cases: list[dict[str, Any]], key: str) -> dict[str, Any]:
         return await app._benchmark_index_candidate(
             "appdb", session_id, candidate_id, sql, "dbo", "Items", ["id"], None, None,
-            False, "screening", False, None, 30, key, parameter_cases,
+            False, "screening", True, None, 30, key, parameter_cases,
         )
 
     real_collect = server_module.collect_existing_indexes
@@ -2358,6 +2394,7 @@ async def test_estimated_typed_plan_digest_does_not_call_xml_parameter_local(
 @pytest.mark.asyncio
 async def test_tune_query_returns_structured_evidence_pack(app: AzureSqlMcpApplication) -> None:
     preflight = stub_case_preflight(app)
+    allow_tuning_sessions(app)
     app.performance_workflows.start_case = Mock(
         return_value=Mock(case_id="case-1")
     )
@@ -2666,6 +2703,7 @@ async def test_tune_query_binds_explicit_parameters_once(app: AzureSqlMcpApplica
 @pytest.mark.asyncio
 async def test_benchmark_query_rewrite_reports_sample_equivalence(app: AzureSqlMcpApplication) -> None:
     stub_case_preflight(app)
+    allow_tuning_sessions(app)
     app.performance_workflows.start_case = Mock(return_value=Mock(case_id="case-b1"))
     app.performance_workflows.start_session = Mock(
         return_value={"session_id": "session-b1"}
@@ -2705,6 +2743,7 @@ async def test_benchmark_query_rewrite_runs_k_reports_median_and_spread(
     app: AzureSqlMcpApplication,
 ) -> None:
     stub_case_preflight(app)
+    allow_tuning_sessions(app)
     app.performance_workflows.start_case = Mock(return_value=Mock(case_id="case-b2"))
     app.performance_workflows.start_session = Mock(
         return_value={"session_id": "session-b2"}
@@ -2740,6 +2779,7 @@ async def test_benchmark_can_compare_unordered_result_samples(
     app: AzureSqlMcpApplication,
 ) -> None:
     stub_case_preflight(app)
+    allow_tuning_sessions(app)
     app.performance_workflows.start_case = Mock(return_value=Mock(case_id="case-b3"))
     app.performance_workflows.start_session = Mock(
         return_value={"session_id": "session-b3"}
@@ -2897,7 +2937,7 @@ async def test_tune_history_requires_exact_query_store_identity(app: AzureSqlMcp
     assert history["fuzzy_match_used"] is False
     assert history["matches"] == [{"query_id": 19}]
     app.query_store.resolve_query_identity.assert_awaited_once_with(
-        "appdb", original_sql
+        "appdb", original_sql, query_hash="0x90FC7E5399EA52A5"
     )
     app.query_store.get_query_history_by_text.assert_not_awaited()
 
