@@ -720,6 +720,34 @@ def compare_result_sets(
     }
     if nullability_only:
         result["metadata_difference"] = "nullability_only"
+    if status == "mismatch" and columns_match and row_widths_match and not rows_match:
+        # Where the results part, without any row value: counts, the first
+        # row that differs and the columns that differ in it.
+        differences: dict[str, Any] = {
+            "rows_only_in_baseline": sum((baseline_counts - candidate_counts).values()),
+            "rows_only_in_candidate": sum((candidate_counts - baseline_counts).values()),
+        }
+        if compare_order:
+            shared = min(len(baseline_rows), len(candidate_rows))
+            first = next(
+                (
+                    position
+                    for position in range(shared)
+                    if baseline_canonical[position] != candidate_canonical[position]
+                ),
+                shared if len(baseline_rows) != len(candidate_rows) else None,
+            )
+            if first is not None:
+                differences["first_differing_row"] = first + 1
+                if first < shared:
+                    differences["first_differing_columns"] = [
+                        column
+                        for column, before, after in zip(
+                            baseline.columns, baseline_rows[first], candidate_rows[first]
+                        )
+                        if _canonical_row((before,)) != _canonical_row((after,))
+                    ]
+        result["first_differences"] = differences
     return result
 
 
@@ -2033,6 +2061,12 @@ def compact_benchmark_result(result: Mapping[str, Any]) -> dict[str, Any]:
             for code in side.get("risk_codes") or ()
         )
     )
+    comparisons = [item for item in result.get("equivalence") or () if isinstance(item, Mapping)]
+    # Compared under a preflight gap: a test on today's data, and it did run.
+    tested = bool(comparisons) and all(
+        item.get("proof_scope") == "snapshot_test" for item in comparisons
+    )
+    bases = {item.get("comparison_basis") for item in comparisons if item.get("comparison_basis")}
     decision = {
         "classification": result.get("classification"),
         "performance_classification": result.get("performance_classification"),
@@ -2042,8 +2076,8 @@ def compact_benchmark_result(result: Mapping[str, Any]) -> dict[str, Any]:
         "executions": result.get("executions"),
         "equivalence": {
             "status": _equivalence_status(result),
-            "proof_scope": result.get("proof_scope"),
-            "deferred": bool(result.get("equivalence_deferred")),
+            "proof_scope": "snapshot_test" if tested else result.get("proof_scope"),
+            "deferred": bool(result.get("equivalence_deferred")) and not tested,
             "risk_codes": risk_codes,
             "rewrite_requirements": [
                 item.get("code")
@@ -2053,6 +2087,8 @@ def compact_benchmark_result(result: Mapping[str, Any]) -> dict[str, Any]:
         },
         "cases": cases,
     }
+    if len(bases) == 1:
+        decision["equivalence"]["comparison_basis"] = next(iter(bases))
     metadata_differences = [
         {"parameter_case": comparison.get("parameter_case"), **difference}
         for comparison in result.get("equivalence") or ()

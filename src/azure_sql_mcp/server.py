@@ -50,6 +50,8 @@ from .auth import AzureSqlAuthenticator
 from .capabilities import CapabilityService
 from .column_statistics import ColumnStatisticsService
 from .capacity_assessment import CapacityAssessmentService
+from .catalog_constraints import TableConstraintFacts
+from .catalog_constraints import UniqueKey
 from .columnstore_health import OBJECT_FILTER
 from .columnstore_health import ROW_GROUP_SQL
 from .columnstore_health import ColumnstoreHealthService
@@ -73,8 +75,8 @@ from .database_policy import extends_test_index_prefix
 from .database_policy import load_database_policy_or_deny
 from .diagnostics import DiagnosticQueryService
 from .elastic_pool import ElasticPoolService
-from .equivalence_contract import analyze_equivalence_preflight
 from .equivalence_contract import effective_compare_order
+from .equivalence_contract import inline_relation
 from .equivalence_contract import rewrite_requirements
 from .equivalence_contract import statement_hint_profile
 from .equivalence_preflight import EquivalencePreflightService
@@ -576,6 +578,45 @@ def _test_index_build_online(
 
 
 _INDEX_DDL_STEPS = frozenset({"create_index", "drop_index"})
+
+
+def _not_compared(blocking_gaps: Sequence[str], failure: Any = None) -> dict[str, Any]:
+    """The equivalence entry of a case whose results were not compared, with the reason."""
+
+    if blocking_gaps:
+        reason = (
+            "a result comparison cannot settle "
+            + ", ".join(blocking_gaps)
+            + ": the rows or the order of a statement can change between two runs "
+            "on the same data"
+        )
+    elif failure:
+        reason = "the experiment stopped before the results were compared"
+    else:
+        reason = "the results of this case were not compared"
+    return {
+        "status": "not_compared",
+        "proven_for_parameter_case": False,
+        "same_snapshot": False,
+        "reason": reason,
+    }
+
+
+def _tested_match_reason(subject: str, statuses: set[str], gaps: Sequence[str]) -> str:
+    """Why a candidate whose results were tested under a preflight gap is performance-only."""
+
+    return (
+        f"{subject} improved the measured objective. Its results were tested against "
+        "the original in one snapshot per parameter case and "
+        + (
+            "matched as multisets with duplicate counts"
+            if statuses == {"match"}
+            else "did not match for every case (" + ", ".join(sorted(statuses)) + ")"
+        )
+        + "; that is a test on today's data, and the static proof still has a gap ("
+        + ", ".join(gaps)
+        + "), so the result is performance-only."
+    )
 # compare_query_results stops after this many seconds unless the caller sets max_seconds.
 _DEFAULT_COMPARISON_SECONDS = 120.0
 
@@ -9878,13 +9919,18 @@ class AzureSqlMcpApplication:
             and direct_snapshot_supported
             and phase == "finalist"
         )
-        # A gap that a comparison can settle (a UNION ALL rewrite, possible
-        # ties) is tested in the call too. That result is a test on today's
-        # data: the candidate stays performance_only.
-        tested_gaps: list[str] = []
-        if normalized_rewrite is not None and not direct_snapshot_supported and phase == "finalist":
+        # The results of the two statements are compared in every call that
+        # builds the indexes, a screening run too: the build is the cost. A gap
+        # that a comparison can settle (a UNION ALL rewrite, possible ties) is
+        # tested; that result is a test on today's data and the candidate
+        # stays performance_only. Only a gap that makes a result unstable
+        # (a clock, NEWID, an unordered row limit) leaves it uncompared.
+        gap_codes: list[str] = []
+        blocking_gaps: list[str] = []
+        if normalized_rewrite is not None:
             gap_codes, blocking_gaps = preflight_gap_codes(equivalence_preflight)
-            tested_gaps = [] if blocking_gaps else gap_codes
+        compare_results = normalized_rewrite is not None and not blocking_gaps
+        tested_gaps = gap_codes if compare_results else []
         parent_equivalence_unproven = bool(
             lineage and lineage.get("parent_equivalence") == "unproven"
         )
@@ -9985,7 +10031,7 @@ class AzureSqlMcpApplication:
             if str(parameter_case["name"]) in slow_cases
             else runs * 3
             for parameter_case in cases
-        ) + (2 * len(cases) if compare_in_call or tested_gaps else 0)
+        ) + (2 * len(cases) if compare_results else 0)
         if not policy.can_benchmark(requested_executions):
             raise PermissionError("Database policy does not permit this benchmark count.")
         if not idempotency_key or not idempotency_key.strip():
@@ -11205,10 +11251,10 @@ class AzureSqlMcpApplication:
                 member.built = await self._built_index_facts(database_name, member)
             for measurement in measurements:
                 await measure_arm(measurement, "candidate")
-            if compare_in_call or tested_gaps:
+            if compare_results:
                 step = "compare_results"
                 for measurement in measurements:
-                    self._require_tuning_session_time(session_id)
+                    remaining_seconds = self._require_tuning_session_time(session_id)
                     # Charged before the await: a timeout can follow an execution.
                     measured_executions += 2
                     comparison = await self.performance_workflows._compare_execution_contracts(
@@ -11217,9 +11263,13 @@ class AzureSqlMcpApplication:
                         measurement["candidate_contract"],
                         compare_order=compare_order,
                         before_dispatch=lambda: self._require_tuning_session_time(session_id),
+                        # The session time left is the cap of the comparison.
+                        max_seconds=(
+                            remaining_seconds if math.isfinite(remaining_seconds) else None
+                        ),
                     )
                     measured_executions -= 2 - int(comparison.get("executions", 0))
-                    if tested_gaps and "rows_match" in comparison:
+                    if "rows_match" in comparison:
                         label_comparison(comparison, tested_gaps, compare_order)
                     measurement["snapshot_comparison"] = comparison
         except asyncio.CancelledError:
@@ -11406,16 +11456,9 @@ class AzureSqlMcpApplication:
             )
             if normalized_rewrite is not None:
                 # Two statements: only the snapshot comparison says they agree.
-                snapshot_comparison = measurement.get("snapshot_comparison") or {
-                    "status": "not_compared",
-                    "proven_for_parameter_case": False,
-                    "same_snapshot": False,
-                    "reason": (
-                        "this SQL shape has no deterministic comparison"
-                        if not direct_snapshot_supported
-                        else "a screening run does not compare results; the finalist does"
-                    ),
-                }
+                snapshot_comparison = measurement.get(
+                    "snapshot_comparison"
+                ) or _not_compared(blocking_gaps, benchmark_error)
                 equivalence.append(
                     {
                         **snapshot_comparison,
@@ -11570,7 +11613,7 @@ class AzureSqlMcpApplication:
             {str(comparison.get("status")) for comparison in equivalence} if tested_gaps else set()
         )
         if (
-            tested_statuses
+            compare_results
             and state in {"promising", "improved", "neutral", "regressed"}
             and any(
                 comparison.get("status") == "mismatch"
@@ -11601,17 +11644,7 @@ class AzureSqlMcpApplication:
                     "index, so the result is performance-only."
                 )
                 if hinted
-                else (
-                    "Candidate improved the measured objective. Its results were tested "
-                    "against the original in one snapshot per parameter case and "
-                    + (
-                        "matched as multisets with duplicate counts"
-                        if tested_statuses == {"match"}
-                        else "did not match for every case (" + ", ".join(sorted(tested_statuses)) + ")"
-                    )
-                    + "; that is a test on today's data, and the static proof still has a "
-                    "gap (" + ", ".join(tested_gaps) + "), so the result is performance-only."
-                )
+                else _tested_match_reason("Candidate", tested_statuses, tested_gaps)
                 if tested_gaps
                 else (
                     "Candidate improved the measured objective, but semantic "
@@ -12062,21 +12095,62 @@ class AzureSqlMcpApplication:
         )
         direct_snapshot_supported = bool(equivalence_preflight["direct_snapshot_supported"])
         if noexpand:
+            # The view does not exist yet, so the catalog cannot resolve it. It
+            # is declared to the order analysis with the key of its unique
+            # clustered index: SQL Server treats NULLs as equal in a unique
+            # index, so that key leaves no two rows of the view tied.
+            view_key = tuple(
+                parse_candidate_key(column).name for column in plan.clustered_index.key_columns
+            )
+            candidate_preflight = (
+                await self.equivalence_preflight.analyze(
+                    database_name,
+                    measured,
+                    declared_tables={
+                        (plan.schema.casefold(), plan.view_name.casefold()): TableConstraintFacts(
+                            schema_name=plan.schema,
+                            table_name=plan.view_name,
+                            exists=True,
+                            object_type="USER_TABLE",
+                            nullable={column.casefold(): False for column in view_key},
+                            unique_keys=(
+                                UniqueKey(
+                                    name=str(plan.clustered_index.index_name),
+                                    kind="unique_index",
+                                    columns=view_key,
+                                ),
+                            ),
+                        )
+                    },
+                )
+            ).as_dict()
+            # For the ORDER BY contract the view is read as its definition, so
+            # a column of the view is the base column it copies.
+            contract_sql = (
+                None
+                if plan.definition.column_list
+                else inline_relation(
+                    measured, plan.schema, plan.view_name, plan.definition.body
+                )
+            ) or measured
             equivalence_preflight = with_order_contract(
-                {
-                    "baseline": equivalence_preflight,
-                    # The view does not exist yet, so the catalog cannot resolve
-                    # it. Its body passed the indexed-view rules (deterministic,
-                    # schema-bound), so the statement text is what is analysed.
-                    "candidate": analyze_equivalence_preflight(measured).as_dict(),
-                },
+                {"baseline": equivalence_preflight, "candidate": candidate_preflight},
                 original,
-                measured,
+                contract_sql,
             )
             direct_snapshot_supported = all(
                 bool(side["direct_snapshot_supported"]) for side in equivalence_preflight.values()
             )
         compare_in_call = noexpand and direct_snapshot_supported and phase == "finalist"
+        # The view statement is compared with the original in every call that
+        # builds the view. A gap that a comparison can settle is tested; only a
+        # gap that makes a result unstable leaves the case uncompared.
+        gap_codes: list[str] = []
+        blocking_gaps: list[str] = []
+        if noexpand:
+            gap_codes, blocking_gaps = preflight_gap_codes(equivalence_preflight)
+        compare_results = noexpand and not blocking_gaps
+        tested_gaps = gap_codes if compare_results else []
         cases = self.performance_workflows._resolve_parameter_cases(case.case_id, parameter_cases)
         supplied = tuple(parameter_case_fingerprint(item) for item in cases)
         registered = set(case.parameter_case_fingerprints)
@@ -12104,7 +12178,7 @@ class AzureSqlMcpApplication:
         elif not 1 <= runs <= default_runs:
             raise ValueError(f"runs must be between 1 and the {phase} limit of {default_runs}.")
         requested_executions = len(cases) * runs * INDEX_ABA_PHASES + (
-            2 * len(cases) if compare_in_call else 0
+            2 * len(cases) if compare_results else 0
         )
         if not policy.can_benchmark(requested_executions):
             raise PermissionError("Database policy does not permit this benchmark count.")
@@ -12406,10 +12480,10 @@ class AzureSqlMcpApplication:
             step = "candidate_measure"
             for measurement in measurements:
                 await measure_arm(measurement, "candidate")
-            if compare_in_call:
+            if compare_results:
                 step = "compare_results"
                 for measurement in measurements:
-                    self._require_tuning_session_time(session_id)
+                    remaining_seconds = self._require_tuning_session_time(session_id)
                     measured_executions += 2
                     comparison = await self.performance_workflows._compare_execution_contracts(
                         database_name,
@@ -12417,8 +12491,14 @@ class AzureSqlMcpApplication:
                         measurement["candidate_contract"],
                         compare_order=compare_order,
                         before_dispatch=lambda: self._require_tuning_session_time(session_id),
+                        # The session time left is the cap of the comparison.
+                        max_seconds=(
+                            remaining_seconds if math.isfinite(remaining_seconds) else None
+                        ),
                     )
                     measured_executions -= 2 - int(comparison.get("executions", 0))
+                    if "rows_match" in comparison:
+                        label_comparison(comparison, tested_gaps, compare_order)
                     comparisons[str(measurement["parameter_case"])] = comparison
         except asyncio.CancelledError:
             cancelled = True
@@ -12503,16 +12583,7 @@ class AzureSqlMcpApplication:
             name = str(measurement["parameter_case"])
             used = bool(measurement["plan_use"]) and all(measurement["plan_use"])
             if noexpand:
-                comparison = comparisons.get(name) or {
-                    "status": "not_compared",
-                    "proven_for_parameter_case": False,
-                    "same_snapshot": False,
-                    "reason": (
-                        "this SQL shape has no deterministic comparison"
-                        if not direct_snapshot_supported
-                        else "a screening run does not compare results; the finalist does"
-                    ),
-                }
+                comparison = comparisons.get(name) or _not_compared(blocking_gaps, failure)
                 equivalence.append(
                     {
                         **comparison,
@@ -12600,12 +12671,35 @@ class AzureSqlMcpApplication:
                 require_equivalence=compare_in_call if noexpand else direct_snapshot_supported,
                 require_snapshot_attestation=compare_in_call,
             )
+        if (
+            compare_results
+            and state_name in {"promising", "improved", "neutral", "regressed"}
+            and any(
+                item.get("status") == "mismatch" and not item.get("mismatch_may_be_a_tie")
+                for item in equivalence
+            )
+        ):
+            # Different rows on today's data: no phase and no proof gap excuses that.
+            state_name, reason = (
+                "equivalence_failed",
+                "at least one parameter case returned different results",
+            )
         performance_classification = state_name
         if phase == "finalist" and performance_only_scope and state_name in {"promising", "improved"}:
             state_name, performance_classification = "performance_only", "improved"
             reason = (
-                "The view statement improved the measured objective, but this SQL shape "
-                "has no deterministic comparison; the result is performance-only."
+                _tested_match_reason(
+                    "The view statement",
+                    {str(item.get("status")) for item in equivalence},
+                    tested_gaps,
+                )
+                if tested_gaps
+                else (
+                    "The view statement improved the measured objective, but its results "
+                    "were not compared with the original ("
+                    + str(equivalence[0].get("reason") if equivalence else "no case ran")
+                    + "); the result is performance-only."
+                )
             )
         proof_scope = (
             "performance_only"

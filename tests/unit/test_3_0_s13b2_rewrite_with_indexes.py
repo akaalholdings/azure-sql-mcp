@@ -457,3 +457,43 @@ async def test_a_union_all_rewrite_that_returns_other_rows_fails_in_the_same_cal
 
     assert result["classification"] == "equivalence_failed"
     assert result["equivalence"][0]["status"] == "mismatch"
+
+
+@pytest.mark.asyncio
+async def test_a_screening_run_of_the_one_call_path_compares_the_results_too(
+    server_config_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live defect: a call that builds the indexes must not leave the results uncompared."""
+
+    app, session_id, candidate_id, events = _one_call_app(server_config_factory)
+    index_name, _ = _install_catalog(monkeypatch, key_columns=["id"])
+
+    async def profile(_database: str, sql: str, **_kwargs: Any) -> Any:
+        is_rewrite = "AS candidate" in sql
+        return _profile(20 if is_rewrite else 100, index_name=index_name if is_rewrite else None)
+
+    app.plans.profile_query = AsyncMock(side_effect=profile)  # type: ignore[method-assign]
+
+    result = await _run_one_call(app, session_id, candidate_id, phase="screening")
+
+    assert events == ["create_index", "compare", "drop_index"]
+    assert result["equivalence"][0]["status"] == "match"
+    # The helper asks for an ordered comparison (compare_order=True).
+    assert result["equivalence"][0]["comparison_basis"] == "ordered_rows"
+    assert result["classification"] == "promising"
+    assert result["executions"] == 9 + 2
+
+
+@pytest.mark.asyncio
+async def test_a_settleable_gap_shows_as_a_tested_match_in_the_decision_block(
+    server_config_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from azure_sql_mcp.server import _compact_benchmark_payload
+
+    result = await _union_all_one_call(server_config_factory, monkeypatch, None)
+
+    decision = _compact_benchmark_payload(result)["decision"]["equivalence"]
+    assert decision["status"] == "match"
+    assert decision["proof_scope"] == "snapshot_test"
+    assert decision["deferred"] is False
+    assert decision["risk_codes"] == ["order_contract_changed"]

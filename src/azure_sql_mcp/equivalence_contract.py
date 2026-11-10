@@ -894,6 +894,88 @@ def _set_operation_order(
     return {"provable": True, "tables": [], "unique_relations": [relation]}
 
 
+_STATEMENT_CONSTANT_NODES = (
+    exp.Literal,
+    exp.Parameter,
+    exp.Placeholder,
+    exp.Var,
+    exp.Neg,
+    exp.Paren,
+    exp.Cast,
+    exp.DataType,
+    exp.DataTypeParam,
+    exp.Identifier,
+    exp.Boolean,
+)
+
+
+def _pinned_columns(select: exp.Select) -> list[exp.Column]:
+    """Columns the WHERE clause fixes to one value in every returned row.
+
+    Only ``column = <literal, parameter or variable>`` at the top level of an
+    AND chain counts. A range, an OR, a comparison with another column or with
+    a function call fixes nothing.
+    """
+
+    where = select.args.get("where")
+    pending = [where.this] if where is not None else []
+    pinned: list[exp.Column] = []
+    while pending:
+        node = pending.pop()
+        if isinstance(node, exp.Paren):
+            pending.append(node.this)
+        elif isinstance(node, exp.And):
+            pending.extend((node.this, node.expression))
+        elif isinstance(node, exp.EQ):
+            for column, value in ((node.this, node.expression), (node.expression, node.this)):
+                if isinstance(column, exp.Column) and all(
+                    isinstance(item, _STATEMENT_CONSTANT_NODES) for item in value.walk()
+                ):
+                    pinned.append(column)
+    return pinned
+
+
+def inline_relation(sql: str, schema: str, name: str, body: str) -> str | None:
+    """Read a view as its definition: each reference becomes ``(body) AS alias``.
+
+    For analysis only, never for execution. A column of the view then
+    resolves to the base column it copies, so an ORDER BY on the view and one
+    on its base table are compared as the same key. Table hints on the
+    reference (NOEXPAND) are dropped. Returns None when the statement does
+    not read the relation or either text cannot be parsed as one statement.
+    """
+
+    try:
+        statements = _parse_statements(sql)
+        definitions = _parse_statements(body)
+    except (ParseError, ValueError):
+        return None
+    if len(statements) != 1 or len(definitions) != 1:
+        return None
+    definition = definitions[0]
+    if not isinstance(definition, exp.Query):
+        return None
+    replaced = 0
+
+    def inline(node: exp.Expr) -> exp.Expr:
+        nonlocal replaced
+        if (
+            isinstance(node, exp.Table)
+            and node.name.casefold() == name.casefold()
+            and (node.db or "").casefold() == schema.casefold()
+            and not node.catalog
+        ):
+            replaced += 1
+            return exp.Subquery(
+                this=definition.copy(),
+                alias=exp.TableAlias(this=exp.to_identifier(node.alias or node.name)),
+            )
+        return node
+
+    inlined = statements[0].transform(inline)
+    return inlined.sql(dialect="tsql") if replaced else None
+
+
 def _total_order_requirement(
     select: exp.Select,
     keys: list[exp.Expr],
@@ -938,11 +1020,17 @@ def _total_order_requirement(
                 )
         resolved.append(expression)
     key_columns = [item for item in resolved if isinstance(item, exp.Column)]
+    # A column the WHERE clause fixes to one value is the same in every row,
+    # so it orders nothing and may count as an ordering column: a unique key
+    # (a, b) with a = @x leaves no two rows tied on ORDER BY b.
+    pinned = _pinned_columns(select)
 
     group = select.args.get("group")
     if group is not None:
         grouped = list(group.expressions)
-        ordered = {(item.table.casefold(), item.name.casefold()) for item in key_columns}
+        ordered = {
+            (item.table.casefold(), item.name.casefold()) for item in (*key_columns, *pinned)
+        }
         if grouped and all(
             isinstance(item, exp.Column)
             and (item.table.casefold(), item.name.casefold()) in ordered
@@ -969,6 +1057,10 @@ def _total_order_requirement(
         if target is None:
             return {"provable": False, "unprovable_reason": identity.why_unresolved(column)}
         if target[1] not in by_alias[target[0]]["order_columns"]:
+            by_alias[target[0]]["order_columns"].append(target[1])
+    for column in pinned:
+        target = identity.resolve(column)
+        if target is not None and target[1] not in by_alias[target[0]]["order_columns"]:
             by_alias[target[0]]["order_columns"].append(target[1])
     requirement: dict[str, Any] = {"provable": True, "tables": identity.tables}
     if identity.unique_relations:

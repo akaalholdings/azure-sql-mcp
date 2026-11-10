@@ -257,16 +257,32 @@ class EquivalencePreflightService:
         self,
         database_name: str,
         sql: str,
+        *,
+        declared_tables: Mapping[tuple[str, str], TableConstraintFacts] | None = None,
     ) -> DatabaseEquivalencePreflight:
+        """Analyse one statement against the catalog.
+
+        ``declared_tables`` maps a casefolded (schema, name) to the facts of a
+        relation the catalog does not hold yet, such as a test view that the
+        caller is about to build with a unique clustered index. Its facts are
+        used for the order proofs and it is not looked up as a dependency.
+        """
+
+        declared = dict(declared_tables or {})
         branches = read_only_batch_branches(sql)
         if branches:
             return _merge_branch_preflights(
-                [await self.analyze(database_name, branch.select_sql) for branch in branches]
+                [
+                    await self.analyze(
+                        database_name, branch.select_sql, declared_tables=declared
+                    )
+                    for branch in branches
+                ]
             )
         sql = parseable_sql(sql)
         direct = analyze_equivalence_preflight(sql)
         observations = _collect_function_observations(sql, "query")
-        facts_by_table: dict[tuple[str, str], TableConstraintFacts] = {}
+        facts_by_table: dict[tuple[str, str], TableConstraintFacts] = dict(declared)
         total_order_proofs, total_order_gaps = await self._prove_total_orders(
             database_name,
             direct.details,
@@ -293,7 +309,12 @@ class EquivalencePreflightService:
         resolved: list[dict[str, Any]] = []
         analyzed_views: set[tuple[str, str, str]] = set()
         resolution_cache: dict[tuple[str, str, str], _Resolution] = {}
-        references = _referenced_objects(sql, "query")
+        references = [
+            reference
+            for reference in _referenced_objects(sql, "query")
+            if (reference.schema_name.casefold(), reference.object_name.casefold())
+            not in declared
+        ]
 
         for reference in references:
             await self._inspect_reference(
