@@ -21,7 +21,7 @@ uv sync --dev --locked
 ```
 
 The optional companion skills remain in the
-[`akaalholdings/SQL`](https://github.com/akaalholdings/SQL) repository:
+[`akaalholdings/sql-skills`](https://github.com/akaalholdings/sql-skills) repository:
 
 ```bash
 cd /absolute/path/to/SQL

@@ -26,7 +26,7 @@ The supported tuning path is evidence-first but rewrite-active: a missing plan l
 - Audited general DBA T-SQL execution that rejects direct or statically recoverable `DROP DATABASE` statements.
 - Optional long-term index portfolio history over two manually installed `dbatools` tables, for removal decisions across usage-counter resets. Neither index workflow creates schema or executes index DDL.
 
-The Copilot operating instructions live in the [`akaalholdings/SQL` skills](https://github.com/akaalholdings/SQL/tree/main/skills). The skills decide what to investigate and how to present the result; this package owns database execution, policy, durable state, and deterministic workflow transitions.
+The Copilot operating instructions live in the [`akaalholdings/sql-skills`](https://github.com/akaalholdings/sql-skills) repository. The skills decide what to investigate and how to present the result; this package owns database execution, policy, durable state, and deterministic workflow transitions.
 
 ## Support boundary
 
@@ -912,4 +912,4 @@ Treat unavailable permissions, missing Query Store history, truncation, mismatch
 
 ## Repository handoff
 
-This is the canonical standalone repository for the Azure SQL MCP server. Companion SQL skills and broader assessment tooling remain in [`akaalholdings/SQL`](https://github.com/akaalholdings/SQL). Package operations are in [`docs/09-operations.md`](docs/09-operations.md); release history is in [`CHANGELOG.md`](CHANGELOG.md); security reporting is in [`SECURITY.md`](SECURITY.md).
+This is the canonical standalone repository for the Azure SQL MCP server. The companion SQL skills are in [`akaalholdings/sql-skills`](https://github.com/akaalholdings/sql-skills). Package operations are in [`docs/09-operations.md`](docs/09-operations.md); release history is in [`CHANGELOG.md`](CHANGELOG.md); security reporting is in [`SECURITY.md`](SECURITY.md).

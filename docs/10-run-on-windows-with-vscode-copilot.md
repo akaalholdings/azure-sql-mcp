@@ -75,7 +75,7 @@ Get-ChildItem "$env:USERPROFILE\.copilot\skills" -Directory | Select-Object Name
 Expected folders: `sql_health_triage`, `sql_index_manager`, `sql_optimizer`
 and `sql_plan_enforcer`.
 
-With a checkout of the skills repository you can use its installer instead:
+With a checkout of [`akaalholdings/sql-skills`](https://github.com/akaalholdings/sql-skills) you can use its installer instead:
 
 ```powershell
 py -3.12 skills\install_all.py --dest "$env:USERPROFILE\.copilot\skills"
