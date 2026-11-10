@@ -24,12 +24,18 @@ _REQUIRED_SET_OPTIONS = (
 
 # Said with every adviser statement that had to lose its ONLINE option.
 COLUMNSTORE_OFFLINE_BUILD_NOTE = (
-    "The table has a columnstore index. Azure SQL Database cannot build an index online "
-    "on such a table, so the CREATE INDEX statement has no ONLINE option: the build is "
-    "offline and blocks all writes to the table while it runs. Plan a window for it."
+    "The table has a clustered columnstore index. Azure SQL Database cannot build an "
+    "index or an index-backed constraint online on such a table (engine errors 35352 and "
+    "1750), so the CREATE INDEX or ADD CONSTRAINT statement has no ONLINE option: the "
+    "build is offline and blocks all writes to the table while it runs. Plan a window "
+    "for it."
 )
-_CREATE_INDEX_START = re.compile(
-    r"\bCREATE\s+(?:UNIQUE\s+)?(?:(?:NON)?CLUSTERED\s+)?INDEX\b", re.IGNORECASE
+# The statements the engine refuses online on a clustered columnstore table.
+# ALTER INDEX ... REBUILD WITH (ONLINE = ON) works there and is not matched.
+_OFFLINE_ONLY_STATEMENT_START = re.compile(
+    r"\bCREATE\s+(?:UNIQUE\s+)?(?:(?:NON)?CLUSTERED\s+)?INDEX\b"
+    r"|\bALTER\s+TABLE\b(?=[^;]*?\bADD\s+(?:CONSTRAINT|PRIMARY\s+KEY|UNIQUE)\b)",
+    re.IGNORECASE,
 )
 # ONLINE = ON, with or without (WAIT_AT_LOW_PRIORITY (...)).
 _ONLINE_OPTION = re.compile(
@@ -39,16 +45,18 @@ _EMPTY_WITH = re.compile(r"(?:\n--[ \t]*|\s*)WITH\s*\(\s*\)", re.IGNORECASE)
 
 
 def without_online_create(ddl: str) -> str:
-    """Remove the ONLINE = ON option from every CREATE INDEX statement in ``ddl``.
+    """Remove the ONLINE = ON option from every CREATE INDEX and ALTER TABLE ...
+    ADD CONSTRAINT statement in ``ddl``, also in commented SQL.
 
-    For a table with a columnstore index, where the engine refuses an online
-    index build. Other statements (DROP INDEX, ALTER INDEX ... REBUILD) and
-    commented statements keep their form.
+    For a table whose clustered index is columnstore, where the engine refuses
+    both online. A table with only a nonclustered columnstore index accepts
+    them online: do not call this for it. Other statements (DROP INDEX,
+    ALTER INDEX ... REBUILD, ALTER TABLE ... REBUILD) keep their form.
     """
 
     parts: list[str] = []
     position = 0
-    for match in _CREATE_INDEX_START.finditer(ddl):
+    for match in _OFFLINE_ONLY_STATEMENT_START.finditer(ddl):
         if match.start() < position:
             continue
         end = _statement_end(ddl, match.end())

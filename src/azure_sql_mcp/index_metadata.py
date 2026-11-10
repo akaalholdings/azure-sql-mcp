@@ -737,6 +737,94 @@ def _quoted_object_name(schema_name: str, table_name: str) -> str:
     return ".".join("[" + str(part).replace("]", "]]") + "]" for part in (schema_name, table_name))
 
 
+# One row per column of one table: what decides whether a columnstore index
+# can hold the column, and whether an indexed view may SUM it. An alias type
+# reads as the system type it stores. Every system type reads by its own name:
+# vector and sysname are stored as another type (vector as varbinary), and a
+# join to the base type alone lost them. The parameter is the quoted two-part
+# table name.
+TABLE_COLUMN_FACTS_SQL = """
+SELECT
+    c.name AS column_name,
+    CASE
+        WHEN ut.is_user_defined = 1 AND ut.is_assembly_type = 0
+        THEN COALESCE(bt.name, ut.name)
+        ELSE ut.name
+    END AS type_name,
+    c.max_length,
+    c.is_nullable,
+    c.is_computed,
+    c.is_sparse
+FROM sys.columns AS c
+INNER JOIN sys.types AS ut
+    ON ut.user_type_id = c.user_type_id
+LEFT JOIN sys.types AS bt
+    ON bt.user_type_id = c.system_type_id
+WHERE c.object_id = OBJECT_ID(?)
+ORDER BY c.column_id
+"""
+
+
+@dataclass(frozen=True)
+class TableColumnFacts:
+    """One table column as the catalog describes it.
+
+    ``max_length`` -1 is a (max) type. ``is_nullable`` None means not read.
+    """
+
+    name: str
+    type_name: str
+    max_length: int | None = None
+    is_computed: bool = False
+    is_sparse: bool = False
+    is_nullable: bool | None = None
+
+
+async def collect_table_column_facts(
+    executor: AzureSqlExecutor,
+    database_name: str,
+    *,
+    schema_name: str,
+    table_name: str,
+) -> list[TableColumnFacts]:
+    """Read the columns of one table: one catalog query, no rows when it does not exist."""
+
+    rows = await executor.fetch_all(
+        database_name,
+        TABLE_COLUMN_FACTS_SQL,
+        params=[_quoted_object_name(schema_name, table_name)],
+    )
+    return [
+        TableColumnFacts(
+            name=str(row.get("column_name") or ""),
+            type_name=str(row.get("type_name") or "").strip().lower(),
+            max_length=_as_optional_int(row.get("max_length")),
+            is_computed=_as_bool(row.get("is_computed")),
+            is_sparse=_as_bool(row.get("is_sparse")),
+            is_nullable=_as_optional_bool(row.get("is_nullable")),
+        )
+        for row in rows
+    ]
+
+
+def generated_test_object_name(
+    prefix: str, readable_parts: Iterable[str], definition_fingerprint: str
+) -> str:
+    """The name rule of every generated test object: readable, bounded, one per definition.
+
+    ``<prefix><part>_<part>..._<8 hex>``: every character of a part outside
+    letters, digits and underscore becomes an underscore, the readable text
+    is cut so the name holds at most ``MAX_GENERATED_TEST_INDEX_NAME_LENGTH``
+    characters, and the first 8 hex digits of the definition fingerprint
+    always end it.
+    """
+
+    readable = "_".join(re.sub(r"[^A-Za-z0-9_]", "_", str(part)) for part in readable_parts)
+    room = MAX_GENERATED_TEST_INDEX_NAME_LENGTH - len(prefix) - 1 - 8
+    readable = readable[: max(0, room)].rstrip("_")
+    return f"{prefix}{readable}_{definition_fingerprint[:8]}"
+
+
 async def _fetch_scoped(
     executor: AzureSqlExecutor,
     database_name: str,

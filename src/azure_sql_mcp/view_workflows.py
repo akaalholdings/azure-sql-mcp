@@ -530,11 +530,20 @@ def _validate_indexed_view(statement: Any, upper: str) -> list[str]:
     if statement is None:
         return ["indexed view definition could not be analyzed"]
     errors: list[str] = []
-    for count in statement.find_all(exp.Count):
+    counts = list(statement.find_all(exp.Count))
+    # The engine accepts COUNT_BIG(expression) beside COUNT_BIG(*), and refuses
+    # it alone with error 10138.
+    has_count_big_star = any(
+        bool(count.args.get("big_int")) and isinstance(count.this, exp.Star) for count in counts
+    )
+    for count in counts:
         if not bool(count.args.get("big_int")):
             errors.append("COUNT is not supported in an indexed view; use COUNT_BIG")
-        elif not isinstance(count.this, exp.Star):
-            errors.append("indexed views require COUNT_BIG(*) when counting rows")
+        elif not isinstance(count.this, exp.Star) and not has_count_big_star:
+            errors.append(
+                "COUNT_BIG of an expression in an indexed view needs COUNT_BIG(*) in the "
+                "select list as well (engine error 10138)"
+            )
     for total in statement.find_all(exp.Sum):
         if not isinstance(total.this, exp.Coalesce):
             errors.append(

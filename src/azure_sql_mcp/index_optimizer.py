@@ -21,6 +21,8 @@ from sqlglot.errors import ParseError
 
 from .connection import AzureSqlExecutor
 from .index_metadata import ExistingIndex
+from .index_metadata import IndexKeyColumn
+from .index_metadata import TableColumnFacts
 from .index_metadata import coerce_existing_indexes
 from .index_metadata import collect_existing_indexes
 from .index_metadata import existing_index_covers_candidate
@@ -50,10 +52,44 @@ _PAGE_SIZE_BYTES = 8192
 # Non-leaf overhead multiplier (typically ~10% for B-tree levels above leaf)
 _NON_LEAF_MULTIPLIER = 1.1
 
-# ``build_index_candidate_statement`` emits a rowstore NONCLUSTERED INDEX.
-# COLUMNSTORE and COLUMNSTORE_ARCHIVE belong to columnstore index DDL and must
-# not be accepted for this statement shape.
+# What an IndexCandidate builds. The default is the nonclustered B-tree index
+# every candidate was before the kind existed.
+INDEX_KIND_ROWSTORE = "rowstore"
+# CREATE NONCLUSTERED COLUMNSTORE INDEX: ``key_columns`` holds the columns of the
+# index (it has no key, no INCLUDE list and no ASC or DESC).
+INDEX_KIND_NONCLUSTERED_COLUMNSTORE = "nonclustered_columnstore"
+# The unique clustered index that materialises a schema-bound view. Only the
+# view experiment builds it; the test index path refuses it.
+INDEX_KIND_VIEW_CLUSTERED = "view_unique_clustered"
+# The kinds benchmark_index_candidate may build on a table.
+TEST_INDEX_KINDS = (INDEX_KIND_ROWSTORE, INDEX_KIND_NONCLUSTERED_COLUMNSTORE)
+_CATALOG_INDEX_TYPE = {
+    INDEX_KIND_ROWSTORE: "NONCLUSTERED",
+    INDEX_KIND_NONCLUSTERED_COLUMNSTORE: "NONCLUSTERED COLUMNSTORE",
+    INDEX_KIND_VIEW_CLUSTERED: "CLUSTERED",
+}
+
+# A rowstore index statement takes NONE, ROW or PAGE. COLUMNSTORE and
+# COLUMNSTORE_ARCHIVE belong to columnstore index DDL only.
 _SUPPORTED_ROWSTORE_INDEX_COMPRESSIONS = frozenset({"NONE", "ROW", "PAGE"})
+_COLUMNSTORE_DEFAULT_COMPRESSION = "COLUMNSTORE"
+_SUPPORTED_COLUMNSTORE_COMPRESSIONS = frozenset({"COLUMNSTORE", "COLUMNSTORE_ARCHIVE"})
+# Engine limit of a nonclustered columnstore index.
+MAX_COLUMNSTORE_INDEX_COLUMNS = 1024
+# System types a columnstore index can hold (Microsoft Learn, CREATE
+# COLUMNSTORE INDEX, limitations; each one and vector observed on Azure SQL
+# Database). A (max) length is checked apart from the type: only a clustered
+# columnstore index holds it. Every other type is refused there with error
+# 35343: text, ntext, image, xml, sql_variant, timestamp, json, CLR types.
+_COLUMNSTORE_COLUMN_TYPES = frozenset(
+    {
+        "bigint", "int", "smallint", "tinyint", "bit",
+        "decimal", "numeric", "money", "smallmoney", "float", "real",
+        "date", "datetime", "datetime2", "smalldatetime", "datetimeoffset", "time",
+        "char", "varchar", "nchar", "nvarchar", "binary", "varbinary",
+        "uniqueidentifier", "sysname", "vector",
+    }
+)  # fmt: skip
 
 # Test-index builds wait for their final schema lock at low priority, so readers
 # and writers do not queue behind them, and give up themselves when it runs out.
@@ -178,15 +214,24 @@ class IndexCandidate:
     workflow_id: str | None = None
     partition_scheme_name: str | None = None
     partition_function_name: str | None = None
+    # One of the INDEX_KIND_ values. For a nonclustered columnstore index,
+    # ``key_columns`` holds the columns of the index.
+    index_kind: str = INDEX_KIND_ROWSTORE
 
     @property
     def definition_fingerprint(self) -> str:
         compression = self.compression.upper() if self.compression else None
+        if (
+            self.index_kind == INDEX_KIND_NONCLUSTERED_COLUMNSTORE
+            and compression == _COLUMNSTORE_DEFAULT_COMPRESSION
+        ):
+            compression = None
         partition_compression = ((0, compression),) if compression else ()
         return index_definition_fingerprint(
             schema=self.schema,
             table=self.table,
-            index_type="NONCLUSTERED",
+            # An unknown kind fingerprints as itself; the DDL builder refuses it.
+            index_type=_CATALOG_INDEX_TYPE.get(self.index_kind, self.index_kind),
             key_columns=self.key_columns,
             include_columns=self.include_columns,
             filter_definition=self.filter_definition,
@@ -221,6 +266,7 @@ class IndexCandidate:
             "workflow_id": self.workflow_id,
             "partition_scheme_name": self.partition_scheme_name,
             "partition_function_name": self.partition_function_name,
+            "index_kind": self.index_kind,
             "definition_fingerprint": self.definition_fingerprint,
         }
 
@@ -1456,19 +1502,40 @@ def build_index_candidate_statement(
     low_priority_wait_minutes: int | None = None,
     maxdop: int | None = None,
 ) -> str:
-    """Render a review-only CREATE INDEX statement, including a filter.
+    """Render the review-only CREATE INDEX statement of a candidate, by its kind.
 
-    ``low_priority_wait_minutes`` (online builds only) adds WAIT_AT_LOW_PRIORITY
-    with ABORT_AFTER_WAIT = SELF; ``maxdop`` adds MAXDOP.
+    ``low_priority_wait_minutes`` (online builds only) adds
+    WAIT_AT_LOW_PRIORITY with ABORT_AFTER_WAIT = SELF; ``maxdop`` adds MAXDOP.
+    Raises ValueError for a definition the statement of that kind cannot hold.
     """
 
     if low_priority_wait_minutes is not None and not 1 <= int(low_priority_wait_minutes) <= 1440:
         raise ValueError("low_priority_wait_minutes must be between 1 and 1440")
     if maxdop is not None and not 1 <= int(maxdop) <= _MAX_MAXDOP:
         raise ValueError(f"maxdop must be between 1 and {_MAX_MAXDOP}")
+    if candidate.index_kind not in _CATALOG_INDEX_TYPE:
+        raise ValueError(
+            f"unsupported index_kind {candidate.index_kind!r}; use one of "
+            + ", ".join(_CATALOG_INDEX_TYPE)
+        )
+    if candidate.index_kind == INDEX_KIND_NONCLUSTERED_COLUMNSTORE:
+        return _columnstore_index_statement(
+            candidate,
+            online=online,
+            low_priority_wait_minutes=low_priority_wait_minutes,
+            maxdop=maxdop,
+        )
 
     if not candidate.key_columns:
         raise ValueError("an index candidate requires at least one key column")
+    clustered = candidate.index_kind == INDEX_KIND_VIEW_CLUSTERED
+    if clustered:
+        if not candidate.is_unique:
+            raise ValueError("the clustered index of a view must be unique")
+        if candidate.include_columns or candidate.filter_definition:
+            raise ValueError("a clustered index has no INCLUDE columns and no filter")
+        if online:
+            raise ValueError("the first clustered index of a view cannot be built online")
     compression = _validate_index_compression(candidate.compression)
     index_name = candidate.index_name or _derived_index_name(candidate)
     parsed_keys = tuple(parse_candidate_key(column) for column in candidate.key_columns)
@@ -1481,11 +1548,22 @@ def build_index_candidate_statement(
         include = " INCLUDE (" + ", ".join(
             _quote_identifier(column) for column in candidate.include_columns
         ) + ")"
-    filter_clause = ""
-    if candidate.filter_definition:
-        filter_text = candidate.filter_definition.strip()
-        _validate_filtered_index_predicate(filter_text)
-        filter_clause = f" WHERE {filter_text}"
+    with_clause = _with_clause(compression, online, low_priority_wait_minutes, maxdop)
+    uniqueness = "UNIQUE " if candidate.is_unique else ""
+    index_type = "CLUSTERED" if clustered else "NONCLUSTERED"
+    return (
+        f"CREATE {uniqueness}{index_type} INDEX {_quote_identifier(index_name)} "
+        f"ON {_quote_identifier(candidate.schema)}.{_quote_identifier(candidate.table)} "
+        f"({keys}){include}{_filter_clause(candidate)}{with_clause}{_on_clause(candidate)};"
+    )
+
+
+def _with_clause(
+    compression: str | None,
+    online: bool,
+    low_priority_wait_minutes: int | None,
+    maxdop: int | None,
+) -> str:
     options: list[str] = []
     if compression:
         options.append(f"DATA_COMPRESSION = {compression}")
@@ -1498,21 +1576,158 @@ def build_index_candidate_statement(
         options.append("ONLINE = ON")
     if maxdop is not None:
         options.append(f"MAXDOP = {int(maxdop)}")
-    with_clause = f" WITH ({', '.join(options)})" if options else ""
-    on_clause = ""
-    if candidate.data_space_name:
-        partition_clause = ""
-        if candidate.partition_columns:
-            partition_clause = "(" + ", ".join(
-                _quote_identifier(column) for column in candidate.partition_columns
-            ) + ")"
-        on_clause = f" ON {_quote_identifier(candidate.data_space_name)}{partition_clause}"
-    uniqueness = "UNIQUE " if candidate.is_unique else ""
+    return f" WITH ({', '.join(options)})" if options else ""
+
+
+def _filter_clause(candidate: IndexCandidate) -> str:
+    if not candidate.filter_definition:
+        return ""
+    filter_text = candidate.filter_definition.strip()
+    _validate_filtered_index_predicate(filter_text)
+    return f" WHERE {filter_text}"
+
+
+def _on_clause(candidate: IndexCandidate) -> str:
+    if not candidate.data_space_name:
+        return ""
+    partition_clause = ""
+    if candidate.partition_columns:
+        partition_clause = "(" + ", ".join(
+            _quote_identifier(column) for column in candidate.partition_columns
+        ) + ")"
+    return f" ON {_quote_identifier(candidate.data_space_name)}{partition_clause}"
+
+
+def _columnstore_column_names(candidate: IndexCandidate) -> tuple[str, ...]:
+    """The column names of a columnstore candidate, as written, without delimiters."""
+
+    names: list[str] = []
+    for column in candidate.key_columns:
+        if re.search(r"\s(?:ASC|DESC)\s*$", str(column), re.IGNORECASE):
+            raise ValueError(
+                f"a columnstore index column takes no ASC or DESC: {str(column).strip()}"
+            )
+        names.append(_parse_identifier_input(column))
+    return tuple(names)
+
+
+def _columnstore_index_statement(
+    candidate: IndexCandidate,
+    *,
+    online: bool,
+    low_priority_wait_minutes: int | None,
+    maxdop: int | None,
+) -> str:
+    """CREATE NONCLUSTERED COLUMNSTORE INDEX with DATA_COMPRESSION (COLUMNSTORE or
+    COLUMNSTORE_ARCHIVE), ONLINE and MAXDOP.
+
+    Azure SQL Database accepts the WAIT_AT_LOW_PRIORITY form of ONLINE for
+    this statement (observed), though its documented syntax does not list it.
+    """
+
+    if candidate.include_columns:
+        raise ValueError(
+            "a columnstore index has no INCLUDE list; name every column in key_columns"
+        )
+    if candidate.is_unique:
+        raise ValueError("a columnstore index cannot be unique")
+    names = _columnstore_column_names(candidate)
+    if not names:
+        raise ValueError("a nonclustered columnstore index requires at least one column")
+    if len(names) > MAX_COLUMNSTORE_INDEX_COLUMNS:
+        raise ValueError(
+            "a nonclustered columnstore index holds at most "
+            f"{MAX_COLUMNSTORE_INDEX_COLUMNS} columns"
+        )
+    folded = [name.casefold() for name in names]
+    repeated = next((name for name in names if folded.count(name.casefold()) > 1), None)
+    if repeated is not None:
+        raise ValueError(f"column {repeated} is named twice in the columnstore index")
+    compression = _validate_columnstore_compression(candidate.compression)
+    index_name = candidate.index_name or _derived_index_name(candidate)
+    columns = ", ".join(_quote_validated_identifier(name) for name in names)
+    with_clause = _with_clause(compression, online, low_priority_wait_minutes, maxdop)
     return (
-        f"CREATE {uniqueness}NONCLUSTERED INDEX {_quote_identifier(index_name)} "
+        f"CREATE NONCLUSTERED COLUMNSTORE INDEX {_quote_identifier(index_name)} "
         f"ON {_quote_identifier(candidate.schema)}.{_quote_identifier(candidate.table)} "
-        f"({keys}){include}{filter_clause}{with_clause}{on_clause};"
+        f"({columns}){_filter_clause(candidate)}{with_clause}{_on_clause(candidate)};"
     )
+
+
+def columnstore_index_blockers(
+    candidate: IndexCandidate,
+    *,
+    existing_indexes: Sequence[ExistingIndex],
+    table_columns: Sequence[TableColumnFacts],
+) -> tuple[str, ...]:
+    """Why the engine would refuse this nonclustered columnstore index; empty when it would not.
+
+    Checked from the catalog before any query runs: a table holds one
+    columnstore index (clustered or nonclustered, enabled or disabled), and a
+    nonclustered columnstore index cannot hold a (max) column, a computed or
+    sparse column, or a type outside the documented list. ``existing_indexes``
+    are the indexes of the database or of the table (collect_existing_indexes);
+    ``table_columns`` are the columns of the table (collect_table_column_facts).
+    """
+
+    if candidate.index_kind != INDEX_KIND_NONCLUSTERED_COLUMNSTORE:
+        raise ValueError(
+            f"columnstore_index_blockers checks the {INDEX_KIND_NONCLUSTERED_COLUMNSTORE} "
+            f"kind only, not {candidate.index_kind!r}"
+        )
+    table = f"{candidate.schema}.{candidate.table}"
+    blockers: list[str] = []
+    for index in existing_indexes:
+        if (
+            _canonical_catalog_identifier(index.schema)
+            == _canonical_catalog_identifier(candidate.schema)
+            and _canonical_catalog_identifier(index.table)
+            == _canonical_catalog_identifier(candidate.table)
+            and (
+                index.index_type_code in {5, 6}
+                or "COLUMNSTORE" in str(index.index_type).upper()
+            )
+        ):
+            state = ", disabled" if index.is_disabled else ""
+            blockers.append(
+                f"{table} already has the columnstore index {index.name} "
+                f"({str(index.index_type).strip().lower()}{state}). Azure SQL Database allows "
+                "one columnstore index on a table (engine error 35339), so a nonclustered "
+                "columnstore test index cannot be built on it."
+            )
+            break
+    facts = {column.name.casefold(): column for column in table_columns}
+    seen: set[str] = set()
+    for name in _columnstore_column_names(candidate):
+        folded = name.casefold()
+        if folded in seen:
+            continue
+        seen.add(folded)
+        reason = _columnstore_column_blocker(facts.get(folded))
+        if reason is not None:
+            blockers.append(f"Column {name} of {table} {reason}.")
+    return tuple(blockers)
+
+
+def _columnstore_column_blocker(column: TableColumnFacts | None) -> str | None:
+    if column is None:
+        return "does not exist"
+    type_name = column.type_name.strip().lower()
+    if column.is_computed:
+        return (
+            "is a computed column, which a nonclustered columnstore index cannot hold "
+            "(engine error 35307)"
+        )
+    if column.is_sparse:
+        return "is a sparse column, which a columnstore index cannot hold (engine error 35309)"
+    if type_name not in _COLUMNSTORE_COLUMN_TYPES:
+        return f"has type {type_name}, which a columnstore index cannot hold (engine error 35343)"
+    if column.max_length == -1:
+        return (
+            f"has type {type_name}(max): only a clustered columnstore index holds a (max) "
+            "column, a nonclustered one cannot (engine error 35343)"
+        )
+    return None
 
 
 def make_temporary_index_candidate(
@@ -1543,12 +1758,19 @@ def build_test_index_statement(
 ) -> str:
     """CREATE INDEX for a workflow-managed test index on a sandbox database.
 
-    An online build waits for its last lock at low priority and aborts itself,
-    so it never heads a blocking chain. An offline build blocks every writer of
-    the table for the whole build: refused unless the database policy allows it.
-    ``maxdop`` comes from policy; None leaves the database default.
+    An online build waits for its last lock at low priority and aborts
+    itself, so it never heads a blocking chain. An offline build blocks every
+    writer of the table for the whole build: refused unless the database policy
+    allows it. ``maxdop`` comes from policy; None leaves the database default.
+    The candidate's ``index_kind`` chooses a B-tree or a nonclustered
+    columnstore index.
     """
 
+    if candidate.index_kind == INDEX_KIND_VIEW_CLUSTERED:
+        raise ValueError(
+            "A clustered index is built only on a leased test view, by the view "
+            "experiment; a test index on a table is rowstore or nonclustered columnstore."
+        )
     if not online and not allow_offline:
         raise PermissionError(
             "An offline test index build blocks all writes to the table while it runs. "
@@ -2025,19 +2247,24 @@ def expected_index_definition_matches(
         _canonical_catalog_identifier(expected.index_name)
     ):
         return False
-    if str(actual.index_type).strip().upper() != "NONCLUSTERED":
+    columnstore = expected.index_kind == INDEX_KIND_NONCLUSTERED_COLUMNSTORE
+    catalog_type = _CATALOG_INDEX_TYPE.get(expected.index_kind)
+    if catalog_type is None or str(actual.index_type).strip().upper() != catalog_type:
         return False
     expected_keys = tuple(parse_candidate_key(column) for column in expected.key_columns)
-    if len(actual.key_columns) != len(expected_keys) or any(
+    if columnstore:
+        if not _columnstore_columns_match(actual, expected_keys):
+            return False
+    elif len(actual.key_columns) != len(expected_keys) or any(
         _canonical_catalog_identifier(actual_key.name)
         != _canonical_catalog_identifier(expected_key.name)
         or actual_key.direction != expected_key.direction
         for actual_key, expected_key in zip(actual.key_columns, expected_keys)
     ):
         return False
-    if tuple(_canonical_catalog_identifier(column) for column in actual.include_columns) != tuple(
-        _canonical_catalog_identifier(column) for column in expected.include_columns
-    ):
+    elif tuple(
+        _canonical_catalog_identifier(column) for column in actual.include_columns
+    ) != tuple(_canonical_catalog_identifier(column) for column in expected.include_columns):
         return False
     if _canonical_filter_definition(actual.filter_definition) != _canonical_filter_definition(
         expected.filter_definition
@@ -2100,7 +2327,8 @@ def expected_index_definition_matches(
         or expected.partition_function_name is not None
     ):
         return False
-    expected_compression = str(expected.compression or "NONE").strip().upper()
+    default_compression = _COLUMNSTORE_DEFAULT_COMPRESSION if columnstore else "NONE"
+    expected_compression = str(expected.compression or default_compression).strip().upper()
     actual_compression = tuple(
         str(compression).strip().upper()
         for _partition_number, compression in actual.partition_compression
@@ -2113,6 +2341,31 @@ def expected_index_definition_matches(
     ):
         return False
     return True
+
+
+def _columnstore_columns_match(
+    actual: ExistingIndex, expected_columns: Sequence[IndexKeyColumn]
+) -> bool:
+    """Whether a catalog columnstore index holds the requested columns and no other.
+
+    The catalog lists the columns of a columnstore index as nonkey columns and
+    their order has no meaning. The partitioning column of an aligned index
+    may be present without being requested.
+    """
+
+    expected = {_canonical_catalog_identifier(column.name) for column in expected_columns}
+    held = {
+        _canonical_catalog_identifier(name)
+        for name in (
+            *(column.name for column in actual.key_columns),
+            *actual.include_columns,
+            *actual.nonkey_columns,
+        )
+    }
+    partitioning = {
+        _canonical_catalog_identifier(column) for column in actual.partition_columns
+    }
+    return expected <= held and held - expected <= partitioning
 
 
 def _identifier_spelling(value: str) -> str:
@@ -2234,6 +2487,20 @@ def _validate_index_compression(value: str | None) -> str | None:
         supported = ", ".join(sorted(_SUPPORTED_ROWSTORE_INDEX_COMPRESSIONS))
         raise ValueError(
             f"unsupported rowstore index compression {value!r}; use one of {supported}"
+        )
+    return normalized
+
+
+def _validate_columnstore_compression(value: str | None) -> str | None:
+    """Validate columnstore DATA_COMPRESSION before it reaches generated DDL."""
+
+    if value is None or not str(value).strip():
+        return None
+    normalized = str(value).strip().upper()
+    if normalized not in _SUPPORTED_COLUMNSTORE_COMPRESSIONS:
+        supported = ", ".join(sorted(_SUPPORTED_COLUMNSTORE_COMPRESSIONS))
+        raise ValueError(
+            f"unsupported columnstore index compression {value!r}; use one of {supported}"
         )
     return normalized
 

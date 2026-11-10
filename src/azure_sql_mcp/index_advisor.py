@@ -29,6 +29,7 @@ from datetime import timezone
 from typing import Any
 from typing import Iterable
 from typing import Mapping
+from typing import Sequence
 
 from .index_ddl import COLUMNSTORE_OFFLINE_BUILD_NOTE
 from .index_ddl import quote_identifier
@@ -227,6 +228,8 @@ class AdvisorSettings:
     focus_schema: str | None = None
     # Test index prefixes of the database policy; the built-in ones always apply.
     test_index_name_prefixes: tuple[str, ...] = ()
+    # Query Store query ids the caller named: each gets its own unmerged design.
+    requested_query_ids: frozenset[int] = frozenset()
 
 
 @dataclass
@@ -364,6 +367,7 @@ def build_index_advice(inputs: AdvisorInputs) -> dict[str, Any]:
     window, _ = _query_store_window(inputs)
     rate_days = _rate_days(inputs)
     recommendations: list[dict[str, Any]] = []
+    requested_designs: list[dict[str, Any]] = []
     tables_out: list[dict[str, Any]] = []
     unread_columnstore_health = False
     fill_factor_unread = False
@@ -395,6 +399,16 @@ def build_index_advice(inputs: AdvisorInputs) -> dict[str, Any]:
         elif table_accesses:
             candidates = _candidates_for_table(
                 schema, table, table_accesses, columns, inputs, settings
+            )
+            # Before the merge: the index each named query would get alone.
+            requested_designs.extend(
+                _requested_query_design(candidate, existing)
+                for candidate in candidates
+                if candidate.keys
+                and any(
+                    item.query.query_id in settings.requested_query_ids
+                    for item in candidate.supports
+                )
             )
             candidates = _merge_candidates(candidates, columns, settings)
             table_recs.extend(
@@ -460,13 +474,14 @@ def build_index_advice(inputs: AdvisorInputs) -> dict[str, Any]:
         table_recs = actionable[: settings.max_recommendations_per_table] + advisory
         if not table_accesses and not table_recs:
             continue
-        # The engine refuses an online index build on a table that has an
-        # enabled columnstore index.
-        columnstore_table = any(
-            _is_columnstore_index(index) and not index.is_disabled for index in existing
+        # The engine refuses an online index build on a table whose clustered
+        # index is columnstore. A nonclustered columnstore index does not
+        # force an offline build.
+        clustered_columnstore_table = any(
+            _is_clustered_columnstore_index(index) for index in existing
         )
         for rec in table_recs:
-            if columnstore_table:
+            if clustered_columnstore_table:
                 _build_offline(rec)
             rec["id"] = f"R{len(recommendations) + 1}"
             recommendations.append(rec)
@@ -559,10 +574,21 @@ def build_index_advice(inputs: AdvisorInputs) -> dict[str, Any]:
         },
         "tables": tables_out,
         "recommendations": recommendations,
+        **({"requested_query_design": requested_designs} if requested_designs else {}),
         "rewrite_opportunities": rewrites,
         "gaps": gaps,
         "next_steps": _next_steps(recommendations, rewrites),
     }
+
+
+# Said with every proposal or test of an index that is not partition-aligned.
+NON_ALIGNED_INDEX_WARNING = (
+    "This index is not partition-aligned. A non-aligned index blocks partition SWITCH "
+    "in and out of the table: it must be dropped or disabled for a switch-based load "
+    "and rebuilt after it. It gives up partition elimination for this index, and it "
+    "gives one ordered B-tree across all partitions, so a seek or an ordered read "
+    "does not visit every partition."
+)
 
 
 _IMPROVEMENT_ACTIONS = frozenset(
@@ -832,8 +858,6 @@ def _access_candidate(
         return float(value.distinct_estimate or 0.0) if value else 0.0
 
     eq.sort(key=lambda column: (-frequency.get(_norm(column), 0.0), -distinct(column), _norm(column)))
-    keys: list[tuple[str, str]] = [(column, "ASC") for column in eq]
-    range_column: str | None = None
     if ranges:
         order_names = [_norm(column) for column, _ in order_columns]
         ranges.sort(
@@ -844,16 +868,7 @@ def _access_candidate(
                 _norm(column),
             )
         )
-        range_column = ranges[0]
-        direction = next(
-            (d for column, d in order_columns if _norm(column) == _norm(range_column)), "ASC"
-        )
-        keys.append((range_column, direction))
-    elif order_columns:
-        for column, direction in order_columns:
-            if _norm(column) not in {_norm(name) for name, _ in keys}:
-                keys.append((column, direction))
-    keys = keys[:MAX_KEY_COLUMNS]
+    keys = _ordered_keys(eq, order_columns, ranges)
 
     # Range columns that did not become the key still need to be in the index;
     # _set_includes skips the ones that are keys.
@@ -889,6 +904,31 @@ def _access_candidate(
         factor = 0.4
     candidate.savings = item.attributed * max(0.0, factor)
     return candidate
+
+
+def _ordered_keys(
+    eq: Sequence[str],
+    order_columns: Sequence[tuple[str, str]],
+    ranges: Sequence[str],
+) -> list[tuple[str, str]]:
+    """Key order of a new index: equality columns, the ORDER BY columns, one range column.
+
+    The equality columns seek. The ORDER BY columns follow in the direction
+    of the query, so the rows leave the index in order and no sort is needed.
+    One range column comes last: a range column placed before the ORDER BY
+    columns would return the rows in its own order. A range column that is
+    also an ORDER BY column keeps its ORDER BY position and direction.
+    """
+
+    keys: list[tuple[str, str]] = [(column, "ASC") for column in eq]
+    present = {_norm(column) for column in eq}
+    for column, direction in order_columns:
+        if _norm(column) not in present:
+            keys.append((column, direction))
+            present.add(_norm(column))
+    if ranges and _norm(ranges[0]) not in present:
+        keys.append((ranges[0], "ASC"))
+    return keys[:MAX_KEY_COLUMNS]
 
 
 def _lookup_feeders(accesses: list[_Access]) -> dict[int, _Access]:
@@ -954,7 +994,6 @@ def _lookup_candidate(
         for column, direction in (feed.order_columns or access.order_columns)
         if _key_eligible(columns, column)
     ]
-    keys: list[tuple[str, str]] = [(column, "ASC") for column in eq]
     if ranges:
         order_names = [_norm(column) for column, _ in order_columns]
         ranges.sort(
@@ -965,10 +1004,7 @@ def _lookup_candidate(
                 _norm(column),
             )
         )
-        direction = next(
-            (d for column, d in order_columns if _norm(column) == _norm(ranges[0])), "ASC"
-        )
-        keys.append((ranges[0], direction))
+    keys = _ordered_keys(eq, order_columns, ranges)
     if not keys:
         return None
     needed = (
@@ -2353,7 +2389,8 @@ def _foreign_key_findings(
 
 
 def _build_offline(rec: dict[str, Any]) -> None:
-    """Take ONLINE out of every CREATE INDEX statement of one recommendation, and say so."""
+    """Take ONLINE out of every CREATE INDEX and ADD CONSTRAINT statement of one
+    recommendation, and say so."""
 
     changed = False
 
@@ -2373,7 +2410,7 @@ def _build_offline(rec: dict[str, Any]) -> None:
         rec[key] = offline(value)
     if changed:
         rec["offline_build"] = {
-            "reason": "columnstore_table",
+            "reason": "clustered_columnstore_table",
             "note": COLUMNSTORE_OFFLINE_BUILD_NOTE,
         }
 
@@ -2382,6 +2419,15 @@ def _is_columnstore_index(index: ExistingIndex) -> bool:
     return (
         index.index_type_code in COLUMNSTORE_TYPE_CODES
         or "COLUMNSTORE" in (index.index_type or "").upper()
+    )
+
+
+def _is_clustered_columnstore_index(index: ExistingIndex) -> bool:
+    """sys.indexes type 5. "NONCLUSTERED COLUMNSTORE" (type 6) is not one."""
+
+    return (
+        index.index_type_code == 5
+        or (index.index_type or "").strip().upper() == "CLUSTERED COLUMNSTORE"
     )
 
 
@@ -3052,7 +3098,10 @@ def _add_partition_advice(
     count = summary["partition_count"]
     partitions = f"all {count} partitions" if count else "every partition"
     alternative: dict[str, Any] | None = None
-    if unfiltered and rec["ddl"]:
+    # A nonclustered index on a partitioned clustered columnstore table must be
+    # partition-aligned: the engine refuses a non-aligned one.
+    columnstore_table = _is_clustered_columnstore_index(base)
+    if unfiltered and rec["ddl"] and not columnstore_table:
         alternative = {
             "when_better": (
                 f"{unfiltered} of the {len(filtered)} supporting quer"
@@ -3069,7 +3118,13 @@ def _add_partition_advice(
                 "cannot be rebuilt one partition at a time."
             ),
             "ddl": rec["ddl"][:-1] + " ON [PRIMARY];",
+            "warning": NON_ALIGNED_INDEX_WARNING,
+            "test_with": (
+                "benchmark_index_candidate with partition_aligned=false on this index "
+                "measures the non-aligned form on a non-production copy."
+            ),
         }
+    if unfiltered and rec["ddl"]:
         rec["risks"] = list(rec["risks"]) + [
             f"The index is aligned with the table's partitions: a query that does not filter on "
             f"{shown} seeks every partition."
@@ -3081,6 +3136,12 @@ def _add_partition_advice(
             "The statement has no ON clause, so the index is created on the table's partition "
             "scheme: it is aligned, partition switching and partition-level maintenance keep "
             "working, and SQL Server adds the partitioning column to the index."
+        )
+        + (
+            " On a table with a clustered columnstore index a nonclustered index must be "
+            "partition-aligned, so there is no non-aligned form to choose."
+            if columnstore_table
+            else ""
         ),
         "non_aligned_alternative": alternative,
     }
@@ -3562,6 +3623,52 @@ def _display_identity(
     if existing:
         return existing[0].schema, existing[0].table
     return key
+
+
+def _requested_query_design(
+    candidate: _Candidate, existing: Sequence[ExistingIndex]
+) -> dict[str, Any]:
+    """The index one named query would get by itself, before any merge with the workload.
+
+    A recommendation merges the needs of every query on the table and can
+    change the key order one query wants. This is that query's own design;
+    the recommendation that serves it is the workload variant.
+    """
+
+    keys_sql = ", ".join(f"{quote_identifier(name)} {direction}" for name, direction in candidate.keys)
+    include_sql = (
+        " INCLUDE (" + ", ".join(quote_identifier(column) for column in candidate.includes) + ")"
+        if candidate.includes
+        else ""
+    )
+    name = _generated_name(candidate, {_norm(index.name) for index in existing})
+    # A clustered columnstore table takes an offline build only.
+    online = (
+        ""
+        if any(_is_clustered_columnstore_index(index) for index in existing)
+        else " WITH (ONLINE = ON)"
+    )
+    return {
+        "query_id": candidate.supports[0].query.query_id,
+        "schema": candidate.schema,
+        "table": candidate.table,
+        "basis": "this_query_alone",
+        "rule": "equality columns, then ORDER BY columns, then one range column",
+        "key_columns": [
+            name if direction == "ASC" else f"{name} {direction}"
+            for name, direction in candidate.keys
+        ],
+        "include_columns": list(candidate.includes),
+        "ddl": (
+            f"CREATE NONCLUSTERED INDEX {quote_identifier(name)} ON "
+            f"{quote_identifier(candidate.schema)}.{quote_identifier(candidate.table)} "
+            f"({keys_sql}){include_sql}{online};"
+        ),
+        "note": (
+            "Compare with the existing indexes of the table before adding it: a "
+            "recommendation that serves this query may extend one of them instead."
+        ),
+    }
 
 
 def _generated_name(candidate: _Candidate, taken: set[str]) -> str:

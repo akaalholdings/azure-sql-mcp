@@ -5359,9 +5359,10 @@ def _review_subjects(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
 
 
 def _columnstore_tables(subjects: Sequence[Mapping[str, Any]]) -> frozenset[tuple[str, str]]:
-    """The tables of a review that have an enabled columnstore index.
+    """The tables of a review whose clustered index is columnstore (type 5).
 
-    The engine refuses an online index build on such a table.
+    The engine refuses an online index build on such a table. A table with
+    only a nonclustered columnstore index (type 6) accepts it.
     """
 
     tables: set[tuple[str, str]] = set()
@@ -5374,9 +5375,9 @@ def _columnstore_tables(subjects: Sequence[Mapping[str, Any]]) -> frozenset[tupl
         reversible = reversible if isinstance(reversible, Mapping) else {}
         index_type = str(definition.get("index_type") or reversible.get("index_type") or "")
         if (
-            _as_int(reversible.get("index_type_code"), 0) in {5, 6}
-            or "COLUMNSTORE" in index_type.upper()
-        ) and not reversible.get("is_disabled"):
+            _as_int(reversible.get("index_type_code"), 0) == 5
+            or index_type.strip().upper() == "CLUSTERED COLUMNSTORE"
+        ):
             tables.add(_subject_table(subject))
     return frozenset(tables)
 
@@ -5393,7 +5394,7 @@ def _offline_on_columnstore(
     subject: Mapping[str, Any],
     columnstore_tables: frozenset[tuple[str, str]],
 ) -> str | None:
-    """Inert SQL of a subject, with no ONLINE build when its table has a columnstore index."""
+    """Inert SQL of a subject, with no ONLINE build on a clustered columnstore table."""
 
     if inert_sql is None or _subject_table(subject) not in columnstore_tables:
         return inert_sql

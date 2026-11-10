@@ -1,8 +1,12 @@
-"""S13a F5: adviser DDL for a table with a columnstore index has no ONLINE option.
+"""S13a F5: adviser DDL for a clustered columnstore table has no ONLINE build option.
 
-Azure SQL Database refuses CREATE INDEX ... WITH (ONLINE = ON) on a table that
-has a columnstore index. DDL that carries the option fails when the DBA runs
-it; the recommendation must also say that the offline build blocks writes.
+Observed on Azure SQL Database: on a table whose clustered index is columnstore
+(sys.indexes type 5), CREATE NONCLUSTERED INDEX ... WITH (ONLINE = ON) fails
+with error 35352 and ALTER TABLE ... ADD CONSTRAINT ... WITH (ONLINE = ON) fails
+with error 1750; ALTER INDEX ... REBUILD WITH (ONLINE = ON) works. A rowstore
+table with a nonclustered columnstore index (type 6) accepts all three online.
+DDL that carries a refused option fails when the DBA runs it; DDL that drops
+the option without need blocks writers for the whole build.
 """
 
 from __future__ import annotations
@@ -26,9 +30,14 @@ def _recs(report: dict[str, Any], action: str) -> list[dict[str, Any]]:
     return [rec for rec in report["recommendations"] if rec["action"] == action]
 
 
-def _columnstore(*, disabled: bool = False) -> Any:
+def _nonclustered_columnstore(*, disabled: bool = False) -> Any:
     ncci = _index("Sales", "Orders", "NCCI_Orders", ("OrderDate",), index_id=7, type_code=6)
     return replace(ncci, index_type="NONCLUSTERED COLUMNSTORE", is_disabled=disabled)
+
+
+def _clustered_columnstore() -> Any:
+    cci = _index("Sales", "Orders", "CCI_Orders", ("OrderDate",), index_id=8, type_code=5)
+    return replace(cci, index_type="CLUSTERED COLUMNSTORE")
 
 
 @pytest.mark.parametrize(
@@ -64,17 +73,34 @@ def _columnstore(*, disabled: bool = False) -> Any:
             "CREATE NONCLUSTERED INDEX [IX_A] ON [dbo].[T] ([a] ASC) WHERE [b] = 'x;y' "
             "ON [PRIMARY];",
         ),
+        (
+            # Error 1750 on a clustered columnstore table.
+            "ALTER TABLE [dbo].[T] ADD CONSTRAINT [UQ_T_a] UNIQUE NONCLUSTERED ([a] ASC) "
+            "WITH (ONLINE = ON);",
+            "ALTER TABLE [dbo].[T] ADD CONSTRAINT [UQ_T_a] UNIQUE NONCLUSTERED ([a] ASC);",
+        ),
+        (
+            "ALTER TABLE [dbo].[T] ADD CONSTRAINT [PK_T] PRIMARY KEY NONCLUSTERED ([a] ASC) "
+            "WITH (FILLFACTOR = 90, ONLINE = ON);",
+            "ALTER TABLE [dbo].[T] ADD CONSTRAINT [PK_T] PRIMARY KEY NONCLUSTERED ([a] ASC) "
+            "WITH (FILLFACTOR = 90);",
+        ),
     ],
 )
-def test_online_option_is_removed_from_create_index_statements(ddl: str, expected: str) -> None:
+def test_online_option_is_removed_from_create_index_and_add_constraint(
+    ddl: str, expected: str
+) -> None:
     assert without_online_create(ddl) == expected
 
 
-def test_only_create_index_statements_lose_the_online_option() -> None:
-    # Rebuilding the columnstore index itself online is supported; a DROP has no option.
+def test_rebuild_and_drop_statements_keep_their_form() -> None:
+    # A rebuild works online on a clustered columnstore table; a DROP has no option.
     untouched = (
         "DROP INDEX [IX_A] ON [dbo].[T];\n"
-        "ALTER INDEX [CCI_T] ON [dbo].[T] REBUILD WITH (ONLINE = ON);"
+        "ALTER INDEX [IX_B] ON [dbo].[T] REBUILD WITH (ONLINE = ON);\n"
+        "ALTER INDEX [CCI_T] ON [dbo].[T] REBUILD WITH (ONLINE = ON);\n"
+        "ALTER TABLE [dbo].[T] DROP CONSTRAINT [UQ_T_a];\n"
+        "ALTER TABLE [dbo].[T] REBUILD WITH (ONLINE = ON);"
     )
     mixed = untouched + "\nCREATE INDEX [IX_B] ON [dbo].[T] ([b]) WITH (ONLINE = ON);"
 
@@ -95,20 +121,27 @@ def _widen_and_drop(existing: list[Any]) -> tuple[dict[str, Any], dict[str, Any]
     return _recs(report, "widen_index")[0], _recs(report, "drop_index")[0]
 
 
-def test_adviser_ddl_on_a_columnstore_table_is_offline_and_says_so() -> None:
-    widen, drop = _widen_and_drop([*_orders_indexes(), _columnstore()])
+def test_adviser_ddl_on_a_clustered_columnstore_table_is_offline_and_says_so() -> None:
+    widen, drop = _widen_and_drop([*_orders_indexes(), _clustered_columnstore()])
 
     for rec in (widen, drop):
         assert "ONLINE" not in (rec["ddl"] or "")
         assert "ONLINE" not in rec["rollback_ddl"]
-        assert rec["offline_build"]["reason"] == "columnstore_table"
+        assert rec["offline_build"]["reason"] == "clustered_columnstore_table"
+        assert "clustered columnstore" in rec["offline_build"]["note"]
         assert "blocks all writes" in rec["offline_build"]["note"]
     assert "CREATE NONCLUSTERED INDEX" in widen["ddl"] and "DROP_EXISTING = ON" in widen["ddl"]
     assert "CREATE NONCLUSTERED INDEX" in drop["rollback_ddl"]
 
 
-@pytest.mark.parametrize("extra", [[], [_columnstore(disabled=True)]])
-def test_adviser_ddl_stays_online_without_an_enabled_columnstore_index(extra: list[Any]) -> None:
+@pytest.mark.parametrize(
+    "extra",
+    [[], [_nonclustered_columnstore()], [_nonclustered_columnstore(disabled=True)]],
+    ids=["rowstore_only", "nonclustered_columnstore", "disabled_nonclustered_columnstore"],
+)
+def test_adviser_ddl_stays_online_without_a_clustered_columnstore_index(
+    extra: list[Any],
+) -> None:
     widen, drop = _widen_and_drop([*_orders_indexes(), *extra])
 
     assert widen["ddl"].count("ONLINE = ON") == 1
@@ -117,6 +150,17 @@ def test_adviser_ddl_stays_online_without_an_enabled_columnstore_index(extra: li
 
 
 def _review_subjects() -> list[dict[str, Any]]:
+    nonclustered_columnstore = {
+        "subject_kind": "existing_index",
+        "subject_id": "index:2:7",
+        "schema_name": "dw",
+        "table_name": "DimUser",
+        "state": "keep",
+        "definition": {
+            "index_type": "NONCLUSTERED COLUMNSTORE",
+            "reversible_definition": {"index_type_code": 6, "is_disabled": False},
+        },
+    }
     columnstore = {
         "subject_kind": "existing_index",
         "subject_id": "index:1:1",
@@ -139,12 +183,13 @@ def _review_subjects() -> list[dict[str, Any]]:
         "include_columns": ["VoteTypeKey"],
     }
     rowstore = {**create, "subject_id": "missing:2", "table_name": "DimUser"}
-    return [columnstore, create, rowstore]
+    return [columnstore, create, rowstore, nonclustered_columnstore]
 
 
-def test_index_review_create_candidate_on_a_columnstore_table_is_offline() -> None:
-    columnstore, create, rowstore = _review_subjects()
-    tables = _columnstore_tables([columnstore, create, rowstore])
+def test_index_review_create_candidate_is_offline_only_on_a_clustered_columnstore_table() -> None:
+    columnstore, create, rowstore, nonclustered_columnstore = _review_subjects()
+    # dw.DimUser has a nonclustered columnstore index only: its build stays online.
+    tables = _columnstore_tables([columnstore, create, rowstore, nonclustered_columnstore])
 
     assert tables == {("dw", "FactVote")}
     offline_ddl, _ = _actionable_subject_sql(create, tables)
