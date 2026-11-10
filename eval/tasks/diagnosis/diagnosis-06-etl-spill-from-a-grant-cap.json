@@ -1,0 +1,251 @@
+{
+  "format_version": 1,
+  "id": "diagnosis-06-etl-spill-from-a-grant-cap",
+  "kind": "diagnosis",
+  "title": "The fact load spills 186 GB to tempdb",
+  "split": "public",
+  "source": "case-exam-v1:6",
+  "tags": [
+    "memory-grant",
+    "spill",
+    "hint"
+  ],
+  "prompt": [
+    "Client: Harbourline Commerce, a multi-tenant retail order platform with about 400 tenants. Database hlc-orders-prod: Azure SQL Database, Business Critical, Gen5, 16 vCores, compatibility level 160, READ_COMMITTED_SNAPSHOT ON. All times are UTC. Business hours are 07:30 to 18:00. The nightly batch must finish by 06:00. Evidence was collected from Mon 21 Sep to Sun 27 Sep 2026.",
+    "Batch step 2, etl.LoadFactSales, took 58 minutes in August and takes 2 hours 40 minutes to 3 hours 5 minutes now. It",
+    "aggregates the nightly staging rows (10.8M in August, about 22.4M since tenant 'MegaMart' was onboarded) into",
+    "dw.FactSales.",
+    "Client change log: 2025-03-11 a developer added OPTION (MAX_GRANT_PERCENT = 5) to etl.LoadFactSales, then a daytime job. 2026-01-20 etl.LoadFactSales moved into the nightly pipeline. 2026-08-30 release 5.2: ORM upgrade from version 7 to 8, new ProductSearch endpoint. 2026-09-01 tenant 'MegaMart' onboarded; nightly volume about doubled. 2026-09-04 the nightly index job was changed: rebuild threshold 30% to 5%, reorganize removed, ONLINE = ON, MAXDOP = 0, and UPDATE STATISTICS WITH FULLSCAN on every user table added. 2026-09-16 hotfix 5.2.3: an outer retry policy on every database call and Max Pool Size 100 to 400. 2026-09-24 11:47 planned maintenance reconfiguration, completed 11:48.",
+    "Name the root cause of the spill."
+  ],
+  "evidence": [
+    {
+      "id": "grants",
+      "tool": "get_memory_grants",
+      "arguments": {},
+      "result": {
+        "result_status": "ok",
+        "sampled_at": "2026-09-23T04:52:30Z",
+        "grants": [
+          {
+            "session_id": 388,
+            "source": "etl.LoadFactSales",
+            "dop": 8,
+            "requested_mb": 2918,
+            "granted_mb": 2918,
+            "ideal_mb": 9830,
+            "max_used_mb": 2918
+          },
+          {
+            "session_id": 97,
+            "source": "ALTER INDEX ... REBUILD (sort)",
+            "dop": 16,
+            "requested_mb": 1240,
+            "granted_mb": 1240,
+            "ideal_mb": 1240,
+            "max_used_mb": 1240
+          }
+        ],
+        "semaphore": {
+          "available_mb": 54000,
+          "waiter_count": 0
+        }
+      }
+    },
+    {
+      "id": "etl_plan",
+      "tool": "analyze_query_plan",
+      "arguments": {
+        "session_id": 388
+      },
+      "result": {
+        "result_status": "ok",
+        "plan_kind": "actual",
+        "statement": "INSERT INTO dw.FactSales (...) SELECT ... FROM stg.SalesDelta AS s JOIN dw.DimProduct AS p ON p.ProductId = s.ProductId GROUP BY s.SaleDate, s.StoreId, s.ProductId, s.TenantId OPTION (MAX_GRANT_PERCENT = 5)",
+        "elapsed_s": 11100,
+        "cpu_s": 2980,
+        "warnings": [
+          {
+            "operator": "Hash Match (Aggregate)",
+            "spill_level": 3,
+            "spilled_threads": 8
+          },
+          {
+            "operator": "Sort",
+            "spill_level": 2
+          }
+        ],
+        "cardinality": {
+          "hash_aggregate_input": {
+            "estimated_rows": 22100000,
+            "actual_rows": 22400000
+          },
+          "hash_aggregate_output": {
+            "estimated_rows": 3900000,
+            "actual_rows": 4100000
+          }
+        },
+        "memory_grant": {
+          "desired_mb": 9830,
+          "requested_mb": 2918,
+          "granted_mb": 2918,
+          "max_used_mb": 2918
+        },
+        "spill_history_gb": {
+          "2026-08-24": 11,
+          "2026-08-31": 12,
+          "2026-09-07": 171,
+          "2026-09-14": 180,
+          "2026-09-23": 186
+        }
+      }
+    },
+    {
+      "id": "tempdb",
+      "tool": "get_tempdb_usage",
+      "arguments": {},
+      "result": {
+        "result_status": "ok",
+        "max_size_gb": 512,
+        "samples": [
+          {
+            "time": "2026-09-23T02:30Z",
+            "internal_objects_gb": 6,
+            "version_store_gb": 22,
+            "free_gb": 481
+          },
+          {
+            "time": "2026-09-23T05:10Z",
+            "internal_objects_gb": 191,
+            "version_store_gb": 41,
+            "free_gb": 274
+          },
+          {
+            "time": "2026-09-23T08:40Z",
+            "internal_objects_gb": 9,
+            "version_store_gb": 47,
+            "free_gb": 452
+          }
+        ],
+        "top_sessions": [
+          {
+            "session_id": 388,
+            "internal_objects_gb": 186
+          },
+          {
+            "session_id": 97,
+            "internal_objects_gb": 3.8
+          }
+        ]
+      }
+    },
+    {
+      "id": "limits",
+      "tool": "get_resource_limits",
+      "arguments": {},
+      "result": {
+        "result_status": "ok",
+        "service_objective": "BC_Gen5_16",
+        "cpu_limit": 16,
+        "max_log_rate_mb_per_sec": 96,
+        "max_db_memory_gb": 81.6,
+        "max_workers": 1680,
+        "max_sessions": 30000,
+        "tempdb_max_size_gb": 512
+      }
+    }
+  ],
+  "key": {
+    "root_cause": "memory_grant_capped_by_hint",
+    "required_facts": [
+      {
+        "id": "granted_below_ideal",
+        "evidence": "grants",
+        "description": "The query was granted 2,918 MB and its ideal grant is 9,830 MB.",
+        "signals": {
+          "all": [
+            "2,?918",
+            "9,?830"
+          ]
+        },
+        "example": "The load was granted 2,918 MB against an ideal grant of 9,830 MB, and it used all of it."
+      },
+      {
+        "id": "memory_was_free",
+        "evidence": "grants",
+        "description": "About 54,000 MB of grant memory was free and no query was waiting.",
+        "signals": {
+          "all": [
+            "54,?000|54 GB",
+            "\\b(0|no|zero)\\b"
+          ]
+        },
+        "example": "The grant semaphore had about 54,000 MB available and 0 waiters."
+      },
+      {
+        "id": "estimates_are_accurate",
+        "evidence": "etl_plan",
+        "description": "Estimated and actual rows agree: 22.1M against 22.4M.",
+        "signals": {
+          "all": [
+            "22\\.1",
+            "22\\.4"
+          ]
+        },
+        "example": "The estimate is accurate: 22.1M rows estimated against 22.4M actual."
+      }
+    ],
+    "harmful_conclusions": [
+      {
+        "id": "update_statistics",
+        "description": "The estimates are within 2%. Statistics are not the problem, and a FULLSCAN adds to the log load.",
+        "root_causes": [
+          "stale_statistics"
+        ],
+        "signals": {
+          "any": [
+            "update statistics",
+            "\\bfullscan\\b"
+          ]
+        },
+        "example": "Run UPDATE STATISTICS WITH FULLSCAN on stg.SalesDelta before the load."
+      },
+      {
+        "id": "scale_up_for_memory",
+        "description": "Five percent of a pool one and a half times as large is about 4.4 GB: still under the 9.8 GB the query needs.",
+        "root_causes": [
+          "memory_pressure",
+          "cpu_capacity"
+        ],
+        "signals": {
+          "any": [
+            "\\bscale (up|to)\\b",
+            "\\b24[\\s-]?v?cores?\\b",
+            "\\bupgrade (to|the)\\b",
+            "\\bmore v?cores\\b",
+            "\\bhyperscale\\b"
+          ]
+        },
+        "example": "Scale up to 24 vCores for the extra memory."
+      },
+      {
+        "id": "min_grant_percent",
+        "description": "MIN_GRANT_PERCENT cannot raise a grant above the MAX_GRANT_PERCENT cap.",
+        "signals": {
+          "any": [
+            "min_grant_percent"
+          ]
+        },
+        "example": "Add MIN_GRANT_PERCENT = 20 to the query."
+      },
+      {
+        "id": "blame_tempdb_or_storage",
+        "description": "tempdb is at most 47% used and each IO is fast. The spill is the cause of the tempdb work, not the result.",
+        "root_causes": [
+          "tempdb_contention",
+          "storage_latency"
+        ]
+      }
+    ]
+  }
+}

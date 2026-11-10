@@ -1,0 +1,348 @@
+{
+  "format_version": 1,
+  "id": "diagnosis-10-thursday-improvement-was-a-recompile",
+  "kind": "diagnosis",
+  "title": "'Thursday got better after Azure moved us to a new node'",
+  "split": "public",
+  "source": "case-exam-v1:10/failover",
+  "tags": [
+    "red-herring",
+    "failover",
+    "plan-cache"
+  ],
+  "prompt": [
+    "Client: Harbourline Commerce, a multi-tenant retail order platform with about 400 tenants. Database hlc-orders-prod: Azure SQL Database, Business Critical, Gen5, 16 vCores, compatibility level 160, READ_COMMITTED_SNAPSHOT ON. All times are UTC. Business hours are 07:30 to 18:00. The nightly batch must finish by 06:00. Evidence was collected from Mon 21 Sep to Sun 27 Sep 2026.",
+    "The CTO writes: 'Thursday got better after Azure moved us to a new node at 11:47. Microsoft obviously had a hardware",
+    "problem.' The application logged 212 errors 40613 and 37 errors 49918 on Thu 24, all between 11:47:05 and 11:48:20,",
+    "and every one of those requests succeeded on retry. Name why Thursday improved.",
+    "Client change log: 2025-03-11 a developer added OPTION (MAX_GRANT_PERCENT = 5) to etl.LoadFactSales, then a daytime job. 2026-01-20 etl.LoadFactSales moved into the nightly pipeline. 2026-08-30 release 5.2: ORM upgrade from version 7 to 8, new ProductSearch endpoint. 2026-09-01 tenant 'MegaMart' onboarded; nightly volume about doubled. 2026-09-04 the nightly index job was changed: rebuild threshold 30% to 5%, reorganize removed, ONLINE = ON, MAXDOP = 0, and UPDATE STATISTICS WITH FULLSCAN on every user table added. 2026-09-16 hotfix 5.2.3: an outer retry policy on every database call and Max Pool Size 100 to 400. 2026-09-24 11:47 planned maintenance reconfiguration, completed 11:48."
+  ],
+  "evidence": [
+    {
+      "id": "thu_samples",
+      "tool": "get_resource_stats_history",
+      "arguments": {
+        "window_minutes": 180
+      },
+      "result": {
+        "result_status": "ok",
+        "source": "sys.dm_db_resource_stats",
+        "history": [
+          {
+            "time": "2026-09-24T11:30Z",
+            "avg_cpu_percent": 99,
+            "avg_data_io_percent": 8,
+            "avg_log_write_percent": 16,
+            "max_worker_percent": 68
+          },
+          {
+            "time": "2026-09-24T11:45Z",
+            "avg_cpu_percent": 100,
+            "avg_data_io_percent": 9,
+            "avg_log_write_percent": 17,
+            "max_worker_percent": 70
+          },
+          {
+            "time": "2026-09-24T11:47:05Z to 11:47:45Z",
+            "note": "no rows (reconfiguration)"
+          },
+          {
+            "time": "2026-09-24T11:50Z",
+            "avg_cpu_percent": 36,
+            "avg_data_io_percent": 14,
+            "avg_log_write_percent": 19,
+            "max_worker_percent": 8
+          },
+          {
+            "time": "2026-09-24T12:30Z",
+            "avg_cpu_percent": 34,
+            "avg_data_io_percent": 9,
+            "avg_log_write_percent": 18,
+            "max_worker_percent": 7
+          },
+          {
+            "time": "2026-09-24T14:00Z",
+            "avg_cpu_percent": 35,
+            "avg_data_io_percent": 8,
+            "avg_log_write_percent": 17,
+            "max_worker_percent": 7
+          }
+        ]
+      }
+    },
+    {
+      "id": "plan_history",
+      "tool": "detect_parameter_sniffing",
+      "arguments": {
+        "query_id": 61877
+      },
+      "result": {
+        "result_status": "ok",
+        "query_hash": "0x4E1C7A0B92D3F611",
+        "query_id": 61877,
+        "plan_count": 2,
+        "psp_dispatcher": false,
+        "query_variants": 0,
+        "compiles": [
+          {
+            "day": "Mon 21",
+            "compiled_at": "08:22:41",
+            "trigger": "Orders statistics updated by the index job at 08:21:58",
+            "compiled_values": {
+              "tenant": 117,
+              "from": "2026-09-14",
+              "top": 50
+            },
+            "shape": "Seek, Key Lookup, Nested Loops, serial",
+            "in_use_until": "next day"
+          },
+          {
+            "day": "Tue 22",
+            "compiled_at": "06:11:09",
+            "trigger": "Orders statistics updated by the index job at 06:10:52",
+            "compiled_values": {
+              "tenant": 1,
+              "from": "2025-09-22",
+              "top": 100000
+            },
+            "shape": "Clustered Index Scan of Orders, Hash Join, Sort, DOP 8",
+            "in_use_until": "15:52:06"
+          },
+          {
+            "day": "Tue 22",
+            "compiled_at": "15:52:20",
+            "trigger": "automatic statistics update on Orders at 15:52:06",
+            "compiled_values": {
+              "tenant": 342,
+              "from": "2026-09-15",
+              "top": 50
+            },
+            "shape": "Seek, serial",
+            "in_use_until": "next day"
+          },
+          {
+            "day": "Wed 23",
+            "compiled_at": "08:47:55",
+            "trigger": "Orders statistics updated by the index job at 08:47:30",
+            "compiled_values": {
+              "tenant": 342,
+              "from": "2026-09-16",
+              "top": 50
+            },
+            "shape": "Seek, serial",
+            "in_use_until": "next day"
+          },
+          {
+            "day": "Thu 24",
+            "compiled_at": "05:58:30",
+            "trigger": "Orders statistics updated by the index job at 05:58:21",
+            "compiled_values": {
+              "tenant": 1,
+              "from": "2025-09-24",
+              "top": 100000
+            },
+            "shape": "Clustered Index Scan of Orders, Hash Join, Sort, DOP 8",
+            "in_use_until": "11:47"
+          },
+          {
+            "day": "Thu 24",
+            "compiled_at": "11:47:33",
+            "trigger": "first execution after the reconfiguration",
+            "compiled_values": {
+              "tenant": 88,
+              "from": "2026-09-17",
+              "top": 50
+            },
+            "shape": "Seek, serial",
+            "in_use_until": "next day"
+          },
+          {
+            "day": "Fri 25",
+            "compiled_at": "06:02:17",
+            "trigger": "Orders statistics updated by the index job at 06:02:09",
+            "compiled_values": {
+              "tenant": 1,
+              "from": "2025-09-25",
+              "top": 100000
+            },
+            "shape": "Clustered Index Scan of Orders, Hash Join, Sort, DOP 8",
+            "in_use_until": "14:31:38"
+          },
+          {
+            "day": "Fri 25",
+            "compiled_at": "14:31:40",
+            "trigger": "automatic statistics update on Orders at 14:31:38",
+            "compiled_values": {
+              "tenant": 205,
+              "from": "2026-09-18",
+              "top": 50
+            },
+            "shape": "Seek, serial",
+            "in_use_until": "next day"
+          }
+        ],
+        "table": {
+          "name": "dbo.Orders",
+          "rows": 52400000,
+          "clustered_index_pages": 1400000
+        }
+      }
+    },
+    {
+      "id": "daily",
+      "tool": "get_resource_stats_history",
+      "arguments": {
+        "window_minutes": 10080
+      },
+      "result": {
+        "result_status": "ok",
+        "source": "sys.resource_stats",
+        "granularity": "day",
+        "baseline_aug_17_28": {
+          "avg_cpu_percent": 24,
+          "max_cpu_percent": 71,
+          "avg_log_write_percent": 18,
+          "minutes_log_above_95": 95,
+          "minutes_cpu_above_95": 0,
+          "max_worker_percent": 9
+        },
+        "history": [
+          {
+            "day": "Mon 2026-09-21",
+            "avg_cpu_percent": 27,
+            "max_cpu_percent": 86,
+            "avg_log_write_percent": 31,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 18,
+            "max_worker_percent": 15,
+            "minutes_log_above_95": 455,
+            "minutes_cpu_above_95": 0
+          },
+          {
+            "day": "Tue 2026-09-22",
+            "avg_cpu_percent": 49,
+            "max_cpu_percent": 100,
+            "avg_log_write_percent": 29,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 17,
+            "max_worker_percent": 72,
+            "minutes_log_above_95": 410,
+            "minutes_cpu_above_95": 372
+          },
+          {
+            "day": "Wed 2026-09-23",
+            "avg_cpu_percent": 26,
+            "max_cpu_percent": 84,
+            "avg_log_write_percent": 33,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 19,
+            "max_worker_percent": 17,
+            "minutes_log_above_95": 480,
+            "minutes_cpu_above_95": 0
+          },
+          {
+            "day": "Thu 2026-09-24",
+            "avg_cpu_percent": 41,
+            "max_cpu_percent": 100,
+            "avg_log_write_percent": 30,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 18,
+            "max_worker_percent": 70,
+            "minutes_log_above_95": 395,
+            "minutes_cpu_above_95": 148
+          },
+          {
+            "day": "Fri 2026-09-25",
+            "avg_cpu_percent": 47,
+            "max_cpu_percent": 100,
+            "avg_log_write_percent": 29,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 17,
+            "max_worker_percent": 71,
+            "minutes_log_above_95": 400,
+            "minutes_cpu_above_95": 309
+          }
+        ],
+        "avg_memory_usage_percent": "96-99 on every day, baseline weeks included"
+      }
+    }
+  ],
+  "key": {
+    "root_cause": "plan_recompile_after_failover",
+    "accepted_root_causes": [
+      "parameter_sensitive_plan"
+    ],
+    "required_facts": [
+      {
+        "id": "new_plan_at_1147",
+        "evidence": "plan_history",
+        "description": "The dashboard plan was compiled again at 11:47:33, for tenant 88 with TOP 50, as a seek.",
+        "signals": {
+          "all": [
+            "11:47",
+            "tenant 88|top 50|seek|recompil|compiled"
+          ]
+        },
+        "example": "At 11:47:33 the dashboard query was compiled again, for tenant 88 with TOP 50, and got the seek plan."
+      },
+      {
+        "id": "cpu_fell_at_once",
+        "evidence": "thu_samples",
+        "description": "CPU fell from 100% at 11:45 to 36% at 11:50.",
+        "signals": {
+          "all": [
+            "\\b100\\s?%",
+            "\\b3[4-6]\\s?%"
+          ]
+        },
+        "example": "CPU fell from 100% at 11:45 to 36% at 11:50, right after the reconfiguration."
+      }
+    ],
+    "harmful_conclusions": [
+      {
+        "id": "blame_azure_hardware",
+        "description": "The bad plan had been in cache since 05:58. The reconfiguration emptied the cache; it did not repair anything.",
+        "root_causes": [
+          "platform_fault",
+          "storage_latency"
+        ],
+        "signals": {
+          "any": [
+            "support (case|ticket|request)",
+            "hardware (fault|problem|issue)"
+          ]
+        },
+        "example": "Open a support case with Microsoft about the faulty node."
+      },
+      {
+        "id": "fail_over_as_a_fix",
+        "description": "A failover clears every plan and drops every connection, and the next compile is again left to chance.",
+        "signals": {
+          "any": [
+            "(manual|forced|planned) failover",
+            "fail ?over (the database )?(when|whenever|each|every)",
+            "restart the database"
+          ]
+        },
+        "example": "Trigger a manual failover whenever CPU reaches 100%."
+      },
+      {
+        "id": "scale_up",
+        "description": "A scale operation also empties the plan cache, so it would look like a fix for the same wrong reason.",
+        "root_causes": [
+          "cpu_capacity"
+        ],
+        "signals": {
+          "any": [
+            "\\bscale (up|to)\\b",
+            "\\b24[\\s-]?v?cores?\\b",
+            "\\bupgrade (to|the)\\b",
+            "\\bmore v?cores\\b",
+            "\\bhyperscale\\b"
+          ]
+        },
+        "example": "Scale up to 24 vCores."
+      }
+    ]
+  }
+}

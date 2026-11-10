@@ -1,0 +1,208 @@
+{
+  "format_version": 1,
+  "id": "exam-q14-distinct-is-not-redundant",
+  "kind": "tuning",
+  "title": "Recall email list: the DISTINCT is not redundant",
+  "split": "public",
+  "source": "rewrite-exam-v1:Q14",
+  "tags": [
+    "distinct-semantics",
+    "semi-join"
+  ],
+  "prompt": [
+    "Product recall mailing, run on demand a few times a month and urgent when it runs. Example: prefix 'BAT-2291'",
+    "matches 3 SKUs, about 2.1M order lines on 1.6M orders, about 410k customers and about 402k distinct emails. Runtime",
+    "about 70 s: the plan builds 2.1M joined rows and does a Sort (Distinct) on the varchar(254) Email with a large",
+    "spill. About 2% of emails are shared by several customer rows. The email platform rejects a file that contains an",
+    "address twice. Email comparison is case-insensitive (database collation)."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.Customers",
+      "qe.Orders",
+      "qe.OrderLines",
+      "qe.Products"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "Customers: 2.0M rows. Tier S = 1.85M, G = ~150k, P = 25 partner accounts (CustomerID 1 to 25). IsActive = 1 for 88%. Email is NULL for ~9% (~180k rows, ~160k of them active). About 2% of non-NULL emails are shared by two or more customer rows (households). ReferredByCustomerID is non-NULL for 18%; 312 rows are self-referrals (ReferredByCustomerID = CustomerID, CustomerID 500001 to 500312). AccountNumber always matches 'AC' + 10 digits (CHECK constraint).",
+    "Orders: 30M rows, 2016 to now, ~12k per day now. The 25 partner customers own ~9M orders (30%), up to 1.2M each. Other customers average ~10 orders (max ~400). The density estimate for CustomerID is ~15 rows. Status: Shipped 83.8%, Cancelled 7%, Paid 6%, Returned 3%, Pending 0.2% (~60k rows, all from the last 72 hours). SalesChannel: Web 62%, Store 20%, Partner 12%, Phone 6%. PromoCode is NULL for 85%. ShipRegionID is NULL for Store pickups (~20%). OrderDate is datetime2(7); Partner and Store imports stamp one timestamp on a whole batch, so many orders of one customer share an OrderDate.",
+    "OrderLines: 120M rows, 4 per order on average. About 0.3% of orders have no lines.",
+    "Products: 40k rows. SKU prefixes group product families, 1-3 SKUs per prefix."
+  ],
+  "baseline_kind": "select",
+  "baseline_sql": [
+    "SELECT DISTINCT c.Email",
+    "FROM qe.Customers c",
+    "JOIN qe.Orders o      ON o.CustomerID = c.CustomerID",
+    "JOIN qe.OrderLines ol ON ol.OrderID = o.OrderID",
+    "WHERE ol.ProductID IN (SELECT p.ProductID FROM qe.Products p WHERE p.SKU LIKE @SkuPrefix + '%')",
+    "  AND o.OrderDate >= @From",
+    "  AND c.Email IS NOT NULL;"
+  ],
+  "parameter_cases": [
+    {
+      "name": "recall_prefix",
+      "values": {
+        "SkuPrefix": "BAT-2291",
+        "From": "2025-01-01"
+      },
+      "types": {
+        "SkuPrefix": "varchar(30)",
+        "From": "datetime2(3)"
+      },
+      "weight": 1.0
+    }
+  ],
+  "key": {
+    "decision": "rewrite",
+    "correct_families": [
+      {
+        "id": "semi_join_keep_distinct",
+        "description": "A semi join reduces the work to one row per qualifying customer; DISTINCT then removes the emails that several customers share.",
+        "signals": {
+          "all": [
+            "\\bexists\\s*\\(|c\\.CustomerID in\\s*\\(\\s*select",
+            "Email is not null"
+          ],
+          "any": [
+            "select distinct c\\.Email",
+            "group by c\\.Email\\s*(;|$)"
+          ],
+          "none": [
+            "collate"
+          ]
+        },
+        "reference_sql": [
+          "SELECT DISTINCT c.Email",
+          "FROM qe.Customers c",
+          "WHERE c.Email IS NOT NULL",
+          "  AND EXISTS (",
+          "        SELECT 1",
+          "        FROM qe.Orders o",
+          "        JOIN qe.OrderLines ol ON ol.OrderID = o.OrderID",
+          "        JOIN qe.Products   p  ON p.ProductID = ol.ProductID",
+          "        WHERE o.CustomerID = c.CustomerID",
+          "          AND o.OrderDate >= @From",
+          "          AND p.SKU LIKE @SkuPrefix + '%');"
+        ]
+      }
+    ],
+    "traps": [
+      {
+        "id": "distinct_removed",
+        "class": "not_equivalent",
+        "why": "EXISTS makes customers unique, not emails. The output column is Email, and about 2% of emails belong to several customers.",
+        "signals": {
+          "all": [
+            "\\bexists\\s*\\(|\\bin\\s*\\(\\s*select"
+          ],
+          "none": [
+            "\\bdistinct\\b",
+            "group by c\\.Email\\s*(;|$)"
+          ]
+        },
+        "told_apart_by": "Two customers that share one email address and both bought a recalled product.",
+        "example_sql": [
+          "SELECT c.Email",
+          "FROM qe.Customers c",
+          "WHERE c.Email IS NOT NULL",
+          "  AND EXISTS (",
+          "        SELECT 1",
+          "        FROM qe.Orders o",
+          "        JOIN qe.OrderLines ol ON ol.OrderID = o.OrderID",
+          "        JOIN qe.Products   p  ON p.ProductID = ol.ProductID",
+          "        WHERE o.CustomerID = c.CustomerID",
+          "          AND o.OrderDate >= @From",
+          "          AND p.SKU LIKE @SkuPrefix + '%');"
+        ]
+      },
+      {
+        "id": "group_by_customer",
+        "class": "not_equivalent",
+        "why": "GROUP BY CustomerID, Email still returns a shared email once per customer.",
+        "signals": {
+          "all": [
+            "group by c\\.CustomerID\\s*,\\s*c\\.Email"
+          ]
+        },
+        "told_apart_by": "Two customers that share one email address and both bought a recalled product.",
+        "example_sql": [
+          "SELECT c.Email",
+          "FROM qe.Customers c",
+          "WHERE c.Email IS NOT NULL",
+          "  AND EXISTS (",
+          "        SELECT 1",
+          "        FROM qe.Orders o",
+          "        JOIN qe.OrderLines ol ON ol.OrderID = o.OrderID",
+          "        JOIN qe.Products   p  ON p.ProductID = ol.ProductID",
+          "        WHERE o.CustomerID = c.CustomerID",
+          "          AND o.OrderDate >= @From",
+          "          AND p.SKU LIKE @SkuPrefix + '%')",
+          "GROUP BY c.CustomerID, c.Email;"
+        ]
+      },
+      {
+        "id": "not_null_filter_dropped",
+        "class": "not_equivalent",
+        "why": "Without c.Email IS NOT NULL, DISTINCT returns one NULL row.",
+        "signals": {
+          "all": [
+            "\\bdistinct\\b"
+          ],
+          "none": [
+            "Email is not null"
+          ]
+        },
+        "told_apart_by": "A customer with a NULL email who bought a recalled product.",
+        "example_sql": [
+          "SELECT DISTINCT c.Email",
+          "FROM qe.Customers c",
+          "WHERE EXISTS (",
+          "        SELECT 1",
+          "        FROM qe.Orders o",
+          "        JOIN qe.OrderLines ol ON ol.OrderID = o.OrderID",
+          "        JOIN qe.Products   p  ON p.ProductID = ol.ProductID",
+          "        WHERE o.CustomerID = c.CustomerID",
+          "          AND o.OrderDate >= @From",
+          "          AND p.SKU LIKE @SkuPrefix + '%');"
+        ]
+      },
+      {
+        "id": "case_sensitive_dedupe",
+        "class": "not_equivalent",
+        "why": "A binary or case-sensitive collation keeps addresses that differ only in case, which the platform treats as duplicates.",
+        "signals": {
+          "all": [
+            "collate"
+          ]
+        },
+        "told_apart_by": "Two customers with the same address in different letter case.",
+        "example_sql": [
+          "SELECT DISTINCT c.Email COLLATE Latin1_General_BIN2 AS Email",
+          "FROM qe.Customers c",
+          "WHERE c.Email IS NOT NULL",
+          "  AND EXISTS (",
+          "        SELECT 1",
+          "        FROM qe.Orders o",
+          "        JOIN qe.OrderLines ol ON ol.OrderID = o.OrderID",
+          "        JOIN qe.Products   p  ON p.ProductID = ol.ProductID",
+          "        WHERE o.CustomerID = c.CustomerID",
+          "          AND o.OrderDate >= @From",
+          "          AND p.SKU LIKE @SkuPrefix + '%');"
+        ]
+      }
+    ],
+    "index": {
+      "role": "none"
+    },
+    "min_improvement": {
+      "metric": "elapsed_ms",
+      "ratio": 2,
+      "basis": "Provisional: no reference measurement. The sort handles about 410k emails instead of 2.1M joined rows."
+    },
+    "reference_notes": "The existing indexes are enough: UX_Products_SKU, IX_OrderLines_ProductID, and PK_Orders or IX_Orders_OrderDate."
+  }
+}

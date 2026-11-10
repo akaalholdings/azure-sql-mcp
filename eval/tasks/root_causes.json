@@ -1,0 +1,31 @@
+{
+  "format_version": 1,
+  "codes": {
+    "log_rate_cap": "Log generation is at the service objective's log rate cap. The cap does not rise with more vCores in the same tier.",
+    "maintenance_log_volume": "An index or statistics maintenance job generates the log and IO volume that crowds out other work.",
+    "parameter_sensitive_plan": "A plan compiled for one set of parameter values is reused for values that need another plan.",
+    "query_store_read_only": "Query Store has stopped capturing, so its reports are stale and the features that depend on it are off.",
+    "forced_plan_orphaned": "A change of query text gave the query a new identity, and a forced plan or hint no longer applies to it.",
+    "memory_grant_capped_by_hint": "A hint or setting caps the memory grant below what the query needs, so it spills to tempdb.",
+    "lock_escalation_blocking": "A long set-based write holds a table-level lock and blocks the transactional workload.",
+    "lock_order_deadlock": "Two code paths take locks on the same rows or pages in different orders.",
+    "client_retry_amplification": "Client retries multiply the load during an incident, or repeat a write that had already committed.",
+    "scan_volume_not_storage_latency": "IO waits are high in total because many pages are read; each read is fast and storage is healthy.",
+    "plan_recompile_after_failover": "A failover or reconfiguration emptied the plan cache, and the next compile produced a different plan.",
+    "cpu_capacity": "The workload needs more CPU than the service objective provides, with no single query or plan to blame.",
+    "memory_pressure": "The buffer pool or the grant memory is too small for the workload.",
+    "storage_latency": "Storage is slow: single reads or writes take long.",
+    "stale_statistics": "Statistics are out of date, the estimates are wrong, and the plan is poor because of it.",
+    "missing_index": "A frequent query has no index to seek on.",
+    "implicit_conversion": "A type mismatch converts a column and prevents an index seek.",
+    "tempdb_contention": "Allocation or metadata contention in tempdb.",
+    "last_page_insert_contention": "Many sessions insert at the end of one ever-increasing index and wait on its last page.",
+    "long_open_transaction": "An idle or long transaction holds locks or keeps row versions alive.",
+    "version_store_growth": "The version store grows because old row versions cannot be cleaned up.",
+    "worker_exhaustion": "The database runs out of worker threads or sessions.",
+    "connection_pool_exhaustion": "The application runs out of pooled connections while the database has capacity.",
+    "index_fragmentation": "Index fragmentation or low page density is the cause of the slowness.",
+    "parallelism_misconfiguration": "The degree of parallelism setting is wrong for the workload.",
+    "platform_fault": "A fault or maintenance event in the Azure platform, outside the customer's control."
+  }
+}

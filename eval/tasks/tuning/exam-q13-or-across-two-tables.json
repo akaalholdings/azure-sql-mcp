@@ -1,0 +1,213 @@
+{
+  "format_version": 1,
+  "id": "exam-q13-or-across-two-tables",
+  "kind": "tuning",
+  "title": "Referral revenue with OR across two tables",
+  "split": "public",
+  "source": "rewrite-exam-v1:Q13",
+  "tags": [
+    "or-to-union",
+    "duplicates"
+  ],
+  "prompt": [
+    "Referral dashboard: about 15 calls per second, about 900 ms each. Plan: full scans of Customers and of",
+    "IX_Orders_CustomerID or PK_Orders, a hash join, and the OR applied as a residual filter after the join. There is no",
+    "index on Customers.ReferredByCustomerID. A typical customer has referred 0 to 50 customers. 312 customers are",
+    "self-referrals (ReferredByCustomerID = CustomerID) from an old signup bug that cannot be cleaned yet. Payouts are",
+    "computed from these numbers, so they must not change."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.Orders",
+      "qe.Customers"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "Orders: 30M rows, 2016 to now, ~12k per day now. The 25 partner customers own ~9M orders (30%), up to 1.2M each. Other customers average ~10 orders (max ~400). The density estimate for CustomerID is ~15 rows. Status: Shipped 83.8%, Cancelled 7%, Paid 6%, Returned 3%, Pending 0.2% (~60k rows, all from the last 72 hours). SalesChannel: Web 62%, Store 20%, Partner 12%, Phone 6%. PromoCode is NULL for 85%. ShipRegionID is NULL for Store pickups (~20%). OrderDate is datetime2(7); Partner and Store imports stamp one timestamp on a whole batch, so many orders of one customer share an OrderDate.",
+    "Customers: 2.0M rows. Tier S = 1.85M, G = ~150k, P = 25 partner accounts (CustomerID 1 to 25). IsActive = 1 for 88%. Email is NULL for ~9% (~180k rows, ~160k of them active). About 2% of non-NULL emails are shared by two or more customer rows (households). ReferredByCustomerID is non-NULL for 18%; 312 rows are self-referrals (ReferredByCustomerID = CustomerID, CustomerID 500001 to 500312). AccountNumber always matches 'AC' + 10 digits (CHECK constraint)."
+  ],
+  "baseline_kind": "select",
+  "baseline_sql": [
+    "SELECT COUNT(*) AS OrderCount, SUM(o.TotalAmount) AS Revenue",
+    "FROM qe.Orders o",
+    "JOIN qe.Customers c ON c.CustomerID = o.CustomerID",
+    "WHERE o.Status IN ('Paid','Shipped')",
+    "  AND (o.CustomerID = @CustomerID OR c.ReferredByCustomerID = @CustomerID);"
+  ],
+  "parameter_cases": [
+    {
+      "name": "typical_customer",
+      "values": {
+        "CustomerID": 48213
+      },
+      "types": {
+        "CustomerID": "int"
+      },
+      "weight": 0.9
+    },
+    {
+      "name": "self_referral",
+      "values": {
+        "CustomerID": 500007
+      },
+      "types": {
+        "CustomerID": "int"
+      },
+      "weight": 0.1
+    }
+  ],
+  "key": {
+    "decision": "rewrite",
+    "correct_families": [
+      {
+        "id": "union_on_the_order_key",
+        "description": "Two seekable branches combined with UNION on the order key, which removes exactly the orders that satisfy both branches.",
+        "signals": {
+          "all": [
+            "\\bunion\\b(?!\\s+all)",
+            "select\\s+o\\.OrderID\\s*,"
+          ]
+        },
+        "reference_sql": [
+          "SELECT COUNT(*) AS OrderCount, SUM(x.TotalAmount) AS Revenue",
+          "FROM (",
+          "    SELECT o.OrderID, o.TotalAmount",
+          "    FROM qe.Orders o",
+          "    WHERE o.CustomerID = @CustomerID",
+          "      AND o.Status IN ('Paid','Shipped')",
+          "    UNION",
+          "    SELECT o.OrderID, o.TotalAmount",
+          "    FROM qe.Customers c",
+          "    JOIN qe.Orders o ON o.CustomerID = c.CustomerID",
+          "    WHERE c.ReferredByCustomerID = @CustomerID",
+          "      AND o.Status IN ('Paid','Shipped')",
+          ") x;"
+        ]
+      },
+      {
+        "id": "semi_join_on_customer_set",
+        "description": "Filter Orders by the set of customers: the customer and the customers it referred. IN ignores duplicates in the set.",
+        "signals": {
+          "all": [
+            "o\\.CustomerID in\\s*\\(\\s*select"
+          ]
+        },
+        "reference_sql": [
+          "SELECT COUNT(*) AS OrderCount, SUM(o.TotalAmount) AS Revenue",
+          "FROM qe.Orders o",
+          "WHERE o.Status IN ('Paid','Shipped')",
+          "  AND o.CustomerID IN (SELECT @CustomerID",
+          "                       UNION ALL",
+          "                       SELECT c.CustomerID FROM qe.Customers c WHERE c.ReferredByCustomerID = @CustomerID);"
+        ]
+      },
+      {
+        "id": "union_all_with_exclusion",
+        "description": "UNION ALL with the first branch's rows excluded from the second. It is exact only because CustomerID is NOT NULL.",
+        "signals": {
+          "all": [
+            "union all",
+            "\\w+\\.CustomerID\\s*<>\\s*@CustomerID"
+          ]
+        },
+        "reference_sql": [
+          "SELECT COUNT(*) AS OrderCount, SUM(x.TotalAmount) AS Revenue",
+          "FROM (",
+          "    SELECT o.OrderID, o.TotalAmount",
+          "    FROM qe.Orders o",
+          "    WHERE o.CustomerID = @CustomerID",
+          "      AND o.Status IN ('Paid','Shipped')",
+          "    UNION ALL",
+          "    SELECT o.OrderID, o.TotalAmount",
+          "    FROM qe.Customers c",
+          "    JOIN qe.Orders o ON o.CustomerID = c.CustomerID",
+          "    WHERE c.ReferredByCustomerID = @CustomerID",
+          "      AND c.CustomerID <> @CustomerID",
+          "      AND o.Status IN ('Paid','Shipped')",
+          ") x;"
+        ]
+      }
+    ],
+    "traps": [
+      {
+        "id": "union_all_double_count",
+        "class": "not_equivalent",
+        "why": "A self-referral customer's own orders satisfy both branches. UNION ALL counts them twice.",
+        "signals": {
+          "all": [
+            "union all"
+          ],
+          "none": [
+            "CustomerID in\\s*\\(\\s*select",
+            "<>\\s*@CustomerID",
+            "not exists"
+          ]
+        },
+        "told_apart_by": "Parameter case self_referral: one of the 312 customers that referred themselves.",
+        "example_sql": [
+          "SELECT COUNT(*) AS OrderCount, SUM(x.TotalAmount) AS Revenue",
+          "FROM (",
+          "    SELECT o.OrderID, o.TotalAmount",
+          "    FROM qe.Orders o",
+          "    WHERE o.CustomerID = @CustomerID",
+          "      AND o.Status IN ('Paid','Shipped')",
+          "    UNION ALL",
+          "    SELECT o.OrderID, o.TotalAmount",
+          "    FROM qe.Customers c",
+          "    JOIN qe.Orders o ON o.CustomerID = c.CustomerID",
+          "    WHERE c.ReferredByCustomerID = @CustomerID",
+          "      AND o.Status IN ('Paid','Shipped')",
+          ") x;"
+        ]
+      },
+      {
+        "id": "union_without_the_key",
+        "class": "not_equivalent",
+        "why": "UNION on TotalAmount alone merges different orders that have the same amount.",
+        "signals": {
+          "all": [
+            "\\bunion\\b(?!\\s+all)"
+          ],
+          "none": [
+            "OrderID"
+          ]
+        },
+        "told_apart_by": "Two orders of the customer with the same TotalAmount.",
+        "example_sql": [
+          "SELECT COUNT(*) AS OrderCount, SUM(x.TotalAmount) AS Revenue",
+          "FROM (",
+          "    SELECT o.TotalAmount",
+          "    FROM qe.Orders o",
+          "    WHERE o.CustomerID = @CustomerID",
+          "      AND o.Status IN ('Paid','Shipped')",
+          "    UNION",
+          "    SELECT o.TotalAmount",
+          "    FROM qe.Customers c",
+          "    JOIN qe.Orders o ON o.CustomerID = c.CustomerID",
+          "    WHERE c.ReferredByCustomerID = @CustomerID",
+          "      AND o.Status IN ('Paid','Shipped')",
+          ") x;"
+        ]
+      }
+    ],
+    "index": {
+      "role": "required",
+      "accepted": [
+        {
+          "table": "qe.Customers",
+          "key_columns": [
+            "ReferredByCustomerID"
+          ]
+        }
+      ]
+    },
+    "min_improvement": {
+      "metric": "logical_reads",
+      "ratio": 20,
+      "basis": "Full scans of Customers and an Orders index become a few hundred seeks."
+    },
+    "reference_notes": "The first branch can drop the Customers join because Orders.CustomerID is NOT NULL with a trusted foreign key."
+  }
+}

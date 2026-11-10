@@ -1,0 +1,250 @@
+{
+  "format_version": 1,
+  "id": "exam-q03-monthly-report-year-month-functions",
+  "kind": "tuning",
+  "title": "Monthly report filtered with YEAR() and MONTH() on the column",
+  "split": "public",
+  "source": "rewrite-exam-v1:Q03",
+  "tags": [
+    "non-sargable-date",
+    "boundary"
+  ],
+  "prompt": [
+    "Called by the finance dashboard about 200 times a day, usually for the current or the previous month (about 360k",
+    "orders per month now). Average 9 s and about 420k logical reads. Plan: full scan of PK_Orders with an estimate that",
+    "is far off. OrderDate is datetime2(7) and holds times up to 23:59:59.9999999. Finance reconciles these numbers to",
+    "the cent, so the result must be identical to the current procedure for every input, including an invalid month."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.Orders"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "Orders: 30M rows, 2016 to now, ~12k per day now. The 25 partner customers own ~9M orders (30%), up to 1.2M each. Other customers average ~10 orders (max ~400). The density estimate for CustomerID is ~15 rows. Status: Shipped 83.8%, Cancelled 7%, Paid 6%, Returned 3%, Pending 0.2% (~60k rows, all from the last 72 hours). SalesChannel: Web 62%, Store 20%, Partner 12%, Phone 6%. PromoCode is NULL for 85%. ShipRegionID is NULL for Store pickups (~20%). OrderDate is datetime2(7); Partner and Store imports stamp one timestamp on a whole batch, so many orders of one customer share an OrderDate."
+  ],
+  "baseline_kind": "procedure",
+  "baseline_sql": [
+    "CREATE OR ALTER PROCEDURE qe.usp_MonthlyChannelSales",
+    "    @Year  int,",
+    "    @Month int",
+    "AS",
+    "SELECT o.SalesChannel, COUNT(*) AS Orders, SUM(o.TotalAmount) AS Revenue",
+    "FROM qe.Orders o",
+    "WHERE YEAR(o.OrderDate) = @Year",
+    "  AND MONTH(o.OrderDate) = @Month",
+    "  AND o.Status IN ('Paid','Shipped')",
+    "GROUP BY o.SalesChannel;"
+  ],
+  "parameter_cases": [
+    {
+      "name": "current_month",
+      "values": {
+        "Year": 2026,
+        "Month": 10
+      },
+      "types": {
+        "Year": "int",
+        "Month": "int"
+      },
+      "weight": 0.6
+    },
+    {
+      "name": "previous_month",
+      "values": {
+        "Year": 2026,
+        "Month": 9
+      },
+      "types": {
+        "Year": "int",
+        "Month": "int"
+      },
+      "weight": 0.39
+    },
+    {
+      "name": "invalid_month",
+      "values": {
+        "Year": 2026,
+        "Month": 13
+      },
+      "types": {
+        "Year": "int",
+        "Month": "int"
+      },
+      "weight": 0.01
+    }
+  ],
+  "key": {
+    "decision": "rewrite",
+    "correct_families": [
+      {
+        "id": "half_open_range_with_input_guard",
+        "description": "A half-open range built from the parameters, with a guard so that invalid input still returns an empty result.",
+        "signals": {
+          "all": [
+            "OrderDate\\s*>=\\s*datefromparts\\(",
+            "OrderDate\\s*<\\s*dateadd\\(\\s*month\\s*,\\s*1\\s*,"
+          ],
+          "any": [
+            "@Month\\s+(not\\s+)?between\\s+1\\s+and\\s+12",
+            "@Month\\s*(<|>|<=|>=)\\s*\\d+"
+          ]
+        },
+        "reference_sql": [
+          "CREATE OR ALTER PROCEDURE qe.usp_MonthlyChannelSales",
+          "    @Year  int,",
+          "    @Month int",
+          "AS",
+          "SET NOCOUNT ON;",
+          "IF @Month BETWEEN 1 AND 12 AND @Year BETWEEN 1 AND 9999 AND NOT (@Year = 9999 AND @Month = 12)",
+          "BEGIN",
+          "SELECT o.SalesChannel, COUNT(*) AS Orders, SUM(o.TotalAmount) AS Revenue",
+          "FROM qe.Orders o",
+          "WHERE o.OrderDate >= DATEFROMPARTS(@Year, @Month, 1)",
+          "  AND o.OrderDate <  DATEADD(month, 1, DATEFROMPARTS(@Year, @Month, 1))",
+          "  AND o.Status IN ('Paid','Shipped')",
+          "GROUP BY o.SalesChannel;",
+          "END",
+          "ELSE",
+          "BEGIN",
+          "    -- invalid or NULL input: keep the original behaviour, an empty result, instead of an error",
+          "SELECT o.SalesChannel, COUNT(*) AS Orders, SUM(o.TotalAmount) AS Revenue",
+          "FROM qe.Orders o",
+          "WHERE YEAR(o.OrderDate) = @Year",
+          "  AND MONTH(o.OrderDate) = @Month",
+          "  AND o.Status IN ('Paid','Shipped')",
+          "GROUP BY o.SalesChannel;",
+          "END"
+        ]
+      }
+    ],
+    "traps": [
+      {
+        "id": "no_guard_for_invalid_input",
+        "class": "not_equivalent",
+        "why": "DATEFROMPARTS raises an error for month 13 or a NULL part, where the original returns an empty result.",
+        "signals": {
+          "all": [
+            "datefromparts\\("
+          ],
+          "none": [
+            "@Month\\s+(not\\s+)?between\\s+1\\s+and\\s+12",
+            "@Month\\s*(<|>|<=|>=)\\s*\\d+"
+          ]
+        },
+        "told_apart_by": "Parameter case invalid_month: the baseline returns no rows, the rewrite fails with an error.",
+        "example_sql": [
+          "CREATE OR ALTER PROCEDURE qe.usp_MonthlyChannelSales",
+          "    @Year  int,",
+          "    @Month int",
+          "AS",
+          "SELECT o.SalesChannel, COUNT(*) AS Orders, SUM(o.TotalAmount) AS Revenue",
+          "FROM qe.Orders o",
+          "WHERE o.OrderDate >= DATEFROMPARTS(@Year, @Month, 1)",
+          "  AND o.OrderDate <  DATEADD(month, 1, DATEFROMPARTS(@Year, @Month, 1))",
+          "  AND o.Status IN ('Paid','Shipped')",
+          "GROUP BY o.SalesChannel;"
+        ]
+      },
+      {
+        "id": "between_eomonth",
+        "class": "not_equivalent",
+        "why": "EOMONTH returns a date, which is midnight at the start of the last day. Every order later that day is lost.",
+        "signals": {
+          "all": [
+            "\\bbetween\\b",
+            "eomonth\\("
+          ]
+        },
+        "told_apart_by": "Any order after 00:00 on the last day of the month.",
+        "example_sql": [
+          "CREATE OR ALTER PROCEDURE qe.usp_MonthlyChannelSales",
+          "    @Year  int,",
+          "    @Month int",
+          "AS",
+          "IF @Month BETWEEN 1 AND 12 AND @Year BETWEEN 1 AND 9998",
+          "SELECT o.SalesChannel, COUNT(*) AS Orders, SUM(o.TotalAmount) AS Revenue",
+          "FROM qe.Orders o",
+          "WHERE o.OrderDate BETWEEN DATEFROMPARTS(@Year, @Month, 1) AND EOMONTH(DATEFROMPARTS(@Year, @Month, 1))",
+          "  AND o.Status IN ('Paid','Shipped')",
+          "GROUP BY o.SalesChannel;"
+        ]
+      },
+      {
+        "id": "end_of_day_literal",
+        "class": "not_equivalent",
+        "why": "An upper bound three milliseconds before midnight drops rows after .997 on a datetime2(7) column.",
+        "signals": {
+          "any": [
+            "23:59:59",
+            "dateadd\\(\\s*(millisecond|ms|second|ss|s)\\s*,\\s*-\\s*\\d+"
+          ]
+        },
+        "told_apart_by": "An order stamped 23:59:59.9990000 on the last day of the month.",
+        "example_sql": [
+          "CREATE OR ALTER PROCEDURE qe.usp_MonthlyChannelSales",
+          "    @Year  int,",
+          "    @Month int",
+          "AS",
+          "IF @Month BETWEEN 1 AND 12 AND @Year BETWEEN 1 AND 9998",
+          "SELECT o.SalesChannel, COUNT(*) AS Orders, SUM(o.TotalAmount) AS Revenue",
+          "FROM qe.Orders o",
+          "WHERE o.OrderDate BETWEEN DATEFROMPARTS(@Year, @Month, 1)",
+          "      AND DATEADD(millisecond, -3, DATEADD(month, 1, CAST(DATEFROMPARTS(@Year, @Month, 1) AS datetime2(3))))",
+          "  AND o.Status IN ('Paid','Shipped')",
+          "GROUP BY o.SalesChannel;"
+        ]
+      },
+      {
+        "id": "local_variable_bounds",
+        "class": "ineffective",
+        "why": "Bounds held in local variables are unknown at compile time, so the estimate is a fixed guess and the plan can still scan.",
+        "signals": {
+          "all": [
+            "declare\\s+@\\w+\\s+(date|datetime2?|smalldatetime)\\b"
+          ]
+        },
+        "example_sql": [
+          "CREATE OR ALTER PROCEDURE qe.usp_MonthlyChannelSales",
+          "    @Year  int,",
+          "    @Month int",
+          "AS",
+          "IF @Month BETWEEN 1 AND 12 AND @Year BETWEEN 1 AND 9998",
+          "BEGIN",
+          "DECLARE @Start date = DATEFROMPARTS(@Year, @Month, 1);",
+          "DECLARE @End date = DATEADD(month, 1, @Start);",
+          "SELECT o.SalesChannel, COUNT(*) AS Orders, SUM(o.TotalAmount) AS Revenue",
+          "FROM qe.Orders o",
+          "WHERE o.OrderDate >= @Start AND o.OrderDate < @End",
+          "  AND o.Status IN ('Paid','Shipped')",
+          "GROUP BY o.SalesChannel;",
+          "END"
+        ]
+      }
+    ],
+    "index": {
+      "role": "required",
+      "accepted": [
+        {
+          "table": "qe.Orders",
+          "key_columns": [
+            "OrderDate"
+          ],
+          "include_columns": [
+            "Status",
+            "TotalAmount",
+            "SalesChannel"
+          ]
+        }
+      ]
+    },
+    "min_improvement": {
+      "metric": "logical_reads",
+      "ratio": 50,
+      "basis": "420k reads for the scan against a covering range seek over one month (about 360k narrow rows)."
+    },
+    "reference_notes": "Without SalesChannel in the date index, a 360k-row range with key lookups still tips to a scan. The index change is part of the fix."
+  }
+}

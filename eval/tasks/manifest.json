@@ -1,0 +1,24 @@
+{
+  "format_version": 1,
+  "split": "public",
+  "sources": {
+    "rewrite-exam-v1": "16-item blind rewrite exam, 2026-10. All 16 items converted to tuning tasks.",
+    "index-exam-v1": "14-item index portfolio exam (case 'RetailOps'). Items 1 to 13 converted to index review tasks.",
+    "case-exam-v1": "12-item performance diagnosis exam (case 'Harbourline Commerce'). Items 1 to 10 converted to diagnosis tasks; item 10 became two tasks.",
+    "s6-new": "Tuning tasks written for the 3.0 static tier."
+  },
+  "not_converted": [
+    {
+      "source": "index-exam-v1:14",
+      "reason": "Sequencing, scheduling and governance of the whole change set. The key would need an order of steps against a calendar; this format scores decisions per index, not their order."
+    },
+    {
+      "source": "case-exam-v1:11",
+      "reason": "Prioritised remediation with scripts and rollback. It grades a written plan; the deliverable checker covers its form, and no deterministic key covers its content."
+    },
+    {
+      "source": "case-exam-v1:12",
+      "reason": "Measurement plan and success criteria. It grades a written plan, which has no deterministic key in this format."
+    }
+  ]
+}

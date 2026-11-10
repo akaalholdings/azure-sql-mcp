@@ -1,0 +1,137 @@
+{
+  "format_version": 1,
+  "id": "new-10-no-change-psp-variants",
+  "kind": "tuning",
+  "title": "Three plans for one query: parameter sensitive plan optimization at work",
+  "split": "public",
+  "source": "s6-new:10",
+  "tags": [
+    "no-change",
+    "parameter-sensitivity",
+    "psp"
+  ],
+  "prompt": [
+    "A developer saw 'three plans for one query' in a Query Store report and asks for the fastest plan to be forced, or",
+    "for OPTION (RECOMPILE). Facts: the query has one dispatcher plan and three query variants",
+    "(sys.query_store_query_variant has three rows for the parent query). The variant for @Status = 'Pending' seeks",
+    "IX_Orders_Status and runs in 12 ms. The variant for 'Paid' runs in 0.9 s. The variant for 'Shipped' scans and runs in",
+    "2.1 s; that case runs four times a day and its target is 5 s. Each variant has had one plan for 30 days, with no",
+    "regression and no forced plan. The Orders table has three nonclustered indexes and takes about 2.1M status updates a",
+    "day; the owner does not want another index for a query that meets its targets."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.Orders",
+      "qe.Customers"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "Orders: 30M rows, 2016 to now, ~12k per day now. The 25 partner customers own ~9M orders (30%), up to 1.2M each. Other customers average ~10 orders (max ~400). The density estimate for CustomerID is ~15 rows. Status: Shipped 83.8%, Cancelled 7%, Paid 6%, Returned 3%, Pending 0.2% (~60k rows, all from the last 72 hours). SalesChannel: Web 62%, Store 20%, Partner 12%, Phone 6%. PromoCode is NULL for 85%. ShipRegionID is NULL for Store pickups (~20%). OrderDate is datetime2(7); Partner and Store imports stamp one timestamp on a whole batch, so many orders of one customer share an OrderDate.",
+    "Customers: 2.0M rows. Tier S = 1.85M, G = ~150k, P = 25 partner accounts (CustomerID 1 to 25). IsActive = 1 for 88%. Email is NULL for ~9% (~180k rows, ~160k of them active). About 2% of non-NULL emails are shared by two or more customer rows (households). ReferredByCustomerID is non-NULL for 18%; 312 rows are self-referrals (ReferredByCustomerID = CustomerID, CustomerID 500001 to 500312). AccountNumber always matches 'AC' + 10 digits (CHECK constraint)."
+  ],
+  "baseline_kind": "select",
+  "baseline_sql": [
+    "SELECT o.OrderID, o.OrderDate, c.AccountNumber, c.LastName",
+    "FROM qe.Orders o",
+    "JOIN qe.Customers c ON c.CustomerID = o.CustomerID",
+    "WHERE o.Status = @Status",
+    "  AND o.OrderDate >= @From;"
+  ],
+  "parameter_cases": [
+    {
+      "name": "pending",
+      "values": {
+        "Status": "Pending",
+        "From": "2026-10-01"
+      },
+      "types": {
+        "Status": "varchar(12)",
+        "From": "datetime2(3)"
+      },
+      "weight": 0.7
+    },
+    {
+      "name": "paid",
+      "values": {
+        "Status": "Paid",
+        "From": "2026-10-01"
+      },
+      "types": {
+        "Status": "varchar(12)",
+        "From": "datetime2(3)"
+      },
+      "weight": 0.2
+    },
+    {
+      "name": "shipped",
+      "values": {
+        "Status": "Shipped",
+        "From": "2026-10-01"
+      },
+      "types": {
+        "Status": "varchar(12)",
+        "From": "datetime2(3)"
+      },
+      "weight": 0.1
+    }
+  ],
+  "key": {
+    "decision": "no_change",
+    "correct_families": [],
+    "traps": [
+      {
+        "id": "force_a_variant_plan",
+        "class": "unsafe",
+        "why": "The three plans are the feature: one per data volume. Forcing one of them, or the parent, takes the right plan away from the other two groups.",
+        "signals": {
+          "all": [
+            "sp_query_store_force_plan"
+          ]
+        },
+        "example_sql": "EXEC sys.sp_query_store_force_plan @query_id = 5120, @plan_id = 7731;"
+      },
+      {
+        "id": "recompile_hint",
+        "class": "ineffective",
+        "why": "OPTION (RECOMPILE) replaces three cached plans that already fit with a compile on every call.",
+        "signals": {
+          "all": [
+            "option\\s*\\(\\s*recompile"
+          ]
+        },
+        "example_sql": [
+          "SELECT o.OrderID, o.OrderDate, c.AccountNumber, c.LastName",
+          "FROM qe.Orders o",
+          "JOIN qe.Customers c ON c.CustomerID = o.CustomerID",
+          "WHERE o.Status = @Status",
+          "  AND o.OrderDate >= @From",
+          "OPTION (RECOMPILE);"
+        ]
+      },
+      {
+        "id": "turn_psp_off",
+        "class": "unsafe",
+        "why": "Turning the feature off, for the database or with a hint, brings back one plan for all three volumes.",
+        "signals": {
+          "any": [
+            "parameter_sensitive_plan_optimization\\s*=\\s*off",
+            "disable_parameter_sniffing",
+            "optimize for"
+          ]
+        },
+        "example_sql": "ALTER DATABASE SCOPED CONFIGURATION SET PARAMETER_SENSITIVE_PLAN_OPTIMIZATION = OFF;"
+      }
+    ],
+    "index": {
+      "role": "none"
+    },
+    "min_improvement": {
+      "metric": "cpu_ms",
+      "ratio": 0.9,
+      "basis": "No change is the answer. A candidate is measured only to show that no status group gets more than 10% worse."
+    },
+    "reference_notes": "Several plans for one parent query are expected when sys.query_store_query_variant has rows. Judge each variant against its own target."
+  }
+}

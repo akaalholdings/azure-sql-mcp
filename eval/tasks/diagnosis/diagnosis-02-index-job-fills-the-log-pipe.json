@@ -1,0 +1,330 @@
+{
+  "format_version": 1,
+  "id": "diagnosis-02-index-job-fills-the-log-pipe",
+  "kind": "diagnosis",
+  "title": "What fills the log at night?",
+  "split": "public",
+  "source": "case-exam-v1:2",
+  "tags": [
+    "log-rate",
+    "index-maintenance",
+    "batch-overrun"
+  ],
+  "prompt": [
+    "Client: Harbourline Commerce, a multi-tenant retail order platform with about 400 tenants. Database hlc-orders-prod: Azure SQL Database, Business Critical, Gen5, 16 vCores, compatibility level 160, READ_COMMITTED_SNAPSHOT ON. All times are UTC. Business hours are 07:30 to 18:00. The nightly batch must finish by 06:00. Evidence was collected from Mon 21 Sep to Sun 27 Sep 2026.",
+    "The batch met its 06:00 deadline until 31 Aug and has missed it on every business day since 07 Sep. Job history of",
+    "the nightly index job: 24 Aug 17 indexes, 402 GB rebuilt, finished 01:58, no statistics step. 07 Sep 36 indexes,",
+    "958 GB rebuilt, rebuild phase ended 05:31 and the statistics phase 07:58. 23 Sep 41 indexes, 1,071 GB rebuilt,",
+    "rebuild phase ended 06:20 and the statistics phase 09:05. The batch starts at 02:00.",
+    "Client change log: 2025-03-11 a developer added OPTION (MAX_GRANT_PERCENT = 5) to etl.LoadFactSales, then a daytime job. 2026-01-20 etl.LoadFactSales moved into the nightly pipeline. 2026-08-30 release 5.2: ORM upgrade from version 7 to 8, new ProductSearch endpoint. 2026-09-01 tenant 'MegaMart' onboarded; nightly volume about doubled. 2026-09-04 the nightly index job was changed: rebuild threshold 30% to 5%, reorganize removed, ONLINE = ON, MAXDOP = 0, and UPDATE STATISTICS WITH FULLSCAN on every user table added. 2026-09-16 hotfix 5.2.3: an outer retry policy on every database call and Max Pool Size 100 to 400. 2026-09-24 11:47 planned maintenance reconfiguration, completed 11:48.",
+    "Name the cause of the log saturation."
+  ],
+  "evidence": [
+    {
+      "id": "log_bytes",
+      "tool": "get_io_stats",
+      "arguments": {},
+      "result": {
+        "result_status": "ok",
+        "files": [
+          {
+            "file_type": "LOG",
+            "avg_write_latency_ms": 2.3
+          }
+        ],
+        "log_bytes_written_by_source": [
+          {
+            "window": "Mon 2026-08-24 00:30-04:36",
+            "total_tb": 1.09,
+            "index_maintenance_tb": 0.71,
+            "batch_tb": 0.36,
+            "oltp_tb": 0.02
+          },
+          {
+            "window": "Wed 2026-09-23 00:30-09:06",
+            "total_tb": 2.71,
+            "index_maintenance_tb": 1.94,
+            "batch_tb": 0.71,
+            "oltp_tb": 0.06
+          }
+        ]
+      }
+    },
+    {
+      "id": "waits_night",
+      "tool": "get_wait_stats",
+      "arguments": {
+        "sample_seconds": 0
+      },
+      "result": {
+        "result_status": "ok",
+        "window": {
+          "mode": "delta",
+          "start": "2026-09-23T00:30Z",
+          "end": "2026-09-23T06:00Z"
+        },
+        "top_waits": [
+          {
+            "wait_type": "LOG_RATE_GOVERNOR",
+            "wait_time_s": 61840,
+            "avg_wait_ms": 38,
+            "pct_of_total": 31.0
+          },
+          {
+            "wait_type": "PAGEIOLATCH_SH",
+            "wait_time_s": 38950,
+            "avg_wait_ms": 0.6,
+            "pct_of_total": 19.5
+          },
+          {
+            "wait_type": "CXPACKET",
+            "wait_time_s": 27300,
+            "pct_of_total": 13.7
+          },
+          {
+            "wait_type": "CXCONSUMER",
+            "wait_time_s": 19800,
+            "pct_of_total": 9.9
+          },
+          {
+            "wait_type": "IO_COMPLETION",
+            "wait_time_s": 17450,
+            "avg_wait_ms": 4.1,
+            "pct_of_total": 8.7
+          },
+          {
+            "wait_type": "HADR_THROTTLE_LOG_RATE_SEND_RECV_QUEUE_SIZE",
+            "wait_time_s": 6210,
+            "avg_wait_ms": 22,
+            "pct_of_total": 3.1
+          },
+          {
+            "wait_type": "WRITELOG",
+            "wait_time_s": 5980,
+            "avg_wait_ms": 2.3,
+            "pct_of_total": 3.0
+          },
+          {
+            "wait_type": "HADR_SYNC_COMMIT",
+            "wait_time_s": 4420,
+            "avg_wait_ms": 1.1,
+            "pct_of_total": 2.2
+          },
+          {
+            "wait_type": "SOS_SCHEDULER_YIELD",
+            "wait_time_s": 3900,
+            "pct_of_total": 2.0
+          },
+          {
+            "wait_type": "PAGEIOLATCH_EX",
+            "wait_time_s": 3100,
+            "avg_wait_ms": 0.8,
+            "pct_of_total": 1.6
+          }
+        ],
+        "signal_wait_pct": 7
+      }
+    },
+    {
+      "id": "wed_night",
+      "tool": "get_resource_stats_history",
+      "arguments": {
+        "window_minutes": 720
+      },
+      "result": {
+        "result_status": "ok",
+        "source": "sys.dm_db_resource_stats",
+        "history": [
+          {
+            "time": "2026-09-23T00:15Z",
+            "avg_cpu_percent": 9,
+            "avg_data_io_percent": 4,
+            "avg_log_write_percent": 3,
+            "max_worker_percent": 1,
+            "activity": "idle"
+          },
+          {
+            "time": "2026-09-23T00:45Z",
+            "avg_cpu_percent": 41,
+            "avg_data_io_percent": 38,
+            "avg_log_write_percent": 100,
+            "max_worker_percent": 2,
+            "activity": "index rebuild phase"
+          },
+          {
+            "time": "2026-09-23T02:15Z",
+            "avg_cpu_percent": 58,
+            "avg_data_io_percent": 61,
+            "avg_log_write_percent": 100,
+            "max_worker_percent": 3,
+            "activity": "rebuild and batch step 1"
+          },
+          {
+            "time": "2026-09-23T03:30Z",
+            "avg_cpu_percent": 62,
+            "avg_data_io_percent": 66,
+            "avg_log_write_percent": 100,
+            "max_worker_percent": 3,
+            "activity": "rebuild and batch step 1"
+          },
+          {
+            "time": "2026-09-23T05:30Z",
+            "avg_cpu_percent": 49,
+            "avg_data_io_percent": 63,
+            "avg_log_write_percent": 100,
+            "max_worker_percent": 3,
+            "activity": "rebuild and batch step 2"
+          },
+          {
+            "time": "2026-09-23T06:30Z",
+            "avg_cpu_percent": 47,
+            "avg_data_io_percent": 52,
+            "avg_log_write_percent": 92,
+            "max_worker_percent": 3,
+            "activity": "statistics phase and batch step 2"
+          },
+          {
+            "time": "2026-09-23T07:45Z",
+            "avg_cpu_percent": 43,
+            "avg_data_io_percent": 31,
+            "avg_log_write_percent": 97,
+            "max_worker_percent": 9,
+            "activity": "statistics phase and batch step 3"
+          },
+          {
+            "time": "2026-09-23T08:30Z",
+            "avg_cpu_percent": 46,
+            "avg_data_io_percent": 29,
+            "avg_log_write_percent": 100,
+            "max_worker_percent": 14,
+            "activity": "batch step 4 and OLTP"
+          },
+          {
+            "time": "2026-09-23T08:45Z",
+            "avg_cpu_percent": 44,
+            "avg_data_io_percent": 27,
+            "avg_log_write_percent": 100,
+            "max_worker_percent": 16,
+            "activity": "batch step 4 and OLTP"
+          },
+          {
+            "time": "2026-09-23T09:10Z",
+            "avg_cpu_percent": 31,
+            "avg_data_io_percent": 12,
+            "avg_log_write_percent": 47,
+            "max_worker_percent": 6,
+            "activity": "batch finished 09:06"
+          },
+          {
+            "time": "2026-09-23T10:30Z",
+            "avg_cpu_percent": 28,
+            "avg_data_io_percent": 7,
+            "avg_log_write_percent": 22,
+            "max_worker_percent": 5,
+            "activity": "normal day"
+          }
+        ]
+      }
+    },
+    {
+      "id": "limits",
+      "tool": "get_resource_limits",
+      "arguments": {},
+      "result": {
+        "result_status": "ok",
+        "service_objective": "BC_Gen5_16",
+        "cpu_limit": 16,
+        "max_log_rate_mb_per_sec": 96,
+        "max_db_memory_gb": 81.6,
+        "max_workers": 1680,
+        "max_sessions": 30000,
+        "tempdb_max_size_gb": 512
+      }
+    }
+  ],
+  "key": {
+    "root_cause": "maintenance_log_volume",
+    "required_facts": [
+      {
+        "id": "index_job_writes_most_of_the_log",
+        "evidence": "log_bytes",
+        "description": "The index job wrote 1.94 TB of the 2.71 TB of log on Wed 23.",
+        "signals": {
+          "all": [
+            "1\\.94",
+            "2\\.71|\\bTB\\b"
+          ]
+        },
+        "example": "Index maintenance wrote 1.94 TB of the 2.71 TB of log on Wed 23; the batch wrote 0.71 TB."
+      },
+      {
+        "id": "volume_grew_after_the_job_change",
+        "evidence": "log_bytes",
+        "description": "Log volume was 1.09 TB on a night in August, before the job change.",
+        "signals": {
+          "all": [
+            "1\\.09|0\\.71",
+            "aug|before|was\\b"
+          ]
+        },
+        "example": "On 24 Aug, before the job change, the night wrote 1.09 TB of log in total and index maintenance 0.71 TB."
+      },
+      {
+        "id": "log_at_cap_while_both_run",
+        "evidence": "wed_night",
+        "description": "Log write is at 100% while the rebuild and the batch run together.",
+        "signals": {
+          "all": [
+            "\\blog\\b",
+            "\\b100\\s?%",
+            "rebuild|index job|maintenance"
+          ]
+        },
+        "example": "Log write is at 100% of the limit from 00:45, while the rebuild and the batch run together."
+      }
+    ],
+    "harmful_conclusions": [
+      {
+        "id": "reorganize_as_the_light_option",
+        "description": "REORGANIZE is fully logged and often writes more log than a rebuild.",
+        "signals": {
+          "any": [
+            "reorgani[sz]e"
+          ]
+        },
+        "example": "Switch the job from REBUILD to REORGANIZE to cut the log."
+      },
+      {
+        "id": "change_the_recovery_model",
+        "description": "Azure SQL Database always runs in FULL recovery; there is no minimal logging to switch on.",
+        "signals": {
+          "any": [
+            "recovery model",
+            "\\bsimple recovery\\b",
+            "bulk[\\s_-]?logged",
+            "minimal(ly)? logg"
+          ]
+        },
+        "example": "Set the recovery model to SIMPLE during the maintenance window."
+      },
+      {
+        "id": "scale_up_for_the_log",
+        "description": "The log rate cap is 96 MiB/s at 16 and at 24 vCores.",
+        "root_causes": [
+          "cpu_capacity",
+          "storage_latency"
+        ],
+        "signals": {
+          "any": [
+            "\\bscale (up|to)\\b",
+            "\\b24[\\s-]?v?cores?\\b",
+            "\\bupgrade (to|the)\\b",
+            "\\bmore v?cores\\b",
+            "\\bhyperscale\\b"
+          ]
+        },
+        "example": "Scale up to 24 vCores to get more log throughput."
+      }
+    ]
+  }
+}

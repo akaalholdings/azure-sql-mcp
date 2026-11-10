@@ -1,0 +1,268 @@
+{
+  "format_version": 1,
+  "id": "exam-q04-scalar-udf-net-paid",
+  "kind": "tuning",
+  "title": "Scalar function that cannot be inlined, called in SELECT and WHERE",
+  "split": "public",
+  "source": "rewrite-exam-v1:Q04",
+  "tags": [
+    "scalar-udf",
+    "rounding",
+    "outer-join"
+  ],
+  "prompt": [
+    "Nightly export of high-value customers per region. For region 3 (about 264k active customers) it runs about",
+    "14 minutes. sys.sql_modules.is_inlineable is 0 for qe.fn_CustomerNetPaid12m because it calls SYSDATETIME(). The",
+    "plan is serial (NonParallelPlanReason TSQLUserDefinedFunctionsNotParallelizable). sys.dm_exec_function_stats shows",
+    "about 528k executions per run at about 1.6 ms each. Analysts sometimes run it with @MinNetPaid = 0 to get the full",
+    "list, including customers with no payments. Finance reconciles the output, so values (to the cent) and row",
+    "membership must not change. Other code uses the function, so it must stay as it is. The function is in the",
+    "schema file."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.Customers",
+      "qe.Orders",
+      "qe.Payments"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "Customers: 2.0M rows. Tier S = 1.85M, G = ~150k, P = 25 partner accounts (CustomerID 1 to 25). IsActive = 1 for 88%. Email is NULL for ~9% (~180k rows, ~160k of them active). About 2% of non-NULL emails are shared by two or more customer rows (households). ReferredByCustomerID is non-NULL for 18%; 312 rows are self-referrals (ReferredByCustomerID = CustomerID, CustomerID 500001 to 500312). AccountNumber always matches 'AC' + 10 digits (CHECK constraint).",
+    "Orders: 30M rows, 2016 to now, ~12k per day now. The 25 partner customers own ~9M orders (30%), up to 1.2M each. Other customers average ~10 orders (max ~400). The density estimate for CustomerID is ~15 rows. Status: Shipped 83.8%, Cancelled 7%, Paid 6%, Returned 3%, Pending 0.2% (~60k rows, all from the last 72 hours). SalesChannel: Web 62%, Store 20%, Partner 12%, Phone 6%. PromoCode is NULL for 85%. ShipRegionID is NULL for Store pickups (~20%). OrderDate is datetime2(7); Partner and Store imports stamp one timestamp on a whole batch, so many orders of one customer share an OrderDate.",
+    "Payments: 60M rows. Status: Settled 88%, Failed 6%, Refunded 4% (negative Amount), Pending 2%. ExternalRef is NULL for ~30%; non-NULL values are almost unique, with a few duplicates from provider retries. Partner accounts have up to 180k Settled or Refunded payments each. Settlement batches stamp the same PaidAt on 50-500 payments."
+  ],
+  "baseline_kind": "select",
+  "baseline_sql": [
+    "SELECT c.CustomerID, c.AccountNumber, c.LastName,",
+    "       qe.fn_CustomerNetPaid12m(c.CustomerID) AS NetPaid12m",
+    "FROM qe.Customers c",
+    "WHERE c.RegionID = @RegionID",
+    "  AND c.IsActive = 1",
+    "  AND qe.fn_CustomerNetPaid12m(c.CustomerID) >= @MinNetPaid",
+    "ORDER BY NetPaid12m DESC;"
+  ],
+  "parameter_cases": [
+    {
+      "name": "region3_threshold",
+      "values": {
+        "RegionID": 3,
+        "MinNetPaid": 1000
+      },
+      "types": {
+        "RegionID": "tinyint",
+        "MinNetPaid": "decimal(19,2)"
+      },
+      "weight": 0.5
+    },
+    {
+      "name": "region3_full_list",
+      "values": {
+        "RegionID": 3,
+        "MinNetPaid": 0
+      },
+      "types": {
+        "RegionID": "tinyint",
+        "MinNetPaid": "decimal(19,2)"
+      },
+      "weight": 0.3
+    },
+    {
+      "name": "region1_threshold",
+      "values": {
+        "RegionID": 1,
+        "MinNetPaid": 5000
+      },
+      "types": {
+        "RegionID": "tinyint",
+        "MinNetPaid": "decimal(19,2)"
+      },
+      "weight": 0.2
+    }
+  ],
+  "key": {
+    "decision": "rewrite",
+    "correct_families": [
+      {
+        "id": "set_based_aggregate_with_rounding",
+        "description": "One aggregate over Payments for the region, outer-joined to the customers, rounded to decimal(19,2) before the comparison.",
+        "signals": {
+          "all": [
+            "sum\\(\\s*p\\.Amount\\s*\\)",
+            "decimal\\(\\s*19\\s*,\\s*2\\s*\\)",
+            "left (outer )?join|outer apply",
+            "isnull\\(|coalesce\\("
+          ],
+          "none": [
+            "fn_CustomerNetPaid12m"
+          ]
+        },
+        "reference_sql": [
+          "WITH Net AS (",
+          "    SELECT o.CustomerID, SUM(p.Amount) AS NetRaw",
+          "    FROM qe.Customers c",
+          "    JOIN qe.Orders   o ON o.CustomerID = c.CustomerID",
+          "    JOIN qe.Payments p ON p.OrderID = o.OrderID",
+          "    WHERE c.RegionID = @RegionID",
+          "      AND c.IsActive = 1",
+          "      AND p.Status IN ('Settled','Refunded')",
+          "      AND p.PaidAt >= DATEADD(month, -12, SYSDATETIME())",
+          "    GROUP BY o.CustomerID",
+          ")",
+          "SELECT c.CustomerID, c.AccountNumber, c.LastName, x.NetPaid12m",
+          "FROM qe.Customers c",
+          "LEFT JOIN Net n ON n.CustomerID = c.CustomerID",
+          "CROSS APPLY (SELECT CAST(ISNULL(n.NetRaw, 0) AS decimal(19,2)) AS NetPaid12m) x",
+          "WHERE c.RegionID = @RegionID",
+          "  AND c.IsActive = 1",
+          "  AND x.NetPaid12m >= @MinNetPaid",
+          "ORDER BY x.NetPaid12m DESC;"
+        ]
+      }
+    ],
+    "traps": [
+      {
+        "id": "rounding_dropped",
+        "class": "not_equivalent",
+        "why": "The function returns decimal(19,2), so it rounds the sum. Comparing the unrounded sum treats 99.995 differently at a threshold of 100.00 and returns four decimals.",
+        "signals": {
+          "all": [
+            "sum\\(\\s*p\\.Amount\\s*\\)"
+          ],
+          "none": [
+            "decimal\\(\\s*19\\s*,\\s*2\\s*\\)",
+            "\\bround\\(",
+            "fn_CustomerNetPaid12m"
+          ]
+        },
+        "told_apart_by": "A customer whose 12-month sum is 999.9950 with @MinNetPaid = 1000.",
+        "example_sql": [
+          "WITH Net AS (",
+          "    SELECT o.CustomerID, SUM(p.Amount) AS NetRaw",
+          "    FROM qe.Customers c",
+          "    JOIN qe.Orders   o ON o.CustomerID = c.CustomerID",
+          "    JOIN qe.Payments p ON p.OrderID = o.OrderID",
+          "    WHERE c.RegionID = @RegionID",
+          "      AND c.IsActive = 1",
+          "      AND p.Status IN ('Settled','Refunded')",
+          "      AND p.PaidAt >= DATEADD(month, -12, SYSDATETIME())",
+          "    GROUP BY o.CustomerID",
+          ")",
+          "SELECT c.CustomerID, c.AccountNumber, c.LastName, ISNULL(n.NetRaw, 0) AS NetPaid12m",
+          "FROM qe.Customers c",
+          "LEFT JOIN Net n ON n.CustomerID = c.CustomerID",
+          "WHERE c.RegionID = @RegionID AND c.IsActive = 1 AND ISNULL(n.NetRaw, 0) >= @MinNetPaid",
+          "ORDER BY NetPaid12m DESC;"
+        ]
+      },
+      {
+        "id": "inner_join_drops_customers_without_payments",
+        "class": "not_equivalent",
+        "why": "Customers with no qualifying payment have a net of 0 and must appear when @MinNetPaid is 0 or less.",
+        "signals": {
+          "all": [
+            "sum\\(\\s*p\\.Amount\\s*\\)"
+          ],
+          "none": [
+            "left (outer )?join",
+            "outer apply",
+            "(isnull|coalesce)\\(\\s*\\(\\s*select",
+            "fn_CustomerNetPaid12m"
+          ]
+        },
+        "told_apart_by": "Parameter case region3_full_list: customers with no payment in 12 months disappear.",
+        "example_sql": [
+          "WITH Net AS (",
+          "    SELECT o.CustomerID, SUM(p.Amount) AS NetRaw",
+          "    FROM qe.Customers c",
+          "    JOIN qe.Orders   o ON o.CustomerID = c.CustomerID",
+          "    JOIN qe.Payments p ON p.OrderID = o.OrderID",
+          "    WHERE c.RegionID = @RegionID",
+          "      AND c.IsActive = 1",
+          "      AND p.Status IN ('Settled','Refunded')",
+          "      AND p.PaidAt >= DATEADD(month, -12, SYSDATETIME())",
+          "    GROUP BY o.CustomerID",
+          ")",
+          "SELECT c.CustomerID, c.AccountNumber, c.LastName, CAST(n.NetRaw AS decimal(19,2)) AS NetPaid12m",
+          "FROM qe.Customers c",
+          "JOIN Net n ON n.CustomerID = c.CustomerID",
+          "WHERE c.RegionID = @RegionID AND c.IsActive = 1 AND CAST(n.NetRaw AS decimal(19,2)) >= @MinNetPaid",
+          "ORDER BY NetPaid12m DESC;"
+        ]
+      },
+      {
+        "id": "function_changed_or_dropped",
+        "class": "unsafe",
+        "why": "Other code calls the function. The task is to stop calling it here.",
+        "signals": {
+          "any": [
+            "(drop|alter) function qe\\.fn_CustomerNetPaid12m",
+            "create or alter function qe\\.fn_CustomerNetPaid12m"
+          ]
+        },
+        "example_sql": [
+          "DROP FUNCTION qe.fn_CustomerNetPaid12m;",
+          "WITH Net AS (",
+          "    SELECT o.CustomerID, SUM(p.Amount) AS NetRaw",
+          "    FROM qe.Customers c",
+          "    JOIN qe.Orders   o ON o.CustomerID = c.CustomerID",
+          "    JOIN qe.Payments p ON p.OrderID = o.OrderID",
+          "    WHERE c.RegionID = @RegionID",
+          "      AND c.IsActive = 1",
+          "      AND p.Status IN ('Settled','Refunded')",
+          "      AND p.PaidAt >= DATEADD(month, -12, SYSDATETIME())",
+          "    GROUP BY o.CustomerID",
+          ")",
+          "SELECT c.CustomerID, c.AccountNumber, c.LastName, x.NetPaid12m",
+          "FROM qe.Customers c",
+          "LEFT JOIN Net n ON n.CustomerID = c.CustomerID",
+          "CROSS APPLY (SELECT CAST(ISNULL(n.NetRaw, 0) AS decimal(19,2)) AS NetPaid12m) x",
+          "WHERE c.RegionID = @RegionID",
+          "  AND c.IsActive = 1",
+          "  AND x.NetPaid12m >= @MinNetPaid",
+          "ORDER BY x.NetPaid12m DESC;"
+        ]
+      },
+      {
+        "id": "still_calls_the_function",
+        "class": "ineffective",
+        "why": "Any form that still calls the function runs it once per row in a serial plan.",
+        "signals": {
+          "all": [
+            "fn_CustomerNetPaid12m\\("
+          ]
+        },
+        "example_sql": [
+          "SELECT c.CustomerID, c.AccountNumber, c.LastName, f.NetPaid12m",
+          "FROM qe.Customers c",
+          "CROSS APPLY (SELECT qe.fn_CustomerNetPaid12m(c.CustomerID) AS NetPaid12m) f",
+          "WHERE c.RegionID = @RegionID AND c.IsActive = 1 AND f.NetPaid12m >= @MinNetPaid",
+          "ORDER BY f.NetPaid12m DESC;"
+        ]
+      }
+    ],
+    "index": {
+      "role": "required",
+      "accepted": [
+        {
+          "table": "qe.Payments",
+          "key_columns": [
+            "OrderID"
+          ],
+          "include_columns": [
+            "Status",
+            "PaidAt",
+            "Amount"
+          ]
+        }
+      ]
+    },
+    "min_improvement": {
+      "metric": "elapsed_ms",
+      "ratio": 10,
+      "basis": "528k function calls at 1.6 ms each are the 14 minutes. One parallel aggregate must be at least ten times faster."
+    },
+    "reference_notes": "The function reads SYSDATETIME() on each call, so its 12-month boundary moves by milliseconds during the run. The rewrite uses one value for the whole statement. State that difference to the owner."
+  }
+}

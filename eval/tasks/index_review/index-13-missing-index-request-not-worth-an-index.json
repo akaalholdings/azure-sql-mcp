@@ -1,0 +1,91 @@
+{
+  "format_version": 1,
+  "id": "index-13-missing-index-request-not-worth-an-index",
+  "kind": "index_review",
+  "title": "Missing-index request on Product with an impact of 96.4%",
+  "split": "public",
+  "source": "index-exam-v1:13",
+  "tags": [
+    "missing-index",
+    "no-change"
+  ],
+  "prompt": [
+    "Azure SQL Database 'RetailOps', General Purpose, 8 vCores, about 41.5 GB of memory, compatibility level 160, no readable secondary. Snapshot taken Thursday 2026-09-24 09:00 UTC. A platform failover reset the index usage counters on 2026-09-15 02:41, so they cover 9.26 days. Query Store holds data from 2026-09-11 only, because size-based cleanup has run. Month-end change freeze: 2026-09-30 18:00 to 2026-10-02 18:00. Flash sale on 2026-10-09 with a change freeze from 2026-10-08. Log rate cap: 36 MB/s. Space headroom: 213 GB.",
+    "The missing-index DMV reports for Q18: equality CategoryId, IsActive; include Sku, Name, ListPrice; user_seeks 1,950;",
+    "avg_total_user_cost 0.71; avg_user_impact 96.4. The advisor script wants CREATE INDEX IX_MI_Product_1 ON dbo.Product",
+    "(CategoryId, IsActive) INCLUDE (Sku, Name, ListPrice). Decide."
+  ],
+  "usage_window": {
+    "start": "2026-09-15T02:41Z",
+    "end": "2026-09-24T09:00Z",
+    "days": 9.26,
+    "reset_by": "platform failover",
+    "query_store_from": "2026-09-11"
+  },
+  "inventory": [
+    {
+      "table": "dbo.Product",
+      "name": "PK_Product",
+      "type": "clustered",
+      "key_columns": [
+        "ProductId"
+      ],
+      "include_columns": [],
+      "size_gb": 0.0095,
+      "usage": {
+        "user_seeks": 1210000,
+        "user_scans": 1950,
+        "user_lookups": 0,
+        "user_updates": 900
+      },
+      "is_unique": true
+    },
+    {
+      "table": "dbo.Product",
+      "name": "UQ_Product_Sku",
+      "type": "nonclustered",
+      "key_columns": [
+        "Sku"
+      ],
+      "include_columns": [],
+      "size_gb": 0.0021,
+      "usage": {
+        "user_seeks": 640000,
+        "user_scans": 0,
+        "user_lookups": 0,
+        "user_updates": 40
+      },
+      "is_unique": true,
+      "is_constraint": true
+    }
+  ],
+  "workload": [
+    {
+      "id": "Q18",
+      "description": "Catalog category list",
+      "sql": "SELECT p.ProductId, p.Sku, p.Name, p.ListPrice FROM dbo.Product p WHERE p.CategoryId = @CategoryId AND p.IsActive = 1;",
+      "executions_per_day": 210,
+      "plan": "Clustered Index Scan PK_Product.",
+      "avg_cpu_ms": 6,
+      "avg_logical_reads": 1210
+    }
+  ],
+  "facts": [
+    "dbo.Product: 48,200 rows, 9.5 MB.",
+    "Q18 runs 210 times a day at 6 ms of CPU: about 1.3 CPU-seconds a day in total. The catalog service caches product lists for 10 minutes."
+  ],
+  "key": {
+    "no_new_index": true,
+    "must_not_create": [
+      {
+        "id": "advisor_index_for_a_trivial_cost",
+        "table": "dbo.Product",
+        "key_columns": [
+          "CategoryId"
+        ],
+        "why": "A 96% improvement of 1.3 CPU-seconds a day does not pay for another index to maintain and review."
+      }
+    ],
+    "reference_notes": "Record the request as reviewed, with no action."
+  }
+}

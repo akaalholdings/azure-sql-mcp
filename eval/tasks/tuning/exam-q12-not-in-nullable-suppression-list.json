@@ -1,0 +1,185 @@
+{
+  "format_version": 1,
+  "id": "exam-q12-not-in-nullable-suppression-list",
+  "kind": "tuning",
+  "title": "Campaign list with NOT IN over a nullable suppression list",
+  "split": "public",
+  "source": "rewrite-exam-v1:Q12",
+  "tags": [
+    "not-in-null",
+    "anti-join"
+  ],
+  "prompt": [
+    "Weekly campaign build job: about 26 minutes. Plan: nested-loops anti semi joins with a Row Count Spool for the NULL",
+    "check, and repeated work against the 3.1M-row EmailSuppressions table, which has no index on Email. Customers.Email",
+    "is varchar(254); EmailSuppressions.Email is nvarchar(320). The current output (about 1.44M rows) has gone to the",
+    "email platform for two years. Who receives marketing email is a compliance decision: the result must not change",
+    "without sign-off."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.Customers",
+      "qe.EmailSuppressions"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "Customers: 2.0M rows. Tier S = 1.85M, G = ~150k, P = 25 partner accounts (CustomerID 1 to 25). IsActive = 1 for 88%. Email is NULL for ~9% (~180k rows, ~160k of them active). About 2% of non-NULL emails are shared by two or more customer rows (households). ReferredByCustomerID is non-NULL for 18%; 312 rows are self-referrals (ReferredByCustomerID = CustomerID, CustomerID 500001 to 500312). AccountNumber always matches 'AC' + 10 digits (CHECK constraint).",
+    "EmailSuppressions: 3.1M rows. 0 NULL emails today, but the column is nullable and the nightly loader does not validate. Duplicate emails exist."
+  ],
+  "baseline_kind": "select",
+  "baseline_sql": [
+    "SELECT c.CustomerID, c.Email, c.FirstName",
+    "FROM qe.Customers c",
+    "WHERE c.IsActive = 1",
+    "  AND c.Email NOT IN (SELECT s.Email FROM qe.EmailSuppressions s);"
+  ],
+  "parameter_cases": [
+    {
+      "name": "no_parameters",
+      "values": {},
+      "types": {},
+      "weight": 1.0
+    }
+  ],
+  "key": {
+    "decision": "rewrite",
+    "correct_families": [
+      {
+        "id": "exact_three_valued_not_exists",
+        "description": "NOT EXISTS for the match, plus the two NULL rules of NOT IN: a NULL in the list returns no row, and a NULL email is kept only when the list is empty.",
+        "signals": {
+          "all": [
+            "not exists",
+            "\\b(?!c\\.)\\w+\\.Email is null",
+            "c\\.Email is not null\\s+or\\b|\\bor\\s+c\\.Email is not null"
+          ]
+        },
+        "reference_sql": [
+          "SELECT c.CustomerID, c.Email, c.FirstName",
+          "FROM qe.Customers c",
+          "WHERE c.IsActive = 1",
+          "  AND NOT EXISTS (SELECT 1 FROM qe.EmailSuppressions s WHERE s.Email = c.Email)",
+          "  AND NOT EXISTS (SELECT 1 FROM qe.EmailSuppressions s WHERE s.Email IS NULL)",
+          "  AND (c.Email IS NOT NULL",
+          "       OR NOT EXISTS (SELECT 1 FROM qe.EmailSuppressions s));"
+        ]
+      }
+    ],
+    "traps": [
+      {
+        "id": "plain_not_exists",
+        "class": "not_equivalent",
+        "why": "NOT EXISTS keeps a customer whose Email is NULL; NOT IN rejects it. Today that adds about 160k active customers with no email address.",
+        "signals": {
+          "all": [
+            "not exists"
+          ],
+          "none": [
+            "c\\.Email is not null",
+            "\\b(?!c\\.)\\w+\\.Email is null"
+          ]
+        },
+        "told_apart_by": "Today's data: the 160k active customers whose Email is NULL.",
+        "example_sql": [
+          "SELECT c.CustomerID, c.Email, c.FirstName",
+          "FROM qe.Customers c",
+          "WHERE c.IsActive = 1",
+          "  AND NOT EXISTS (SELECT 1 FROM qe.EmailSuppressions s WHERE s.Email = c.Email);"
+        ]
+      },
+      {
+        "id": "intent_form",
+        "class": "not_equivalent",
+        "why": "c.Email IS NOT NULL AND NOT EXISTS (match) is the probable intent, but it differs from NOT IN when the list holds a NULL (NOT IN returns no rows) or is empty (NOT IN returns NULL emails too).",
+        "signals": {
+          "all": [
+            "not exists",
+            "c\\.Email is not null"
+          ],
+          "none": [
+            "\\b(?!c\\.)\\w+\\.Email is null"
+          ]
+        },
+        "told_apart_by": "One row in EmailSuppressions with Email NULL: the baseline returns no rows.",
+        "example_sql": [
+          "SELECT c.CustomerID, c.Email, c.FirstName",
+          "FROM qe.Customers c",
+          "WHERE c.IsActive = 1",
+          "  AND c.Email IS NOT NULL",
+          "  AND NOT EXISTS (SELECT 1 FROM qe.EmailSuppressions s WHERE s.Email = c.Email);"
+        ]
+      },
+      {
+        "id": "left_join_is_null",
+        "class": "not_equivalent",
+        "why": "LEFT JOIN ... IS NULL keeps NULL-email customers like plain NOT EXISTS does.",
+        "signals": {
+          "all": [
+            "left (outer )?join qe\\.EmailSuppressions"
+          ]
+        },
+        "told_apart_by": "Today's data: the 160k active customers whose Email is NULL.",
+        "example_sql": [
+          "SELECT c.CustomerID, c.Email, c.FirstName",
+          "FROM qe.Customers c",
+          "LEFT JOIN qe.EmailSuppressions s ON s.Email = c.Email",
+          "WHERE c.IsActive = 1 AND s.SuppressionID IS NULL;"
+        ]
+      },
+      {
+        "id": "null_filter_inside_not_in",
+        "class": "not_equivalent",
+        "why": "Filtering NULLs out of the subquery changes the behaviour when the loader inserts a NULL: the original then returns no rows.",
+        "signals": {
+          "all": [
+            "not in\\s*\\(",
+            "where \\w+\\.Email is not null\\s*\\)"
+          ]
+        },
+        "told_apart_by": "One row in EmailSuppressions with Email NULL.",
+        "example_sql": [
+          "SELECT c.CustomerID, c.Email, c.FirstName",
+          "FROM qe.Customers c",
+          "WHERE c.IsActive = 1",
+          "  AND c.Email NOT IN (SELECT s.Email FROM qe.EmailSuppressions s WHERE s.Email IS NOT NULL);"
+        ]
+      },
+      {
+        "id": "except",
+        "class": "not_equivalent",
+        "why": "EXCEPT removes duplicates and treats NULLs as equal.",
+        "signals": {
+          "all": [
+            "\\bexcept\\b"
+          ]
+        },
+        "told_apart_by": "One row in EmailSuppressions with Email NULL.",
+        "example_sql": [
+          "SELECT c.CustomerID, c.Email, c.FirstName",
+          "FROM qe.Customers c",
+          "WHERE c.IsActive = 1",
+          "  AND c.Email IN (SELECT c2.Email FROM qe.Customers c2 EXCEPT SELECT s.Email FROM qe.EmailSuppressions s);"
+        ]
+      }
+    ],
+    "index": {
+      "role": "required",
+      "accepted": [
+        {
+          "table": "qe.EmailSuppressions",
+          "key_columns": [
+            "Email"
+          ]
+        }
+      ]
+    },
+    "min_improvement": {
+      "metric": "elapsed_ms",
+      "ratio": 10,
+      "basis": "26 minutes of repeated work against an unindexed 3.1M-row table become one anti join with an index."
+    },
+    "reference_notes": "Tell the owner: one NULL loaded by the vendor job makes the original, and the exact rewrite, return no rows. Clean the data and make EmailSuppressions.Email NOT NULL. After that the short NOT EXISTS form is provably equal."
+  }
+}

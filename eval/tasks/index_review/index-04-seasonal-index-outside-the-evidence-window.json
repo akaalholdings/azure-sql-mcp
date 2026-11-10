@@ -1,0 +1,130 @@
+{
+  "format_version": 1,
+  "id": "index-04-seasonal-index-outside-the-evidence-window",
+  "kind": "index_review",
+  "title": "IX_Orders_InvoiceDate: 0 reads, 6.4M writes",
+  "split": "public",
+  "source": "index-exam-v1:4",
+  "tags": [
+    "seasonal",
+    "keep",
+    "evidence-window"
+  ],
+  "prompt": [
+    "Azure SQL Database 'RetailOps', General Purpose, 8 vCores, about 41.5 GB of memory, compatibility level 160, no readable secondary. Snapshot taken Thursday 2026-09-24 09:00 UTC. A platform failover reset the index usage counters on 2026-09-15 02:41, so they cover 9.26 days. Query Store holds data from 2026-09-11 only, because size-based cleanup has run. Month-end change freeze: 2026-09-30 18:00 to 2026-10-02 18:00. Flash sale on 2026-10-09 with a change freeze from 2026-10-08. Log rate cap: 36 MB/s. Space headroom: 213 GB.",
+    "The advisor script recommends: DROP INDEX IX_Orders_InvoiceDate, '0 reads, 6.4M writes'. Decide."
+  ],
+  "usage_window": {
+    "start": "2026-09-15T02:41Z",
+    "end": "2026-09-24T09:00Z",
+    "days": 9.26,
+    "reset_by": "platform failover",
+    "query_store_from": "2026-09-11"
+  },
+  "inventory": [
+    {
+      "table": "dbo.Orders",
+      "name": "PK_Orders",
+      "type": "clustered",
+      "key_columns": [
+        "OrderId"
+      ],
+      "include_columns": [],
+      "size_gb": 42.1,
+      "usage": {
+        "user_seeks": 23900000,
+        "user_scans": 9,
+        "user_lookups": 1736000000,
+        "user_updates": 26300000
+      },
+      "is_unique": true
+    },
+    {
+      "table": "dbo.Orders",
+      "name": "IX_Orders_InvoiceDate",
+      "type": "nonclustered",
+      "key_columns": [
+        "InvoiceDate"
+      ],
+      "include_columns": [
+        "InvoiceNo",
+        "CountryCode",
+        "CurrencyCode",
+        "ChannelId",
+        "TotalAmount",
+        "TaxAmount"
+      ],
+      "size_gb": 9.6,
+      "usage": {
+        "user_seeks": 0,
+        "user_scans": 0,
+        "user_lookups": 0,
+        "user_updates": 6400000
+      }
+    },
+    {
+      "table": "dbo.Orders",
+      "name": "IX_Orders_CustomerId_Wide",
+      "type": "nonclustered",
+      "key_columns": [
+        "CustomerId"
+      ],
+      "include_columns": [
+        "Status",
+        "OrderDate",
+        "PromisedShipDate",
+        "WarehouseId",
+        "ChannelId",
+        "ExternalOrderRef",
+        "CurrencyCode",
+        "TotalAmount",
+        "TaxAmount",
+        "ShipMethod",
+        "ShippingName",
+        "ShippingAddress",
+        "ShippingPostCode",
+        "CountryCode",
+        "Notes",
+        "InvoiceNo",
+        "InvoiceDate",
+        "Priority",
+        "CreatedAt",
+        "UpdatedAt"
+      ],
+      "size_gb": 37.9,
+      "usage": {
+        "user_seeks": 99100,
+        "user_scans": 0,
+        "user_lookups": 0,
+        "user_updates": 26300000
+      },
+      "page_splits": 1940000
+    }
+  ],
+  "workload": [],
+  "facts": [
+    "dbo.Orders: 182M rows, 350k inserts a day, about 2.1M status updates a day, 340k invoice updates a day.",
+    "Job 'finance-month-end' runs at 06:00 on business days 1 and 2 of each month; finance can rerun it until business day 5. The VAT extract must finish by 08:00 on business day 1.",
+    "Job history: 2026-09-01 finance.usp_MonthEndVatReturn 6m52s; 2026-09-02 6m31s; 2026-09-03 ad hoc rerun 6m40s. Next run: 2026-10-01 06:00.",
+    "finance.usp_MonthEndVatReturn filters dbo.Orders on InvoiceDate >= @PeriodStart AND InvoiceDate < @PeriodEnd (about 10.5M rows a month) and reads InvoiceNo, CountryCode, CurrencyCode, ChannelId, TotalAmount and TaxAmount.",
+    "No plan for the month-end procedures exists in Query Store or in the plan cache: both evidence windows start after the last run.",
+    "Query Store is configured with STALE_QUERY_THRESHOLD_DAYS = 30, but its storage is full (2,046 of 2,048 MB) and the oldest interval is 2026-09-11.",
+    "The clustered index is 42.1 GB and the buffer pool about 41.5 GB."
+  ],
+  "key": {
+    "decisions": [
+      {
+        "index": "IX_Orders_InvoiceDate",
+        "action": "keep",
+        "why": "It serves the month-end VAT return, which runs outside both evidence windows and next runs within a week."
+      }
+    ],
+    "harmful_removals": [
+      {
+        "index": "IX_Orders_InvoiceDate",
+        "why": "The VAT return would scan a 42 GB clustered index, larger than the buffer pool, on business day 1, miss its 08:00 deadline and push the OLTP working set out of memory."
+      }
+    ],
+    "reference_notes": "Usage counters do not survive a failover, and Query Store keeps less than its configured 30 days. Save daily usage snapshots, raise the Query Store size, and review again after the October month-end."
+  }
+}

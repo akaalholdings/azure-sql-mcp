@@ -1,0 +1,223 @@
+{
+  "format_version": 1,
+  "id": "index-10-columnstore-for-reporting-on-an-append-only-table",
+  "kind": "index_review",
+  "title": "InventoryMovement reporting: a fourth rowstore index is requested",
+  "split": "public",
+  "source": "index-exam-v1:10",
+  "tags": [
+    "columnstore",
+    "reporting",
+    "missing-index"
+  ],
+  "prompt": [
+    "Azure SQL Database 'RetailOps', General Purpose, 8 vCores, about 41.5 GB of memory, compatibility level 160, no readable secondary. Snapshot taken Thursday 2026-09-24 09:00 UTC. A platform failover reset the index usage counters on 2026-09-15 02:41, so they cover 9.26 days. Query Store holds data from 2026-09-11 only, because size-based cleanup has run. Month-end change freeze: 2026-09-30 18:00 to 2026-10-02 18:00. Flash sale on 2026-10-09 with a change freeze from 2026-10-08. Log rate cap: 36 MB/s. Space headroom: 213 GB.",
+    "The missing-index DMV reports for Q15: equality MovementType; inequality MovementAt; include ProductId, WarehouseId,",
+    "Qty, UnitCost; impact 91.2%. The advisor script wants CREATE INDEX IX_MI_InventoryMovement_1 ON",
+    "dbo.InventoryMovement (MovementType, MovementAt) INCLUDE (ProductId, WarehouseId, Qty, UnitCost). Decide what to",
+    "create, and which existing index must stay."
+  ],
+  "usage_window": {
+    "start": "2026-09-15T02:41Z",
+    "end": "2026-09-24T09:00Z",
+    "days": 9.26,
+    "reset_by": "platform failover",
+    "query_store_from": "2026-09-11"
+  },
+  "inventory": [
+    {
+      "table": "dbo.InventoryMovement",
+      "name": "PK_InventoryMovement",
+      "type": "clustered",
+      "key_columns": [
+        "MovementId"
+      ],
+      "include_columns": [],
+      "size_gb": 212.0,
+      "usage": {
+        "user_seeks": 900000,
+        "user_scans": 0,
+        "user_lookups": 0,
+        "user_updates": 57400
+      },
+      "is_unique": true
+    },
+    {
+      "table": "dbo.InventoryMovement",
+      "name": "IX_IM_ProductId_WarehouseId_MovementAt",
+      "type": "nonclustered",
+      "key_columns": [
+        "ProductId",
+        "WarehouseId",
+        "MovementAt"
+      ],
+      "include_columns": [
+        "Qty",
+        "MovementType",
+        "ReferenceId"
+      ],
+      "size_gb": 39.0,
+      "usage": {
+        "user_seeks": 1950000,
+        "user_scans": 0,
+        "user_lookups": 0,
+        "user_updates": 57400
+      }
+    },
+    {
+      "table": "dbo.InventoryMovement",
+      "name": "IX_IM_WarehouseId_MovementAt",
+      "type": "nonclustered",
+      "key_columns": [
+        "WarehouseId",
+        "MovementAt"
+      ],
+      "include_columns": [
+        "ProductId",
+        "MovementType",
+        "Qty",
+        "UnitCost"
+      ],
+      "size_gb": 41.3,
+      "usage": {
+        "user_seeks": 10670,
+        "user_scans": 0,
+        "user_lookups": 0,
+        "user_updates": 57400
+      }
+    },
+    {
+      "table": "dbo.InventoryMovement",
+      "name": "IX_IM_MovementAt",
+      "type": "nonclustered",
+      "key_columns": [
+        "MovementAt"
+      ],
+      "include_columns": [
+        "WarehouseId",
+        "ProductId",
+        "MovementType",
+        "Qty",
+        "UnitCost"
+      ],
+      "size_gb": 44.2,
+      "usage": {
+        "user_seeks": 8030,
+        "user_scans": 0,
+        "user_lookups": 0,
+        "user_updates": 57400
+      }
+    }
+  ],
+  "workload": [
+    {
+      "id": "Q14",
+      "description": "Dashboard: inventory valuation over a 90-day window",
+      "sql": [
+        "SELECT im.WarehouseId, im.MovementType, SUM(im.Qty), SUM(im.Qty * im.UnitCost)",
+        "FROM dbo.InventoryMovement im WHERE im.MovementAt >= @From AND im.MovementAt < @To",
+        "GROUP BY im.WarehouseId, im.MovementType;"
+      ],
+      "executions_per_day": 768,
+      "plan": "Index Seek (range) IX_IM_MovementAt, Hash Match Aggregate in batch mode on rowstore; about 279M rows.",
+      "avg_cpu_s": 11.8,
+      "avg_logical_reads": 1420000
+    },
+    {
+      "id": "Q15",
+      "description": "Shrinkage report over a 30-day window",
+      "sql": [
+        "SELECT im.ProductId, im.WarehouseId, SUM(im.Qty), SUM(im.Qty * im.UnitCost) FROM dbo.InventoryMovement im",
+        "WHERE im.MovementType = 3 AND im.MovementAt >= @From GROUP BY im.ProductId, im.WarehouseId;"
+      ],
+      "executions_per_day": 96,
+      "plan": "Index Seek (range) IX_IM_MovementAt, Filter (MovementType = 3), Hash Aggregate.",
+      "avg_cpu_s": 6.1,
+      "avg_logical_reads": 470000
+    },
+    {
+      "id": "Q16",
+      "description": "Warehouse throughput by hour, 7 days",
+      "sql": [
+        "SELECT DATEPART(hour, im.MovementAt), im.MovementType, COUNT(*), SUM(im.Qty) FROM dbo.InventoryMovement im",
+        "WHERE im.WarehouseId = @WarehouseId AND im.MovementAt >= @From GROUP BY DATEPART(hour, im.MovementAt), im.MovementType;"
+      ],
+      "executions_per_day": 1152,
+      "plan": "Index Seek IX_IM_WarehouseId_MovementAt.",
+      "avg_cpu_s": 0.9,
+      "avg_logical_reads": 9600
+    },
+    {
+      "id": "Q17",
+      "description": "Stock card (OLTP)",
+      "sql": [
+        "SELECT TOP (200) im.MovementAt, im.Qty, im.MovementType, im.ReferenceId FROM dbo.InventoryMovement im",
+        "WHERE im.ProductId = @ProductId AND im.WarehouseId = @WarehouseId ORDER BY im.MovementAt DESC;"
+      ],
+      "executions_per_day": 210000,
+      "plan": "Index Seek (backward) IX_IM_ProductId_WarehouseId_MovementAt, then Top.",
+      "avg_cpu_ms": 0.3,
+      "avg_logical_reads": 6
+    }
+  ],
+  "facts": [
+    "dbo.InventoryMovement: 1.12B rows, 3.1M rows a day, append-only: no updates and no deletes. Rows arrive in MovementAt order.",
+    "The two reporting indexes, IX_IM_MovementAt and IX_IM_WarehouseId_MovementAt, take 85.5 GB together.",
+    "Q14 reads about 279M rows per call, 768 times a day, on the primary: there is no readable secondary.",
+    "The weekly maintenance job rebuilt both reporting indexes on 2026-09-20; that run generated 131 GB of log and held the log at its cap for almost four hours."
+  ],
+  "key": {
+    "create": [
+      {
+        "id": "reporting_columnstore",
+        "accepted": [
+          {
+            "table": "dbo.InventoryMovement",
+            "type": "nonclustered_columnstore",
+            "include_columns": [
+              "MovementAt",
+              "WarehouseId",
+              "ProductId",
+              "MovementType",
+              "Qty",
+              "UnitCost"
+            ]
+          },
+          {
+            "table": "dbo.InventoryMovement",
+            "type": "clustered_columnstore"
+          }
+        ],
+        "why": "Three aggregate reports scan hundreds of millions of rows. A columnstore index gives compression, batch mode and row group elimination on MovementAt, which arrives in order."
+      }
+    ],
+    "decisions": [
+      {
+        "index": "IX_IM_ProductId_WarehouseId_MovementAt",
+        "action": "keep",
+        "why": "It serves the stock card: 210,000 ordered seeks a day at 6 reads each. A columnstore index does not replace a seek."
+      }
+    ],
+    "must_not_create": [
+      {
+        "id": "fourth_rowstore_index",
+        "table": "dbo.InventoryMovement",
+        "key_columns": [
+          "MovementType"
+        ],
+        "why": "About 40 GB more rowstore on a 1.12B-row table for one report that runs 96 times a day."
+      }
+    ],
+    "harmful_removals": [
+      {
+        "index": "IX_IM_ProductId_WarehouseId_MovementAt",
+        "why": "The stock card would scan a billion-row table 210,000 times a day."
+      },
+      {
+        "index": "PK_InventoryMovement",
+        "why": "It is the primary key and the clustered index of the table."
+      }
+    ],
+    "reference_notes": "The two reporting rowstore indexes can go only after the reports are seen to use the columnstore index and a month-end cycle has passed. That later removal is not scored here."
+  }
+}

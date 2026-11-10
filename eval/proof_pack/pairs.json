@@ -1,0 +1,2265 @@
+{
+  "format_version": 1,
+  "schema": "pp",
+  "invariant": {
+    "max_proof_scope": "snapshot_matched",
+    "deployment_ready": false
+  },
+  "tables": {
+    "pp.Customers": {
+      "columns": [
+        {
+          "name": "CustomerID",
+          "type": "int",
+          "nullable": false
+        },
+        {
+          "name": "Email",
+          "type": "varchar(100)",
+          "nullable": true
+        },
+        {
+          "name": "Tier",
+          "type": "char(1)",
+          "nullable": false
+        },
+        {
+          "name": "ReferredByCustomerID",
+          "type": "int",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "CustomerID"
+      ]
+    },
+    "pp.Suppressions": {
+      "columns": [
+        {
+          "name": "SuppressionID",
+          "type": "int",
+          "nullable": false
+        },
+        {
+          "name": "Email",
+          "type": "varchar(100)",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "SuppressionID"
+      ]
+    },
+    "pp.Regions": {
+      "columns": [
+        {
+          "name": "RegionID",
+          "type": "int",
+          "nullable": false
+        },
+        {
+          "name": "RegionName",
+          "type": "varchar(50)",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "RegionID"
+      ]
+    },
+    "pp.Orders": {
+      "columns": [
+        {
+          "name": "OrderID",
+          "type": "int",
+          "nullable": false
+        },
+        {
+          "name": "CustomerID",
+          "type": "int",
+          "nullable": false
+        },
+        {
+          "name": "OrderDate",
+          "type": "date",
+          "nullable": false
+        },
+        {
+          "name": "Status",
+          "type": "varchar(12)",
+          "nullable": false
+        },
+        {
+          "name": "PromoCode",
+          "type": "varchar(20)",
+          "nullable": true
+        },
+        {
+          "name": "ShipRegionID",
+          "type": "int",
+          "nullable": true
+        },
+        {
+          "name": "TotalAmount",
+          "type": "int",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "OrderID"
+      ]
+    },
+    "pp.OrderLines": {
+      "columns": [
+        {
+          "name": "OrderID",
+          "type": "int",
+          "nullable": false
+        },
+        {
+          "name": "LineNumber",
+          "type": "int",
+          "nullable": false
+        },
+        {
+          "name": "Quantity",
+          "type": "int",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "OrderID",
+        "LineNumber"
+      ]
+    },
+    "pp.Payments": {
+      "columns": [
+        {
+          "name": "PaymentID",
+          "type": "int",
+          "nullable": false
+        },
+        {
+          "name": "OrderID",
+          "type": "int",
+          "nullable": false
+        },
+        {
+          "name": "Amount",
+          "type": "int",
+          "nullable": false
+        },
+        {
+          "name": "PaidAt",
+          "type": "datetime2(3)",
+          "nullable": false
+        },
+        {
+          "name": "PaymentMethod",
+          "type": "varchar(10)",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "PaymentID"
+      ]
+    },
+    "pp.Events": {
+      "columns": [
+        {
+          "name": "EventID",
+          "type": "int",
+          "nullable": false
+        },
+        {
+          "name": "EventTime",
+          "type": "datetime2(7)",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "EventID"
+      ]
+    }
+  },
+  "pairs": [
+    {
+      "id": "not_in_null_in_list",
+      "title": "NOT IN to NOT EXISTS: a NULL arrives in the list",
+      "baseline_sql": "SELECT c.CustomerID FROM pp.Customers AS c WHERE c.Email NOT IN (SELECT s.Email FROM pp.Suppressions AS s)",
+      "rewrite_sql": "SELECT c.CustomerID FROM pp.Customers AS c WHERE NOT EXISTS (SELECT 1 FROM pp.Suppressions AS s WHERE s.Email = c.Email)",
+      "parameters": {},
+      "parameter_types": {},
+      "reason": "x NOT IN (list) is never true when the list holds a NULL, so the baseline returns no rows. NOT EXISTS ignores the NULL.",
+      "tells_apart": "One row in Suppressions with Email NULL.",
+      "would_be_equivalent_if": [
+        {
+          "kind": "not_null",
+          "table": "pp.Suppressions",
+          "columns": [
+            "Email"
+          ]
+        },
+        {
+          "kind": "not_null",
+          "table": "pp.Customers",
+          "columns": [
+            "Email"
+          ]
+        }
+      ],
+      "equal_on": {
+        "pp.Customers": [
+          [
+            1,
+            "a@x.test",
+            "S",
+            null
+          ],
+          [
+            2,
+            "b@x.test",
+            "S",
+            null
+          ],
+          [
+            3,
+            "c@x.test",
+            "G",
+            null
+          ]
+        ],
+        "pp.Suppressions": [
+          [
+            1,
+            "b@x.test"
+          ]
+        ]
+      },
+      "differs_on": {
+        "pp.Customers": [
+          [
+            1,
+            "a@x.test",
+            "S",
+            null
+          ],
+          [
+            2,
+            "b@x.test",
+            "S",
+            null
+          ],
+          [
+            3,
+            "c@x.test",
+            "G",
+            null
+          ]
+        ],
+        "pp.Suppressions": [
+          [
+            1,
+            "b@x.test"
+          ],
+          [
+            2,
+            null
+          ]
+        ]
+      },
+      "expected": {
+        "equal_rows": [
+          [
+            1
+          ],
+          [
+            3
+          ]
+        ],
+        "baseline_rows": [],
+        "rewrite_rows": [
+          [
+            1
+          ],
+          [
+            3
+          ]
+        ]
+      },
+      "portable": true
+    },
+    {
+      "id": "not_in_null_outer_value",
+      "title": "NOT IN to NOT EXISTS: a customer has no email",
+      "baseline_sql": "SELECT c.CustomerID FROM pp.Customers AS c WHERE c.Email NOT IN (SELECT s.Email FROM pp.Suppressions AS s)",
+      "rewrite_sql": "SELECT c.CustomerID FROM pp.Customers AS c WHERE NOT EXISTS (SELECT 1 FROM pp.Suppressions AS s WHERE s.Email = c.Email)",
+      "parameters": {},
+      "parameter_types": {},
+      "reason": "NULL NOT IN (non-empty list) is unknown, so the baseline rejects a customer whose Email is NULL. NOT EXISTS keeps it.",
+      "tells_apart": "One customer with Email NULL.",
+      "would_be_equivalent_if": [
+        {
+          "kind": "not_null",
+          "table": "pp.Suppressions",
+          "columns": [
+            "Email"
+          ]
+        },
+        {
+          "kind": "not_null",
+          "table": "pp.Customers",
+          "columns": [
+            "Email"
+          ]
+        }
+      ],
+      "equal_on": {
+        "pp.Customers": [
+          [
+            1,
+            "a@x.test",
+            "S",
+            null
+          ],
+          [
+            2,
+            "b@x.test",
+            "S",
+            null
+          ],
+          [
+            3,
+            "c@x.test",
+            "G",
+            null
+          ]
+        ],
+        "pp.Suppressions": [
+          [
+            1,
+            "b@x.test"
+          ]
+        ]
+      },
+      "differs_on": {
+        "pp.Customers": [
+          [
+            1,
+            "a@x.test",
+            "S",
+            null
+          ],
+          [
+            2,
+            "b@x.test",
+            "S",
+            null
+          ],
+          [
+            3,
+            "c@x.test",
+            "G",
+            null
+          ],
+          [
+            4,
+            null,
+            "S",
+            null
+          ]
+        ],
+        "pp.Suppressions": [
+          [
+            1,
+            "b@x.test"
+          ]
+        ]
+      },
+      "expected": {
+        "equal_rows": [
+          [
+            1
+          ],
+          [
+            3
+          ]
+        ],
+        "baseline_rows": [
+          [
+            1
+          ],
+          [
+            3
+          ]
+        ],
+        "rewrite_rows": [
+          [
+            1
+          ],
+          [
+            3
+          ],
+          [
+            4
+          ]
+        ]
+      },
+      "portable": true
+    },
+    {
+      "id": "not_in_intent_form_empty_list",
+      "title": "NOT IN to IS NOT NULL AND NOT EXISTS: the list is empty",
+      "baseline_sql": "SELECT c.CustomerID FROM pp.Customers AS c WHERE c.Email NOT IN (SELECT s.Email FROM pp.Suppressions AS s)",
+      "rewrite_sql": "SELECT c.CustomerID FROM pp.Customers AS c WHERE c.Email IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pp.Suppressions AS s WHERE s.Email = c.Email)",
+      "parameters": {},
+      "parameter_types": {},
+      "reason": "NOT IN over an empty list is true for every row, including a row whose Email is NULL. The rewrite always rejects a NULL Email.",
+      "tells_apart": "Suppressions empty, with one customer whose Email is NULL.",
+      "would_be_equivalent_if": [
+        {
+          "kind": "not_null",
+          "table": "pp.Suppressions",
+          "columns": [
+            "Email"
+          ]
+        },
+        {
+          "kind": "not_null",
+          "table": "pp.Customers",
+          "columns": [
+            "Email"
+          ]
+        }
+      ],
+      "equal_on": {
+        "pp.Customers": [
+          [
+            1,
+            "a@x.test",
+            "S",
+            null
+          ],
+          [
+            2,
+            "b@x.test",
+            "S",
+            null
+          ],
+          [
+            3,
+            "c@x.test",
+            "G",
+            null
+          ],
+          [
+            4,
+            null,
+            "S",
+            null
+          ]
+        ],
+        "pp.Suppressions": [
+          [
+            1,
+            "b@x.test"
+          ]
+        ]
+      },
+      "differs_on": {
+        "pp.Customers": [
+          [
+            1,
+            "a@x.test",
+            "S",
+            null
+          ],
+          [
+            2,
+            "b@x.test",
+            "S",
+            null
+          ],
+          [
+            3,
+            "c@x.test",
+            "G",
+            null
+          ],
+          [
+            4,
+            null,
+            "S",
+            null
+          ]
+        ],
+        "pp.Suppressions": []
+      },
+      "expected": {
+        "equal_rows": [
+          [
+            1
+          ],
+          [
+            3
+          ]
+        ],
+        "baseline_rows": [
+          [
+            1
+          ],
+          [
+            2
+          ],
+          [
+            3
+          ],
+          [
+            4
+          ]
+        ],
+        "rewrite_rows": [
+          [
+            1
+          ],
+          [
+            2
+          ],
+          [
+            3
+          ]
+        ]
+      },
+      "portable": true
+    },
+    {
+      "id": "join_to_exists_duplicates",
+      "title": "JOIN to EXISTS: a customer has two matching orders",
+      "baseline_sql": "SELECT c.CustomerID FROM pp.Customers AS c JOIN pp.Orders AS o ON o.CustomerID = c.CustomerID WHERE o.Status = 'Paid'",
+      "rewrite_sql": "SELECT c.CustomerID FROM pp.Customers AS c WHERE EXISTS (SELECT 1 FROM pp.Orders AS o WHERE o.CustomerID = c.CustomerID AND o.Status = 'Paid')",
+      "parameters": {},
+      "parameter_types": {},
+      "reason": "The join returns one row per matching order. EXISTS returns one row per customer.",
+      "tells_apart": "A second Paid order for customer 1.",
+      "would_be_equivalent_if": [
+        {
+          "kind": "unique",
+          "table": "pp.Orders",
+          "columns": [
+            "CustomerID"
+          ]
+        }
+      ],
+      "equal_on": {
+        "pp.Customers": [
+          [
+            1,
+            "a@x.test",
+            "S",
+            null
+          ],
+          [
+            2,
+            "b@x.test",
+            "S",
+            null
+          ],
+          [
+            3,
+            "c@x.test",
+            "G",
+            null
+          ]
+        ],
+        "pp.Orders": [
+          [
+            10,
+            1,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            11,
+            2,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ]
+        ]
+      },
+      "differs_on": {
+        "pp.Customers": [
+          [
+            1,
+            "a@x.test",
+            "S",
+            null
+          ],
+          [
+            2,
+            "b@x.test",
+            "S",
+            null
+          ],
+          [
+            3,
+            "c@x.test",
+            "G",
+            null
+          ]
+        ],
+        "pp.Orders": [
+          [
+            10,
+            1,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            11,
+            2,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            12,
+            1,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ]
+        ]
+      },
+      "expected": {
+        "equal_rows": [
+          [
+            1
+          ],
+          [
+            2
+          ]
+        ],
+        "baseline_rows": [
+          [
+            1
+          ],
+          [
+            1
+          ],
+          [
+            2
+          ]
+        ],
+        "rewrite_rows": [
+          [
+            1
+          ],
+          [
+            2
+          ]
+        ]
+      },
+      "portable": true
+    },
+    {
+      "id": "distinct_removed",
+      "title": "DISTINCT removed after a semi join: two customers share an email",
+      "baseline_sql": "SELECT DISTINCT c.Email FROM pp.Customers AS c WHERE EXISTS (SELECT 1 FROM pp.Orders AS o WHERE o.CustomerID = c.CustomerID)",
+      "rewrite_sql": "SELECT c.Email FROM pp.Customers AS c WHERE EXISTS (SELECT 1 FROM pp.Orders AS o WHERE o.CustomerID = c.CustomerID)",
+      "parameters": {},
+      "parameter_types": {},
+      "reason": "EXISTS makes customers unique, not emails. The output column is Email, which is not a key.",
+      "tells_apart": "A fourth customer with the same Email as customer 1, with an order.",
+      "would_be_equivalent_if": [
+        {
+          "kind": "unique",
+          "table": "pp.Customers",
+          "columns": [
+            "Email"
+          ]
+        }
+      ],
+      "equal_on": {
+        "pp.Customers": [
+          [
+            1,
+            "a@x.test",
+            "S",
+            null
+          ],
+          [
+            2,
+            "b@x.test",
+            "S",
+            null
+          ],
+          [
+            3,
+            "c@x.test",
+            "G",
+            null
+          ]
+        ],
+        "pp.Orders": [
+          [
+            10,
+            1,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            11,
+            2,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ]
+        ]
+      },
+      "differs_on": {
+        "pp.Customers": [
+          [
+            1,
+            "a@x.test",
+            "S",
+            null
+          ],
+          [
+            2,
+            "b@x.test",
+            "S",
+            null
+          ],
+          [
+            3,
+            "c@x.test",
+            "G",
+            null
+          ],
+          [
+            4,
+            "a@x.test",
+            "S",
+            null
+          ]
+        ],
+        "pp.Orders": [
+          [
+            10,
+            1,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            11,
+            2,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            12,
+            4,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ]
+        ]
+      },
+      "expected": {
+        "equal_rows": [
+          [
+            "a@x.test"
+          ],
+          [
+            "b@x.test"
+          ]
+        ],
+        "baseline_rows": [
+          [
+            "a@x.test"
+          ],
+          [
+            "b@x.test"
+          ]
+        ],
+        "rewrite_rows": [
+          [
+            "a@x.test"
+          ],
+          [
+            "a@x.test"
+          ],
+          [
+            "b@x.test"
+          ]
+        ]
+      },
+      "portable": true
+    },
+    {
+      "id": "row_number_drops_ties",
+      "title": "Latest order per customer: MAX to ROW_NUMBER = 1 with a tie",
+      "baseline_sql": "SELECT o.OrderID FROM pp.Orders AS o WHERE o.OrderDate = (SELECT MAX(o2.OrderDate) FROM pp.Orders AS o2 WHERE o2.CustomerID = o.CustomerID)",
+      "rewrite_sql": "SELECT t.OrderID FROM (SELECT o.OrderID, ROW_NUMBER() OVER (PARTITION BY o.CustomerID ORDER BY o.OrderDate DESC, o.OrderID DESC) AS rn FROM pp.Orders AS o) AS t WHERE t.rn = 1",
+      "parameters": {},
+      "parameter_types": {},
+      "reason": "The baseline returns every order on the customer's latest date. ROW_NUMBER keeps one.",
+      "tells_apart": "Two orders of customer 1 on the same latest OrderDate.",
+      "would_be_equivalent_if": [
+        {
+          "kind": "unique",
+          "table": "pp.Orders",
+          "columns": [
+            "CustomerID",
+            "OrderDate"
+          ]
+        }
+      ],
+      "equal_on": {
+        "pp.Orders": [
+          [
+            10,
+            1,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            11,
+            1,
+            "2026-09-05",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            12,
+            2,
+            "2026-09-03",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ]
+        ]
+      },
+      "differs_on": {
+        "pp.Orders": [
+          [
+            10,
+            1,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            11,
+            1,
+            "2026-09-05",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            12,
+            2,
+            "2026-09-03",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            13,
+            1,
+            "2026-09-05",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ]
+        ]
+      },
+      "expected": {
+        "equal_rows": [
+          [
+            11
+          ],
+          [
+            12
+          ]
+        ],
+        "baseline_rows": [
+          [
+            11
+          ],
+          [
+            12
+          ],
+          [
+            13
+          ]
+        ],
+        "rewrite_rows": [
+          [
+            12
+          ],
+          [
+            13
+          ]
+        ]
+      },
+      "portable": true
+    },
+    {
+      "id": "left_join_to_inner_join",
+      "title": "LEFT JOIN to INNER JOIN: an order has no ship region",
+      "baseline_sql": "SELECT o.OrderID, r.RegionName FROM pp.Orders AS o LEFT JOIN pp.Regions AS r ON r.RegionID = o.ShipRegionID",
+      "rewrite_sql": "SELECT o.OrderID, r.RegionName FROM pp.Orders AS o JOIN pp.Regions AS r ON r.RegionID = o.ShipRegionID",
+      "parameters": {},
+      "parameter_types": {},
+      "reason": "The outer join keeps an order whose ShipRegionID is NULL or has no region row. The inner join drops it.",
+      "tells_apart": "One order with ShipRegionID NULL.",
+      "would_be_equivalent_if": [
+        {
+          "kind": "not_null",
+          "table": "pp.Orders",
+          "columns": [
+            "ShipRegionID"
+          ]
+        },
+        {
+          "kind": "trusted_foreign_key",
+          "table": "pp.Orders",
+          "columns": [
+            "ShipRegionID"
+          ],
+          "references": "pp.Regions"
+        }
+      ],
+      "equal_on": {
+        "pp.Regions": [
+          [
+            1,
+            "North"
+          ],
+          [
+            2,
+            "South"
+          ]
+        ],
+        "pp.Orders": [
+          [
+            10,
+            1,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            11,
+            2,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            2,
+            100
+          ]
+        ]
+      },
+      "differs_on": {
+        "pp.Regions": [
+          [
+            1,
+            "North"
+          ],
+          [
+            2,
+            "South"
+          ]
+        ],
+        "pp.Orders": [
+          [
+            10,
+            1,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            11,
+            2,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            2,
+            100
+          ],
+          [
+            12,
+            3,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            null,
+            100
+          ]
+        ]
+      },
+      "expected": {
+        "equal_rows": [
+          [
+            10,
+            "North"
+          ],
+          [
+            11,
+            "South"
+          ]
+        ],
+        "baseline_rows": [
+          [
+            10,
+            "North"
+          ],
+          [
+            11,
+            "South"
+          ],
+          [
+            12,
+            null
+          ]
+        ],
+        "rewrite_rows": [
+          [
+            10,
+            "North"
+          ],
+          [
+            11,
+            "South"
+          ]
+        ]
+      },
+      "portable": true
+    },
+    {
+      "id": "join_removed_without_foreign_key",
+      "title": "Join to the parent removed: an order has no customer row",
+      "baseline_sql": "SELECT o.OrderID FROM pp.Orders AS o JOIN pp.Customers AS c ON c.CustomerID = o.CustomerID",
+      "rewrite_sql": "SELECT o.OrderID FROM pp.Orders AS o",
+      "parameters": {},
+      "parameter_types": {},
+      "reason": "Without a trusted foreign key an order can name a customer that does not exist. The join removes that order.",
+      "tells_apart": "One order for CustomerID 99, which has no row in Customers.",
+      "would_be_equivalent_if": [
+        {
+          "kind": "trusted_foreign_key",
+          "table": "pp.Orders",
+          "columns": [
+            "CustomerID"
+          ],
+          "references": "pp.Customers"
+        }
+      ],
+      "equal_on": {
+        "pp.Customers": [
+          [
+            1,
+            "a@x.test",
+            "S",
+            null
+          ],
+          [
+            2,
+            "b@x.test",
+            "S",
+            null
+          ],
+          [
+            3,
+            "c@x.test",
+            "G",
+            null
+          ]
+        ],
+        "pp.Orders": [
+          [
+            10,
+            1,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            11,
+            2,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ]
+        ]
+      },
+      "differs_on": {
+        "pp.Customers": [
+          [
+            1,
+            "a@x.test",
+            "S",
+            null
+          ],
+          [
+            2,
+            "b@x.test",
+            "S",
+            null
+          ],
+          [
+            3,
+            "c@x.test",
+            "G",
+            null
+          ]
+        ],
+        "pp.Orders": [
+          [
+            10,
+            1,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            11,
+            2,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            12,
+            99,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ]
+        ]
+      },
+      "expected": {
+        "equal_rows": [
+          [
+            10
+          ],
+          [
+            11
+          ]
+        ],
+        "baseline_rows": [
+          [
+            10
+          ],
+          [
+            11
+          ]
+        ],
+        "rewrite_rows": [
+          [
+            10
+          ],
+          [
+            11
+          ],
+          [
+            12
+          ]
+        ]
+      },
+      "portable": true
+    },
+    {
+      "id": "or_to_union_all",
+      "title": "OR to UNION ALL: one row satisfies both branches",
+      "baseline_sql": "SELECT c.CustomerID FROM pp.Customers AS c WHERE c.CustomerID = @CustomerID OR c.ReferredByCustomerID = @CustomerID",
+      "rewrite_sql": "SELECT c.CustomerID FROM pp.Customers AS c WHERE c.CustomerID = @CustomerID UNION ALL SELECT c.CustomerID FROM pp.Customers AS c WHERE c.ReferredByCustomerID = @CustomerID",
+      "parameters": {
+        "CustomerID": 1
+      },
+      "parameter_types": {
+        "CustomerID": "int"
+      },
+      "reason": "A row that satisfies both branches of the OR is returned once by the baseline and twice by UNION ALL.",
+      "tells_apart": "Customer 1 referred by itself.",
+      "would_be_equivalent_if": [
+        {
+          "kind": "trusted_check",
+          "table": "pp.Customers",
+          "columns": [
+            "ReferredByCustomerID",
+            "CustomerID"
+          ],
+          "definition": "ReferredByCustomerID <> CustomerID"
+        }
+      ],
+      "equal_on": {
+        "pp.Customers": [
+          [
+            1,
+            "a@x.test",
+            "S",
+            null
+          ],
+          [
+            2,
+            "b@x.test",
+            "S",
+            1
+          ],
+          [
+            3,
+            "c@x.test",
+            "G",
+            null
+          ]
+        ]
+      },
+      "differs_on": {
+        "pp.Customers": [
+          [
+            1,
+            "a@x.test",
+            "S",
+            1
+          ],
+          [
+            2,
+            "b@x.test",
+            "S",
+            1
+          ],
+          [
+            3,
+            "c@x.test",
+            "G",
+            null
+          ]
+        ]
+      },
+      "expected": {
+        "equal_rows": [
+          [
+            1
+          ],
+          [
+            2
+          ]
+        ],
+        "baseline_rows": [
+          [
+            1
+          ],
+          [
+            2
+          ]
+        ],
+        "rewrite_rows": [
+          [
+            1
+          ],
+          [
+            1
+          ],
+          [
+            2
+          ]
+        ]
+      },
+      "portable": true
+    },
+    {
+      "id": "union_merges_equal_values",
+      "title": "OR to UNION: two rows have the same value",
+      "baseline_sql": "SELECT o.TotalAmount FROM pp.Orders AS o WHERE o.CustomerID = @A OR o.CustomerID = @B",
+      "rewrite_sql": "SELECT o.TotalAmount FROM pp.Orders AS o WHERE o.CustomerID = @A UNION SELECT o.TotalAmount FROM pp.Orders AS o WHERE o.CustomerID = @B",
+      "parameters": {
+        "A": 1,
+        "B": 2
+      },
+      "parameter_types": {
+        "A": "int",
+        "B": "int"
+      },
+      "reason": "UNION removes duplicates over the output columns. The output holds no key, so two orders with one amount become one row.",
+      "tells_apart": "Two orders with TotalAmount 100.",
+      "would_be_equivalent_if": [
+        {
+          "kind": "unique",
+          "table": "pp.Orders",
+          "columns": [
+            "TotalAmount"
+          ]
+        }
+      ],
+      "equal_on": {
+        "pp.Orders": [
+          [
+            10,
+            1,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            11,
+            2,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            250
+          ]
+        ]
+      },
+      "differs_on": {
+        "pp.Orders": [
+          [
+            10,
+            1,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            11,
+            2,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            250
+          ],
+          [
+            12,
+            2,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ]
+        ]
+      },
+      "expected": {
+        "equal_rows": [
+          [
+            100
+          ],
+          [
+            250
+          ]
+        ],
+        "baseline_rows": [
+          [
+            100
+          ],
+          [
+            100
+          ],
+          [
+            250
+          ]
+        ],
+        "rewrite_rows": [
+          [
+            100
+          ],
+          [
+            250
+          ]
+        ]
+      },
+      "portable": true
+    },
+    {
+      "id": "aggregate_over_join_fan_out",
+      "title": "Two correlated sums to one join with GROUP BY: lines and payments multiply",
+      "baseline_sql": "SELECT o.OrderID, (SELECT SUM(l.Quantity) FROM pp.OrderLines AS l WHERE l.OrderID = o.OrderID) AS Units, (SELECT SUM(p.Amount) FROM pp.Payments AS p WHERE p.OrderID = o.OrderID) AS Paid FROM pp.Orders AS o",
+      "rewrite_sql": "SELECT o.OrderID, SUM(l.Quantity) AS Units, SUM(p.Amount) AS Paid FROM pp.Orders AS o LEFT JOIN pp.OrderLines AS l ON l.OrderID = o.OrderID LEFT JOIN pp.Payments AS p ON p.OrderID = o.OrderID GROUP BY o.OrderID",
+      "parameters": {},
+      "parameter_types": {},
+      "reason": "A join to two child tables returns lines times payments rows per order, so each sum is multiplied by the other table's row count.",
+      "tells_apart": "An order with two lines and two payments.",
+      "would_be_equivalent_if": [
+        {
+          "kind": "unique",
+          "table": "pp.OrderLines",
+          "columns": [
+            "OrderID"
+          ]
+        },
+        {
+          "kind": "unique",
+          "table": "pp.Payments",
+          "columns": [
+            "OrderID"
+          ]
+        }
+      ],
+      "equal_on": {
+        "pp.Orders": [
+          [
+            10,
+            1,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            11,
+            2,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ]
+        ],
+        "pp.OrderLines": [
+          [
+            10,
+            1,
+            2
+          ]
+        ],
+        "pp.Payments": [
+          [
+            1,
+            10,
+            100,
+            "2026-09-01T10:00:00.000",
+            "Card"
+          ]
+        ]
+      },
+      "differs_on": {
+        "pp.Orders": [
+          [
+            10,
+            1,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            11,
+            2,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ]
+        ],
+        "pp.OrderLines": [
+          [
+            10,
+            1,
+            2
+          ],
+          [
+            10,
+            2,
+            3
+          ]
+        ],
+        "pp.Payments": [
+          [
+            1,
+            10,
+            100,
+            "2026-09-01T10:00:00.000",
+            "Card"
+          ],
+          [
+            2,
+            10,
+            50,
+            "2026-09-02T10:00:00.000",
+            "Card"
+          ]
+        ]
+      },
+      "expected": {
+        "equal_rows": [
+          [
+            10,
+            2,
+            100
+          ],
+          [
+            11,
+            null,
+            null
+          ]
+        ],
+        "baseline_rows": [
+          [
+            10,
+            5,
+            150
+          ],
+          [
+            11,
+            null,
+            null
+          ]
+        ],
+        "rewrite_rows": [
+          [
+            10,
+            10,
+            300
+          ],
+          [
+            11,
+            null,
+            null
+          ]
+        ]
+      },
+      "portable": true
+    },
+    {
+      "id": "outer_join_filter_moved_to_where",
+      "title": "Outer join predicate moved from ON to WHERE: a customer has no order",
+      "baseline_sql": "SELECT c.CustomerID, COUNT(o.OrderID) AS Orders FROM pp.Customers AS c LEFT JOIN pp.Orders AS o ON o.CustomerID = c.CustomerID AND o.Status <> 'Cancelled' GROUP BY c.CustomerID",
+      "rewrite_sql": "SELECT c.CustomerID, COUNT(o.OrderID) AS Orders FROM pp.Customers AS c LEFT JOIN pp.Orders AS o ON o.CustomerID = c.CustomerID WHERE o.Status <> 'Cancelled' GROUP BY c.CustomerID",
+      "parameters": {},
+      "parameter_types": {},
+      "reason": "A predicate on the inner table in WHERE rejects the NULL-extended row, so a customer with no qualifying order disappears. In the ON clause it stays with a count of 0.",
+      "tells_apart": "Customer 3 has no order.",
+      "would_be_equivalent_if": [],
+      "equal_on": {
+        "pp.Customers": [
+          [
+            1,
+            "a@x.test",
+            "S",
+            null
+          ],
+          [
+            2,
+            "b@x.test",
+            "S",
+            null
+          ],
+          [
+            3,
+            "c@x.test",
+            "G",
+            null
+          ]
+        ],
+        "pp.Orders": [
+          [
+            10,
+            1,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            11,
+            2,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            12,
+            3,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            13,
+            3,
+            "2026-09-01",
+            "Cancelled",
+            "SPRING",
+            1,
+            100
+          ]
+        ]
+      },
+      "differs_on": {
+        "pp.Customers": [
+          [
+            1,
+            "a@x.test",
+            "S",
+            null
+          ],
+          [
+            2,
+            "b@x.test",
+            "S",
+            null
+          ],
+          [
+            3,
+            "c@x.test",
+            "G",
+            null
+          ]
+        ],
+        "pp.Orders": [
+          [
+            10,
+            1,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            11,
+            2,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            13,
+            3,
+            "2026-09-01",
+            "Cancelled",
+            "SPRING",
+            1,
+            100
+          ]
+        ]
+      },
+      "expected": {
+        "equal_rows": [
+          [
+            1,
+            1
+          ],
+          [
+            2,
+            1
+          ],
+          [
+            3,
+            1
+          ]
+        ],
+        "baseline_rows": [
+          [
+            1,
+            1
+          ],
+          [
+            2,
+            1
+          ],
+          [
+            3,
+            0
+          ]
+        ],
+        "rewrite_rows": [
+          [
+            1,
+            1
+          ],
+          [
+            2,
+            1
+          ]
+        ]
+      },
+      "portable": true,
+      "no_constraint_because": "'Every customer has an order that is not cancelled' is a property of the data, not something a catalog constraint can state."
+    },
+    {
+      "id": "optional_parameter_isnull_form",
+      "title": "col = COALESCE(@p, col) to (@p IS NULL OR col = @p): the column holds a NULL",
+      "baseline_sql": "SELECT o.OrderID FROM pp.Orders AS o WHERE o.PromoCode = COALESCE(@PromoCode, o.PromoCode)",
+      "rewrite_sql": "SELECT o.OrderID FROM pp.Orders AS o WHERE (@PromoCode IS NULL OR o.PromoCode = @PromoCode)",
+      "parameters": {
+        "PromoCode": null
+      },
+      "parameter_types": {
+        "PromoCode": "varchar(20)"
+      },
+      "reason": "With the parameter NULL the baseline tests PromoCode = PromoCode, which is not true for a NULL PromoCode. The rewrite returns every row. ISNULL in place of COALESCE behaves the same here.",
+      "tells_apart": "One order with PromoCode NULL, with @PromoCode NULL.",
+      "would_be_equivalent_if": [
+        {
+          "kind": "not_null",
+          "table": "pp.Orders",
+          "columns": [
+            "PromoCode"
+          ]
+        }
+      ],
+      "equal_on": {
+        "pp.Orders": [
+          [
+            10,
+            1,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            11,
+            2,
+            "2026-09-01",
+            "Paid",
+            "AUTUMN",
+            1,
+            100
+          ]
+        ]
+      },
+      "differs_on": {
+        "pp.Orders": [
+          [
+            10,
+            1,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ],
+          [
+            11,
+            2,
+            "2026-09-01",
+            "Paid",
+            "AUTUMN",
+            1,
+            100
+          ],
+          [
+            12,
+            3,
+            "2026-09-01",
+            "Paid",
+            null,
+            1,
+            100
+          ]
+        ]
+      },
+      "expected": {
+        "equal_rows": [
+          [
+            10
+          ],
+          [
+            11
+          ]
+        ],
+        "baseline_rows": [
+          [
+            10
+          ],
+          [
+            11
+          ]
+        ],
+        "rewrite_rows": [
+          [
+            10
+          ],
+          [
+            11
+          ],
+          [
+            12
+          ]
+        ]
+      },
+      "portable": true
+    },
+    {
+      "id": "running_total_rows_frame",
+      "title": "Running total: correlated SUM with <= to a ROWS window frame, with a tie",
+      "baseline_sql": "SELECT p.PaymentID, (SELECT SUM(p2.Amount) FROM pp.Payments AS p2 WHERE p2.OrderID = p.OrderID AND p2.PaidAt <= p.PaidAt) AS RunningTotal FROM pp.Payments AS p WHERE p.OrderID = @OrderID",
+      "rewrite_sql": "SELECT p.PaymentID, SUM(p.Amount) OVER (ORDER BY p.PaidAt, p.PaymentID ROWS UNBOUNDED PRECEDING) AS RunningTotal FROM pp.Payments AS p WHERE p.OrderID = @OrderID",
+      "parameters": {
+        "OrderID": 10
+      },
+      "parameter_types": {
+        "OrderID": "int"
+      },
+      "reason": "With <= every payment at one PaidAt gets the same total, which includes all of them. A ROWS frame gives each tied row a different partial total.",
+      "tells_apart": "Two payments of the order with the same PaidAt.",
+      "would_be_equivalent_if": [
+        {
+          "kind": "unique",
+          "table": "pp.Payments",
+          "columns": [
+            "OrderID",
+            "PaidAt"
+          ]
+        }
+      ],
+      "equal_on": {
+        "pp.Payments": [
+          [
+            1,
+            10,
+            100,
+            "2026-09-01T10:00:00.000",
+            "Card"
+          ],
+          [
+            2,
+            10,
+            50,
+            "2026-09-02T10:00:00.000",
+            "Card"
+          ]
+        ]
+      },
+      "differs_on": {
+        "pp.Payments": [
+          [
+            1,
+            10,
+            100,
+            "2026-09-01T10:00:00.000",
+            "Card"
+          ],
+          [
+            2,
+            10,
+            50,
+            "2026-09-02T10:00:00.000",
+            "Card"
+          ],
+          [
+            3,
+            10,
+            25,
+            "2026-09-02T10:00:00.000",
+            "Card"
+          ]
+        ]
+      },
+      "expected": {
+        "equal_rows": [
+          [
+            1,
+            100
+          ],
+          [
+            2,
+            150
+          ]
+        ],
+        "baseline_rows": [
+          [
+            1,
+            100
+          ],
+          [
+            2,
+            175
+          ],
+          [
+            3,
+            175
+          ]
+        ],
+        "rewrite_rows": [
+          [
+            1,
+            100
+          ],
+          [
+            2,
+            150
+          ],
+          [
+            3,
+            175
+          ]
+        ]
+      },
+      "portable": true
+    },
+    {
+      "id": "except_removes_duplicates",
+      "title": "NOT EXISTS to EXCEPT: two customers share an email",
+      "baseline_sql": "SELECT c.Email FROM pp.Customers AS c WHERE NOT EXISTS (SELECT 1 FROM pp.Suppressions AS s WHERE s.Email = c.Email)",
+      "rewrite_sql": "SELECT c.Email FROM pp.Customers AS c EXCEPT SELECT s.Email FROM pp.Suppressions AS s",
+      "parameters": {},
+      "parameter_types": {},
+      "reason": "EXCEPT returns distinct rows. NOT EXISTS returns one row per customer.",
+      "tells_apart": "A fourth customer with the same Email as customer 1.",
+      "would_be_equivalent_if": [
+        {
+          "kind": "unique",
+          "table": "pp.Customers",
+          "columns": [
+            "Email"
+          ]
+        },
+        {
+          "kind": "not_null",
+          "table": "pp.Suppressions",
+          "columns": [
+            "Email"
+          ]
+        },
+        {
+          "kind": "not_null",
+          "table": "pp.Customers",
+          "columns": [
+            "Email"
+          ]
+        }
+      ],
+      "equal_on": {
+        "pp.Customers": [
+          [
+            1,
+            "a@x.test",
+            "S",
+            null
+          ],
+          [
+            2,
+            "b@x.test",
+            "S",
+            null
+          ],
+          [
+            3,
+            "c@x.test",
+            "G",
+            null
+          ]
+        ],
+        "pp.Suppressions": [
+          [
+            1,
+            "b@x.test"
+          ]
+        ]
+      },
+      "differs_on": {
+        "pp.Customers": [
+          [
+            1,
+            "a@x.test",
+            "S",
+            null
+          ],
+          [
+            2,
+            "b@x.test",
+            "S",
+            null
+          ],
+          [
+            3,
+            "c@x.test",
+            "G",
+            null
+          ],
+          [
+            4,
+            "a@x.test",
+            "S",
+            null
+          ]
+        ],
+        "pp.Suppressions": [
+          [
+            1,
+            "b@x.test"
+          ]
+        ]
+      },
+      "expected": {
+        "equal_rows": [
+          [
+            "a@x.test"
+          ],
+          [
+            "c@x.test"
+          ]
+        ],
+        "baseline_rows": [
+          [
+            "a@x.test"
+          ],
+          [
+            "a@x.test"
+          ],
+          [
+            "c@x.test"
+          ]
+        ],
+        "rewrite_rows": [
+          [
+            "a@x.test"
+          ],
+          [
+            "c@x.test"
+          ]
+        ]
+      },
+      "portable": true
+    },
+    {
+      "id": "last_value_from_another_row",
+      "title": "TOP (1) ... ORDER BY to MAX: the latest row does not hold the largest value",
+      "baseline_sql": "SELECT o.OrderID, (SELECT TOP (1) p.PaymentMethod FROM pp.Payments AS p WHERE p.OrderID = o.OrderID ORDER BY p.PaidAt DESC, p.PaymentID DESC) AS LastMethod FROM pp.Orders AS o",
+      "rewrite_sql": "SELECT o.OrderID, (SELECT MAX(p.PaymentMethod) FROM pp.Payments AS p WHERE p.OrderID = o.OrderID) AS LastMethod FROM pp.Orders AS o",
+      "parameters": {},
+      "parameter_types": {},
+      "reason": "MAX(PaymentMethod) is the alphabetically last method of the order, not the method of its latest payment.",
+      "tells_apart": "An order paid first by PayPal and later by Card.",
+      "would_be_equivalent_if": [
+        {
+          "kind": "unique",
+          "table": "pp.Payments",
+          "columns": [
+            "OrderID"
+          ]
+        }
+      ],
+      "equal_on": {
+        "pp.Orders": [
+          [
+            10,
+            1,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ]
+        ],
+        "pp.Payments": [
+          [
+            1,
+            10,
+            100,
+            "2026-09-01T10:00:00.000",
+            "PayPal"
+          ]
+        ]
+      },
+      "differs_on": {
+        "pp.Orders": [
+          [
+            10,
+            1,
+            "2026-09-01",
+            "Paid",
+            "SPRING",
+            1,
+            100
+          ]
+        ],
+        "pp.Payments": [
+          [
+            1,
+            10,
+            100,
+            "2026-09-01T10:00:00.000",
+            "PayPal"
+          ],
+          [
+            2,
+            10,
+            50,
+            "2026-09-02T10:00:00.000",
+            "Card"
+          ]
+        ]
+      },
+      "expected": {
+        "equal_rows": [
+          [
+            10,
+            "PayPal"
+          ]
+        ],
+        "baseline_rows": [
+          [
+            10,
+            "Card"
+          ]
+        ],
+        "rewrite_rows": [
+          [
+            10,
+            "PayPal"
+          ]
+        ]
+      },
+      "portable": false,
+      "not_portable_because": "TOP is T-SQL only. The expected rows are reasoned, not executed here."
+    },
+    {
+      "id": "end_of_day_bound_on_datetime2_7",
+      "title": "CAST(col AS date) = @Day to BETWEEN with an end-of-day bound",
+      "baseline_sql": "SELECT e.EventID FROM pp.Events AS e WHERE CAST(e.EventTime AS date) = @Day",
+      "rewrite_sql": "SELECT e.EventID FROM pp.Events AS e WHERE e.EventTime BETWEEN @Day AND DATEADD(millisecond, -3, DATEADD(day, 1, CAST(@Day AS datetime2(3))))",
+      "parameters": {
+        "Day": "2026-09-01"
+      },
+      "parameter_types": {
+        "Day": "date"
+      },
+      "reason": "The upper bound is 23:59:59.997. A datetime2(7) value later than that on the same day is inside the day and outside the range.",
+      "tells_apart": "One event at 23:59:59.9990000 on @Day.",
+      "would_be_equivalent_if": [],
+      "equal_on": {
+        "pp.Events": [
+          [
+            1,
+            "2026-09-01T10:00:00.0000000"
+          ],
+          [
+            2,
+            "2026-09-01T23:59:59.9970000"
+          ],
+          [
+            3,
+            "2026-09-02T00:00:00.0000000"
+          ]
+        ]
+      },
+      "differs_on": {
+        "pp.Events": [
+          [
+            1,
+            "2026-09-01T10:00:00.0000000"
+          ],
+          [
+            2,
+            "2026-09-01T23:59:59.9970000"
+          ],
+          [
+            3,
+            "2026-09-02T00:00:00.0000000"
+          ],
+          [
+            4,
+            "2026-09-01T23:59:59.9990000"
+          ]
+        ]
+      },
+      "expected": {
+        "equal_rows": [
+          [
+            1
+          ],
+          [
+            2
+          ]
+        ],
+        "baseline_rows": [
+          [
+            1
+          ],
+          [
+            2
+          ],
+          [
+            4
+          ]
+        ],
+        "rewrite_rows": [
+          [
+            1
+          ],
+          [
+            2
+          ]
+        ]
+      },
+      "portable": false,
+      "not_portable_because": "The difference depends on datetime2(7) precision and T-SQL date functions. The expected rows are reasoned, not executed here.",
+      "no_constraint_because": "No constraint limits EventTime to millisecond precision."
+    }
+  ]
+}

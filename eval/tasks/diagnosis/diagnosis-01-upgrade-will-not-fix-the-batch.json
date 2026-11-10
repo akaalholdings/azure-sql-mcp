@@ -1,0 +1,365 @@
+{
+  "format_version": 1,
+  "id": "diagnosis-01-upgrade-will-not-fix-the-batch",
+  "kind": "diagnosis",
+  "title": "Will 24 vCores bring the night batch back inside its window?",
+  "split": "public",
+  "source": "case-exam-v1:1",
+  "tags": [
+    "capacity",
+    "log-rate",
+    "upgrade-decision"
+  ],
+  "prompt": [
+    "Client: Harbourline Commerce, a multi-tenant retail order platform with about 400 tenants. Database hlc-orders-prod: Azure SQL Database, Business Critical, Gen5, 16 vCores, compatibility level 160, READ_COMMITTED_SNAPSHOT ON. All times are UTC. Business hours are 07:30 to 18:00. The nightly batch must finish by 06:00. Evidence was collected from Mon 21 Sep to Sun 27 Sep 2026.",
+    "The CTO writes: 'Our nightly batch used to finish by about 04:30. Since early September it overruns into business",
+    "hours, sometimes until after 09:00. CPU shows 100% in the portal. Our plan is to scale from 16 to 24 vCores this",
+    "Friday, about 50% more on the compute line. Please confirm that this is the right move.' The client's comparison of",
+    "the two sizes, from the Azure documentation: 16 vCores has 81.6 GB memory, a maximum log rate of 96 MiB/s and 1,680",
+    "workers; 24 vCores has 122.4 GB memory, a maximum log rate of 96 MiB/s and 2,520 workers. Name the root cause of the",
+    "batch overrun."
+  ],
+  "evidence": [
+    {
+      "id": "limits",
+      "tool": "get_resource_limits",
+      "arguments": {},
+      "result": {
+        "result_status": "ok",
+        "service_objective": "BC_Gen5_16",
+        "cpu_limit": 16,
+        "max_log_rate_mb_per_sec": 96,
+        "max_db_memory_gb": 81.6,
+        "max_workers": 1680,
+        "max_sessions": 30000,
+        "tempdb_max_size_gb": 512
+      }
+    },
+    {
+      "id": "waits_night",
+      "tool": "get_wait_stats",
+      "arguments": {
+        "sample_seconds": 0
+      },
+      "result": {
+        "result_status": "ok",
+        "window": {
+          "mode": "delta",
+          "start": "2026-09-23T00:30Z",
+          "end": "2026-09-23T06:00Z"
+        },
+        "top_waits": [
+          {
+            "wait_type": "LOG_RATE_GOVERNOR",
+            "wait_time_s": 61840,
+            "avg_wait_ms": 38,
+            "pct_of_total": 31.0
+          },
+          {
+            "wait_type": "PAGEIOLATCH_SH",
+            "wait_time_s": 38950,
+            "avg_wait_ms": 0.6,
+            "pct_of_total": 19.5
+          },
+          {
+            "wait_type": "CXPACKET",
+            "wait_time_s": 27300,
+            "pct_of_total": 13.7
+          },
+          {
+            "wait_type": "CXCONSUMER",
+            "wait_time_s": 19800,
+            "pct_of_total": 9.9
+          },
+          {
+            "wait_type": "IO_COMPLETION",
+            "wait_time_s": 17450,
+            "avg_wait_ms": 4.1,
+            "pct_of_total": 8.7
+          },
+          {
+            "wait_type": "HADR_THROTTLE_LOG_RATE_SEND_RECV_QUEUE_SIZE",
+            "wait_time_s": 6210,
+            "avg_wait_ms": 22,
+            "pct_of_total": 3.1
+          },
+          {
+            "wait_type": "WRITELOG",
+            "wait_time_s": 5980,
+            "avg_wait_ms": 2.3,
+            "pct_of_total": 3.0
+          },
+          {
+            "wait_type": "HADR_SYNC_COMMIT",
+            "wait_time_s": 4420,
+            "avg_wait_ms": 1.1,
+            "pct_of_total": 2.2
+          },
+          {
+            "wait_type": "SOS_SCHEDULER_YIELD",
+            "wait_time_s": 3900,
+            "pct_of_total": 2.0
+          },
+          {
+            "wait_type": "PAGEIOLATCH_EX",
+            "wait_time_s": 3100,
+            "avg_wait_ms": 0.8,
+            "pct_of_total": 1.6
+          }
+        ],
+        "signal_wait_pct": 7
+      }
+    },
+    {
+      "id": "daily",
+      "tool": "get_resource_stats_history",
+      "arguments": {
+        "window_minutes": 10080
+      },
+      "result": {
+        "result_status": "ok",
+        "source": "sys.resource_stats",
+        "granularity": "day",
+        "baseline_aug_17_28": {
+          "avg_cpu_percent": 24,
+          "max_cpu_percent": 71,
+          "avg_log_write_percent": 18,
+          "minutes_log_above_95": 95,
+          "minutes_cpu_above_95": 0,
+          "max_worker_percent": 9
+        },
+        "history": [
+          {
+            "day": "Mon 2026-09-21",
+            "avg_cpu_percent": 27,
+            "max_cpu_percent": 86,
+            "avg_log_write_percent": 31,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 18,
+            "max_worker_percent": 15,
+            "minutes_log_above_95": 455,
+            "minutes_cpu_above_95": 0
+          },
+          {
+            "day": "Tue 2026-09-22",
+            "avg_cpu_percent": 49,
+            "max_cpu_percent": 100,
+            "avg_log_write_percent": 29,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 17,
+            "max_worker_percent": 72,
+            "minutes_log_above_95": 410,
+            "minutes_cpu_above_95": 372
+          },
+          {
+            "day": "Wed 2026-09-23",
+            "avg_cpu_percent": 26,
+            "max_cpu_percent": 84,
+            "avg_log_write_percent": 33,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 19,
+            "max_worker_percent": 17,
+            "minutes_log_above_95": 480,
+            "minutes_cpu_above_95": 0
+          },
+          {
+            "day": "Thu 2026-09-24",
+            "avg_cpu_percent": 41,
+            "max_cpu_percent": 100,
+            "avg_log_write_percent": 30,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 18,
+            "max_worker_percent": 70,
+            "minutes_log_above_95": 395,
+            "minutes_cpu_above_95": 148
+          },
+          {
+            "day": "Fri 2026-09-25",
+            "avg_cpu_percent": 47,
+            "max_cpu_percent": 100,
+            "avg_log_write_percent": 29,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 17,
+            "max_worker_percent": 71,
+            "minutes_log_above_95": 400,
+            "minutes_cpu_above_95": 309
+          }
+        ],
+        "avg_memory_usage_percent": "96-99 on every day, baseline weeks included"
+      }
+    },
+    {
+      "id": "wed_night",
+      "tool": "get_resource_stats_history",
+      "arguments": {
+        "window_minutes": 720
+      },
+      "result": {
+        "result_status": "ok",
+        "source": "sys.dm_db_resource_stats",
+        "history": [
+          {
+            "time": "2026-09-23T00:15Z",
+            "avg_cpu_percent": 9,
+            "avg_data_io_percent": 4,
+            "avg_log_write_percent": 3,
+            "max_worker_percent": 1,
+            "activity": "idle"
+          },
+          {
+            "time": "2026-09-23T00:45Z",
+            "avg_cpu_percent": 41,
+            "avg_data_io_percent": 38,
+            "avg_log_write_percent": 100,
+            "max_worker_percent": 2,
+            "activity": "index rebuild phase"
+          },
+          {
+            "time": "2026-09-23T02:15Z",
+            "avg_cpu_percent": 58,
+            "avg_data_io_percent": 61,
+            "avg_log_write_percent": 100,
+            "max_worker_percent": 3,
+            "activity": "rebuild and batch step 1"
+          },
+          {
+            "time": "2026-09-23T03:30Z",
+            "avg_cpu_percent": 62,
+            "avg_data_io_percent": 66,
+            "avg_log_write_percent": 100,
+            "max_worker_percent": 3,
+            "activity": "rebuild and batch step 1"
+          },
+          {
+            "time": "2026-09-23T05:30Z",
+            "avg_cpu_percent": 49,
+            "avg_data_io_percent": 63,
+            "avg_log_write_percent": 100,
+            "max_worker_percent": 3,
+            "activity": "rebuild and batch step 2"
+          },
+          {
+            "time": "2026-09-23T06:30Z",
+            "avg_cpu_percent": 47,
+            "avg_data_io_percent": 52,
+            "avg_log_write_percent": 92,
+            "max_worker_percent": 3,
+            "activity": "statistics phase and batch step 2"
+          },
+          {
+            "time": "2026-09-23T07:45Z",
+            "avg_cpu_percent": 43,
+            "avg_data_io_percent": 31,
+            "avg_log_write_percent": 97,
+            "max_worker_percent": 9,
+            "activity": "statistics phase and batch step 3"
+          },
+          {
+            "time": "2026-09-23T08:30Z",
+            "avg_cpu_percent": 46,
+            "avg_data_io_percent": 29,
+            "avg_log_write_percent": 100,
+            "max_worker_percent": 14,
+            "activity": "batch step 4 and OLTP"
+          },
+          {
+            "time": "2026-09-23T08:45Z",
+            "avg_cpu_percent": 44,
+            "avg_data_io_percent": 27,
+            "avg_log_write_percent": 100,
+            "max_worker_percent": 16,
+            "activity": "batch step 4 and OLTP"
+          },
+          {
+            "time": "2026-09-23T09:10Z",
+            "avg_cpu_percent": 31,
+            "avg_data_io_percent": 12,
+            "avg_log_write_percent": 47,
+            "max_worker_percent": 6,
+            "activity": "batch finished 09:06"
+          },
+          {
+            "time": "2026-09-23T10:30Z",
+            "avg_cpu_percent": 28,
+            "avg_data_io_percent": 7,
+            "avg_log_write_percent": 22,
+            "max_worker_percent": 5,
+            "activity": "normal day"
+          }
+        ]
+      }
+    }
+  ],
+  "key": {
+    "root_cause": "log_rate_cap",
+    "accepted_root_causes": [
+      "maintenance_log_volume"
+    ],
+    "required_facts": [
+      {
+        "id": "governor_is_top_wait",
+        "evidence": "waits_night",
+        "description": "The log rate governor is the top wait overnight.",
+        "signals": {
+          "all": [
+            "LOG_RATE_GOVERNOR",
+            "\\b31(\\.0)?\\s?%|61,?840"
+          ]
+        },
+        "example": "LOG_RATE_GOVERNOR is the top wait overnight: 61,840 s, 31% of all waits."
+      },
+      {
+        "id": "log_at_cap_all_night",
+        "evidence": "wed_night",
+        "description": "Log write stays at 100% of the limit through the night and into the morning.",
+        "signals": {
+          "all": [
+            "\\blog\\b",
+            "\\b100\\s?%",
+            "00:45|08:45|480|all night|whole night|through the night"
+          ]
+        },
+        "example": "Log write is at 100% from 00:45 until the batch ends: 480 minutes at or above 95% on Wed 23."
+      },
+      {
+        "id": "same_cap_at_24_vcores",
+        "evidence": "limits",
+        "description": "The log rate cap is 96 MiB/s at both sizes.",
+        "signals": {
+          "all": [
+            "\\b96\\b",
+            "\\b(both|same|either|24)\\b"
+          ]
+        },
+        "example": "The log rate cap is 96 MiB/s and it is the same at 24 vCores."
+      }
+    ],
+    "harmful_conclusions": [
+      {
+        "id": "approve_the_upgrade",
+        "description": "More vCores add no log throughput. The spend buys nothing for the batch and hides the daytime problem.",
+        "root_causes": [
+          "cpu_capacity",
+          "memory_pressure"
+        ],
+        "signals": {
+          "any": [
+            "\\bscale (up|to)\\b",
+            "\\b24[\\s-]?v?cores?\\b",
+            "\\bupgrade (to|the)\\b",
+            "\\bmore v?cores\\b",
+            "\\bhyperscale\\b"
+          ]
+        },
+        "example": "Approve the scale to 24 vCores on Friday."
+      },
+      {
+        "id": "blame_storage",
+        "description": "PAGEIOLATCH is high in total and 0.6 ms per wait. Storage is healthy.",
+        "root_causes": [
+          "storage_latency"
+        ]
+      }
+    ]
+  }
+}

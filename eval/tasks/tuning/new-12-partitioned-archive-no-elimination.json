@@ -1,0 +1,154 @@
+{
+  "format_version": 1,
+  "id": "new-12-partitioned-archive-no-elimination",
+  "kind": "tuning",
+  "title": "Query on a partitioned archive that touches every partition",
+  "split": "public",
+  "source": "s6-new:12",
+  "tags": [
+    "partitioned-table",
+    "partition-elimination",
+    "non-sargable-date"
+  ],
+  "prompt": [
+    "Customer history summary for one calendar year, about 5 calls per second. Average 180 ms; for a partner account",
+    "about 6 s and 95,000 logical reads. Plan: Index Seek on IX_EventArchive_Customer with Actual Partition Count 32: the",
+    "seek on CustomerID runs in every partition, reads the customer's events of all eight years, and YEAR(e.EventTime) =",
+    "@Year is a residual predicate. The table is partitioned by quarter on EventTime and the index is aligned. The API",
+    "validates @Year to 2019 through 2026."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.EventArchive"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "EventArchive: 2.9B rows, partitioned by quarter on EventTime (RANGE RIGHT), 32 partitions from 2019 Q1 to 2026 Q4. IX_EventArchive_Customer (CustomerID, EventTime) is partition-aligned."
+  ],
+  "baseline_kind": "select",
+  "baseline_sql": [
+    "SELECT COUNT(*) AS Events, MIN(e.EventTime) AS FirstEvent, MAX(e.EventTime) AS LastEvent",
+    "FROM qe.EventArchive e",
+    "WHERE e.CustomerID = @CustomerID",
+    "  AND YEAR(e.EventTime) = @Year;"
+  ],
+  "parameter_cases": [
+    {
+      "name": "partner_one_year",
+      "values": {
+        "CustomerID": 7,
+        "Year": 2025
+      },
+      "types": {
+        "CustomerID": "int",
+        "Year": "int"
+      },
+      "weight": 0.3
+    },
+    {
+      "name": "normal_one_year",
+      "values": {
+        "CustomerID": 48213,
+        "Year": 2025
+      },
+      "types": {
+        "CustomerID": "int",
+        "Year": "int"
+      },
+      "weight": 0.7
+    }
+  ],
+  "key": {
+    "decision": "rewrite",
+    "correct_families": [
+      {
+        "id": "half_open_range_on_the_partition_column",
+        "description": "A range on EventTime itself. The seek becomes CustomerID plus a range, and only the four partitions of that year are touched.",
+        "signals": {
+          "all": [
+            "e\\.EventTime\\s*>=\\s*datefromparts\\(\\s*@Year\\s*,\\s*1\\s*,\\s*1\\s*\\)"
+          ],
+          "any": [
+            "e\\.EventTime\\s*<\\s*datefromparts\\(\\s*@Year\\s*\\+\\s*1\\s*,\\s*1\\s*,\\s*1\\s*\\)",
+            "e\\.EventTime\\s*<\\s*dateadd\\(\\s*year\\s*,\\s*1\\s*,\\s*datefromparts\\(\\s*@Year\\s*,\\s*1\\s*,\\s*1\\s*\\)\\s*\\)"
+          ]
+        },
+        "reference_sql": [
+          "SELECT COUNT(*) AS Events, MIN(e.EventTime) AS FirstEvent, MAX(e.EventTime) AS LastEvent",
+          "FROM qe.EventArchive e",
+          "WHERE e.CustomerID = @CustomerID",
+          "  AND e.EventTime >= DATEFROMPARTS(@Year, 1, 1)",
+          "  AND e.EventTime <  DATEFROMPARTS(@Year + 1, 1, 1);"
+        ]
+      }
+    ],
+    "traps": [
+      {
+        "id": "between_december_31",
+        "class": "not_equivalent",
+        "why": "DATEFROMPARTS(@Year, 12, 31) is midnight at the start of 31 December. Every event later that day is lost.",
+        "signals": {
+          "all": [
+            "datefromparts\\(\\s*@Year\\s*,\\s*12\\s*,\\s*31\\s*\\)"
+          ],
+          "none": [
+            "dateadd\\(\\s*day\\s*,\\s*1\\s*,\\s*datefromparts\\(\\s*@Year\\s*,\\s*12\\s*,\\s*31"
+          ]
+        },
+        "told_apart_by": "An event at 2025-12-31 09:00 with @Year = 2025.",
+        "example_sql": [
+          "SELECT COUNT(*) AS Events, MIN(e.EventTime) AS FirstEvent, MAX(e.EventTime) AS LastEvent",
+          "FROM qe.EventArchive e",
+          "WHERE e.CustomerID = @CustomerID",
+          "  AND e.EventTime BETWEEN DATEFROMPARTS(@Year, 1, 1) AND DATEFROMPARTS(@Year, 12, 31);"
+        ]
+      },
+      {
+        "id": "end_of_year_literal",
+        "class": "not_equivalent",
+        "why": "An upper bound just before midnight drops events in the last fraction of the year on a datetime2(7) column.",
+        "signals": {
+          "any": [
+            "23:59:59",
+            "dateadd\\(\\s*(millisecond|ms|second|ss|s)\\s*,\\s*-\\s*\\d+"
+          ]
+        },
+        "told_apart_by": "An event at 2025-12-31 23:59:59.9990000 with @Year = 2025.",
+        "example_sql": [
+          "SELECT COUNT(*) AS Events, MIN(e.EventTime) AS FirstEvent, MAX(e.EventTime) AS LastEvent",
+          "FROM qe.EventArchive e",
+          "WHERE e.CustomerID = @CustomerID",
+          "  AND e.EventTime >= DATEFROMPARTS(@Year, 1, 1)",
+          "  AND e.EventTime <= DATEADD(millisecond, -3, CAST(DATEFROMPARTS(@Year + 1, 1, 1) AS datetime2(3)));"
+        ]
+      },
+      {
+        "id": "partition_function_filter",
+        "class": "ineffective",
+        "why": "A $PARTITION filter names partition numbers that move when the partition function is split or merged, and it still leaves YEAR() on the column.",
+        "signals": {
+          "all": [
+            "\\$partition\\."
+          ]
+        },
+        "example_sql": [
+          "SELECT COUNT(*) AS Events, MIN(e.EventTime) AS FirstEvent, MAX(e.EventTime) AS LastEvent",
+          "FROM qe.EventArchive e",
+          "WHERE e.CustomerID = @CustomerID",
+          "  AND YEAR(e.EventTime) = @Year",
+          "  AND $PARTITION.pf_EventArchiveQuarter(e.EventTime) BETWEEN 25 AND 28;"
+        ]
+      }
+    ],
+    "index": {
+      "role": "none"
+    },
+    "min_improvement": {
+      "metric": "logical_reads",
+      "ratio": 4,
+      "basis": "Four of 32 partitions, and one year of the customer's events instead of eight."
+    }
+  }
+}

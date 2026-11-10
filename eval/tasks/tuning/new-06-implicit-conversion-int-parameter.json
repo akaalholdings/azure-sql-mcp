@@ -1,0 +1,149 @@
+{
+  "format_version": 1,
+  "id": "new-06-implicit-conversion-int-parameter",
+  "kind": "tuning",
+  "title": "Integer parameter compared with a number stored as text",
+  "split": "public",
+  "source": "s6-new:06",
+  "tags": [
+    "implicit-conversion",
+    "constraint-backed"
+  ],
+  "prompt": [
+    "Migration lookup, about 60 calls per second. Each call takes about 210 ms of CPU and about 4,400 logical reads and",
+    "returns 0 or 1 rows. Plan: Index Scan of IX_Customers_LegacyRef (2.0M rows) with predicate",
+    "CONVERT_IMPLICIT(int, c.LegacyRef, 0) = @LegacyRef and a PlanAffectingConvert warning. LegacyRef is varchar(9); the",
+    "application binds @LegacyRef as int, and that binding cannot change in this release: only the statement text can.",
+    "CK_Customers_LegacyRef allows digits only, with a first digit of 1 to 9."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.Customers"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "Customers: 2.0M rows. Tier S = 1.85M, G = ~150k, P = 25 partner accounts (CustomerID 1 to 25). IsActive = 1 for 88%. Email is NULL for ~9% (~180k rows, ~160k of them active). About 2% of non-NULL emails are shared by two or more customer rows (households). ReferredByCustomerID is non-NULL for 18%; 312 rows are self-referrals (ReferredByCustomerID = CustomerID, CustomerID 500001 to 500312). AccountNumber always matches 'AC' + 10 digits (CHECK constraint)."
+  ],
+  "baseline_kind": "select",
+  "baseline_sql": [
+    "SELECT c.CustomerID, c.AccountNumber, c.Email",
+    "FROM qe.Customers c",
+    "WHERE c.LegacyRef = @LegacyRef;"
+  ],
+  "parameter_cases": [
+    {
+      "name": "existing_ref",
+      "values": {
+        "LegacyRef": 40021977
+      },
+      "types": {
+        "LegacyRef": "int"
+      },
+      "weight": 0.9
+    },
+    {
+      "name": "nine_digits",
+      "values": {
+        "LegacyRef": 912345678
+      },
+      "types": {
+        "LegacyRef": "int"
+      },
+      "weight": 0.05
+    },
+    {
+      "name": "zero",
+      "values": {
+        "LegacyRef": 0
+      },
+      "types": {
+        "LegacyRef": "int"
+      },
+      "weight": 0.05
+    }
+  ],
+  "key": {
+    "decision": "rewrite",
+    "correct_families": [
+      {
+        "id": "convert_the_parameter",
+        "description": "Convert the parameter to text, wide enough for any int, so the column is compared in its own type and the index can seek.",
+        "signals": {
+          "any": [
+            "c\\.LegacyRef\\s*=\\s*convert\\(\\s*varchar\\(\\s*(9|[1-9]\\d)\\s*\\)\\s*,\\s*@LegacyRef\\s*\\)",
+            "c\\.LegacyRef\\s*=\\s*cast\\(\\s*@LegacyRef as varchar\\(\\s*(9|[1-9]\\d)\\s*\\)\\s*\\)"
+          ]
+        },
+        "reference_sql": [
+          "SELECT c.CustomerID, c.AccountNumber, c.Email",
+          "FROM qe.Customers c",
+          "WHERE c.LegacyRef = CONVERT(varchar(11), @LegacyRef);"
+        ]
+      }
+    ],
+    "traps": [
+      {
+        "id": "convert_the_column",
+        "class": "ineffective",
+        "why": "An explicit conversion of the column is the same scan as the implicit one.",
+        "signals": {
+          "any": [
+            "(try_)?(cast|convert)\\(\\s*(int\\s*,\\s*)?c\\.LegacyRef"
+          ]
+        },
+        "example_sql": [
+          "SELECT c.CustomerID, c.AccountNumber, c.Email",
+          "FROM qe.Customers c",
+          "WHERE TRY_CONVERT(int, c.LegacyRef) = @LegacyRef;"
+        ]
+      },
+      {
+        "id": "varchar_too_short",
+        "class": "not_equivalent",
+        "why": "An int converted to a varchar that is too short becomes '*'. A nine-digit reference then matches nothing.",
+        "signals": {
+          "any": [
+            "convert\\(\\s*varchar\\(\\s*[1-8]\\s*\\)\\s*,\\s*@LegacyRef",
+            "cast\\(\\s*@LegacyRef as varchar\\(\\s*[1-8]\\s*\\)"
+          ]
+        },
+        "told_apart_by": "Parameter case nine_digits: the baseline returns the customer, the rewrite returns no row.",
+        "example_sql": [
+          "SELECT c.CustomerID, c.AccountNumber, c.Email",
+          "FROM qe.Customers c",
+          "WHERE c.LegacyRef = CONVERT(varchar(8), @LegacyRef);"
+        ]
+      },
+      {
+        "id": "str_pads_with_spaces",
+        "class": "not_equivalent",
+        "why": "STR pads the number with leading spaces, so the text never equals a stored reference.",
+        "signals": {
+          "all": [
+            "\\bstr\\(\\s*@LegacyRef"
+          ],
+          "none": [
+            "ltrim\\(\\s*str\\("
+          ]
+        },
+        "told_apart_by": "Parameter case existing_ref: the baseline returns the customer, the rewrite returns no row.",
+        "example_sql": [
+          "SELECT c.CustomerID, c.AccountNumber, c.Email",
+          "FROM qe.Customers c",
+          "WHERE c.LegacyRef = STR(@LegacyRef);"
+        ]
+      }
+    ],
+    "index": {
+      "role": "none"
+    },
+    "min_improvement": {
+      "metric": "logical_reads",
+      "ratio": 100,
+      "basis": "The scan reads about 4,400 pages per call. A seek and one lookup read about 5."
+    },
+    "reference_notes": "The comparison as numbers and the comparison as text agree only because CK_Customers_LegacyRef forbids signs, spaces, leading zeros and the empty string. Without the constraint, '007' would match 7 in the baseline only."
+  }
+}

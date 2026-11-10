@@ -1,0 +1,157 @@
+{
+  "format_version": 1,
+  "id": "new-07-scalar-udf-per-row-rounding",
+  "kind": "tuning",
+  "title": "Scalar function called once per order line inside SUM",
+  "split": "public",
+  "source": "s6-new:07",
+  "tags": [
+    "scalar-udf",
+    "rounding"
+  ],
+  "prompt": [
+    "Product revenue report for one quarter (about 1.1M orders and 4.4M order lines). Runtime about 4 minutes, almost all",
+    "of it CPU in a serial plan. qe.fn_NetLineAmount is called once per line: 4.4M calls. The function could be inlined",
+    "(sys.sql_modules.is_inlineable = 1), but the database-scoped configuration TSQL_SCALAR_UDF_INLINING is OFF after an",
+    "earlier incident and the owner will not turn it on this quarter. Finance reconciles NetAmount to the cent with the",
+    "invoice system, which rounds each line to two decimals before it adds them. The function is in the schema file."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.OrderLines",
+      "qe.Orders"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "OrderLines: 120M rows, 4 per order on average. About 0.3% of orders have no lines.",
+    "Orders: 30M rows, 2016 to now, ~12k per day now. The 25 partner customers own ~9M orders (30%), up to 1.2M each. Other customers average ~10 orders (max ~400). The density estimate for CustomerID is ~15 rows. Status: Shipped 83.8%, Cancelled 7%, Paid 6%, Returned 3%, Pending 0.2% (~60k rows, all from the last 72 hours). SalesChannel: Web 62%, Store 20%, Partner 12%, Phone 6%. PromoCode is NULL for 85%. ShipRegionID is NULL for Store pickups (~20%). OrderDate is datetime2(7); Partner and Store imports stamp one timestamp on a whole batch, so many orders of one customer share an OrderDate."
+  ],
+  "baseline_kind": "select",
+  "baseline_sql": [
+    "SELECT ol.ProductID,",
+    "       SUM(qe.fn_NetLineAmount(ol.Quantity, ol.UnitPrice, ol.Discount)) AS NetAmount",
+    "FROM qe.OrderLines ol",
+    "JOIN qe.Orders o ON o.OrderID = ol.OrderID",
+    "WHERE o.OrderDate >= @From AND o.OrderDate < @To",
+    "GROUP BY ol.ProductID;"
+  ],
+  "parameter_cases": [
+    {
+      "name": "quarter",
+      "values": {
+        "From": "2026-07-01",
+        "To": "2026-10-01"
+      },
+      "types": {
+        "From": "datetime2(3)",
+        "To": "datetime2(3)"
+      },
+      "weight": 1.0
+    }
+  ],
+  "key": {
+    "decision": "rewrite",
+    "correct_families": [
+      {
+        "id": "inline_expression_rounded_per_line",
+        "description": "Write the function's expression in the query and round each line to decimal(19,2) before SUM, as the function's return type does.",
+        "signals": {
+          "any": [
+            "sum\\(\\s*cast\\(\\s*ol\\.Quantity\\s*\\*\\s*ol\\.UnitPrice\\s*\\*\\s*\\(\\s*1\\s*-\\s*ol\\.Discount\\s*\\)\\s*as decimal\\(\\s*19\\s*,\\s*2\\s*\\)\\s*\\)\\s*\\)",
+            "sum\\(\\s*convert\\(\\s*decimal\\(\\s*19\\s*,\\s*2\\s*\\)\\s*,\\s*ol\\.Quantity\\s*\\*\\s*ol\\.UnitPrice\\s*\\*\\s*\\(\\s*1\\s*-\\s*ol\\.Discount\\s*\\)\\s*\\)\\s*\\)"
+          ]
+        },
+        "reference_sql": [
+          "SELECT ol.ProductID,",
+          "       SUM(CAST(ol.Quantity * ol.UnitPrice * (1 - ol.Discount) AS decimal(19,2))) AS NetAmount",
+          "FROM qe.OrderLines ol",
+          "JOIN qe.Orders o ON o.OrderID = ol.OrderID",
+          "WHERE o.OrderDate >= @From AND o.OrderDate < @To",
+          "GROUP BY ol.ProductID;"
+        ]
+      }
+    ],
+    "traps": [
+      {
+        "id": "per_line_rounding_dropped",
+        "class": "not_equivalent",
+        "why": "The function returns decimal(19,2), so each line is rounded before the sum. A sum of unrounded lines differs by fractions of a cent per line and by whole cents per product.",
+        "signals": {
+          "all": [
+            "sum\\(\\s*ol\\.Quantity\\s*\\*"
+          ]
+        },
+        "told_apart_by": "Two lines of one product at 0.3350 each: rounded per line they sum to 0.68, unrounded to 0.67.",
+        "example_sql": [
+          "SELECT ol.ProductID,",
+          "       SUM(ol.Quantity * ol.UnitPrice * (1 - ol.Discount)) AS NetAmount",
+          "FROM qe.OrderLines ol",
+          "JOIN qe.Orders o ON o.OrderID = ol.OrderID",
+          "WHERE o.OrderDate >= @From AND o.OrderDate < @To",
+          "GROUP BY ol.ProductID;"
+        ]
+      },
+      {
+        "id": "rounded_after_the_sum",
+        "class": "not_equivalent",
+        "why": "Rounding the total is not rounding each line.",
+        "signals": {
+          "any": [
+            "cast\\(\\s*sum\\(",
+            "round\\(\\s*sum\\(",
+            "convert\\(\\s*decimal\\(\\s*19\\s*,\\s*2\\s*\\)\\s*,\\s*sum\\("
+          ]
+        },
+        "told_apart_by": "Two lines of one product at 0.3350 each: rounded per line they sum to 0.68, rounded after the sum to 0.67.",
+        "example_sql": [
+          "SELECT ol.ProductID,",
+          "       CAST(SUM(ol.Quantity * ol.UnitPrice * (1 - ol.Discount)) AS decimal(19,2)) AS NetAmount",
+          "FROM qe.OrderLines ol",
+          "JOIN qe.Orders o ON o.OrderID = ol.OrderID",
+          "WHERE o.OrderDate >= @From AND o.OrderDate < @To",
+          "GROUP BY ol.ProductID;"
+        ]
+      },
+      {
+        "id": "turn_inlining_on",
+        "class": "unsafe",
+        "why": "The owner has ruled out the database-wide setting this quarter. It changes the plan of every query that calls a scalar function.",
+        "signals": {
+          "all": [
+            "tsql_scalar_udf_inlining\\s*=\\s*on"
+          ]
+        },
+        "example_sql": "ALTER DATABASE SCOPED CONFIGURATION SET TSQL_SCALAR_UDF_INLINING = ON;"
+      },
+      {
+        "id": "still_calls_the_function",
+        "class": "ineffective",
+        "why": "Any form that still calls the function runs it once per line in a serial plan.",
+        "signals": {
+          "all": [
+            "fn_NetLineAmount\\("
+          ]
+        },
+        "example_sql": [
+          "SELECT ol.ProductID,",
+          "       SUM(x.Net) AS NetAmount",
+          "FROM qe.OrderLines ol",
+          "CROSS APPLY (SELECT qe.fn_NetLineAmount(ol.Quantity, ol.UnitPrice, ol.Discount) AS Net) x",
+          "JOIN qe.Orders o ON o.OrderID = ol.OrderID",
+          "WHERE o.OrderDate >= @From AND o.OrderDate < @To",
+          "GROUP BY ol.ProductID;"
+        ]
+      }
+    ],
+    "index": {
+      "role": "none"
+    },
+    "min_improvement": {
+      "metric": "cpu_ms",
+      "ratio": 5,
+      "basis": "4.4M function calls in a serial plan are the 4 minutes. The inline expression runs in a parallel batch-mode plan."
+    }
+  }
+}

@@ -1,0 +1,109 @@
+{
+  "format_version": 1,
+  "id": "index-09-last-page-insert-contention",
+  "kind": "index_review",
+  "title": "PAGELATCH_EX on the last page of PK_Orders during the flash sale",
+  "split": "public",
+  "source": "index-exam-v1:9",
+  "tags": [
+    "latch-contention",
+    "alter",
+    "sequential-key"
+  ],
+  "prompt": [
+    "Azure SQL Database 'RetailOps', General Purpose, 8 vCores, about 41.5 GB of memory, compatibility level 160, no readable secondary. Snapshot taken Thursday 2026-09-24 09:00 UTC. A platform failover reset the index usage counters on 2026-09-15 02:41, so they cover 9.26 days. Query Store holds data from 2026-09-11 only, because size-based cleanup has run. Month-end change freeze: 2026-09-30 18:00 to 2026-10-02 18:00. Flash sale on 2026-10-09 with a change freeze from 2026-10-08. Log rate cap: 36 MB/s. Space headroom: 213 GB.",
+    "Ticket from the platform team: 'Before the Autumn Sale, stop the order-insert slowdowns we saw on 09-19.' Decide what",
+    "to change on PK_Orders, and whether PK_InventoryMovement needs the same change."
+  ],
+  "usage_window": {
+    "start": "2026-09-15T02:41Z",
+    "end": "2026-09-24T09:00Z",
+    "days": 9.26,
+    "reset_by": "platform failover",
+    "query_store_from": "2026-09-11"
+  },
+  "inventory": [
+    {
+      "table": "dbo.Orders",
+      "name": "PK_Orders",
+      "type": "clustered",
+      "key_columns": [
+        "OrderId"
+      ],
+      "include_columns": [],
+      "size_gb": 42.1,
+      "usage": {
+        "user_seeks": 23900000,
+        "user_scans": 9,
+        "user_lookups": 1736000000,
+        "user_updates": 26300000
+      },
+      "is_unique": true
+    },
+    {
+      "table": "dbo.InventoryMovement",
+      "name": "PK_InventoryMovement",
+      "type": "clustered",
+      "key_columns": [
+        "MovementId"
+      ],
+      "include_columns": [],
+      "size_gb": 212.0,
+      "usage": {
+        "user_seeks": 900000,
+        "user_scans": 0,
+        "user_lookups": 0,
+        "user_updates": 57400
+      },
+      "is_unique": true
+    }
+  ],
+  "workload": [
+    {
+      "id": "Q6",
+      "description": "INSERT dbo.Orders (marketplace importer and web checkout, single-row inserts)",
+      "sql": "INSERT dbo.Orders (...) VALUES (...);",
+      "executions_per_day": 350000,
+      "plan": "Clustered Index Insert PK_Orders plus 8 nonclustered indexes.",
+      "normal_duration_ms": 2.1,
+      "flash_sale_duration_ms": 410
+    }
+  ],
+  "facts": [
+    "Flash sale 2026-09-19 18:00-21:00: PAGELATCH_EX was 61% of wait time. Up to 180 sessions waited on one page: PK_Orders, level 0, the last page of the index. All of them ran Q6.",
+    "Q6 went from 2.1 ms to 410 ms; the importer timed out and retried. CPU peaked at 61%. Peak 900 inserts per second from about 220 sessions.",
+    "PK_Orders: page_latch_wait_count 4.1M, page_latch_wait_in_ms 2,950,000, most of it in that window.",
+    "dbo.InventoryMovement: 12 writers, one per warehouse, each sending 500-row batches. PK_InventoryMovement page_latch_wait_count is 3,200.",
+    "The service tier is General Purpose."
+  ],
+  "key": {
+    "decisions": [
+      {
+        "index": "PK_Orders",
+        "action": "alter",
+        "options": "OPTIMIZE_FOR_SEQUENTIAL_KEY = ON",
+        "why": "The contention is a latch convoy on the last page of an ever-increasing key. The option is a metadata-only change that keeps the key."
+      },
+      {
+        "index": "PK_InventoryMovement",
+        "action": "keep",
+        "why": "Twelve batched writers do not contend: 3,200 latch waits in nine days."
+      }
+    ],
+    "must_not_create": [
+      {
+        "id": "new_clustered_key_on_orders",
+        "table": "dbo.Orders",
+        "type": "clustered",
+        "key_columns": [],
+        "why": "A GUID, reversed or hashed clustered key trades the latch for fragmentation and page splits on a 182M-row table and rebuilds eight nonclustered indexes."
+      }
+    ],
+    "harmful_removals": [
+      {
+        "index": "PK_Orders",
+        "why": "It is the primary key and the clustered index of the table."
+      }
+    ]
+  }
+}

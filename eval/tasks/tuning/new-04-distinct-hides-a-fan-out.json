@@ -1,0 +1,164 @@
+{
+  "format_version": 1,
+  "id": "new-04-distinct-hides-a-fan-out",
+  "kind": "tuning",
+  "title": "DISTINCT that only removes the duplicates a join created",
+  "split": "public",
+  "source": "s6-new:04",
+  "tags": [
+    "distinct-fan-out",
+    "semi-join"
+  ],
+  "prompt": [
+    "Weekly 'customers active on a channel' extract. For @Channel = 'Web' over one year the join produces about 2.7M rows",
+    "and a Hash Match (Distinct) reduces them to about 610k customers. Runtime about 22 s, with a 900 MB memory grant and",
+    "a spill on busy nights. The output must have one row per customer: the next step loads it into a table whose primary",
+    "key is CustomerID."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.Customers",
+      "qe.Orders"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "Customers: 2.0M rows. Tier S = 1.85M, G = ~150k, P = 25 partner accounts (CustomerID 1 to 25). IsActive = 1 for 88%. Email is NULL for ~9% (~180k rows, ~160k of them active). About 2% of non-NULL emails are shared by two or more customer rows (households). ReferredByCustomerID is non-NULL for 18%; 312 rows are self-referrals (ReferredByCustomerID = CustomerID, CustomerID 500001 to 500312). AccountNumber always matches 'AC' + 10 digits (CHECK constraint).",
+    "Orders: 30M rows, 2016 to now, ~12k per day now. The 25 partner customers own ~9M orders (30%), up to 1.2M each. Other customers average ~10 orders (max ~400). The density estimate for CustomerID is ~15 rows. Status: Shipped 83.8%, Cancelled 7%, Paid 6%, Returned 3%, Pending 0.2% (~60k rows, all from the last 72 hours). SalesChannel: Web 62%, Store 20%, Partner 12%, Phone 6%. PromoCode is NULL for 85%. ShipRegionID is NULL for Store pickups (~20%). OrderDate is datetime2(7); Partner and Store imports stamp one timestamp on a whole batch, so many orders of one customer share an OrderDate."
+  ],
+  "baseline_kind": "select",
+  "baseline_sql": [
+    "SELECT DISTINCT c.CustomerID, c.AccountNumber, c.Tier",
+    "FROM qe.Customers c",
+    "JOIN qe.Orders o ON o.CustomerID = c.CustomerID",
+    "WHERE o.OrderDate >= @From",
+    "  AND o.SalesChannel = @Channel;"
+  ],
+  "parameter_cases": [
+    {
+      "name": "web_year",
+      "values": {
+        "From": "2025-10-01",
+        "Channel": "Web"
+      },
+      "types": {
+        "From": "datetime2(3)",
+        "Channel": "varchar(10)"
+      },
+      "weight": 0.7
+    },
+    {
+      "name": "phone_year",
+      "values": {
+        "From": "2025-10-01",
+        "Channel": "Phone"
+      },
+      "types": {
+        "From": "datetime2(3)",
+        "Channel": "varchar(10)"
+      },
+      "weight": 0.3
+    }
+  ],
+  "key": {
+    "decision": "rewrite",
+    "correct_families": [
+      {
+        "id": "exists_semi_join",
+        "description": "A semi join returns each customer once. The select list holds the primary key, so no DISTINCT is needed.",
+        "signals": {
+          "all": [
+            "\\bexists\\s*\\(\\s*select"
+          ],
+          "none": [
+            "\\bleft (outer )?join qe\\.Orders"
+          ]
+        },
+        "reference_sql": [
+          "SELECT c.CustomerID, c.AccountNumber, c.Tier",
+          "FROM qe.Customers c",
+          "WHERE EXISTS (SELECT 1",
+          "              FROM qe.Orders o",
+          "              WHERE o.CustomerID = c.CustomerID",
+          "                AND o.OrderDate >= @From",
+          "                AND o.SalesChannel = @Channel);"
+        ]
+      },
+      {
+        "id": "in_semi_join",
+        "description": "IN over the customers that have a qualifying order is the same semi join.",
+        "signals": {
+          "all": [
+            "c\\.CustomerID in\\s*\\(\\s*select"
+          ]
+        },
+        "reference_sql": [
+          "SELECT c.CustomerID, c.AccountNumber, c.Tier",
+          "FROM qe.Customers c",
+          "WHERE c.CustomerID IN (SELECT o.CustomerID",
+          "                       FROM qe.Orders o",
+          "                       WHERE o.OrderDate >= @From",
+          "                         AND o.SalesChannel = @Channel);"
+        ]
+      }
+    ],
+    "traps": [
+      {
+        "id": "join_without_distinct",
+        "class": "not_equivalent",
+        "why": "Removing DISTINCT while the join stays returns one row per order: a customer with 12 orders appears 12 times and the load fails on the primary key.",
+        "signals": {
+          "all": [
+            "join qe\\.Orders"
+          ],
+          "none": [
+            "\\bdistinct\\b",
+            "group by",
+            "\\bexists\\b",
+            "\\bin\\s*\\(\\s*select"
+          ]
+        },
+        "told_apart_by": "Any customer with two qualifying orders.",
+        "example_sql": [
+          "SELECT c.CustomerID, c.AccountNumber, c.Tier",
+          "FROM qe.Customers c",
+          "JOIN qe.Orders o ON o.CustomerID = c.CustomerID",
+          "WHERE o.OrderDate >= @From",
+          "  AND o.SalesChannel = @Channel;"
+        ]
+      },
+      {
+        "id": "channel_filter_lost",
+        "class": "not_equivalent",
+        "why": "A semi join that keeps only the date predicate returns customers who ordered on another channel.",
+        "signals": {
+          "all": [
+            "\\bexists\\b|\\bin\\s*\\(\\s*select"
+          ],
+          "none": [
+            "SalesChannel\\s*=\\s*@Channel"
+          ]
+        },
+        "told_apart_by": "A customer whose only orders since @From are Store orders, with @Channel = 'Web'.",
+        "example_sql": [
+          "SELECT c.CustomerID, c.AccountNumber, c.Tier",
+          "FROM qe.Customers c",
+          "WHERE EXISTS (SELECT 1",
+          "              FROM qe.Orders o",
+          "              WHERE o.CustomerID = c.CustomerID",
+          "                AND o.OrderDate >= @From);"
+        ]
+      }
+    ],
+    "index": {
+      "role": "optional"
+    },
+    "min_improvement": {
+      "metric": "elapsed_ms",
+      "ratio": 2,
+      "basis": "Provisional: no reference measurement. The distinct over 2.7M joined rows and its spill must go."
+    },
+    "reference_notes": "Contrast with the task converted from rewrite exam Q14, where the output column is not a key and DISTINCT must stay."
+  }
+}

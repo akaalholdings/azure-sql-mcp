@@ -1,0 +1,203 @@
+{
+  "format_version": 1,
+  "id": "new-02-or-across-two-columns",
+  "kind": "tuning",
+  "title": "Fraud review lookup with OR across two columns of one table",
+  "split": "public",
+  "source": "s6-new:02",
+  "tags": [
+    "or-across-columns",
+    "duplicates",
+    "null-semantics"
+  ],
+  "prompt": [
+    "Fraud review screen: about 20 calls per second, about 800 ms each. It lists the accounts that use the suspect's email",
+    "address or were referred by the suspect. Plan: Clustered Index Scan of PK_Customers (2.0M rows, about 31,000 logical",
+    "reads) with the OR as a residual filter. IX_Customers_Email exists; there is no index on ReferredByCustomerID. The",
+    "result has no key column: two household accounts with the same Email, LastName and Tier are two rows, and the",
+    "reviewers count them. Both parameters are always supplied: the API rejects NULL."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.Customers"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "Customers: 2.0M rows. Tier S = 1.85M, G = ~150k, P = 25 partner accounts (CustomerID 1 to 25). IsActive = 1 for 88%. Email is NULL for ~9% (~180k rows, ~160k of them active). About 2% of non-NULL emails are shared by two or more customer rows (households). ReferredByCustomerID is non-NULL for 18%; 312 rows are self-referrals (ReferredByCustomerID = CustomerID, CustomerID 500001 to 500312). AccountNumber always matches 'AC' + 10 digits (CHECK constraint)."
+  ],
+  "baseline_kind": "select",
+  "baseline_sql": [
+    "SELECT c.Email, c.LastName, c.Tier",
+    "FROM qe.Customers c",
+    "WHERE c.Email = @Email",
+    "   OR c.ReferredByCustomerID = @ReferrerID;"
+  ],
+  "parameter_cases": [
+    {
+      "name": "typical_suspect",
+      "values": {
+        "Email": "pat.lee@example.org",
+        "ReferrerID": 48213
+      },
+      "types": {
+        "Email": "varchar(254)",
+        "ReferrerID": "int"
+      },
+      "weight": 0.9
+    },
+    {
+      "name": "self_referral",
+      "values": {
+        "Email": "sam.self@example.org",
+        "ReferrerID": 500007
+      },
+      "types": {
+        "Email": "varchar(254)",
+        "ReferrerID": "int"
+      },
+      "weight": 0.1
+    }
+  ],
+  "key": {
+    "decision": "index_only",
+    "accepted_decisions": [
+      "index_only",
+      "rewrite"
+    ],
+    "correct_families": [
+      {
+        "id": "union_all_with_null_safe_exclusion",
+        "description": "Two seekable branches with UNION ALL. The second branch excludes the rows the first branch returned, and keeps the referred customers whose Email is NULL.",
+        "signals": {
+          "all": [
+            "union all"
+          ],
+          "any": [
+            "c\\.Email\\s*<>\\s*@Email\\s+or\\s+c\\.Email is null",
+            "c\\.Email is null\\s+or\\s+c\\.Email\\s*<>\\s*@Email",
+            "c\\.Email is distinct from @Email"
+          ]
+        },
+        "reference_sql": [
+          "SELECT c.Email, c.LastName, c.Tier",
+          "FROM qe.Customers c",
+          "WHERE c.Email = @Email",
+          "UNION ALL",
+          "SELECT c.Email, c.LastName, c.Tier",
+          "FROM qe.Customers c",
+          "WHERE c.ReferredByCustomerID = @ReferrerID",
+          "  AND (c.Email <> @Email OR c.Email IS NULL);"
+        ]
+      },
+      {
+        "id": "union_on_the_key_then_fetch",
+        "description": "Combine the two branches on CustomerID, which removes exactly the rows that satisfy both, then fetch the output columns.",
+        "signals": {
+          "all": [
+            "\\bunion\\b(?!\\s+all)",
+            "c\\.CustomerID in\\s*\\(\\s*select"
+          ]
+        },
+        "reference_sql": [
+          "SELECT c.Email, c.LastName, c.Tier",
+          "FROM qe.Customers c",
+          "WHERE c.CustomerID IN (SELECT e.CustomerID FROM qe.Customers e WHERE e.Email = @Email",
+          "                       UNION",
+          "                       SELECT r.CustomerID FROM qe.Customers r WHERE r.ReferredByCustomerID = @ReferrerID);"
+        ]
+      }
+    ],
+    "traps": [
+      {
+        "id": "union_all_returns_a_row_twice",
+        "class": "not_equivalent",
+        "why": "An account that uses the email and was also referred by the suspect satisfies both branches. UNION ALL returns it twice.",
+        "signals": {
+          "all": [
+            "union all"
+          ],
+          "none": [
+            "<>\\s*@Email",
+            "is distinct from",
+            "not exists"
+          ]
+        },
+        "told_apart_by": "Parameter case self_referral: the suspect's own account uses the email and refers itself.",
+        "example_sql": [
+          "SELECT c.Email, c.LastName, c.Tier",
+          "FROM qe.Customers c",
+          "WHERE c.Email = @Email",
+          "UNION ALL",
+          "SELECT c.Email, c.LastName, c.Tier",
+          "FROM qe.Customers c",
+          "WHERE c.ReferredByCustomerID = @ReferrerID;"
+        ]
+      },
+      {
+        "id": "exclusion_drops_null_emails",
+        "class": "not_equivalent",
+        "why": "c.Email <> @Email is not true for a NULL Email, so referred customers with no email address vanish from the second branch.",
+        "signals": {
+          "all": [
+            "union all",
+            "c\\.Email\\s*<>\\s*@Email"
+          ],
+          "none": [
+            "Email is null",
+            "is distinct from"
+          ]
+        },
+        "told_apart_by": "A customer referred by the suspect whose Email is NULL (9% of customers).",
+        "example_sql": [
+          "SELECT c.Email, c.LastName, c.Tier",
+          "FROM qe.Customers c",
+          "WHERE c.Email = @Email",
+          "UNION ALL",
+          "SELECT c.Email, c.LastName, c.Tier",
+          "FROM qe.Customers c",
+          "WHERE c.ReferredByCustomerID = @ReferrerID",
+          "  AND c.Email <> @Email;"
+        ]
+      },
+      {
+        "id": "union_merges_household_rows",
+        "class": "not_equivalent",
+        "why": "UNION removes duplicates over Email, LastName and Tier. Two household accounts with the same values become one row.",
+        "signals": {
+          "all": [
+            "select c\\.Email\\s*,\\s*c\\.LastName\\s*,\\s*c\\.Tier\\s+from qe\\.Customers c\\s+where[^;]*\\bunion\\b(?!\\s+all)\\s*select c\\.Email"
+          ]
+        },
+        "told_apart_by": "Two accounts of one household with the same Email, LastName and Tier.",
+        "example_sql": [
+          "SELECT c.Email, c.LastName, c.Tier",
+          "FROM qe.Customers c",
+          "WHERE c.Email = @Email",
+          "UNION",
+          "SELECT c.Email, c.LastName, c.Tier",
+          "FROM qe.Customers c",
+          "WHERE c.ReferredByCustomerID = @ReferrerID;"
+        ]
+      }
+    ],
+    "index": {
+      "role": "required",
+      "accepted": [
+        {
+          "table": "qe.Customers",
+          "key_columns": [
+            "ReferredByCustomerID"
+          ]
+        }
+      ]
+    },
+    "min_improvement": {
+      "metric": "logical_reads",
+      "ratio": 50,
+      "basis": "The scan reads about 31,000 pages. Two seeks with a few lookups read well under 600."
+    },
+    "reference_notes": "With an index on each column the optimizer can answer the unchanged OR with two seeks and a union on the key. A rewrite is an alternative, not a requirement."
+  }
+}

@@ -1,0 +1,217 @@
+{
+  "format_version": 1,
+  "id": "exam-q09-aggregate-before-wide-join",
+  "kind": "tuning",
+  "title": "Regional customer summary: aggregate before joining wide rows",
+  "split": "public",
+  "source": "rewrite-exam-v1:Q09",
+  "tags": [
+    "aggregate-pushdown",
+    "outer-join",
+    "null-versus-zero"
+  ],
+  "prompt": [
+    "Quarterly account-manager report. Region 1 (about 700k customers, 1.1M orders and 4.4M lines per quarter) takes",
+    "about 3.5 minutes. The plan carries AccountNumber and LastName through the joins into a hash aggregate that spills",
+    "about 2.4 GB to tempdb, and COUNT(DISTINCT) adds a second aggregation branch. The report must list every customer",
+    "in the region, including those with no orders in the quarter (OrderCount 0, Revenue NULL). Orders with no lines",
+    "count as orders but add no revenue."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.Customers",
+      "qe.Orders",
+      "qe.OrderLines"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "Customers: 2.0M rows. Tier S = 1.85M, G = ~150k, P = 25 partner accounts (CustomerID 1 to 25). IsActive = 1 for 88%. Email is NULL for ~9% (~180k rows, ~160k of them active). About 2% of non-NULL emails are shared by two or more customer rows (households). ReferredByCustomerID is non-NULL for 18%; 312 rows are self-referrals (ReferredByCustomerID = CustomerID, CustomerID 500001 to 500312). AccountNumber always matches 'AC' + 10 digits (CHECK constraint).",
+    "Orders: 30M rows, 2016 to now, ~12k per day now. The 25 partner customers own ~9M orders (30%), up to 1.2M each. Other customers average ~10 orders (max ~400). The density estimate for CustomerID is ~15 rows. Status: Shipped 83.8%, Cancelled 7%, Paid 6%, Returned 3%, Pending 0.2% (~60k rows, all from the last 72 hours). SalesChannel: Web 62%, Store 20%, Partner 12%, Phone 6%. PromoCode is NULL for 85%. ShipRegionID is NULL for Store pickups (~20%). OrderDate is datetime2(7); Partner and Store imports stamp one timestamp on a whole batch, so many orders of one customer share an OrderDate.",
+    "OrderLines: 120M rows, 4 per order on average. About 0.3% of orders have no lines."
+  ],
+  "baseline_kind": "select",
+  "baseline_sql": [
+    "SELECT c.CustomerID, c.AccountNumber, c.LastName,",
+    "       COUNT(DISTINCT o.OrderID) AS OrderCount,",
+    "       SUM(ol.Quantity * ol.UnitPrice * (1 - ol.Discount)) AS Revenue",
+    "FROM qe.Customers c",
+    "LEFT JOIN qe.Orders o",
+    "       ON o.CustomerID = c.CustomerID",
+    "      AND o.OrderDate >= @From AND o.OrderDate < @To",
+    "      AND o.Status <> 'Cancelled'",
+    "LEFT JOIN qe.OrderLines ol ON ol.OrderID = o.OrderID",
+    "WHERE c.RegionID = @RegionID",
+    "GROUP BY c.CustomerID, c.AccountNumber, c.LastName;"
+  ],
+  "parameter_cases": [
+    {
+      "name": "region1_quarter",
+      "values": {
+        "RegionID": 1,
+        "From": "2026-07-01",
+        "To": "2026-10-01"
+      },
+      "types": {
+        "RegionID": "tinyint",
+        "From": "datetime2(3)",
+        "To": "datetime2(3)"
+      },
+      "weight": 0.7
+    },
+    {
+      "name": "region5_quarter",
+      "values": {
+        "RegionID": 5,
+        "From": "2026-07-01",
+        "To": "2026-10-01"
+      },
+      "types": {
+        "RegionID": "tinyint",
+        "From": "datetime2(3)",
+        "To": "datetime2(3)"
+      },
+      "weight": 0.3
+    }
+  ],
+  "key": {
+    "decision": "rewrite",
+    "correct_families": [
+      {
+        "id": "aggregate_on_keys_then_join",
+        "description": "Group by the narrow keys first (order, then customer) and join the wide customer columns afterwards with an outer join.",
+        "signals": {
+          "all": [
+            "with\\s+\\w+\\s+as\\s*\\(|from\\s*\\(\\s*select|apply\\s*\\(",
+            "left (outer )?join|outer apply",
+            "sum\\(\\s*ol\\.Quantity\\s*\\*\\s*ol\\.UnitPrice\\s*\\*\\s*\\(\\s*1\\s*-\\s*ol\\.Discount\\s*\\)\\s*\\)"
+          ]
+        },
+        "reference_sql": [
+          "WITH OrderRev AS (",
+          "    SELECT o.CustomerID, o.OrderID,",
+          "           SUM(ol.Quantity * ol.UnitPrice * (1 - ol.Discount)) AS Revenue",
+          "    FROM qe.Orders o",
+          "    JOIN qe.Customers c ON c.CustomerID = o.CustomerID AND c.RegionID = @RegionID",
+          "    LEFT JOIN qe.OrderLines ol ON ol.OrderID = o.OrderID",
+          "    WHERE o.OrderDate >= @From AND o.OrderDate < @To",
+          "      AND o.Status <> 'Cancelled'",
+          "    GROUP BY o.CustomerID, o.OrderID",
+          "), CustAgg AS (",
+          "    SELECT CustomerID, COUNT(*) AS OrderCount, SUM(Revenue) AS Revenue",
+          "    FROM OrderRev",
+          "    GROUP BY CustomerID",
+          ")",
+          "SELECT c.CustomerID, c.AccountNumber, c.LastName,",
+          "       ISNULL(a.OrderCount, 0) AS OrderCount,",
+          "       a.Revenue AS Revenue",
+          "FROM qe.Customers c",
+          "LEFT JOIN CustAgg a ON a.CustomerID = c.CustomerID",
+          "WHERE c.RegionID = @RegionID;"
+        ]
+      }
+    ],
+    "traps": [
+      {
+        "id": "order_filter_moved_to_where",
+        "class": "not_equivalent",
+        "why": "The date and status predicates in the outer WHERE turn the LEFT JOIN into an inner join. Customers with no orders in the quarter disappear.",
+        "signals": {
+          "any": [
+            "where\\s+c\\.RegionID\\s*=\\s*@RegionID\\s+and\\s+o\\.(OrderDate|Status)",
+            "left join qe\\.Orders o\\s+on\\s+o\\.CustomerID\\s*=\\s*c\\.CustomerID\\s+(left|where|join)"
+          ]
+        },
+        "told_apart_by": "A customer in the region with no order in the quarter.",
+        "example_sql": [
+          "SELECT c.CustomerID, c.AccountNumber, c.LastName,",
+          "       COUNT(DISTINCT o.OrderID) AS OrderCount,",
+          "       SUM(ol.Quantity * ol.UnitPrice * (1 - ol.Discount)) AS Revenue",
+          "FROM qe.Customers c",
+          "LEFT JOIN qe.Orders o ON o.CustomerID = c.CustomerID",
+          "LEFT JOIN qe.OrderLines ol ON ol.OrderID = o.OrderID",
+          "WHERE c.RegionID = @RegionID",
+          "  AND o.OrderDate >= @From AND o.OrderDate < @To",
+          "  AND o.Status <> 'Cancelled'",
+          "GROUP BY c.CustomerID, c.AccountNumber, c.LastName;"
+        ]
+      },
+      {
+        "id": "revenue_null_turned_into_zero",
+        "class": "not_equivalent",
+        "why": "The report shows Revenue NULL for a customer with no orders or only orders without lines. ISNULL turns it into 0.",
+        "signals": {
+          "any": [
+            "(isnull|coalesce)\\(\\s*sum\\(\\s*(ol\\.Quantity|Revenue|\\w+\\.Revenue)",
+            "(isnull|coalesce)\\(\\s*\\w+\\.Revenue"
+          ]
+        },
+        "told_apart_by": "A customer in the region with no order in the quarter.",
+        "example_sql": [
+          "WITH OrderRev AS (",
+          "    SELECT o.CustomerID, o.OrderID,",
+          "           SUM(ol.Quantity * ol.UnitPrice * (1 - ol.Discount)) AS Revenue",
+          "    FROM qe.Orders o",
+          "    JOIN qe.Customers c ON c.CustomerID = o.CustomerID AND c.RegionID = @RegionID",
+          "    LEFT JOIN qe.OrderLines ol ON ol.OrderID = o.OrderID",
+          "    WHERE o.OrderDate >= @From AND o.OrderDate < @To",
+          "      AND o.Status <> 'Cancelled'",
+          "    GROUP BY o.CustomerID, o.OrderID",
+          "), CustAgg AS (",
+          "    SELECT CustomerID, COUNT(*) AS OrderCount, SUM(Revenue) AS Revenue",
+          "    FROM OrderRev",
+          "    GROUP BY CustomerID",
+          ")",
+          "SELECT c.CustomerID, c.AccountNumber, c.LastName,",
+          "       ISNULL(a.OrderCount, 0) AS OrderCount,",
+          "       ISNULL(a.Revenue, 0) AS Revenue",
+          "FROM qe.Customers c",
+          "LEFT JOIN CustAgg a ON a.CustomerID = c.CustomerID",
+          "WHERE c.RegionID = @RegionID;"
+        ]
+      },
+      {
+        "id": "inner_join_to_order_lines",
+        "class": "not_equivalent",
+        "why": "An inner join to OrderLines drops orders that have no lines, so OrderCount is too low.",
+        "signals": {
+          "all": [
+            "(?<!left )(?<!outer )join qe\\.OrderLines"
+          ]
+        },
+        "told_apart_by": "An order in the quarter that has no lines (0.3% of orders).",
+        "example_sql": [
+          "WITH OrderRev AS (",
+          "    SELECT o.CustomerID, o.OrderID,",
+          "           SUM(ol.Quantity * ol.UnitPrice * (1 - ol.Discount)) AS Revenue",
+          "    FROM qe.Orders o",
+          "    JOIN qe.Customers c ON c.CustomerID = o.CustomerID AND c.RegionID = @RegionID",
+          "    JOIN qe.OrderLines ol ON ol.OrderID = o.OrderID",
+          "    WHERE o.OrderDate >= @From AND o.OrderDate < @To",
+          "      AND o.Status <> 'Cancelled'",
+          "    GROUP BY o.CustomerID, o.OrderID",
+          "), CustAgg AS (",
+          "    SELECT CustomerID, COUNT(*) AS OrderCount, SUM(Revenue) AS Revenue",
+          "    FROM OrderRev",
+          "    GROUP BY CustomerID",
+          ")",
+          "SELECT c.CustomerID, c.AccountNumber, c.LastName,",
+          "       ISNULL(a.OrderCount, 0) AS OrderCount,",
+          "       a.Revenue AS Revenue",
+          "FROM qe.Customers c",
+          "LEFT JOIN CustAgg a ON a.CustomerID = c.CustomerID",
+          "WHERE c.RegionID = @RegionID;"
+        ]
+      }
+    ],
+    "index": {
+      "role": "optional"
+    },
+    "min_improvement": {
+      "metric": "elapsed_ms",
+      "ratio": 2,
+      "basis": "Provisional: no reference measurement. The 2.4 GB spill and the second aggregation branch must go."
+    }
+  }
+}

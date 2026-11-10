@@ -1,0 +1,247 @@
+{
+  "format_version": 1,
+  "id": "exam-q06-running-balance-triangular-join",
+  "kind": "tuning",
+  "title": "Customer statement running balance computed with a triangular join",
+  "split": "public",
+  "source": "rewrite-exam-v1:Q06",
+  "tags": [
+    "running-total",
+    "window-frame",
+    "ties"
+  ],
+  "prompt": [
+    "Statement generation. It is fine for normal customers (fewer than 200 payments). For partner accounts (up to 180k",
+    "Settled or Refunded payments, statements usually cover one month) it hits the 30 s command timeout. Plan: nested",
+    "loops; the inner subquery reads all of the customer's payments again for every output row. Settlement batches stamp",
+    "the same PaidAt on 50-500 payments. Accountants compare the RunningBalance column line by line with the previous",
+    "system, so the values must not change. The balance is cumulative from the customer's first payment, not from @From."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.Payments",
+      "qe.Orders"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "Payments: 60M rows. Status: Settled 88%, Failed 6%, Refunded 4% (negative Amount), Pending 2%. ExternalRef is NULL for ~30%; non-NULL values are almost unique, with a few duplicates from provider retries. Partner accounts have up to 180k Settled or Refunded payments each. Settlement batches stamp the same PaidAt on 50-500 payments.",
+    "Orders: 30M rows, 2016 to now, ~12k per day now. The 25 partner customers own ~9M orders (30%), up to 1.2M each. Other customers average ~10 orders (max ~400). The density estimate for CustomerID is ~15 rows. Status: Shipped 83.8%, Cancelled 7%, Paid 6%, Returned 3%, Pending 0.2% (~60k rows, all from the last 72 hours). SalesChannel: Web 62%, Store 20%, Partner 12%, Phone 6%. PromoCode is NULL for 85%. ShipRegionID is NULL for Store pickups (~20%). OrderDate is datetime2(7); Partner and Store imports stamp one timestamp on a whole batch, so many orders of one customer share an OrderDate."
+  ],
+  "baseline_kind": "select",
+  "baseline_sql": [
+    "SELECT p.PaymentID, p.PaidAt, p.Amount,",
+    "       (SELECT SUM(p2.Amount)",
+    "        FROM qe.Payments p2",
+    "        JOIN qe.Orders o2 ON o2.OrderID = p2.OrderID",
+    "        WHERE o2.CustomerID = @CustomerID",
+    "          AND p2.Status IN ('Settled','Refunded')",
+    "          AND p2.PaidAt <= p.PaidAt) AS RunningBalance",
+    "FROM qe.Payments p",
+    "JOIN qe.Orders o ON o.OrderID = p.OrderID",
+    "WHERE o.CustomerID = @CustomerID",
+    "  AND p.Status IN ('Settled','Refunded')",
+    "  AND p.PaidAt >= @From AND p.PaidAt < @To",
+    "ORDER BY p.PaidAt, p.PaymentID;"
+  ],
+  "parameter_cases": [
+    {
+      "name": "normal_customer",
+      "values": {
+        "CustomerID": 48213,
+        "From": "2026-09-01",
+        "To": "2026-10-01"
+      },
+      "types": {
+        "CustomerID": "int",
+        "From": "datetime2(3)",
+        "To": "datetime2(3)"
+      },
+      "weight": 0.8
+    },
+    {
+      "name": "partner_customer",
+      "values": {
+        "CustomerID": 7,
+        "From": "2026-09-01",
+        "To": "2026-10-01"
+      },
+      "types": {
+        "CustomerID": "int",
+        "From": "datetime2(3)",
+        "To": "datetime2(3)"
+      },
+      "weight": 0.2
+    }
+  ],
+  "key": {
+    "decision": "rewrite",
+    "correct_families": [
+      {
+        "id": "range_window_filtered_outside",
+        "description": "A window sum with RANGE semantics over all history up to @To, with the @From filter applied outside the window.",
+        "signals": {
+          "all": [
+            "sum\\(\\s*p\\.Amount\\s*\\)\\s*over\\s*\\(",
+            "with\\s+\\w+\\s+as\\s*\\(|from\\s*\\(\\s*select"
+          ],
+          "none": [
+            "\\brows\\b",
+            "over\\s*\\([^)]*PaymentID",
+            "partition by\\s+\\w+\\.OrderID"
+          ]
+        },
+        "reference_sql": [
+          "WITH s AS (",
+          "    SELECT p.PaymentID, p.PaidAt, p.Amount,",
+          "           SUM(p.Amount) OVER (ORDER BY p.PaidAt RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningBalance",
+          "    FROM qe.Payments p",
+          "    JOIN qe.Orders o ON o.OrderID = p.OrderID",
+          "    WHERE o.CustomerID = @CustomerID",
+          "      AND p.Status IN ('Settled','Refunded')",
+          "      AND p.PaidAt < @To",
+          ")",
+          "SELECT PaymentID, PaidAt, Amount, RunningBalance",
+          "FROM s",
+          "WHERE PaidAt >= @From",
+          "ORDER BY PaidAt, PaymentID;"
+        ]
+      },
+      {
+        "id": "aggregate_per_timestamp_then_rows",
+        "description": "Sum per PaidAt first, run a ROWS window over the distinct timestamps, then join the balance back to the payments.",
+        "signals": {
+          "all": [
+            "sum\\(\\s*sum\\(\\s*p\\.Amount\\s*\\)\\s*\\)\\s*over\\s*\\(",
+            "group by\\s+p\\.PaidAt"
+          ]
+        },
+        "reference_sql": [
+          "WITH t AS (",
+          "    SELECT p.PaidAt, SUM(SUM(p.Amount)) OVER (ORDER BY p.PaidAt ROWS UNBOUNDED PRECEDING) AS RunningBalance",
+          "    FROM qe.Payments p",
+          "    JOIN qe.Orders o ON o.OrderID = p.OrderID",
+          "    WHERE o.CustomerID = @CustomerID",
+          "      AND p.Status IN ('Settled','Refunded')",
+          "      AND p.PaidAt < @To",
+          "    GROUP BY p.PaidAt",
+          ")",
+          "SELECT p.PaymentID, p.PaidAt, p.Amount, t.RunningBalance",
+          "FROM qe.Payments p",
+          "JOIN qe.Orders o ON o.OrderID = p.OrderID",
+          "JOIN t ON t.PaidAt = p.PaidAt",
+          "WHERE o.CustomerID = @CustomerID",
+          "  AND p.Status IN ('Settled','Refunded')",
+          "  AND p.PaidAt >= @From AND p.PaidAt < @To",
+          "ORDER BY p.PaidAt, p.PaymentID;"
+        ]
+      }
+    ],
+    "traps": [
+      {
+        "id": "rows_frame_splits_ties",
+        "class": "not_equivalent",
+        "why": "The original uses <=, so every payment of one settlement batch shows the same balance. A ROWS frame gives each tied row a different partial balance.",
+        "signals": {
+          "all": [
+            "over\\s*\\(",
+            "\\brows\\b"
+          ],
+          "none": [
+            "sum\\(\\s*sum\\("
+          ]
+        },
+        "told_apart_by": "Two payments of the customer with the same PaidAt.",
+        "example_sql": [
+          "WITH s AS (",
+          "    SELECT p.PaymentID, p.PaidAt, p.Amount,",
+          "           SUM(p.Amount) OVER (ORDER BY p.PaidAt ROWS UNBOUNDED PRECEDING) AS RunningBalance",
+          "    FROM qe.Payments p",
+          "    JOIN qe.Orders o ON o.OrderID = p.OrderID",
+          "    WHERE o.CustomerID = @CustomerID",
+          "      AND p.Status IN ('Settled','Refunded')",
+          "      AND p.PaidAt < @To",
+          ")",
+          "SELECT PaymentID, PaidAt, Amount, RunningBalance",
+          "FROM s",
+          "WHERE PaidAt >= @From",
+          "ORDER BY PaidAt, PaymentID;"
+        ]
+      },
+      {
+        "id": "payment_id_in_window_order",
+        "class": "not_equivalent",
+        "why": "PaymentID in the window ORDER BY makes every row its own peer, which splits tied payments the same way a ROWS frame does.",
+        "signals": {
+          "all": [
+            "over\\s*\\([^)]*order by[^)]*PaymentID"
+          ]
+        },
+        "told_apart_by": "Two payments of the customer with the same PaidAt.",
+        "example_sql": [
+          "WITH s AS (",
+          "    SELECT p.PaymentID, p.PaidAt, p.Amount,",
+          "           SUM(p.Amount) OVER (ORDER BY p.PaidAt, p.PaymentID) AS RunningBalance",
+          "    FROM qe.Payments p",
+          "    JOIN qe.Orders o ON o.OrderID = p.OrderID",
+          "    WHERE o.CustomerID = @CustomerID",
+          "      AND p.Status IN ('Settled','Refunded')",
+          "      AND p.PaidAt < @To",
+          ")",
+          "SELECT PaymentID, PaidAt, Amount, RunningBalance",
+          "FROM s",
+          "WHERE PaidAt >= @From",
+          "ORDER BY PaidAt, PaymentID;"
+        ]
+      },
+      {
+        "id": "from_filter_beside_the_window",
+        "class": "not_equivalent",
+        "why": "A @From filter at the same query level as the window restarts the balance at @From and loses the opening balance.",
+        "signals": {
+          "all": [
+            "over\\s*\\(",
+            "@From"
+          ],
+          "none": [
+            "with\\s+\\w+\\s+as\\s*\\(",
+            "from\\s*\\(\\s*select"
+          ]
+        },
+        "told_apart_by": "A customer with a Settled payment before @From.",
+        "example_sql": [
+          "SELECT p.PaymentID, p.PaidAt, p.Amount,",
+          "       SUM(p.Amount) OVER (ORDER BY p.PaidAt RANGE UNBOUNDED PRECEDING) AS RunningBalance",
+          "FROM qe.Payments p",
+          "JOIN qe.Orders o ON o.OrderID = p.OrderID",
+          "WHERE o.CustomerID = @CustomerID",
+          "  AND p.Status IN ('Settled','Refunded')",
+          "  AND p.PaidAt >= @From AND p.PaidAt < @To",
+          "ORDER BY p.PaidAt, p.PaymentID;"
+        ]
+      }
+    ],
+    "index": {
+      "role": "required",
+      "accepted": [
+        {
+          "table": "qe.Payments",
+          "key_columns": [
+            "OrderID"
+          ],
+          "include_columns": [
+            "Status",
+            "PaidAt",
+            "Amount"
+          ]
+        }
+      ]
+    },
+    "min_improvement": {
+      "metric": "elapsed_ms",
+      "ratio": 10,
+      "basis": "The triangular join visits about 16 billion rows for a 180k-payment partner. One ordered pass must be at least ten times faster on the partner case."
+    }
+  }
+}

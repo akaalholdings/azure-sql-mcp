@@ -1,0 +1,158 @@
+{
+  "format_version": 1,
+  "id": "new-11-columnstore-fact-no-segment-elimination",
+  "kind": "tuning",
+  "title": "Columnstore fact query that reads every row group",
+  "split": "public",
+  "source": "s6-new:11",
+  "tags": [
+    "columnstore",
+    "segment-elimination",
+    "non-sargable-date"
+  ],
+  "prompt": [
+    "Store sales dashboard for a date range, usually the last 30 days. Each call uses about 38 s of CPU at DOP 8. Plan:",
+    "Columnstore Index Scan of CCI_FactSales in batch mode; all 1,400 row groups are read and none is eliminated. The two",
+    "DATEDIFF predicates are not pushed into the scan: a Filter above the scan evaluates them for all 1.4B rows. SaleDate",
+    "is a date column, and both parameters are date. The API validates both dates to the years 2000 to 2100 and never",
+    "sends NULL."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.FactSales"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "FactSales: 1.4B rows in a clustered columnstore index, ~1,400 row groups. Rows are loaded once a day in SaleDate order, so each row group holds a narrow SaleDate range."
+  ],
+  "baseline_kind": "select",
+  "baseline_sql": [
+    "SELECT f.StoreID, SUM(f.Quantity) AS Units, SUM(f.NetAmount) AS Net",
+    "FROM qe.FactSales f",
+    "WHERE DATEDIFF(day, f.SaleDate, @To) >= 0",
+    "  AND DATEDIFF(day, @From, f.SaleDate) >= 0",
+    "GROUP BY f.StoreID;"
+  ],
+  "parameter_cases": [
+    {
+      "name": "last_30_days",
+      "values": {
+        "From": "2026-09-12",
+        "To": "2026-10-11"
+      },
+      "types": {
+        "From": "date",
+        "To": "date"
+      },
+      "weight": 0.8
+    },
+    {
+      "name": "one_day",
+      "values": {
+        "From": "2026-10-11",
+        "To": "2026-10-11"
+      },
+      "types": {
+        "From": "date",
+        "To": "date"
+      },
+      "weight": 0.2
+    }
+  ],
+  "key": {
+    "decision": "rewrite",
+    "correct_families": [
+      {
+        "id": "closed_range_on_the_column",
+        "description": "Compare the column itself with the two dates. The predicate is pushed into the scan and only the row groups whose SaleDate range overlaps are read.",
+        "signals": {
+          "any": [
+            "f\\.SaleDate\\s*>=\\s*@From\\s+and\\s+f\\.SaleDate\\s*<=\\s*@To",
+            "f\\.SaleDate\\s*<=\\s*@To\\s+and\\s+f\\.SaleDate\\s*>=\\s*@From",
+            "f\\.SaleDate between @From and @To",
+            "f\\.SaleDate\\s*>=\\s*@From\\s+and\\s+f\\.SaleDate\\s*<\\s*dateadd\\(\\s*day\\s*,\\s*1\\s*,\\s*@To\\s*\\)"
+          ],
+          "none": [
+            "datediff\\("
+          ]
+        },
+        "reference_sql": [
+          "SELECT f.StoreID, SUM(f.Quantity) AS Units, SUM(f.NetAmount) AS Net",
+          "FROM qe.FactSales f",
+          "WHERE f.SaleDate >= @From",
+          "  AND f.SaleDate <= @To",
+          "GROUP BY f.StoreID;"
+        ]
+      }
+    ],
+    "traps": [
+      {
+        "id": "exclusive_end_date",
+        "class": "not_equivalent",
+        "why": "The original includes @To. SaleDate < @To drops the last day of the range.",
+        "signals": {
+          "all": [
+            "f\\.SaleDate\\s*<\\s*@To\\b"
+          ]
+        },
+        "told_apart_by": "Parameter case one_day: the baseline returns that day's sales, the rewrite returns no rows.",
+        "example_sql": [
+          "SELECT f.StoreID, SUM(f.Quantity) AS Units, SUM(f.NetAmount) AS Net",
+          "FROM qe.FactSales f",
+          "WHERE f.SaleDate >= @From",
+          "  AND f.SaleDate < @To",
+          "GROUP BY f.StoreID;"
+        ]
+      },
+      {
+        "id": "function_still_on_the_column",
+        "class": "ineffective",
+        "why": "Another function on SaleDate is as opaque to the scan as DATEDIFF: no predicate pushdown and no row group elimination.",
+        "signals": {
+          "any": [
+            "(cast|convert|format|datepart|year|month)\\(\\s*(\\w+(\\(\\s*\\d+\\s*\\))?\\s*,\\s*)?f\\.SaleDate",
+            "datediff\\("
+          ]
+        },
+        "example_sql": [
+          "SELECT f.StoreID, SUM(f.Quantity) AS Units, SUM(f.NetAmount) AS Net",
+          "FROM qe.FactSales f",
+          "WHERE CONVERT(char(8), f.SaleDate, 112) BETWEEN CONVERT(char(8), @From, 112) AND CONVERT(char(8), @To, 112)",
+          "GROUP BY f.StoreID;"
+        ]
+      },
+      {
+        "id": "rowstore_index_on_the_fact",
+        "class": "ineffective",
+        "why": "A rowstore index on SaleDate over 1.4B rows costs load time and space, and a 30-day range through it is slower than the eliminated columnstore scan.",
+        "signals": {
+          "all": [
+            "create (unique )?nonclustered index on qe\\.factsales"
+          ]
+        },
+        "on": "indexes",
+        "example_index": {
+          "table": "qe.FactSales",
+          "key_columns": [
+            "SaleDate"
+          ],
+          "include_columns": [
+            "StoreID",
+            "Quantity",
+            "NetAmount"
+          ]
+        }
+      }
+    ],
+    "index": {
+      "role": "none"
+    },
+    "min_improvement": {
+      "metric": "cpu_ms",
+      "ratio": 5,
+      "basis": "About 30 of 1,400 row groups hold a 30-day range, because rows are loaded in SaleDate order."
+    }
+  }
+}

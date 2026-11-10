@@ -1,0 +1,146 @@
+{
+  "format_version": 1,
+  "id": "new-05-not-in-nullable-outer-column",
+  "kind": "tuning",
+  "title": "NOT IN where the outer column is nullable and the list is never NULL",
+  "split": "public",
+  "source": "s6-new:05",
+  "tags": [
+    "not-in-null",
+    "anti-join",
+    "empty-set"
+  ],
+  "prompt": [
+    "Promotions audit, run each morning for the last quarter (about 1.1M orders). Runtime about 95 s. Plan: Nested Loops",
+    "(Left Anti Semi Join) with a Row Count Spool, because Orders.PromoCode is nullable. BlockedPromoCodes.PromoCode is",
+    "the primary key, so the list never holds a NULL. Today the report returns about 160k rows: orders with a promo code",
+    "that is not blocked. Orders without a promo code (85% of all orders) are not in the report, and finance reads the row",
+    "count as 'orders with a valid promo code'. The list is reloaded nightly by truncate and insert, and the audit has run",
+    "during that reload before."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.Orders",
+      "qe.BlockedPromoCodes"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "Orders: 30M rows, 2016 to now, ~12k per day now. The 25 partner customers own ~9M orders (30%), up to 1.2M each. Other customers average ~10 orders (max ~400). The density estimate for CustomerID is ~15 rows. Status: Shipped 83.8%, Cancelled 7%, Paid 6%, Returned 3%, Pending 0.2% (~60k rows, all from the last 72 hours). SalesChannel: Web 62%, Store 20%, Partner 12%, Phone 6%. PromoCode is NULL for 85%. ShipRegionID is NULL for Store pickups (~20%). OrderDate is datetime2(7); Partner and Store imports stamp one timestamp on a whole batch, so many orders of one customer share an OrderDate.",
+    "BlockedPromoCodes: 40k rows. PromoCode is the primary key (NOT NULL). The list is reloaded nightly by truncate and insert."
+  ],
+  "baseline_kind": "select",
+  "baseline_sql": [
+    "SELECT o.OrderID, o.CustomerID, o.TotalAmount",
+    "FROM qe.Orders o",
+    "WHERE o.OrderDate >= @From",
+    "  AND o.PromoCode NOT IN (SELECT b.PromoCode FROM qe.BlockedPromoCodes b);"
+  ],
+  "parameter_cases": [
+    {
+      "name": "last_quarter",
+      "values": {
+        "From": "2026-07-01"
+      },
+      "types": {
+        "From": "datetime2(3)"
+      },
+      "weight": 1.0
+    }
+  ],
+  "key": {
+    "decision": "rewrite",
+    "correct_families": [
+      {
+        "id": "not_exists_with_outer_null_rule",
+        "description": "NOT EXISTS for the match, plus the outer NULL rule of NOT IN: an order with no promo code is returned only when the list is empty.",
+        "signals": {
+          "all": [
+            "not exists",
+            "o\\.PromoCode is not null\\s+or\\s+not exists|not exists\\s*\\([^)]*\\)\\s*or\\s+o\\.PromoCode is not null"
+          ]
+        },
+        "reference_sql": [
+          "SELECT o.OrderID, o.CustomerID, o.TotalAmount",
+          "FROM qe.Orders o",
+          "WHERE o.OrderDate >= @From",
+          "  AND NOT EXISTS (SELECT 1 FROM qe.BlockedPromoCodes b WHERE b.PromoCode = o.PromoCode)",
+          "  AND (o.PromoCode IS NOT NULL OR NOT EXISTS (SELECT 1 FROM qe.BlockedPromoCodes b));"
+        ]
+      }
+    ],
+    "traps": [
+      {
+        "id": "plain_not_exists",
+        "class": "not_equivalent",
+        "why": "NOT EXISTS keeps an order whose PromoCode is NULL; NOT IN rejects it. The report grows from about 160k rows to more than a million.",
+        "signals": {
+          "all": [
+            "not exists"
+          ],
+          "none": [
+            "o\\.PromoCode is not null"
+          ]
+        },
+        "told_apart_by": "Today's data: every order of the quarter that has no promo code.",
+        "example_sql": [
+          "SELECT o.OrderID, o.CustomerID, o.TotalAmount",
+          "FROM qe.Orders o",
+          "WHERE o.OrderDate >= @From",
+          "  AND NOT EXISTS (SELECT 1 FROM qe.BlockedPromoCodes b WHERE b.PromoCode = o.PromoCode);"
+        ]
+      },
+      {
+        "id": "intent_form",
+        "class": "not_equivalent",
+        "why": "PromoCode IS NOT NULL AND NOT EXISTS (match) differs from NOT IN while the list is empty: NOT IN then returns the orders without a promo code as well.",
+        "signals": {
+          "all": [
+            "not exists",
+            "o\\.PromoCode is not null"
+          ],
+          "none": [
+            "o\\.PromoCode is not null\\s+or\\b",
+            "\\bor\\s+o\\.PromoCode is not null"
+          ]
+        },
+        "told_apart_by": "BlockedPromoCodes empty, as it is during the nightly reload.",
+        "example_sql": [
+          "SELECT o.OrderID, o.CustomerID, o.TotalAmount",
+          "FROM qe.Orders o",
+          "WHERE o.OrderDate >= @From",
+          "  AND o.PromoCode IS NOT NULL",
+          "  AND NOT EXISTS (SELECT 1 FROM qe.BlockedPromoCodes b WHERE b.PromoCode = o.PromoCode);"
+        ]
+      },
+      {
+        "id": "left_join_is_null",
+        "class": "not_equivalent",
+        "why": "LEFT JOIN ... IS NULL keeps the orders without a promo code, like plain NOT EXISTS.",
+        "signals": {
+          "all": [
+            "left (outer )?join qe\\.BlockedPromoCodes"
+          ]
+        },
+        "told_apart_by": "Today's data: every order of the quarter that has no promo code.",
+        "example_sql": [
+          "SELECT o.OrderID, o.CustomerID, o.TotalAmount",
+          "FROM qe.Orders o",
+          "LEFT JOIN qe.BlockedPromoCodes b ON b.PromoCode = o.PromoCode",
+          "WHERE o.OrderDate >= @From",
+          "  AND b.PromoCode IS NULL;"
+        ]
+      }
+    ],
+    "index": {
+      "role": "none"
+    },
+    "min_improvement": {
+      "metric": "elapsed_ms",
+      "ratio": 5,
+      "basis": "The spool-based anti join (95 s) becomes one hash or merge anti join over 1.1M orders and 40k codes."
+    },
+    "reference_notes": "The inner column is a primary key, so the 'NULL in the list' rule of NOT IN cannot apply: that part of the proof is backed by a constraint. Tell the owner that the report changes meaning while the list is empty."
+  }
+}

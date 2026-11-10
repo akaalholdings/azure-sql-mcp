@@ -1,0 +1,152 @@
+{
+  "format_version": 1,
+  "id": "new-08-key-lookup-partner-orders",
+  "kind": "tuning",
+  "title": "Recent orders of a partner: one key lookup per order",
+  "split": "public",
+  "source": "s6-new:08",
+  "tags": [
+    "key-lookup",
+    "index-only"
+  ],
+  "prompt": [
+    "Partner portal export of recent orders, about 300 calls a day, each for one of the 25 partner accounts. A call for a",
+    "partner with 1.2M orders takes about 40 s and about 3.7M logical reads, and returns about 90k rows for the usual",
+    "90-day range. Plan: Index Seek on IX_Orders_CustomerID (1.2M rows), then a Key Lookup into PK_Orders for every row",
+    "(OrderDate, TotalAmount, SalesChannel), then a Filter on OrderDate. The same statement runs for normal customers in",
+    "1 ms. The predicate is sargable and the types match."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.Orders"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "Orders: 30M rows, 2016 to now, ~12k per day now. The 25 partner customers own ~9M orders (30%), up to 1.2M each. Other customers average ~10 orders (max ~400). The density estimate for CustomerID is ~15 rows. Status: Shipped 83.8%, Cancelled 7%, Paid 6%, Returned 3%, Pending 0.2% (~60k rows, all from the last 72 hours). SalesChannel: Web 62%, Store 20%, Partner 12%, Phone 6%. PromoCode is NULL for 85%. ShipRegionID is NULL for Store pickups (~20%). OrderDate is datetime2(7); Partner and Store imports stamp one timestamp on a whole batch, so many orders of one customer share an OrderDate."
+  ],
+  "baseline_kind": "select",
+  "baseline_sql": [
+    "SELECT o.OrderID, o.OrderDate, o.TotalAmount, o.SalesChannel",
+    "FROM qe.Orders o",
+    "WHERE o.CustomerID = @CustomerID",
+    "  AND o.OrderDate >= @From;"
+  ],
+  "parameter_cases": [
+    {
+      "name": "partner_90_days",
+      "values": {
+        "CustomerID": 7,
+        "From": "2026-07-12"
+      },
+      "types": {
+        "CustomerID": "int",
+        "From": "datetime2(3)"
+      },
+      "weight": 0.6
+    },
+    {
+      "name": "normal_customer",
+      "values": {
+        "CustomerID": 48213,
+        "From": "2026-07-12"
+      },
+      "types": {
+        "CustomerID": "int",
+        "From": "datetime2(3)"
+      },
+      "weight": 0.4
+    }
+  ],
+  "key": {
+    "decision": "index_only",
+    "correct_families": [],
+    "traps": [
+      {
+        "id": "date_first_key",
+        "class": "ineffective",
+        "why": "With OrderDate first, the seek covers every customer's orders in the range (about 1.1M rows a quarter) and filters CustomerID afterwards.",
+        "signals": {
+          "all": [
+            "on qe\\.orders \\(orderdate, customerid"
+          ]
+        },
+        "on": "indexes",
+        "example_index": {
+          "table": "qe.Orders",
+          "key_columns": [
+            "OrderDate",
+            "CustomerID"
+          ],
+          "include_columns": [
+            "TotalAmount",
+            "SalesChannel"
+          ]
+        }
+      },
+      {
+        "id": "index_hint",
+        "class": "ineffective",
+        "why": "A hint cannot remove lookups for columns the index does not hold.",
+        "signals": {
+          "any": [
+            "with\\s*\\(\\s*(index|forceseek)",
+            "option\\s*\\(\\s*(recompile|optimize for)"
+          ]
+        },
+        "example_sql": [
+          "SELECT o.OrderID, o.OrderDate, o.TotalAmount, o.SalesChannel",
+          "FROM qe.Orders o WITH (FORCESEEK)",
+          "WHERE o.CustomerID = @CustomerID",
+          "  AND o.OrderDate >= @From;"
+        ]
+      },
+      {
+        "id": "offline_build",
+        "class": "unsafe",
+        "why": "An offline build blocks the Orders table, which takes inserts all day.",
+        "signals": {
+          "all": [
+            "online\\s*=\\s*off"
+          ]
+        },
+        "on": "indexes",
+        "example_index": {
+          "table": "qe.Orders",
+          "key_columns": [
+            "CustomerID",
+            "OrderDate"
+          ],
+          "include_columns": [
+            "TotalAmount",
+            "SalesChannel"
+          ],
+          "options": "ONLINE = OFF"
+        }
+      }
+    ],
+    "index": {
+      "role": "required",
+      "accepted": [
+        {
+          "table": "qe.Orders",
+          "key_columns": [
+            "CustomerID",
+            "OrderDate"
+          ],
+          "include_columns": [
+            "TotalAmount",
+            "SalesChannel"
+          ]
+        }
+      ]
+    },
+    "min_improvement": {
+      "metric": "logical_reads",
+      "ratio": 50,
+      "basis": "1.2M lookups (about 3.7M reads) become one covering range seek over about 90k rows."
+    },
+    "reference_notes": "The new index leads with CustomerID, so it also serves what IX_Orders_CustomerID serves. Review that index for removal after the new one is proven."
+  }
+}

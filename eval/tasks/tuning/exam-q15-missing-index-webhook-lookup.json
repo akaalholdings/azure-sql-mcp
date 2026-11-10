@@ -1,0 +1,176 @@
+{
+  "format_version": 1,
+  "id": "exam-q15-missing-index-webhook-lookup",
+  "kind": "tuning",
+  "title": "Payment webhook lookup by provider reference: the query is right, the index is missing",
+  "split": "public",
+  "source": "rewrite-exam-v1:Q15",
+  "tags": [
+    "missing-index",
+    "index-only"
+  ],
+  "prompt": [
+    "Payment-provider webhook handler: about 0.5 calls per second on average, bursts of 5 per second after settlement",
+    "runs. Each call: about 1.4 s elapsed, 6 s CPU at DOP 8, and 1.1M logical reads. Plan: parallel Clustered Index Scan",
+    "of PK_Payments (60M rows) with predicate ExternalRef = @ExternalRef; it returns 0 to 2 rows. The parameter is",
+    "nvarchar(64), the same type as the column. CPU is pinned during bursts. The table takes about 180 inserts per second",
+    "around the clock."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.Payments"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "Payments: 60M rows. Status: Settled 88%, Failed 6%, Refunded 4% (negative Amount), Pending 2%. ExternalRef is NULL for ~30%; non-NULL values are almost unique, with a few duplicates from provider retries. Partner accounts have up to 180k Settled or Refunded payments each. Settlement batches stamp the same PaidAt on 50-500 payments."
+  ],
+  "baseline_kind": "select",
+  "baseline_sql": [
+    "SELECT p.PaymentID, p.OrderID, p.Amount, p.Status",
+    "FROM qe.Payments p",
+    "WHERE p.ExternalRef = @ExternalRef;"
+  ],
+  "parameter_cases": [
+    {
+      "name": "existing_reference",
+      "values": {
+        "ExternalRef": "ch_3PqX81aa02"
+      },
+      "types": {
+        "ExternalRef": "nvarchar(64)"
+      },
+      "weight": 0.9
+    },
+    {
+      "name": "unknown_reference",
+      "values": {
+        "ExternalRef": "ch_does_not_exist"
+      },
+      "types": {
+        "ExternalRef": "nvarchar(64)"
+      },
+      "weight": 0.1
+    }
+  ],
+  "key": {
+    "decision": "index_only",
+    "correct_families": [],
+    "traps": [
+      {
+        "id": "cast_parameter_to_varchar",
+        "class": "not_equivalent",
+        "why": "There is no implicit conversion to fix: the types already match. A cast to varchar loses characters outside the code page and can match the wrong reference.",
+        "signals": {
+          "any": [
+            "cast\\(\\s*@ExternalRef as varchar",
+            "convert\\(\\s*varchar(\\(\\s*\\d+\\s*\\))?\\s*,\\s*@ExternalRef"
+          ]
+        },
+        "told_apart_by": "A provider reference that contains a character outside code page 1252.",
+        "example_sql": [
+          "SELECT p.PaymentID, p.OrderID, p.Amount, p.Status",
+          "FROM qe.Payments p",
+          "WHERE p.ExternalRef = CAST(@ExternalRef AS varchar(64));"
+        ]
+      },
+      {
+        "id": "hint_instead_of_index",
+        "class": "ineffective",
+        "why": "RECOMPILE or MAXDOP 1 lowers the parallel CPU, but each call still reads 1.1M pages.",
+        "signals": {
+          "all": [
+            "option\\s*\\(\\s*(recompile|maxdop)"
+          ]
+        },
+        "example_sql": [
+          "SELECT p.PaymentID, p.OrderID, p.Amount, p.Status",
+          "FROM qe.Payments p",
+          "WHERE p.ExternalRef = @ExternalRef",
+          "OPTION (MAXDOP 1);"
+        ]
+      },
+      {
+        "id": "unique_index",
+        "class": "unsafe",
+        "why": "Provider retries create duplicate references. A unique build fails, or later inserts fail.",
+        "signals": {
+          "all": [
+            "create unique"
+          ]
+        },
+        "on": "indexes",
+        "example_index": {
+          "table": "qe.Payments",
+          "key_columns": [
+            "ExternalRef"
+          ],
+          "include_columns": [
+            "OrderID",
+            "Amount",
+            "Status"
+          ],
+          "unique": true
+        }
+      },
+      {
+        "id": "offline_build",
+        "class": "unsafe",
+        "why": "An offline build blocks a table that takes 180 inserts per second.",
+        "signals": {
+          "all": [
+            "online\\s*=\\s*off"
+          ]
+        },
+        "on": "indexes",
+        "example_index": {
+          "table": "qe.Payments",
+          "key_columns": [
+            "ExternalRef"
+          ],
+          "include_columns": [
+            "OrderID",
+            "Amount",
+            "Status"
+          ],
+          "options": "ONLINE = OFF"
+        }
+      }
+    ],
+    "index": {
+      "role": "required",
+      "accepted": [
+        {
+          "table": "qe.Payments",
+          "key_columns": [
+            "ExternalRef"
+          ],
+          "include_columns": [
+            "OrderID",
+            "Amount",
+            "Status"
+          ]
+        },
+        {
+          "table": "qe.Payments",
+          "key_columns": [
+            "ExternalRef"
+          ],
+          "include_columns": [
+            "OrderID",
+            "Amount",
+            "Status"
+          ],
+          "filter": "ExternalRef IS NOT NULL"
+        }
+      ]
+    },
+    "min_improvement": {
+      "metric": "logical_reads",
+      "ratio": 1000,
+      "basis": "1.1M logical reads per call become a seek of 3 or 4 reads."
+    },
+    "reference_notes": "Build the index ONLINE and RESUMABLE. Use the filtered form only after the plan of the parameterized statement is seen to choose it."
+  }
+}

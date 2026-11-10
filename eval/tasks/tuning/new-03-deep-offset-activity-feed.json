@@ -1,0 +1,185 @@
+{
+  "format_version": 1,
+  "id": "new-03-deep-offset-activity-feed",
+  "kind": "tuning",
+  "title": "Activity feed that pages with OFFSET through millions of rows",
+  "split": "public",
+  "source": "s6-new:03",
+  "tags": [
+    "deep-offset-paging",
+    "keyset"
+  ],
+  "prompt": [
+    "Activity feed with infinite scroll. Partner accounts have up to 40M events and their staff scroll deep: @Skip of",
+    "200,000 and more is common, and such a page takes 4 to 9 s and about 200,000 logical reads. Plan: Index Seek on",
+    "IX_Events_Customer, backward, then Top with an offset: every skipped row is read and discarded. The client already",
+    "holds the EventTime and EventID of the last row it showed. The API team will send them as @LastEventTime",
+    "datetime2(7) and @LastEventID bigint in place of @Skip from the next release; the first page is a separate call that",
+    "is already fast. Several events of one customer can share an EventTime."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.Events"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "Events: 900M rows, append-only, ~1.5M per day. Partner accounts have up to 40M events each."
+  ],
+  "baseline_kind": "select",
+  "baseline_sql": [
+    "SELECT e.EventID, e.EventTime, e.EventType",
+    "FROM qe.Events e",
+    "WHERE e.CustomerID = @CustomerID",
+    "ORDER BY e.EventTime DESC, e.EventID DESC",
+    "OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY;"
+  ],
+  "parameter_cases": [
+    {
+      "name": "deep_page",
+      "values": {
+        "CustomerID": 7,
+        "Skip": 200000,
+        "Take": 50
+      },
+      "types": {
+        "CustomerID": "int",
+        "Skip": "int",
+        "Take": "int"
+      },
+      "weight": 0.7
+    },
+    {
+      "name": "shallow_page",
+      "values": {
+        "CustomerID": 48213,
+        "Skip": 50,
+        "Take": 50
+      },
+      "types": {
+        "CustomerID": "int",
+        "Skip": "int",
+        "Take": "int"
+      },
+      "weight": 0.3
+    }
+  ],
+  "key": {
+    "decision": "rewrite",
+    "correct_families": [
+      {
+        "id": "keyset_on_time_and_id",
+        "description": "Seek straight to the row after the last one shown, using both sort columns, and read @Take rows.",
+        "signals": {
+          "all": [
+            "top\\s*\\(\\s*@Take\\s*\\)",
+            "e\\.EventTime\\s*<\\s*@LastEventTime",
+            "e\\.EventTime\\s*=\\s*@LastEventTime\\s+and\\s+e\\.EventID\\s*<\\s*@LastEventID",
+            "order by e\\.EventTime desc\\s*,\\s*e\\.EventID desc"
+          ],
+          "none": [
+            "\\boffset\\b"
+          ]
+        },
+        "reference_sql": [
+          "SELECT TOP (@Take) e.EventID, e.EventTime, e.EventType",
+          "FROM qe.Events e",
+          "WHERE e.CustomerID = @CustomerID",
+          "  AND (e.EventTime < @LastEventTime OR (e.EventTime = @LastEventTime AND e.EventID < @LastEventID))",
+          "ORDER BY e.EventTime DESC, e.EventID DESC;"
+        ]
+      }
+    ],
+    "traps": [
+      {
+        "id": "keyset_on_time_only",
+        "class": "not_equivalent",
+        "why": "A predicate on EventTime alone skips the events that share the last timestamp shown.",
+        "signals": {
+          "all": [
+            "e\\.EventTime\\s*<\\s*@LastEventTime"
+          ],
+          "none": [
+            "@LastEventID"
+          ]
+        },
+        "told_apart_by": "Three events of the customer with one EventTime, with the page boundary after the first.",
+        "example_sql": [
+          "SELECT TOP (@Take) e.EventID, e.EventTime, e.EventType",
+          "FROM qe.Events e",
+          "WHERE e.CustomerID = @CustomerID",
+          "  AND e.EventTime < @LastEventTime",
+          "ORDER BY e.EventTime DESC, e.EventID DESC;"
+        ]
+      },
+      {
+        "id": "inclusive_boundary",
+        "class": "not_equivalent",
+        "why": "<= on the last key returns the last row of the previous page again.",
+        "signals": {
+          "any": [
+            "e\\.EventID\\s*<=\\s*@LastEventID"
+          ]
+        },
+        "told_apart_by": "Any page after the first: its first row repeats the previous page's last row.",
+        "example_sql": [
+          "SELECT TOP (@Take) e.EventID, e.EventTime, e.EventType",
+          "FROM qe.Events e",
+          "WHERE e.CustomerID = @CustomerID",
+          "  AND (e.EventTime < @LastEventTime OR (e.EventTime = @LastEventTime AND e.EventID <= @LastEventID))",
+          "ORDER BY e.EventTime DESC, e.EventID DESC;"
+        ]
+      },
+      {
+        "id": "tiebreaker_missing_from_order",
+        "class": "not_equivalent",
+        "why": "Without EventID in ORDER BY, TOP can take any of the events that share a timestamp, so rows are skipped or repeated at the page boundary.",
+        "signals": {
+          "all": [
+            "@LastEventID"
+          ],
+          "none": [
+            "order by e\\.EventTime desc\\s*,\\s*e\\.EventID desc"
+          ]
+        },
+        "told_apart_by": "Three events of the customer with one EventTime at a page boundary.",
+        "example_sql": [
+          "SELECT TOP (@Take) e.EventID, e.EventTime, e.EventType",
+          "FROM qe.Events e",
+          "WHERE e.CustomerID = @CustomerID",
+          "  AND (e.EventTime < @LastEventTime OR (e.EventTime = @LastEventTime AND e.EventID < @LastEventID))",
+          "ORDER BY e.EventTime DESC;"
+        ]
+      },
+      {
+        "id": "row_number_paging",
+        "class": "ineffective",
+        "why": "ROW_NUMBER with a range filter numbers every row up to the page, the same work as OFFSET.",
+        "signals": {
+          "all": [
+            "row_number\\s*\\("
+          ]
+        },
+        "example_sql": [
+          "SELECT t.EventID, t.EventTime, t.EventType",
+          "FROM (SELECT e.EventID, e.EventTime, e.EventType,",
+          "             ROW_NUMBER() OVER (ORDER BY e.EventTime DESC, e.EventID DESC) AS rn",
+          "      FROM qe.Events e",
+          "      WHERE e.CustomerID = @CustomerID) t",
+          "WHERE t.rn > @Skip AND t.rn <= @Skip + @Take",
+          "ORDER BY t.rn;"
+        ]
+      }
+    ],
+    "index": {
+      "role": "none"
+    },
+    "min_improvement": {
+      "metric": "logical_reads",
+      "ratio": 20,
+      "basis": "A page at @Skip = 200,000 reads about 200,000 index rows. A keyset seek reads @Take rows."
+    },
+    "reference_notes": "The candidate takes @LastEventTime and @LastEventID where the baseline takes @Skip. To compare them, the live tier must set the two values to the EventTime and EventID of row number @Skip in the baseline order."
+  }
+}

@@ -1,0 +1,194 @@
+{
+  "format_version": 1,
+  "id": "exam-q05-latest-order-per-customer-with-ties",
+  "kind": "tuning",
+  "title": "Latest order per Gold customer, where ties are real",
+  "split": "public",
+  "source": "rewrite-exam-v1:Q05",
+  "tags": [
+    "top-n-per-group",
+    "ties"
+  ],
+  "prompt": [
+    "Nightly retention-email job, always called with @Tier = 'G' (about 150k customers and 3.2M of their orders). It",
+    "runs about 9 minutes. The plan scans Orders twice with hash joins and a hash aggregate that spills to tempdb.",
+    "Store and Partner imports stamp one timestamp on a whole batch, so about 4% of Gold customers have two or more",
+    "orders that share their latest OrderDate. The email lists every latest order. Gold customers with no orders must",
+    "not appear."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.Customers",
+      "qe.Orders"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "Customers: 2.0M rows. Tier S = 1.85M, G = ~150k, P = 25 partner accounts (CustomerID 1 to 25). IsActive = 1 for 88%. Email is NULL for ~9% (~180k rows, ~160k of them active). About 2% of non-NULL emails are shared by two or more customer rows (households). ReferredByCustomerID is non-NULL for 18%; 312 rows are self-referrals (ReferredByCustomerID = CustomerID, CustomerID 500001 to 500312). AccountNumber always matches 'AC' + 10 digits (CHECK constraint).",
+    "Orders: 30M rows, 2016 to now, ~12k per day now. The 25 partner customers own ~9M orders (30%), up to 1.2M each. Other customers average ~10 orders (max ~400). The density estimate for CustomerID is ~15 rows. Status: Shipped 83.8%, Cancelled 7%, Paid 6%, Returned 3%, Pending 0.2% (~60k rows, all from the last 72 hours). SalesChannel: Web 62%, Store 20%, Partner 12%, Phone 6%. PromoCode is NULL for 85%. ShipRegionID is NULL for Store pickups (~20%). OrderDate is datetime2(7); Partner and Store imports stamp one timestamp on a whole batch, so many orders of one customer share an OrderDate."
+  ],
+  "baseline_kind": "select",
+  "baseline_sql": [
+    "SELECT c.CustomerID, c.AccountNumber, o.OrderID, o.OrderDate, o.TotalAmount",
+    "FROM qe.Customers c",
+    "JOIN qe.Orders o ON o.CustomerID = c.CustomerID",
+    "WHERE c.Tier = @Tier",
+    "  AND o.OrderDate = (SELECT MAX(o2.OrderDate)",
+    "                     FROM qe.Orders o2",
+    "                     WHERE o2.CustomerID = c.CustomerID);"
+  ],
+  "parameter_cases": [
+    {
+      "name": "gold",
+      "values": {
+        "Tier": "G"
+      },
+      "types": {
+        "Tier": "char(1)"
+      },
+      "weight": 1.0
+    }
+  ],
+  "key": {
+    "decision": "rewrite",
+    "accepted_decisions": [
+      "rewrite",
+      "index_only"
+    ],
+    "correct_families": [
+      {
+        "id": "apply_top_with_ties",
+        "description": "One ordered seek per customer that returns every order tied on the latest OrderDate.",
+        "signals": {
+          "all": [
+            "cross apply",
+            "top\\s*\\(\\s*1\\s*\\)\\s*with ties"
+          ]
+        },
+        "reference_sql": [
+          "SELECT c.CustomerID, c.AccountNumber, lo.OrderID, lo.OrderDate, lo.TotalAmount",
+          "FROM qe.Customers c",
+          "CROSS APPLY (",
+          "    SELECT TOP (1) WITH TIES o.OrderID, o.OrderDate, o.TotalAmount",
+          "    FROM qe.Orders o",
+          "    WHERE o.CustomerID = c.CustomerID",
+          "    ORDER BY o.OrderDate DESC",
+          ") lo",
+          "WHERE c.Tier = @Tier;"
+        ]
+      },
+      {
+        "id": "rank_equals_one",
+        "description": "RANK or DENSE_RANK keeps every tied row.",
+        "signals": {
+          "all": [
+            "\\b(dense_)?rank\\s*\\(\\s*\\)\\s*over"
+          ],
+          "none": [
+            "row_number"
+          ]
+        },
+        "reference_sql": [
+          "SELECT t.CustomerID, t.AccountNumber, t.OrderID, t.OrderDate, t.TotalAmount",
+          "FROM (SELECT c.CustomerID, c.AccountNumber, o.OrderID, o.OrderDate, o.TotalAmount,",
+          "             RANK() OVER (PARTITION BY o.CustomerID ORDER BY o.OrderDate DESC) AS rk",
+          "      FROM qe.Customers c",
+          "      JOIN qe.Orders o ON o.CustomerID = c.CustomerID",
+          "      WHERE c.Tier = @Tier) t",
+          "WHERE t.rk = 1;"
+        ]
+      }
+    ],
+    "traps": [
+      {
+        "id": "row_number",
+        "class": "not_equivalent",
+        "why": "ROW_NUMBER keeps one row per customer. About 4% of Gold customers lose tied latest orders.",
+        "signals": {
+          "all": [
+            "row_number\\s*\\("
+          ]
+        },
+        "told_apart_by": "A customer with two orders on the same latest OrderDate.",
+        "example_sql": [
+          "SELECT t.CustomerID, t.AccountNumber, t.OrderID, t.OrderDate, t.TotalAmount",
+          "FROM (SELECT c.CustomerID, c.AccountNumber, o.OrderID, o.OrderDate, o.TotalAmount,",
+          "             ROW_NUMBER() OVER (PARTITION BY o.CustomerID ORDER BY o.OrderDate DESC) AS rk",
+          "      FROM qe.Customers c",
+          "      JOIN qe.Orders o ON o.CustomerID = c.CustomerID",
+          "      WHERE c.Tier = @Tier) t",
+          "WHERE t.rk = 1;"
+        ]
+      },
+      {
+        "id": "top_one_without_ties",
+        "class": "not_equivalent",
+        "why": "TOP (1) without WITH TIES returns one of the tied orders, with or without a tiebreaker.",
+        "signals": {
+          "all": [
+            "top\\s*\\(\\s*1\\s*\\)"
+          ],
+          "none": [
+            "with ties"
+          ]
+        },
+        "told_apart_by": "A customer with two orders on the same latest OrderDate.",
+        "example_sql": [
+          "SELECT c.CustomerID, c.AccountNumber, lo.OrderID, lo.OrderDate, lo.TotalAmount",
+          "FROM qe.Customers c",
+          "CROSS APPLY (",
+          "    SELECT TOP (1) o.OrderID, o.OrderDate, o.TotalAmount",
+          "    FROM qe.Orders o",
+          "    WHERE o.CustomerID = c.CustomerID",
+          "    ORDER BY o.OrderDate DESC",
+          ") lo",
+          "WHERE c.Tier = @Tier;"
+        ]
+      },
+      {
+        "id": "outer_apply_adds_customers",
+        "class": "not_equivalent",
+        "why": "OUTER APPLY returns Gold customers that have no orders, with NULL order columns.",
+        "signals": {
+          "all": [
+            "outer apply"
+          ]
+        },
+        "told_apart_by": "A Gold customer with no orders.",
+        "example_sql": [
+          "SELECT c.CustomerID, c.AccountNumber, lo.OrderID, lo.OrderDate, lo.TotalAmount",
+          "FROM qe.Customers c",
+          "OUTER APPLY (",
+          "    SELECT TOP (1) WITH TIES o.OrderID, o.OrderDate, o.TotalAmount",
+          "    FROM qe.Orders o",
+          "    WHERE o.CustomerID = c.CustomerID",
+          "    ORDER BY o.OrderDate DESC",
+          ") lo",
+          "WHERE c.Tier = @Tier;"
+        ]
+      }
+    ],
+    "index": {
+      "role": "required",
+      "accepted": [
+        {
+          "table": "qe.Orders",
+          "key_columns": [
+            "CustomerID",
+            "OrderDate"
+          ],
+          "include_columns": [
+            "TotalAmount"
+          ]
+        }
+      ]
+    },
+    "min_improvement": {
+      "metric": "elapsed_ms",
+      "ratio": 5,
+      "basis": "Two full passes over Orders and a spilling aggregate (9 minutes) against about 150k short ordered seeks."
+    },
+    "reference_notes": "Adding only the index is acceptable for speed. IX_Orders_CustomerID cannot give OrderDate order or TotalAmount."
+  }
+}

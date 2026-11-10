@@ -1,0 +1,247 @@
+{
+  "format_version": 1,
+  "id": "exam-q07-five-correlated-subqueries",
+  "kind": "tuning",
+  "title": "Five correlated subqueries in the SELECT list",
+  "split": "public",
+  "source": "rewrite-exam-v1:Q07",
+  "tags": [
+    "correlated-subquery",
+    "fan-out",
+    "null-versus-zero"
+  ],
+  "prompt": [
+    "Monthly export, usually @Channel = 'Web' for one month (about 230k orders). It runs about 4.5 minutes. Plan: five",
+    "outer-join branches. OrderLines is read twice and Payments three times, each Payments access through",
+    "IX_Payments_OrderID and a Key Lookup. The consumer is a finance CSV that distinguishes NULL from 0: an order with no",
+    "lines must show LineCount 0 and Units empty (NULL). An order with no settled payment shows SettledAmount, LastPaidAt",
+    "and LastMethod empty. Orders with several payments and orders with several lines are both common."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.Orders",
+      "qe.OrderLines",
+      "qe.Payments"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "Orders: 30M rows, 2016 to now, ~12k per day now. The 25 partner customers own ~9M orders (30%), up to 1.2M each. Other customers average ~10 orders (max ~400). The density estimate for CustomerID is ~15 rows. Status: Shipped 83.8%, Cancelled 7%, Paid 6%, Returned 3%, Pending 0.2% (~60k rows, all from the last 72 hours). SalesChannel: Web 62%, Store 20%, Partner 12%, Phone 6%. PromoCode is NULL for 85%. ShipRegionID is NULL for Store pickups (~20%). OrderDate is datetime2(7); Partner and Store imports stamp one timestamp on a whole batch, so many orders of one customer share an OrderDate.",
+    "OrderLines: 120M rows, 4 per order on average. About 0.3% of orders have no lines.",
+    "Payments: 60M rows. Status: Settled 88%, Failed 6%, Refunded 4% (negative Amount), Pending 2%. ExternalRef is NULL for ~30%; non-NULL values are almost unique, with a few duplicates from provider retries. Partner accounts have up to 180k Settled or Refunded payments each. Settlement batches stamp the same PaidAt on 50-500 payments."
+  ],
+  "baseline_kind": "select",
+  "baseline_sql": [
+    "SELECT o.OrderID, o.OrderDate, o.Status, o.TotalAmount,",
+    "       (SELECT COUNT(*)         FROM qe.OrderLines ol WHERE ol.OrderID = o.OrderID)                        AS LineCount,",
+    "       (SELECT SUM(ol.Quantity) FROM qe.OrderLines ol WHERE ol.OrderID = o.OrderID)                        AS Units,",
+    "       (SELECT SUM(p.Amount)    FROM qe.Payments p WHERE p.OrderID = o.OrderID AND p.Status = 'Settled')   AS SettledAmount,",
+    "       (SELECT MAX(p.PaidAt)    FROM qe.Payments p WHERE p.OrderID = o.OrderID AND p.Status = 'Settled')   AS LastPaidAt,",
+    "       (SELECT TOP (1) p.PaymentMethod FROM qe.Payments p",
+    "         WHERE p.OrderID = o.OrderID AND p.Status = 'Settled' ORDER BY p.PaidAt DESC)                      AS LastMethod",
+    "FROM qe.Orders o",
+    "WHERE o.OrderDate >= @From AND o.OrderDate < @To",
+    "  AND o.SalesChannel = @Channel;"
+  ],
+  "parameter_cases": [
+    {
+      "name": "web_month",
+      "values": {
+        "From": "2026-09-01",
+        "To": "2026-10-01",
+        "Channel": "Web"
+      },
+      "types": {
+        "From": "datetime2(3)",
+        "To": "datetime2(3)",
+        "Channel": "varchar(10)"
+      },
+      "weight": 0.8
+    },
+    {
+      "name": "store_month",
+      "values": {
+        "From": "2026-09-01",
+        "To": "2026-10-01",
+        "Channel": "Store"
+      },
+      "types": {
+        "From": "datetime2(3)",
+        "To": "datetime2(3)",
+        "Channel": "varchar(10)"
+      },
+      "weight": 0.2
+    }
+  ],
+  "key": {
+    "decision": "rewrite",
+    "correct_families": [
+      {
+        "id": "one_apply_per_source",
+        "description": "One scalar-aggregate APPLY per source table, and the last settled payment taken from one row.",
+        "signals": {
+          "all": [
+            "(cross|outer) apply",
+            "count\\(\\s*\\*\\s*\\)",
+            "sum\\(\\s*ol\\.Quantity\\s*\\)"
+          ],
+          "none": [
+            "group by"
+          ]
+        },
+        "reference_sql": [
+          "SELECT o.OrderID, o.OrderDate, o.Status, o.TotalAmount,",
+          "       l.LineCount, l.Units, pa.SettledAmount,",
+          "       lp.PaidAt AS LastPaidAt, lp.PaymentMethod AS LastMethod",
+          "FROM qe.Orders o",
+          "CROSS APPLY (SELECT COUNT(*) AS LineCount, SUM(ol.Quantity) AS Units",
+          "             FROM qe.OrderLines ol",
+          "             WHERE ol.OrderID = o.OrderID) l",
+          "CROSS APPLY (SELECT SUM(p.Amount) AS SettledAmount",
+          "             FROM qe.Payments p",
+          "             WHERE p.OrderID = o.OrderID AND p.Status = 'Settled') pa",
+          "OUTER APPLY (SELECT TOP (1) p.PaidAt, p.PaymentMethod",
+          "             FROM qe.Payments p",
+          "             WHERE p.OrderID = o.OrderID AND p.Status = 'Settled'",
+          "             ORDER BY p.PaidAt DESC, p.PaymentID DESC) lp",
+          "WHERE o.OrderDate >= @From AND o.OrderDate < @To",
+          "  AND o.SalesChannel = @Channel;"
+        ]
+      }
+    ],
+    "traps": [
+      {
+        "id": "join_fan_out",
+        "class": "not_equivalent",
+        "why": "One join to both OrderLines and Payments multiplies the rows: Units is multiplied by the payment count and SettledAmount by the line count.",
+        "signals": {
+          "all": [
+            "join qe\\.OrderLines",
+            "join qe\\.Payments",
+            "group by"
+          ],
+          "none": [
+            "\\bapply\\b"
+          ]
+        },
+        "told_apart_by": "An order with two lines and two settled payments.",
+        "example_sql": [
+          "SELECT o.OrderID, o.OrderDate, o.Status, o.TotalAmount,",
+          "       COUNT(ol.LineNumber) AS LineCount, SUM(ol.Quantity) AS Units,",
+          "       SUM(p.Amount) AS SettledAmount, MAX(p.PaidAt) AS LastPaidAt, MAX(p.PaymentMethod) AS LastMethod",
+          "FROM qe.Orders o",
+          "LEFT JOIN qe.OrderLines ol ON ol.OrderID = o.OrderID",
+          "LEFT JOIN qe.Payments p ON p.OrderID = o.OrderID AND p.Status = 'Settled'",
+          "WHERE o.OrderDate >= @From AND o.OrderDate < @To",
+          "  AND o.SalesChannel = @Channel",
+          "GROUP BY o.OrderID, o.OrderDate, o.Status, o.TotalAmount;"
+        ]
+      },
+      {
+        "id": "null_turned_into_zero",
+        "class": "not_equivalent",
+        "why": "The consumer distinguishes NULL from 0. ISNULL on Units or SettledAmount turns 'no lines' and 'no settled payment' into 0.",
+        "signals": {
+          "any": [
+            "(isnull|coalesce)\\(\\s*sum\\(\\s*(ol\\.Quantity|p\\.Amount)",
+            "(isnull|coalesce)\\(\\s*\\w+\\.(Units|SettledAmount)"
+          ]
+        },
+        "told_apart_by": "An order with no lines, or an order with no settled payment.",
+        "example_sql": [
+          "SELECT o.OrderID, o.OrderDate, o.Status, o.TotalAmount,",
+          "       l.LineCount, l.Units, pa.SettledAmount,",
+          "       lp.PaidAt AS LastPaidAt, lp.PaymentMethod AS LastMethod",
+          "FROM qe.Orders o",
+          "CROSS APPLY (SELECT COUNT(*) AS LineCount, ISNULL(SUM(ol.Quantity), 0) AS Units",
+          "             FROM qe.OrderLines ol",
+          "             WHERE ol.OrderID = o.OrderID) l",
+          "CROSS APPLY (SELECT ISNULL(SUM(p.Amount), 0) AS SettledAmount",
+          "             FROM qe.Payments p",
+          "             WHERE p.OrderID = o.OrderID AND p.Status = 'Settled') pa",
+          "OUTER APPLY (SELECT TOP (1) p.PaidAt, p.PaymentMethod",
+          "             FROM qe.Payments p",
+          "             WHERE p.OrderID = o.OrderID AND p.Status = 'Settled'",
+          "             ORDER BY p.PaidAt DESC, p.PaymentID DESC) lp",
+          "WHERE o.OrderDate >= @From AND o.OrderDate < @To",
+          "  AND o.SalesChannel = @Channel;"
+        ]
+      },
+      {
+        "id": "cross_apply_drops_unpaid_orders",
+        "class": "not_equivalent",
+        "why": "CROSS APPLY on the TOP (1) branch returns no row for an order that has no settled payment.",
+        "signals": {
+          "all": [
+            "cross apply\\s*\\(\\s*select top\\s*\\(\\s*1\\s*\\)"
+          ]
+        },
+        "told_apart_by": "An order with no settled payment.",
+        "example_sql": [
+          "SELECT o.OrderID, o.OrderDate, o.Status, o.TotalAmount,",
+          "       l.LineCount, l.Units, pa.SettledAmount,",
+          "       lp.PaidAt AS LastPaidAt, lp.PaymentMethod AS LastMethod",
+          "FROM qe.Orders o",
+          "CROSS APPLY (SELECT COUNT(*) AS LineCount, SUM(ol.Quantity) AS Units",
+          "             FROM qe.OrderLines ol",
+          "             WHERE ol.OrderID = o.OrderID) l",
+          "CROSS APPLY (SELECT SUM(p.Amount) AS SettledAmount",
+          "             FROM qe.Payments p",
+          "             WHERE p.OrderID = o.OrderID AND p.Status = 'Settled') pa",
+          "CROSS APPLY (SELECT TOP (1) p.PaidAt, p.PaymentMethod",
+          "             FROM qe.Payments p",
+          "             WHERE p.OrderID = o.OrderID AND p.Status = 'Settled'",
+          "             ORDER BY p.PaidAt DESC, p.PaymentID DESC) lp",
+          "WHERE o.OrderDate >= @From AND o.OrderDate < @To",
+          "  AND o.SalesChannel = @Channel;"
+        ]
+      },
+      {
+        "id": "last_method_from_another_row",
+        "class": "not_equivalent",
+        "why": "MAX(PaymentMethod) is the alphabetically last method, not the method of the latest payment.",
+        "signals": {
+          "all": [
+            "max\\(\\s*p\\.PaymentMethod\\s*\\)"
+          ]
+        },
+        "told_apart_by": "An order settled first by PayPal and later by Card.",
+        "example_sql": [
+          "SELECT o.OrderID, o.OrderDate, o.Status, o.TotalAmount,",
+          "       l.LineCount, l.Units, pa.SettledAmount, pa.LastPaidAt, pa.LastMethod",
+          "FROM qe.Orders o",
+          "CROSS APPLY (SELECT COUNT(*) AS LineCount, SUM(ol.Quantity) AS Units",
+          "             FROM qe.OrderLines ol WHERE ol.OrderID = o.OrderID) l",
+          "CROSS APPLY (SELECT SUM(p.Amount) AS SettledAmount, MAX(p.PaidAt) AS LastPaidAt, MAX(p.PaymentMethod) AS LastMethod",
+          "             FROM qe.Payments p WHERE p.OrderID = o.OrderID AND p.Status = 'Settled') pa",
+          "WHERE o.OrderDate >= @From AND o.OrderDate < @To",
+          "  AND o.SalesChannel = @Channel;"
+        ]
+      }
+    ],
+    "index": {
+      "role": "required",
+      "accepted": [
+        {
+          "table": "qe.Payments",
+          "key_columns": [
+            "OrderID"
+          ],
+          "include_columns": [
+            "Status",
+            "PaidAt",
+            "Amount",
+            "PaymentMethod"
+          ]
+        }
+      ]
+    },
+    "min_improvement": {
+      "metric": "logical_reads",
+      "ratio": 2,
+      "basis": "OrderLines goes from two accesses to one, Payments from three to two or one, and the key lookups go."
+    },
+    "reference_notes": "A single Payments access with ROW_NUMBER or MAX(CASE ...) is also exact and cheaper than two accesses."
+  }
+}

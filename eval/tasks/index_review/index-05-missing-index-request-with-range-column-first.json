@@ -1,0 +1,141 @@
+{
+  "format_version": 1,
+  "id": "index-05-missing-index-request-with-range-column-first",
+  "kind": "index_review",
+  "title": "Missing-index request on OrderLine for the sales velocity query",
+  "split": "public",
+  "source": "index-exam-v1:5",
+  "tags": [
+    "missing-index",
+    "key-order",
+    "replace"
+  ],
+  "prompt": [
+    "Azure SQL Database 'RetailOps', General Purpose, 8 vCores, about 41.5 GB of memory, compatibility level 160, no readable secondary. Snapshot taken Thursday 2026-09-24 09:00 UTC. A platform failover reset the index usage counters on 2026-09-15 02:41, so they cover 9.26 days. Query Store holds data from 2026-09-11 only, because size-based cleanup has run. Month-end change freeze: 2026-09-30 18:00 to 2026-10-02 18:00. Flash sale on 2026-10-09 with a change freeze from 2026-10-08. Log rate cap: 36 MB/s. Space headroom: 213 GB.",
+    "The missing-index DMV reports for Q12: equality ProductId; inequality CreatedAt, LineStatus; included Qty, UnitPrice;",
+    "user_seeks 481,900; avg_user_impact 97.1. The advisor script built this from it, with the key in column_id order:",
+    "CREATE INDEX IX_MI_OrderLine_1 ON dbo.OrderLine (CreatedAt, LineStatus, ProductId) INCLUDE (Qty, UnitPrice). Decide",
+    "what to create and what to do with IX_OrderLine_ProductId."
+  ],
+  "usage_window": {
+    "start": "2026-09-15T02:41Z",
+    "end": "2026-09-24T09:00Z",
+    "days": 9.26,
+    "reset_by": "platform failover",
+    "query_store_from": "2026-09-11"
+  },
+  "inventory": [
+    {
+      "table": "dbo.OrderLine",
+      "name": "PK_OrderLine",
+      "type": "clustered",
+      "key_columns": [
+        "OrderId",
+        "LineNo"
+      ],
+      "include_columns": [],
+      "size_gb": 61.0,
+      "usage": {
+        "user_seeks": 18400000,
+        "user_scans": 0,
+        "user_lookups": 6430000000,
+        "user_updates": 26100000
+      },
+      "is_unique": true
+    },
+    {
+      "table": "dbo.OrderLine",
+      "name": "IX_OrderLine_ProductId",
+      "type": "nonclustered",
+      "key_columns": [
+        "ProductId"
+      ],
+      "include_columns": [
+        "Qty"
+      ],
+      "size_gb": 17.4,
+      "usage": {
+        "user_seeks": 481900,
+        "user_scans": 0,
+        "user_lookups": 0,
+        "user_updates": 3300000
+      }
+    }
+  ],
+  "workload": [
+    {
+      "id": "Q12",
+      "description": "Product sales velocity",
+      "sql": [
+        "SELECT SUM(ol.Qty), SUM(ol.Qty * ol.UnitPrice) FROM dbo.OrderLine ol",
+        "WHERE ol.ProductId = @ProductId AND ol.CreatedAt >= @From AND ol.LineStatus <> 'C';"
+      ],
+      "executions_per_day": 52000,
+      "plan": "Index Seek IX_OrderLine_ProductId (about 13,300 rows), Key Lookup PK_OrderLine (13,300), Filter on CreatedAt and LineStatus (about 700 rows remain), Stream Aggregate.",
+      "avg_cpu_ms": 64,
+      "avg_logical_reads": 46000
+    }
+  ],
+  "facts": [
+    "dbo.OrderLine: 640M rows, 1.2M rows inserted a day, about 2.4M LineStatus or AllocatedQty updates a day. Column order: OrderId, LineNo, CreatedAt, LineStatus, ProductId.",
+    "LineStatus: O open 0.3%, A allocated 0.2%, S shipped 93.1%, C cancelled 6.4%.",
+    "ProductId: 13,300 lines per product on average over all time; the top SKU has 4.2M. In the last 30 days: about 750 lines per product, 230k for the top SKU.",
+    "@From is normally 30 days ago. FK_OrderLine_Product references dbo.Product (ProductId)."
+  ],
+  "key": {
+    "create": [
+      {
+        "id": "product_then_date",
+        "accepted": [
+          {
+            "table": "dbo.OrderLine",
+            "key_columns": [
+              "ProductId",
+              "CreatedAt"
+            ],
+            "include_columns": [
+              "LineStatus",
+              "Qty",
+              "UnitPrice"
+            ]
+          }
+        ],
+        "why": "Equality column first, then the range column. LineStatus <> 'C' removes only 6.4% of rows, so it is a residual predicate and belongs in INCLUDE. Reads fall from about 46,000 to tens."
+      }
+    ],
+    "decisions": [
+      {
+        "index": "IX_OrderLine_ProductId",
+        "action": "drop",
+        "why": "The new index has the same leading key and holds Qty, so it replaces this one, including for the foreign key. Drop it after the new index is built and Q12 is seen to use it."
+      }
+    ],
+    "must_not_create": [
+      {
+        "id": "advisor_script_date_first",
+        "table": "dbo.OrderLine",
+        "key_columns": [
+          "CreatedAt"
+        ],
+        "why": "With the range column first, the seek reads every product's lines in the date window."
+      },
+      {
+        "id": "line_status_first",
+        "table": "dbo.OrderLine",
+        "key_columns": [
+          "LineStatus"
+        ],
+        "why": "A four-value column with 93% in one value is not a seek key."
+      },
+      {
+        "id": "line_status_before_date",
+        "table": "dbo.OrderLine",
+        "key_columns": [
+          "ProductId",
+          "LineStatus"
+        ],
+        "why": "An inequality on LineStatus ahead of CreatedAt stops the seek at LineStatus; the date range becomes a residual."
+      }
+    ]
+  }
+}

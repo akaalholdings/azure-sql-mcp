@@ -1,0 +1,191 @@
+{
+  "format_version": 1,
+  "id": "diagnosis-09-deadlocks-during-the-batch-tail",
+  "kind": "diagnosis",
+  "title": "63 deadlocks in five days",
+  "split": "public",
+  "source": "case-exam-v1:9",
+  "tags": [
+    "deadlock",
+    "lock-order",
+    "isolation"
+  ],
+  "prompt": [
+    "Client: Harbourline Commerce, a multi-tenant retail order platform with about 400 tenants. Database hlc-orders-prod: Azure SQL Database, Business Critical, Gen5, 16 vCores, compatibility level 160, READ_COMMITTED_SNAPSHOT ON. All times are UTC. Business hours are 07:30 to 18:00. The nightly batch must finish by 06:00. Evidence was collected from Mon 21 Sep to Sun 27 Sep 2026.",
+    "The application logs 9 to 16 deadlock errors (1205) on each business day. The client's DBA proposes NOLOCK hints, or",
+    "turning READ_COMMITTED_SNAPSHOT off 'because it causes version conflicts'. Batch step 4 is one UPDATE of about 6.2M",
+    "rows of dbo.Inventory; since September it runs between about 07:00 and 09:00. Name the root cause of the deadlocks."
+  ],
+  "evidence": [
+    {
+      "id": "deadlocks",
+      "tool": "get_deadlock_history",
+      "arguments": {},
+      "result": {
+        "result_status": "ok",
+        "window": {
+          "start": "2026-09-21",
+          "end": "2026-09-25"
+        },
+        "deadlock_count": 63,
+        "during_batch_step_4": 63,
+        "outside_batch_step_4": 0,
+        "earliest": "06:59",
+        "latest": "09:01",
+        "pattern": {
+          "resource": "dbo.Inventory primary key",
+          "process_a": "batch step 4 UPDATE: holds PAGE X locks, requests U on another page",
+          "process_b": "dbo.usp_CreateOrder for an order with several lines: holds KEY X on one SKU row, requests U on a SKU row on a page that A holds",
+          "victim": "process B every time"
+        },
+        "note": "usp_CreateOrder updates the SKUs in the order in which the client sends the basket lines."
+      }
+    },
+    {
+      "id": "query_store",
+      "tool": "get_database_configuration",
+      "arguments": {},
+      "result": {
+        "result_status": "ok",
+        "query_store": {
+          "desired_state": "READ_WRITE",
+          "actual_state": "READ_ONLY",
+          "readonly_reason": 65536,
+          "current_storage_size_mb": 1024,
+          "max_storage_size_mb": 1024,
+          "query_capture_mode": "ALL",
+          "size_based_cleanup_mode": "OFF",
+          "stale_query_threshold_days": 367,
+          "last_runtime_stats_interval": "2026-09-09T13:00Z to 14:00Z",
+          "query_count": 1184330,
+          "single_use_product_search_queries": 1121900
+        },
+        "automatic_tuning": [
+          {
+            "name": "FORCE_LAST_GOOD_PLAN",
+            "desired_state": "ON",
+            "actual_state": "OFF",
+            "reason": "QUERY_STORE_READ_ONLY"
+          },
+          {
+            "name": "CREATE_INDEX",
+            "desired_state": "OFF",
+            "actual_state": "OFF"
+          },
+          {
+            "name": "DROP_INDEX",
+            "desired_state": "OFF",
+            "actual_state": "OFF"
+          }
+        ],
+        "read_committed_snapshot": true
+      }
+    },
+    {
+      "id": "sessions",
+      "tool": "get_active_sessions",
+      "arguments": {},
+      "result": {
+        "result_status": "ok",
+        "sampled_at": "2026-09-23T08:41:12Z",
+        "blocking_chains": [
+          {
+            "head_blocker_session_id": 412,
+            "head_blocker": {
+              "status": "suspended",
+              "wait_type": "LOG_RATE_GOVERNOR",
+              "wait_ms": 41,
+              "open_transaction_count": 1,
+              "elapsed": "00:36:08",
+              "statement": "Batch step 4: UPDATE i SET OnHand = i.OnHand - a.Qty FROM dbo.Inventory i JOIN stg.InventoryAdj a ON ... (about 6.2M rows)"
+            },
+            "blocked_session_ids": "77 sessions",
+            "blocked": {
+              "count": 77,
+              "wait_types": [
+                "LCK_M_IX",
+                "LCK_M_U"
+              ],
+              "wait_ms_min": 1200,
+              "wait_ms_max": 29410,
+              "statement": "dbo.usp_CreateOrder: UPDATE dbo.Inventory SET Reserved = Reserved + @q WHERE Sku = @sku"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "key": {
+    "root_cause": "lock_order_deadlock",
+    "required_facts": [
+      {
+        "id": "all_during_step_4",
+        "evidence": "deadlocks",
+        "description": "All 63 deadlocks happened while batch step 4 ran, and none outside it.",
+        "signals": {
+          "all": [
+            "\\b63\\b",
+            "step 4|batch"
+          ]
+        },
+        "example": "All 63 deadlocks happened while batch step 4 was running (06:59 to 09:01); there were 0 outside it."
+      },
+      {
+        "id": "page_locks_against_unordered_rows",
+        "evidence": "deadlocks",
+        "description": "The batch holds page locks while order creation updates SKU rows in basket order.",
+        "signals": {
+          "all": [
+            "page",
+            "order|basket|sku|key"
+          ]
+        },
+        "example": "The batch update holds PAGE X locks while usp_CreateOrder updates SKU rows in the order of the basket lines."
+      }
+    ],
+    "harmful_conclusions": [
+      {
+        "id": "dirty_reads",
+        "description": "Both sides are writers. NOLOCK changes nothing for them and risks wrong stock figures elsewhere.",
+        "signals": {
+          "any": [
+            "\\bnolock\\b",
+            "read\\s?uncommitted"
+          ]
+        },
+        "example": "Add NOLOCK hints to the inventory queries."
+      },
+      {
+        "id": "change_rcsi",
+        "description": "READ_COMMITTED_SNAPSHOT is already ON and affects readers only. Turning it off adds reader-writer blocking and removes no deadlock.",
+        "signals": {
+          "any": [
+            "read_committed_snapshot\\s*(=\\s*)?off",
+            "(turn|switch)(ing)? (rcsi|read_committed_snapshot) off",
+            "disable (rcsi|read_committed_snapshot)"
+          ]
+        },
+        "example": "Turn READ_COMMITTED_SNAPSHOT OFF."
+      },
+      {
+        "id": "disable_lock_escalation",
+        "description": "With escalation disabled, a 6.2M-row update holds millions of locks and the page-level conflict stays.",
+        "signals": {
+          "any": [
+            "lock_escalation\\s*=\\s*disable",
+            "disable lock escalation"
+          ]
+        },
+        "example": "ALTER TABLE dbo.Inventory SET (LOCK_ESCALATION = DISABLE)."
+      },
+      {
+        "id": "wrong_cause",
+        "description": "The deadlocks need the batch to overlap business hours; they are not a platform or capacity fault.",
+        "root_causes": [
+          "platform_fault",
+          "cpu_capacity"
+        ]
+      }
+    ]
+  }
+}

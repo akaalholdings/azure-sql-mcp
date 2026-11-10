@@ -1,0 +1,245 @@
+{
+  "format_version": 1,
+  "id": "diagnosis-08-retry-policy-amplifies-the-incident",
+  "kind": "diagnosis",
+  "title": "More database calls than requests, and duplicate orders",
+  "split": "public",
+  "source": "case-exam-v1:8",
+  "tags": [
+    "application",
+    "retries",
+    "data-integrity"
+  ],
+  "prompt": [
+    "Client: Harbourline Commerce, a multi-tenant retail order platform with about 400 tenants. Database hlc-orders-prod: Azure SQL Database, Business Critical, Gen5, 16 vCores, compatibility level 160, READ_COMMITTED_SNAPSHOT ON. All times are UTC. Business hours are 07:30 to 18:00. The nightly batch must finish by 06:00. Evidence was collected from Mon 21 Sep to Sun 27 Sep 2026.",
+    "Application notes from the development lead: six application instances; CommandTimeout 30 s; Max Pool Size 400 per",
+    "instance since hotfix 5.2.3. The hotfix also added an outer retry policy to every repository call, reads and writes,",
+    "dbo.usp_CreateOrder included: it retries timeouts and deadlocks up to 3 times with a fixed 2 s delay, no jitter and",
+    "no circuit breaker. On Fri 25 between 09:00 and 14:30 the API received 74,500 dashboard requests. Support has logged",
+    "23 'duplicate order' tickets since 16 Sep and none before. Name what makes a bad day worse and creates the duplicate",
+    "orders."
+  ],
+  "evidence": [
+    {
+      "id": "top_cached",
+      "tool": "get_top_cached_queries",
+      "arguments": {
+        "sort_by": "cpu"
+      },
+      "result": {
+        "result_status": "ok",
+        "window": {
+          "start": "2026-09-25T09:00Z",
+          "end": "2026-09-25T14:30Z"
+        },
+        "queries": [
+          {
+            "rank": 1,
+            "query_hash": "0x4E1C7A0B92D3F611",
+            "source": "GetOrdersDashboard",
+            "executions": 119880,
+            "total_cpu_s": 271000,
+            "avg_cpu_ms": 2261,
+            "avg_elapsed_ms": 9840,
+            "avg_logical_reads": 1402000,
+            "dop": 8
+          },
+          {
+            "rank": 2,
+            "query_hash": "0x9A02E3C1F0B77D40",
+            "source": "dbo.usp_CreateOrder",
+            "executions": 410220,
+            "total_cpu_s": 9850,
+            "avg_cpu_ms": 24,
+            "avg_elapsed_ms": 310,
+            "avg_logical_reads": 104,
+            "dop": 1
+          },
+          {
+            "rank": 3,
+            "query_hash": "0x11F0AB9C2D5E3381",
+            "source": "ProductSearch ad hoc",
+            "executions": 88400,
+            "total_cpu_s": 4120,
+            "avg_cpu_ms": 47,
+            "avg_elapsed_ms": 160,
+            "avg_logical_reads": 2950,
+            "dop": 1
+          },
+          {
+            "rank": 4,
+            "query_hash": "0x3C77D0E15A9B2204",
+            "source": "dbo.usp_GetInventoryByStore",
+            "executions": 61300,
+            "total_cpu_s": 1980,
+            "avg_cpu_ms": 32,
+            "avg_elapsed_ms": 95,
+            "avg_logical_reads": 610,
+            "dop": 1
+          }
+        ],
+        "all_other_total_cpu_s": 9400,
+        "same_window_on_a_good_day": {
+          "day": "Mon 21",
+          "query_hash": "0x4E1C7A0B92D3F611",
+          "avg_cpu_ms": 3.4,
+          "total_cpu_s": 410,
+          "dop": 1
+        }
+      }
+    },
+    {
+      "id": "limits",
+      "tool": "get_resource_limits",
+      "arguments": {},
+      "result": {
+        "result_status": "ok",
+        "service_objective": "BC_Gen5_16",
+        "cpu_limit": 16,
+        "max_log_rate_mb_per_sec": 96,
+        "max_db_memory_gb": 81.6,
+        "max_workers": 1680,
+        "max_sessions": 30000,
+        "tempdb_max_size_gb": 512
+      }
+    },
+    {
+      "id": "daily",
+      "tool": "get_resource_stats_history",
+      "arguments": {
+        "window_minutes": 10080
+      },
+      "result": {
+        "result_status": "ok",
+        "source": "sys.resource_stats",
+        "granularity": "day",
+        "baseline_aug_17_28": {
+          "avg_cpu_percent": 24,
+          "max_cpu_percent": 71,
+          "avg_log_write_percent": 18,
+          "minutes_log_above_95": 95,
+          "minutes_cpu_above_95": 0,
+          "max_worker_percent": 9
+        },
+        "history": [
+          {
+            "day": "Mon 2026-09-21",
+            "avg_cpu_percent": 27,
+            "max_cpu_percent": 86,
+            "avg_log_write_percent": 31,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 18,
+            "max_worker_percent": 15,
+            "minutes_log_above_95": 455,
+            "minutes_cpu_above_95": 0
+          },
+          {
+            "day": "Tue 2026-09-22",
+            "avg_cpu_percent": 49,
+            "max_cpu_percent": 100,
+            "avg_log_write_percent": 29,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 17,
+            "max_worker_percent": 72,
+            "minutes_log_above_95": 410,
+            "minutes_cpu_above_95": 372
+          },
+          {
+            "day": "Wed 2026-09-23",
+            "avg_cpu_percent": 26,
+            "max_cpu_percent": 84,
+            "avg_log_write_percent": 33,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 19,
+            "max_worker_percent": 17,
+            "minutes_log_above_95": 480,
+            "minutes_cpu_above_95": 0
+          },
+          {
+            "day": "Thu 2026-09-24",
+            "avg_cpu_percent": 41,
+            "max_cpu_percent": 100,
+            "avg_log_write_percent": 30,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 18,
+            "max_worker_percent": 70,
+            "minutes_log_above_95": 395,
+            "minutes_cpu_above_95": 148
+          },
+          {
+            "day": "Fri 2026-09-25",
+            "avg_cpu_percent": 47,
+            "max_cpu_percent": 100,
+            "avg_log_write_percent": 29,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 17,
+            "max_worker_percent": 71,
+            "minutes_log_above_95": 400,
+            "minutes_cpu_above_95": 309
+          }
+        ],
+        "avg_memory_usage_percent": "96-99 on every day, baseline weeks included"
+      }
+    }
+  ],
+  "key": {
+    "root_cause": "client_retry_amplification",
+    "required_facts": [
+      {
+        "id": "more_executions_than_requests",
+        "evidence": "top_cached",
+        "description": "74,500 requests produced 119,880 executions of the dashboard query.",
+        "signals": {
+          "all": [
+            "119,?880",
+            "74,?500|1\\.6"
+          ]
+        },
+        "example": "74,500 dashboard requests produced 119,880 database executions: about 1.6 executions per request."
+      },
+      {
+        "id": "pool_exceeds_worker_limit",
+        "evidence": "limits",
+        "description": "Six pools of 400 connections can ask for 2,400 sessions; the database has 1,680 workers.",
+        "signals": {
+          "all": [
+            "2,?400|400",
+            "1,?680"
+          ]
+        },
+        "example": "6 instances with 400 pooled connections each is 2,400 possible sessions against a limit of 1,680 workers."
+      }
+    ],
+    "harmful_conclusions": [
+      {
+        "id": "retry_more_or_wait_longer",
+        "description": "More retries or a longer timeout add load while the CPU is saturated and repeat more writes.",
+        "signals": {
+          "any": [
+            "(increase|raise|extend|lengthen)\\b[^.]*(retr|timeout|pool)",
+            "\\b(more|longer|higher|larger)\\s+(retr|timeout|pool)",
+            "retry more"
+          ]
+        },
+        "example": "Increase the retry count to 5 and raise the timeout."
+      },
+      {
+        "id": "scale_up_for_the_load",
+        "description": "The extra load is the application's own repeats.",
+        "root_causes": [
+          "cpu_capacity"
+        ],
+        "signals": {
+          "any": [
+            "\\bscale (up|to)\\b",
+            "\\b24[\\s-]?v?cores?\\b",
+            "\\bupgrade (to|the)\\b",
+            "\\bmore v?cores\\b",
+            "\\bhyperscale\\b"
+          ]
+        },
+        "example": "Scale up to 24 vCores to absorb the retries."
+      }
+    ]
+  }
+}

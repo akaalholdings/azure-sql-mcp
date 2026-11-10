@@ -1,0 +1,380 @@
+{
+  "format_version": 1,
+  "id": "diagnosis-10-io-waits-are-volume-not-slow-storage",
+  "kind": "diagnosis",
+  "title": "'The storage is slow and we should set MAXDOP to 1'",
+  "split": "public",
+  "source": "case-exam-v1:10/storage",
+  "tags": [
+    "red-herring",
+    "io-waits",
+    "parallelism"
+  ],
+  "prompt": [
+    "Client: Harbourline Commerce, a multi-tenant retail order platform with about 400 tenants. Database hlc-orders-prod: Azure SQL Database, Business Critical, Gen5, 16 vCores, compatibility level 160, READ_COMMITTED_SNAPSHOT ON. All times are UTC. Business hours are 07:30 to 18:00. The nightly batch must finish by 06:00. Evidence was collected from Mon 21 Sep to Sun 27 Sep 2026.",
+    "The CTO writes: 'Waits show lots of CXPACKET and PAGEIOLATCH. Our DBA thinks the storage is slow and we should set",
+    "MAXDOP to 1.' The nightly index job rebuilds with MAXDOP = 0. Name what the IO waits mean."
+  ],
+  "evidence": [
+    {
+      "id": "waits_night",
+      "tool": "get_wait_stats",
+      "arguments": {
+        "sample_seconds": 0
+      },
+      "result": {
+        "result_status": "ok",
+        "window": {
+          "mode": "delta",
+          "start": "2026-09-23T00:30Z",
+          "end": "2026-09-23T06:00Z"
+        },
+        "top_waits": [
+          {
+            "wait_type": "LOG_RATE_GOVERNOR",
+            "wait_time_s": 61840,
+            "avg_wait_ms": 38,
+            "pct_of_total": 31.0
+          },
+          {
+            "wait_type": "PAGEIOLATCH_SH",
+            "wait_time_s": 38950,
+            "avg_wait_ms": 0.6,
+            "pct_of_total": 19.5
+          },
+          {
+            "wait_type": "CXPACKET",
+            "wait_time_s": 27300,
+            "pct_of_total": 13.7
+          },
+          {
+            "wait_type": "CXCONSUMER",
+            "wait_time_s": 19800,
+            "pct_of_total": 9.9
+          },
+          {
+            "wait_type": "IO_COMPLETION",
+            "wait_time_s": 17450,
+            "avg_wait_ms": 4.1,
+            "pct_of_total": 8.7
+          },
+          {
+            "wait_type": "HADR_THROTTLE_LOG_RATE_SEND_RECV_QUEUE_SIZE",
+            "wait_time_s": 6210,
+            "avg_wait_ms": 22,
+            "pct_of_total": 3.1
+          },
+          {
+            "wait_type": "WRITELOG",
+            "wait_time_s": 5980,
+            "avg_wait_ms": 2.3,
+            "pct_of_total": 3.0
+          },
+          {
+            "wait_type": "HADR_SYNC_COMMIT",
+            "wait_time_s": 4420,
+            "avg_wait_ms": 1.1,
+            "pct_of_total": 2.2
+          },
+          {
+            "wait_type": "SOS_SCHEDULER_YIELD",
+            "wait_time_s": 3900,
+            "pct_of_total": 2.0
+          },
+          {
+            "wait_type": "PAGEIOLATCH_EX",
+            "wait_time_s": 3100,
+            "avg_wait_ms": 0.8,
+            "pct_of_total": 1.6
+          }
+        ],
+        "signal_wait_pct": 7
+      }
+    },
+    {
+      "id": "wed_night",
+      "tool": "get_resource_stats_history",
+      "arguments": {
+        "window_minutes": 720
+      },
+      "result": {
+        "result_status": "ok",
+        "source": "sys.dm_db_resource_stats",
+        "history": [
+          {
+            "time": "2026-09-23T00:15Z",
+            "avg_cpu_percent": 9,
+            "avg_data_io_percent": 4,
+            "avg_log_write_percent": 3,
+            "max_worker_percent": 1,
+            "activity": "idle"
+          },
+          {
+            "time": "2026-09-23T00:45Z",
+            "avg_cpu_percent": 41,
+            "avg_data_io_percent": 38,
+            "avg_log_write_percent": 100,
+            "max_worker_percent": 2,
+            "activity": "index rebuild phase"
+          },
+          {
+            "time": "2026-09-23T02:15Z",
+            "avg_cpu_percent": 58,
+            "avg_data_io_percent": 61,
+            "avg_log_write_percent": 100,
+            "max_worker_percent": 3,
+            "activity": "rebuild and batch step 1"
+          },
+          {
+            "time": "2026-09-23T03:30Z",
+            "avg_cpu_percent": 62,
+            "avg_data_io_percent": 66,
+            "avg_log_write_percent": 100,
+            "max_worker_percent": 3,
+            "activity": "rebuild and batch step 1"
+          },
+          {
+            "time": "2026-09-23T05:30Z",
+            "avg_cpu_percent": 49,
+            "avg_data_io_percent": 63,
+            "avg_log_write_percent": 100,
+            "max_worker_percent": 3,
+            "activity": "rebuild and batch step 2"
+          },
+          {
+            "time": "2026-09-23T06:30Z",
+            "avg_cpu_percent": 47,
+            "avg_data_io_percent": 52,
+            "avg_log_write_percent": 92,
+            "max_worker_percent": 3,
+            "activity": "statistics phase and batch step 2"
+          },
+          {
+            "time": "2026-09-23T07:45Z",
+            "avg_cpu_percent": 43,
+            "avg_data_io_percent": 31,
+            "avg_log_write_percent": 97,
+            "max_worker_percent": 9,
+            "activity": "statistics phase and batch step 3"
+          },
+          {
+            "time": "2026-09-23T08:30Z",
+            "avg_cpu_percent": 46,
+            "avg_data_io_percent": 29,
+            "avg_log_write_percent": 100,
+            "max_worker_percent": 14,
+            "activity": "batch step 4 and OLTP"
+          },
+          {
+            "time": "2026-09-23T08:45Z",
+            "avg_cpu_percent": 44,
+            "avg_data_io_percent": 27,
+            "avg_log_write_percent": 100,
+            "max_worker_percent": 16,
+            "activity": "batch step 4 and OLTP"
+          },
+          {
+            "time": "2026-09-23T09:10Z",
+            "avg_cpu_percent": 31,
+            "avg_data_io_percent": 12,
+            "avg_log_write_percent": 47,
+            "max_worker_percent": 6,
+            "activity": "batch finished 09:06"
+          },
+          {
+            "time": "2026-09-23T10:30Z",
+            "avg_cpu_percent": 28,
+            "avg_data_io_percent": 7,
+            "avg_log_write_percent": 22,
+            "max_worker_percent": 5,
+            "activity": "normal day"
+          }
+        ]
+      }
+    },
+    {
+      "id": "waits_bad_day",
+      "tool": "get_wait_stats",
+      "arguments": {},
+      "result": {
+        "result_status": "ok",
+        "window": {
+          "mode": "delta",
+          "start": "2026-09-25T09:00Z",
+          "end": "2026-09-25T14:30Z"
+        },
+        "top_waits": [
+          {
+            "wait_type": "SOS_SCHEDULER_YIELD",
+            "wait_time_s": 186400
+          },
+          {
+            "wait_type": "CXPACKET",
+            "wait_time_s": 141700
+          },
+          {
+            "wait_type": "CXCONSUMER",
+            "wait_time_s": 98200
+          },
+          {
+            "wait_type": "RESOURCE_SEMAPHORE",
+            "wait_time_s": 3850,
+            "avg_wait_ms": 1900
+          },
+          {
+            "wait_type": "PAGEIOLATCH_SH",
+            "wait_time_s": 2300,
+            "avg_wait_ms": 0.4
+          },
+          {
+            "wait_type": "WRITELOG",
+            "wait_time_s": 1950,
+            "avg_wait_ms": 1.9
+          },
+          {
+            "wait_type": "HADR_SYNC_COMMIT",
+            "wait_time_s": 1610,
+            "avg_wait_ms": 1.0
+          },
+          {
+            "wait_type": "LCK_M_ALL",
+            "wait_time_s": 380
+          },
+          {
+            "wait_type": "THREADPOOL",
+            "wait_time_s": 0
+          }
+        ],
+        "signal_wait_pct": 34
+      }
+    },
+    {
+      "id": "top_cached",
+      "tool": "get_top_cached_queries",
+      "arguments": {
+        "sort_by": "cpu"
+      },
+      "result": {
+        "result_status": "ok",
+        "window": {
+          "start": "2026-09-25T09:00Z",
+          "end": "2026-09-25T14:30Z"
+        },
+        "queries": [
+          {
+            "rank": 1,
+            "query_hash": "0x4E1C7A0B92D3F611",
+            "source": "GetOrdersDashboard",
+            "executions": 119880,
+            "total_cpu_s": 271000,
+            "avg_cpu_ms": 2261,
+            "avg_elapsed_ms": 9840,
+            "avg_logical_reads": 1402000,
+            "dop": 8
+          },
+          {
+            "rank": 2,
+            "query_hash": "0x9A02E3C1F0B77D40",
+            "source": "dbo.usp_CreateOrder",
+            "executions": 410220,
+            "total_cpu_s": 9850,
+            "avg_cpu_ms": 24,
+            "avg_elapsed_ms": 310,
+            "avg_logical_reads": 104,
+            "dop": 1
+          },
+          {
+            "rank": 3,
+            "query_hash": "0x11F0AB9C2D5E3381",
+            "source": "ProductSearch ad hoc",
+            "executions": 88400,
+            "total_cpu_s": 4120,
+            "avg_cpu_ms": 47,
+            "avg_elapsed_ms": 160,
+            "avg_logical_reads": 2950,
+            "dop": 1
+          },
+          {
+            "rank": 4,
+            "query_hash": "0x3C77D0E15A9B2204",
+            "source": "dbo.usp_GetInventoryByStore",
+            "executions": 61300,
+            "total_cpu_s": 1980,
+            "avg_cpu_ms": 32,
+            "avg_elapsed_ms": 95,
+            "avg_logical_reads": 610,
+            "dop": 1
+          }
+        ],
+        "all_other_total_cpu_s": 9400,
+        "same_window_on_a_good_day": {
+          "day": "Mon 21",
+          "query_hash": "0x4E1C7A0B92D3F611",
+          "avg_cpu_ms": 3.4,
+          "total_cpu_s": 410,
+          "dop": 1
+        }
+      }
+    }
+  ],
+  "key": {
+    "root_cause": "scan_volume_not_storage_latency",
+    "required_facts": [
+      {
+        "id": "each_read_is_fast",
+        "evidence": "waits_night",
+        "description": "PAGEIOLATCH_SH averages 0.6 ms per wait.",
+        "signals": {
+          "all": [
+            "PAGEIOLATCH",
+            "0\\.[4-8]\\s?ms"
+          ]
+        },
+        "example": "PAGEIOLATCH_SH is 38,950 s in total but 0.6 ms per wait: each read is fast."
+      },
+      {
+        "id": "data_io_below_the_limit",
+        "evidence": "wed_night",
+        "description": "Data IO peaks at 66% of the limit.",
+        "signals": {
+          "all": [
+            "data[\\s_]?io",
+            "\\b(6[1-6]|58)\\s?%|below|under"
+          ]
+        },
+        "example": "Data IO peaks at 66% of the limit overnight, below its cap."
+      }
+    ],
+    "harmful_conclusions": [
+      {
+        "id": "maxdop_one",
+        "description": "The parallel waits come from the rebuilds and from one bad parallel plan. MAXDOP 1 makes the batch and the rebuilds slower and fixes neither.",
+        "root_causes": [
+          "parallelism_misconfiguration"
+        ],
+        "signals": {
+          "any": [
+            "maxdop\\s*(=|to|of)?\\s*1\\b"
+          ]
+        },
+        "example": "Set MAXDOP to 1."
+      },
+      {
+        "id": "buy_faster_storage",
+        "description": "Business Critical local storage answers in under a millisecond here. More IOPS or another tier changes nothing.",
+        "root_causes": [
+          "storage_latency"
+        ],
+        "signals": {
+          "any": [
+            "\\biops\\b",
+            "faster storage",
+            "storage tier",
+            "\\bhyperscale\\b"
+          ]
+        },
+        "example": "Move to a tier with more IOPS."
+      }
+    ]
+  }
+}

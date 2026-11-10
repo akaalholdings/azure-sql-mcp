@@ -1,0 +1,143 @@
+{
+  "format_version": 1,
+  "id": "exam-q16-no-change-daily-reconciliation",
+  "kind": "tuning",
+  "title": "Daily reconciliation that only looks bad",
+  "split": "public",
+  "source": "rewrite-exam-v1:Q16",
+  "tags": [
+    "no-change",
+    "false-positive"
+  ],
+  "prompt": [
+    "Reconciliation job, every 15 minutes. Average 6 ms elapsed, about 85 logical reads, about 12k rows returned. Actual",
+    "plan: Index Seek on IX_Orders_OrderDate (the seek range comes from GetRangeThroughConvert; the index covers",
+    "CustomerID, Status and TotalAmount), then a Hash Match (Right Anti Semi Join) against a scan of PK_TestAccounts",
+    "(150 rows). No warnings, no spills, estimates within 2x. A static analyzer flagged 'function applied to column in",
+    "WHERE' and 'NOT IN with subquery'. The team asks whether to rewrite it."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.Orders",
+      "qe.TestAccounts"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "Orders: 30M rows, 2016 to now, ~12k per day now. The 25 partner customers own ~9M orders (30%), up to 1.2M each. Other customers average ~10 orders (max ~400). The density estimate for CustomerID is ~15 rows. Status: Shipped 83.8%, Cancelled 7%, Paid 6%, Returned 3%, Pending 0.2% (~60k rows, all from the last 72 hours). SalesChannel: Web 62%, Store 20%, Partner 12%, Phone 6%. PromoCode is NULL for 85%. ShipRegionID is NULL for Store pickups (~20%). OrderDate is datetime2(7); Partner and Store imports stamp one timestamp on a whole batch, so many orders of one customer share an OrderDate.",
+    "TestAccounts: 150 rows."
+  ],
+  "baseline_kind": "select",
+  "baseline_sql": [
+    "SELECT o.OrderID, o.CustomerID, o.Status, o.TotalAmount",
+    "FROM qe.Orders o",
+    "WHERE CAST(o.OrderDate AS date) = @Day",
+    "  AND o.CustomerID NOT IN (SELECT t.CustomerID FROM qe.TestAccounts t);"
+  ],
+  "parameter_cases": [
+    {
+      "name": "typical_day",
+      "values": {
+        "Day": "2026-10-12"
+      },
+      "types": {
+        "Day": "date"
+      },
+      "weight": 0.99
+    },
+    {
+      "name": "max_day",
+      "values": {
+        "Day": "9999-12-31"
+      },
+      "types": {
+        "Day": "date"
+      },
+      "weight": 0.01
+    }
+  ],
+  "key": {
+    "decision": "no_change",
+    "correct_families": [],
+    "traps": [
+      {
+        "id": "end_of_day_literal",
+        "class": "not_equivalent",
+        "why": "An upper bound of 23:59:59.997 loses rows after .997 on a datetime2(7) column.",
+        "signals": {
+          "any": [
+            "23:59:59",
+            "dateadd\\(\\s*(millisecond|ms|second|ss|s)\\s*,\\s*-\\s*\\d+"
+          ]
+        },
+        "told_apart_by": "An order stamped 23:59:59.9990000 on @Day.",
+        "example_sql": [
+          "SELECT o.OrderID, o.CustomerID, o.Status, o.TotalAmount",
+          "FROM qe.Orders o",
+          "WHERE o.OrderDate BETWEEN @Day AND CAST(CONVERT(char(10), @Day, 23) + ' 23:59:59.997' AS datetime2(3))",
+          "  AND o.CustomerID NOT IN (SELECT t.CustomerID FROM qe.TestAccounts t);"
+        ]
+      },
+      {
+        "id": "half_open_dateadd",
+        "class": "not_equivalent",
+        "why": "DATEADD(day, 1, @Day) overflows for @Day = 9999-12-31, where the original returns no rows. It also gives no measurable gain.",
+        "signals": {
+          "all": [
+            "dateadd\\(\\s*day\\s*,\\s*1\\s*,\\s*@Day\\s*\\)"
+          ]
+        },
+        "told_apart_by": "Parameter case max_day: the baseline returns no rows, the rewrite fails with an overflow error.",
+        "example_sql": [
+          "SELECT o.OrderID, o.CustomerID, o.Status, o.TotalAmount",
+          "FROM qe.Orders o",
+          "WHERE o.OrderDate >= @Day AND o.OrderDate < DATEADD(day, 1, @Day)",
+          "  AND o.CustomerID NOT IN (SELECT t.CustomerID FROM qe.TestAccounts t);"
+        ]
+      },
+      {
+        "id": "not_exists_rewrite",
+        "class": "ineffective",
+        "why": "Both NOT IN columns are NOT NULL, so NOT IN and NOT EXISTS compile to the same anti semi join. There is nothing to gain.",
+        "signals": {
+          "all": [
+            "not exists"
+          ]
+        },
+        "example_sql": [
+          "SELECT o.OrderID, o.CustomerID, o.Status, o.TotalAmount",
+          "FROM qe.Orders o",
+          "WHERE CAST(o.OrderDate AS date) = @Day",
+          "  AND NOT EXISTS (SELECT 1 FROM qe.TestAccounts t WHERE t.CustomerID = o.CustomerID);"
+        ]
+      },
+      {
+        "id": "recompile_hint",
+        "class": "ineffective",
+        "why": "A hint on a 6 ms, 85-read query adds compile cost and removes nothing.",
+        "signals": {
+          "all": [
+            "option\\s*\\("
+          ]
+        },
+        "example_sql": [
+          "SELECT o.OrderID, o.CustomerID, o.Status, o.TotalAmount",
+          "FROM qe.Orders o",
+          "WHERE CAST(o.OrderDate AS date) = @Day",
+          "  AND o.CustomerID NOT IN (SELECT t.CustomerID FROM qe.TestAccounts t)",
+          "OPTION (RECOMPILE);"
+        ]
+      }
+    ],
+    "index": {
+      "role": "none"
+    },
+    "min_improvement": {
+      "metric": "logical_reads",
+      "ratio": 0.9,
+      "basis": "No change is the answer. A candidate is measured only to show that it is not more than 10% worse."
+    },
+    "reference_notes": "Both analyzer flags are false positives here: CAST(datetime2 AS date) still seeks, and NOT IN is safe when neither column can be NULL."
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "field_names": [
+    "blocking_chains",
+    "candidate_id",
+    "cardinality_skew",
+    "case_id",
+    "constraint_backed",
+    "deployment_ready",
+    "head_blocker_session_id",
+    "idempotency_key",
+    "mcp_contract",
+    "metric_sources",
+    "next_tools",
+    "pct_of_total",
+    "plan_kind",
+    "presented_as_safe",
+    "proof_contract_required",
+    "proof_scope",
+    "ranking_basis",
+    "regression_pct",
+    "result_status",
+    "risk_codes",
+    "self_elapsed_ms",
+    "semantic_equivalence",
+    "snapshot_isolation_verified",
+    "snapshot_matched",
+    "top_operators",
+    "udf_elapsed_share",
+    "unchanged_sql"
+  ]
+}

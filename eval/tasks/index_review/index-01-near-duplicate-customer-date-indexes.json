@@ -1,0 +1,154 @@
+{
+  "format_version": 1,
+  "id": "index-01-near-duplicate-customer-date-indexes",
+  "kind": "index_review",
+  "title": "Two indexes on Orders with the same key and different includes",
+  "split": "public",
+  "source": "index-exam-v1:1",
+  "tags": [
+    "duplicate",
+    "merge",
+    "hint",
+    "forced-plan"
+  ],
+  "prompt": [
+    "Azure SQL Database 'RetailOps', General Purpose, 8 vCores, about 41.5 GB of memory, compatibility level 160, no readable secondary. Snapshot taken Thursday 2026-09-24 09:00 UTC. A platform failover reset the index usage counters on 2026-09-15 02:41, so they cover 9.26 days. Query Store holds data from 2026-09-11 only, because size-based cleanup has run. Month-end change freeze: 2026-09-30 18:00 to 2026-10-02 18:00. Flash sale on 2026-10-09 with a change freeze from 2026-10-08. Log rate cap: 36 MB/s. Space headroom: 213 GB.",
+    "A nightly advisor script recommends: DROP INDEX IX_Orders_CustomerId_OrderDate, 'duplicate of",
+    "IX_Orders_Customer_OrderDate_Hist'. Decide what to do with the two indexes."
+  ],
+  "usage_window": {
+    "start": "2026-09-15T02:41Z",
+    "end": "2026-09-24T09:00Z",
+    "days": 9.26,
+    "reset_by": "platform failover",
+    "query_store_from": "2026-09-11"
+  },
+  "inventory": [
+    {
+      "table": "dbo.Orders",
+      "name": "PK_Orders",
+      "type": "clustered",
+      "key_columns": [
+        "OrderId"
+      ],
+      "include_columns": [],
+      "size_gb": 42.1,
+      "usage": {
+        "user_seeks": 23900000,
+        "user_scans": 9,
+        "user_lookups": 1736000000,
+        "user_updates": 26300000
+      },
+      "is_unique": true
+    },
+    {
+      "table": "dbo.Orders",
+      "name": "IX_Orders_CustomerId_OrderDate",
+      "type": "nonclustered",
+      "key_columns": [
+        "CustomerId",
+        "OrderDate"
+      ],
+      "include_columns": [
+        "Status",
+        "TotalAmount"
+      ],
+      "size_gb": 7.4,
+      "usage": {
+        "user_seeks": 3982000,
+        "user_scans": 0,
+        "user_lookups": 0,
+        "user_updates": 22700000
+      }
+    },
+    {
+      "table": "dbo.Orders",
+      "name": "IX_Orders_Customer_OrderDate_Hist",
+      "type": "nonclustered",
+      "key_columns": [
+        "CustomerId",
+        "OrderDate"
+      ],
+      "include_columns": [
+        "TotalAmount",
+        "CurrencyCode",
+        "ChannelId"
+      ],
+      "size_gb": 7.6,
+      "usage": {
+        "user_seeks": 1157000,
+        "user_scans": 0,
+        "user_lookups": 0,
+        "user_updates": 3240000
+      }
+    }
+  ],
+  "workload": [
+    {
+      "id": "Q1",
+      "description": "Customer order history (ORM, sp_executesql)",
+      "sql": "SELECT TOP (20) o.OrderId, o.OrderDate, o.Status, o.TotalAmount FROM dbo.Orders o WHERE o.CustomerId = @CustomerId ORDER BY o.OrderDate DESC;",
+      "executions_per_day": 430000,
+      "plan": "Index Seek (backward) IX_Orders_CustomerId_OrderDate, then Top. Plan 88213 is forced in Query Store since 2026-06-14; force_failure_count 0.",
+      "avg_cpu_ms": 0.21,
+      "avg_logical_reads": 7
+    },
+    {
+      "id": "Q2",
+      "description": "dbo.usp_GetOrderHistoryForExport (@CustomerId, @From)",
+      "sql": [
+        "SELECT o.OrderId, o.OrderDate, o.TotalAmount, o.CurrencyCode, o.ChannelId",
+        "FROM dbo.Orders o WITH (INDEX(IX_Orders_Customer_OrderDate_Hist))",
+        "WHERE o.CustomerId = @CustomerId AND o.OrderDate >= @From;"
+      ],
+      "executions_per_day": 125000,
+      "plan": "Index Seek IX_Orders_Customer_OrderDate_Hist (named in an index hint).",
+      "avg_cpu_ms": 0.4,
+      "avg_logical_reads": 9
+    },
+    {
+      "id": "Q7",
+      "description": "Order status update",
+      "sql": "UPDATE dbo.Orders SET Status = @Status, UpdatedAt = SYSUTCDATETIME() WHERE OrderId = @OrderId;",
+      "executions_per_day": 2100000,
+      "plan": "Maintains IX_Orders_CustomerId_OrderDate, IX_Orders_CustomerId_Wide, IX_Orders_Status and IX_Orders_ChannelId_UpdatedAt.",
+      "avg_cpu_ms": 0.3
+    }
+  ],
+  "facts": [
+    "dbo.Orders: 182M rows, 350k inserts a day, about 2.1M status updates a day, 340k invoice updates a day.",
+    "A search of sys.sql_modules finds one index hint: WITH (INDEX(IX_Orders_Customer_OrderDate_Hist)) in dbo.usp_GetOrderHistoryForExport. A hint that names a missing index fails the statement with error 308.",
+    "Query Store plan 88213 for Q1 is forced and uses IX_Orders_CustomerId_OrderDate. It was forced after an incident in which the optimizer chose a wider index and a sort.",
+    "finance.usp_MonthEndRevenueByChannel reads OrderDate, Status, ChannelId, CurrencyCode and TotalAmount for one month. It next runs on 2026-10-01.",
+    "The procedure can be changed and deployed within 2 working days."
+  ],
+  "key": {
+    "merges": [
+      {
+        "indexes": [
+          "IX_Orders_CustomerId_OrderDate",
+          "IX_Orders_Customer_OrderDate_Hist"
+        ],
+        "include_columns": [
+          "Status",
+          "TotalAmount",
+          "CurrencyCode",
+          "ChannelId"
+        ],
+        "why": "Same key. One index with the union of the includes serves Q1 and Q2 and saves about 7.4 GB and one index write per insert. Build the survivor first, then handle the hint and the forced plan, then drop the other."
+      }
+    ],
+    "must_not_create": [
+      {
+        "id": "third_index_on_the_same_key",
+        "table": "dbo.Orders",
+        "key_columns": [
+          "CustomerId",
+          "OrderDate"
+        ],
+        "why": "A third index on the same key adds write cost and removes nothing. Widen one of the two that exist."
+      }
+    ],
+    "reference_notes": "Dropping either index as an exact duplicate leaves Q1 or Q2 with key lookups. The order of the steps matters and is not scored here: create before drop, change the hinted procedure before its index goes, and keep the forced plan valid."
+  }
+}

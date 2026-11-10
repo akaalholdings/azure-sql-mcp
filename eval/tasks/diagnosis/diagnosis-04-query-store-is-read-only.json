@@ -1,0 +1,260 @@
+{
+  "format_version": 1,
+  "id": "diagnosis-04-query-store-is-read-only",
+  "kind": "diagnosis",
+  "title": "The client's Query Store reports show nothing wrong",
+  "split": "public",
+  "source": "case-exam-v1:4",
+  "tags": [
+    "query-store",
+    "stale-evidence",
+    "automatic-tuning"
+  ],
+  "prompt": [
+    "Client: Harbourline Commerce, a multi-tenant retail order platform with about 400 tenants. Database hlc-orders-prod: Azure SQL Database, Business Critical, Gen5, 16 vCores, compatibility level 160, READ_COMMITTED_SNAPSHOT ON. All times are UTC. Business hours are 07:30 to 18:00. The nightly batch must finish by 06:00. Evidence was collected from Mon 21 Sep to Sun 27 Sep 2026.",
+    "The CTO writes: 'Query Store shows nothing regressed, so it isn't a query problem.' The client ran its 'Top queries by",
+    "CPU' and 'Regressed queries' reports on 28 Sep for the last 30 days. The ProductSearch endpoint, added on 30 Aug,",
+    "builds its statement by concatenating the search term into the text. Name the reason why the reports show no",
+    "problem."
+  ],
+  "evidence": [
+    {
+      "id": "query_store",
+      "tool": "get_database_configuration",
+      "arguments": {},
+      "result": {
+        "result_status": "ok",
+        "query_store": {
+          "desired_state": "READ_WRITE",
+          "actual_state": "READ_ONLY",
+          "readonly_reason": 65536,
+          "current_storage_size_mb": 1024,
+          "max_storage_size_mb": 1024,
+          "query_capture_mode": "ALL",
+          "size_based_cleanup_mode": "OFF",
+          "stale_query_threshold_days": 367,
+          "last_runtime_stats_interval": "2026-09-09T13:00Z to 14:00Z",
+          "query_count": 1184330,
+          "single_use_product_search_queries": 1121900
+        },
+        "automatic_tuning": [
+          {
+            "name": "FORCE_LAST_GOOD_PLAN",
+            "desired_state": "ON",
+            "actual_state": "OFF",
+            "reason": "QUERY_STORE_READ_ONLY"
+          },
+          {
+            "name": "CREATE_INDEX",
+            "desired_state": "OFF",
+            "actual_state": "OFF"
+          },
+          {
+            "name": "DROP_INDEX",
+            "desired_state": "OFF",
+            "actual_state": "OFF"
+          }
+        ],
+        "read_committed_snapshot": true
+      }
+    },
+    {
+      "id": "query_store_top",
+      "tool": "get_top_queries",
+      "arguments": {
+        "sort_by": "cpu"
+      },
+      "result": {
+        "result_status": "ok",
+        "requested_range": "last 30 days",
+        "data_ends": "2026-09-09T14:00Z",
+        "queries": [
+          {
+            "query_id": 70112,
+            "source": "etl.LoadFactSales INSERT ... SELECT",
+            "plans": 1,
+            "executions": 14,
+            "avg_cpu_ms": 1402000,
+            "last_execution": "2026-09-09T04:31Z"
+          },
+          {
+            "query_id": 61877,
+            "source": "GetOrdersDashboard (ORM 8 text: StatusId IN (SELECT value FROM OPENJSON(@statuses)))",
+            "plans": 1,
+            "plan_ids": [
+              1201
+            ],
+            "executions": 1912400,
+            "avg_cpu_ms": 3.1,
+            "first_execution": "2026-08-30T22:14Z",
+            "last_execution": "2026-09-09T13:59Z",
+            "is_forced_plan": false
+          },
+          {
+            "query_id": 55120,
+            "source": "dbo.usp_CreateOrder",
+            "plans": 1,
+            "executions": 3880100,
+            "avg_cpu_ms": 1.9,
+            "last_execution": "2026-09-09T13:59Z"
+          },
+          {
+            "query_id": 48213,
+            "source": "GetOrdersDashboard (ORM 7 text: StatusId IN (1, 2, 5))",
+            "plans": 2,
+            "plan_ids": [
+              7741,
+              9902
+            ],
+            "executions": 371900,
+            "avg_cpu_ms": 3.3,
+            "last_execution": "2026-08-30T21:58Z"
+          }
+        ],
+        "regressed_queries_report": []
+      }
+    },
+    {
+      "id": "top_cached",
+      "tool": "get_top_cached_queries",
+      "arguments": {
+        "sort_by": "cpu"
+      },
+      "result": {
+        "result_status": "ok",
+        "window": {
+          "start": "2026-09-25T09:00Z",
+          "end": "2026-09-25T14:30Z"
+        },
+        "queries": [
+          {
+            "rank": 1,
+            "query_hash": "0x4E1C7A0B92D3F611",
+            "source": "GetOrdersDashboard",
+            "executions": 119880,
+            "total_cpu_s": 271000,
+            "avg_cpu_ms": 2261,
+            "avg_elapsed_ms": 9840,
+            "avg_logical_reads": 1402000,
+            "dop": 8
+          },
+          {
+            "rank": 2,
+            "query_hash": "0x9A02E3C1F0B77D40",
+            "source": "dbo.usp_CreateOrder",
+            "executions": 410220,
+            "total_cpu_s": 9850,
+            "avg_cpu_ms": 24,
+            "avg_elapsed_ms": 310,
+            "avg_logical_reads": 104,
+            "dop": 1
+          },
+          {
+            "rank": 3,
+            "query_hash": "0x11F0AB9C2D5E3381",
+            "source": "ProductSearch ad hoc",
+            "executions": 88400,
+            "total_cpu_s": 4120,
+            "avg_cpu_ms": 47,
+            "avg_elapsed_ms": 160,
+            "avg_logical_reads": 2950,
+            "dop": 1
+          },
+          {
+            "rank": 4,
+            "query_hash": "0x3C77D0E15A9B2204",
+            "source": "dbo.usp_GetInventoryByStore",
+            "executions": 61300,
+            "total_cpu_s": 1980,
+            "avg_cpu_ms": 32,
+            "avg_elapsed_ms": 95,
+            "avg_logical_reads": 610,
+            "dop": 1
+          }
+        ],
+        "all_other_total_cpu_s": 9400,
+        "same_window_on_a_good_day": {
+          "day": "Mon 21",
+          "query_hash": "0x4E1C7A0B92D3F611",
+          "avg_cpu_ms": 3.4,
+          "total_cpu_s": 410,
+          "dop": 1
+        }
+      }
+    }
+  ],
+  "key": {
+    "root_cause": "query_store_read_only",
+    "required_facts": [
+      {
+        "id": "read_only_and_full",
+        "evidence": "query_store",
+        "description": "Query Store is READ_ONLY because its storage is full: 1,024 of 1,024 MB.",
+        "signals": {
+          "all": [
+            "read[_\\s-]?only",
+            "1,?024|65536|full"
+          ]
+        },
+        "example": "Query Store actual state is READ_ONLY (reason 65536): storage is full at 1,024 of 1,024 MB."
+      },
+      {
+        "id": "no_data_after_9_sep",
+        "evidence": "query_store",
+        "description": "The last interval with data ended on 2026-09-09 at 14:00.",
+        "signals": {
+          "all": [
+            "(0?9[\\s-]sep|sep(tember)? 0?9|2026-09-09)"
+          ]
+        },
+        "example": "The last runtime statistics interval is 2026-09-09 13:00 to 14:00; nothing was captured after that."
+      },
+      {
+        "id": "automatic_tuning_is_off",
+        "evidence": "query_store",
+        "description": "FORCE_LAST_GOOD_PLAN is desired ON and actually OFF, because Query Store is read-only.",
+        "signals": {
+          "all": [
+            "FORCE_LAST_GOOD_PLAN|automatic tuning|automatic plan correction",
+            "\\boff\\b"
+          ]
+        },
+        "example": "FORCE_LAST_GOOD_PLAN is desired ON but actually OFF, with reason QUERY_STORE_READ_ONLY."
+      }
+    ],
+    "harmful_conclusions": [
+      {
+        "id": "clear_query_store",
+        "description": "Clearing Query Store destroys the forced-plan history and the evidence of the June regression.",
+        "signals": {
+          "any": [
+            "query_store\\s+clear",
+            "clear (the )?query store",
+            "sp_query_store_reset"
+          ]
+        },
+        "example": "Run ALTER DATABASE CURRENT SET QUERY_STORE CLEAR to free the space."
+      },
+      {
+        "id": "turn_query_store_off",
+        "description": "Without Query Store there is no plan history and no automatic plan correction.",
+        "signals": {
+          "any": [
+            "query_store\\s*=?\\s*off",
+            "(turn|switch) (off )?(the )?query store off",
+            "disable (the )?query store"
+          ]
+        },
+        "example": "Set QUERY_STORE = OFF until the incident is over."
+      },
+      {
+        "id": "trust_the_reports",
+        "description": "The reports end on 9 Sep. They cannot show a regression that started later.",
+        "root_causes": [
+          "cpu_capacity",
+          "platform_fault"
+        ]
+      }
+    ]
+  }
+}

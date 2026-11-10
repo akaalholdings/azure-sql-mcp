@@ -1,0 +1,144 @@
+{
+  "format_version": 1,
+  "id": "index-12-index-key-over-the-byte-limit",
+  "kind": "index_review",
+  "title": "Request to extend an index key to (PostCode, LastName, AddressLine1, Email)",
+  "split": "public",
+  "source": "index-exam-v1:12",
+  "tags": [
+    "key-size-limit",
+    "include",
+    "alter"
+  ],
+  "prompt": [
+    "Azure SQL Database 'RetailOps', General Purpose, 8 vCores, about 41.5 GB of memory, compatibility level 160, no readable secondary. Snapshot taken Thursday 2026-09-24 09:00 UTC. A platform failover reset the index usage counters on 2026-09-15 02:41, so they cover 9.26 days. Query Store holds data from 2026-09-11 only, because size-based cleanup has run. Month-end change freeze: 2026-09-30 18:00 to 2026-10-02 18:00. Flash sale on 2026-10-09 with a change freeze from 2026-10-08. Log rate cap: 36 MB/s. Space headroom: 213 GB.",
+    "Developer ticket: 'Extend IX_Customer_PostCode_LastName to (PostCode, LastName, AddressLine1, Email) so the fraud",
+    "check (Q13) seeks on both columns.' The missing-index DMV suggests equality PostCode, AddressLine1; include Email.",
+    "Decide."
+  ],
+  "usage_window": {
+    "start": "2026-09-15T02:41Z",
+    "end": "2026-09-24T09:00Z",
+    "days": 9.26,
+    "reset_by": "platform failover",
+    "query_store_from": "2026-09-11"
+  },
+  "inventory": [
+    {
+      "table": "dbo.Customer",
+      "name": "PK_Customer",
+      "type": "clustered",
+      "key_columns": [
+        "CustomerId"
+      ],
+      "include_columns": [],
+      "size_gb": 2.9,
+      "usage": {
+        "user_seeks": 6100000,
+        "user_scans": 0,
+        "user_lookups": 11900000,
+        "user_updates": 600000
+      },
+      "is_unique": true
+    },
+    {
+      "table": "dbo.Customer",
+      "name": "UQ_Customer_Email",
+      "type": "nonclustered",
+      "key_columns": [
+        "Email"
+      ],
+      "include_columns": [],
+      "size_gb": 0.31,
+      "usage": {
+        "user_seeks": 3600000,
+        "user_scans": 0,
+        "user_lookups": 0,
+        "user_updates": 61000
+      },
+      "is_unique": true,
+      "is_constraint": true
+    },
+    {
+      "table": "dbo.Customer",
+      "name": "IX_Customer_PostCode_LastName",
+      "type": "nonclustered",
+      "key_columns": [
+        "PostCode",
+        "LastName"
+      ],
+      "include_columns": [],
+      "size_gb": 0.26,
+      "usage": {
+        "user_seeks": 3880000,
+        "user_scans": 0,
+        "user_lookups": 0,
+        "user_updates": 74000
+      }
+    }
+  ],
+  "workload": [
+    {
+      "id": "Q13",
+      "description": "Checkout fraud address check",
+      "sql": "SELECT c.CustomerId, c.Email FROM dbo.Customer c WHERE c.PostCode = @PostCode AND c.AddressLine1 = @AddressLine1;",
+      "executions_per_day": 410000,
+      "plan": "Index Seek IX_Customer_PostCode_LastName (PostCode), Key Lookup (3.1 rows on average), Filter.",
+      "avg_cpu_ms": 0.2,
+      "avg_logical_reads": 18,
+      "max_logical_reads": 11800
+    }
+  ],
+  "facts": [
+    "dbo.Customer: 4.2M rows. PostCode NVARCHAR(16), LastName NVARCHAR(200), AddressLine1 NVARCHAR(500), Email NVARCHAR(320). NVARCHAR takes 2 bytes per character.",
+    "The maximum size of a nonclustered index key is 1,700 bytes. An index whose declared key can exceed it is created with a warning; an insert or update whose key does exceed it then fails with error 1946.",
+    "PostCode: about 3.1 customers per postcode; the largest postcode has 2,940 customers. AddressLine1: 58 characters on average, 412 at most.",
+    "Q13 runs 410,000 times a day at checkout. Customer rows are written at checkout."
+  ],
+  "key": {
+    "decisions": [
+      {
+        "index": "IX_Customer_PostCode_LastName",
+        "action": "alter",
+        "key_columns": [
+          "PostCode",
+          "LastName"
+        ],
+        "include_columns": [
+          "AddressLine1",
+          "Email"
+        ],
+        "why": "The requested key is 32 + 400 + 1,000 + 640 = 2,072 bytes, over the 1,700-byte limit. PostCode is selective, so AddressLine1 as an included column is a cheap residual check, and with Email included the key lookup goes."
+      }
+    ],
+    "must_not_create": [
+      {
+        "id": "requested_key_over_1700_bytes",
+        "table": "dbo.Customer",
+        "key_columns": [
+          "PostCode",
+          "LastName",
+          "AddressLine1"
+        ],
+        "why": "The key can exceed 1,700 bytes. The index is created with a warning, and customer writes at checkout then fail."
+      },
+      {
+        "id": "address_line_in_the_key",
+        "table": "dbo.Customer",
+        "key_columns": [
+          "PostCode",
+          "AddressLine1"
+        ],
+        "why": "32 + 1,000 bytes fits, but a 1,000-byte key column makes every index page hold a few rows; a residual check on about 3 rows needs no key column."
+      },
+      {
+        "id": "separate_index_on_address_line",
+        "table": "dbo.Customer",
+        "key_columns": [
+          "AddressLine1"
+        ],
+        "why": "A separate index on a 1,000-byte column does not serve a predicate that always comes with PostCode."
+      }
+    ]
+  }
+}

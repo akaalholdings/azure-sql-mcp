@@ -1,0 +1,173 @@
+{
+  "format_version": 1,
+  "id": "exam-q01-account-lookup-nvarchar-parameter",
+  "kind": "tuning",
+  "title": "Account lookup with an nvarchar parameter against a varchar column",
+  "split": "public",
+  "source": "rewrite-exam-v1:Q01",
+  "tags": [
+    "implicit-conversion",
+    "parameter-type"
+  ],
+  "prompt": [
+    "Highest-frequency statement on the database: about 250 calls per second at peak. Average CPU 140 ms and",
+    "about 7,800 logical reads per call. It returns 0 or 1 rows. Actual plan: Index Scan of",
+    "UX_Customers_AccountNumber (2.0M rows) with predicate CONVERT_IMPLICIT(nvarchar(20), c.AccountNumber, 0) = @p0,",
+    "then a Key Lookup. The plan has a PlanAffectingConvert warning. The application sends the parameter with",
+    "ADO.NET AddWithValue. The application team can change how the parameter is declared. The column type cannot",
+    "change this quarter: more than 40 procedures and an ETL depend on it. Input comes from a public search box,",
+    "so a caller can send any string, including one longer than 20 characters."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.Customers"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "Customers: 2.0M rows. Tier S = 1.85M, G = ~150k, P = 25 partner accounts (CustomerID 1 to 25). IsActive = 1 for 88%. Email is NULL for ~9% (~180k rows, ~160k of them active). About 2% of non-NULL emails are shared by two or more customer rows (households). ReferredByCustomerID is non-NULL for 18%; 312 rows are self-referrals (ReferredByCustomerID = CustomerID, CustomerID 500001 to 500312). AccountNumber always matches 'AC' + 10 digits (CHECK constraint)."
+  ],
+  "baseline_kind": "batch",
+  "baseline_sql": [
+    "exec sp_executesql N'SELECT c.CustomerID, c.FirstName, c.LastName, c.Email, c.Tier",
+    "FROM qe.Customers c",
+    "WHERE c.AccountNumber = @p0', N'@p0 nvarchar(4000)', @p0 = N'AC0001234567';"
+  ],
+  "parameter_cases": [
+    {
+      "name": "existing_account",
+      "values": {
+        "p0": "AC0001234567"
+      },
+      "types": {
+        "p0": "nvarchar(4000)"
+      },
+      "weight": 0.9
+    },
+    {
+      "name": "unknown_account",
+      "values": {
+        "p0": "AC9999999999"
+      },
+      "types": {
+        "p0": "nvarchar(4000)"
+      },
+      "weight": 0.09
+    },
+    {
+      "name": "long_input",
+      "values": {
+        "p0": "AC0001234567        XYZ"
+      },
+      "types": {
+        "p0": "nvarchar(4000)"
+      },
+      "weight": 0.01
+    }
+  ],
+  "key": {
+    "decision": "rewrite",
+    "correct_families": [
+      {
+        "id": "varchar_parameter",
+        "description": "Declare the parameter as varchar so the column is not converted. The application must reject input longer than the declared size before it binds the value, because the client truncates silently.",
+        "signals": {
+          "all": [
+            "'@p0 varchar\\(\\s*\\d+\\s*\\)'"
+          ]
+        },
+        "reference_sql": [
+          "exec sp_executesql N'SELECT c.CustomerID, c.FirstName, c.LastName, c.Email, c.Tier",
+          "FROM qe.Customers c",
+          "WHERE c.AccountNumber = @p0', N'@p0 varchar(20)', @p0 = 'AC0001234567';"
+        ]
+      },
+      {
+        "id": "convert_parameter_without_truncation",
+        "description": "Convert the parameter, not the column, to a varchar wide enough to hold any input.",
+        "signals": {
+          "all": [
+            "AccountNumber\\s*=\\s*(cast\\(\\s*@p0 as varchar\\(\\s*(4000|8000)\\s*\\)\\s*\\)|convert\\(\\s*varchar\\(\\s*(4000|8000)\\s*\\)\\s*,\\s*@p0\\s*\\))"
+          ]
+        },
+        "reference_sql": [
+          "exec sp_executesql N'SELECT c.CustomerID, c.FirstName, c.LastName, c.Email, c.Tier",
+          "FROM qe.Customers c",
+          "WHERE c.AccountNumber = CAST(@p0 AS varchar(4000))', N'@p0 nvarchar(4000)', @p0 = N'AC0001234567';"
+        ]
+      }
+    ],
+    "traps": [
+      {
+        "id": "truncating_cast",
+        "class": "not_equivalent",
+        "why": "A cast to a short varchar cuts long input. A 23-character input whose first 20 characters equal a real account then matches that account.",
+        "signals": {
+          "any": [
+            "cast\\(\\s*@p0 as varchar\\(\\s*\\d{1,3}\\s*\\)\\s*\\)",
+            "convert\\(\\s*varchar\\(\\s*\\d{1,3}\\s*\\)\\s*,\\s*@p0\\s*\\)",
+            "left\\(\\s*@p0\\s*,"
+          ]
+        },
+        "told_apart_by": "Parameter case long_input: the baseline returns no row, the truncating cast returns the account.",
+        "example_sql": [
+          "exec sp_executesql N'SELECT c.CustomerID, c.FirstName, c.LastName, c.Email, c.Tier",
+          "FROM qe.Customers c",
+          "WHERE c.AccountNumber = CAST(@p0 AS varchar(20))', N'@p0 nvarchar(4000)', @p0 = N'AC0001234567';"
+        ]
+      },
+      {
+        "id": "convert_column",
+        "class": "ineffective",
+        "why": "An explicit conversion of the column is the same scan as the implicit one.",
+        "signals": {
+          "any": [
+            "convert\\(\\s*nvarchar\\(\\s*\\d+\\s*\\)\\s*,\\s*c\\.AccountNumber",
+            "cast\\(\\s*c\\.AccountNumber as nvarchar"
+          ]
+        },
+        "example_sql": [
+          "exec sp_executesql N'SELECT c.CustomerID, c.FirstName, c.LastName, c.Email, c.Tier",
+          "FROM qe.Customers c",
+          "WHERE CONVERT(nvarchar(20), c.AccountNumber) = @p0', N'@p0 nvarchar(4000)', @p0 = N'AC0001234567';"
+        ]
+      },
+      {
+        "id": "alter_column_type",
+        "class": "unsafe",
+        "why": "The context rules out a column type change this quarter; it also doubles the index size.",
+        "signals": {
+          "all": [
+            "alter table qe\\.Customers alter column AccountNumber"
+          ]
+        },
+        "example_sql": "ALTER TABLE qe.Customers ALTER COLUMN AccountNumber nvarchar(20) NOT NULL;"
+      },
+      {
+        "id": "recompile_hint",
+        "class": "ineffective",
+        "why": "A fresh compile still converts the column, so the scan stays.",
+        "signals": {
+          "all": [
+            "option\\s*\\(\\s*recompile"
+          ]
+        },
+        "example_sql": [
+          "exec sp_executesql N'SELECT c.CustomerID, c.FirstName, c.LastName, c.Email, c.Tier",
+          "FROM qe.Customers c",
+          "WHERE c.AccountNumber = @p0 OPTION (RECOMPILE)', N'@p0 nvarchar(4000)', @p0 = N'AC0001234567';"
+        ]
+      }
+    ],
+    "index": {
+      "role": "optional"
+    },
+    "min_improvement": {
+      "metric": "logical_reads",
+      "ratio": 100,
+      "basis": "The scan reads about 7,800 pages per call. A seek and one lookup read about 5."
+    },
+    "reference_notes": "With a SQL collation, a varchar column compared with an nvarchar value is converted to nvarchar and the index order cannot be used. The CHECK constraint on AccountNumber allows only ASCII letters and digits, so a character that becomes '?' in varchar can never match a row."
+  }
+}

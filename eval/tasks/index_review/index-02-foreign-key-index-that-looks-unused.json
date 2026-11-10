@@ -1,0 +1,139 @@
+{
+  "format_version": 1,
+  "id": "index-02-foreign-key-index-that-looks-unused",
+  "kind": "index_review",
+  "title": "IX_Shipment_OrderId: 372 seeks against 3.42M updates",
+  "split": "public",
+  "source": "index-exam-v1:2",
+  "tags": [
+    "foreign-key",
+    "keep",
+    "read-write-ratio"
+  ],
+  "prompt": [
+    "Azure SQL Database 'RetailOps', General Purpose, 8 vCores, about 41.5 GB of memory, compatibility level 160, no readable secondary. Snapshot taken Thursday 2026-09-24 09:00 UTC. A platform failover reset the index usage counters on 2026-09-15 02:41, so they cover 9.26 days. Query Store holds data from 2026-09-11 only, because size-based cleanup has run. Month-end change freeze: 2026-09-30 18:00 to 2026-10-02 18:00. Flash sale on 2026-10-09 with a change freeze from 2026-10-08. Log rate cap: 36 MB/s. Space headroom: 213 GB.",
+    "The advisor script recommends: DROP INDEX IX_Shipment_OrderId, 'reads/writes 0.011%'. Decide."
+  ],
+  "usage_window": {
+    "start": "2026-09-15T02:41Z",
+    "end": "2026-09-24T09:00Z",
+    "days": 9.26,
+    "reset_by": "platform failover",
+    "query_store_from": "2026-09-11"
+  },
+  "inventory": [
+    {
+      "table": "dbo.Shipment",
+      "name": "Shipment_heap",
+      "type": "heap",
+      "key_columns": [],
+      "include_columns": [],
+      "size_gb": 74.2,
+      "usage": {
+        "user_seeks": 0,
+        "user_scans": 223,
+        "user_lookups": 47400000,
+        "user_updates": 21600000
+      },
+      "forwarded_records": 31400000,
+      "forwarded_fetches": 7080000000,
+      "page_density_pct": 61
+    },
+    {
+      "table": "dbo.Shipment",
+      "name": "PK_Shipment",
+      "type": "nonclustered",
+      "key_columns": [
+        "ShipmentId"
+      ],
+      "include_columns": [],
+      "size_gb": 2.1,
+      "usage": {
+        "user_seeks": 18600000,
+        "user_scans": 0,
+        "user_lookups": 0,
+        "user_updates": 3400000
+      },
+      "is_unique": true,
+      "is_constraint": true
+    },
+    {
+      "table": "dbo.Shipment",
+      "name": "IX_Shipment_OrderId",
+      "type": "nonclustered",
+      "key_columns": [
+        "OrderId"
+      ],
+      "include_columns": [],
+      "size_gb": 2.3,
+      "usage": {
+        "user_seeks": 372,
+        "user_scans": 0,
+        "user_lookups": 0,
+        "user_updates": 3420000
+      },
+      "last_user_seek": "2026-09-24T01:52Z"
+    },
+    {
+      "table": "dbo.Shipment",
+      "name": "IX_Shipment_TrackingNumber",
+      "type": "nonclustered",
+      "key_columns": [
+        "TrackingNumber"
+      ],
+      "include_columns": [
+        "Status"
+      ],
+      "size_gb": 4.6,
+      "usage": {
+        "user_seeks": 28800000,
+        "user_scans": 0,
+        "user_lookups": 0,
+        "user_updates": 21900000
+      }
+    }
+  ],
+  "workload": [
+    {
+      "id": "Q8",
+      "description": "Tracking API",
+      "sql": "SELECT s.ShipmentId, s.OrderId, s.CarrierId, s.Status, s.LastEventAt, s.DeliveredAt FROM dbo.Shipment s WHERE s.TrackingNumber = @TrackingNumber;",
+      "executions_per_day": 3100000,
+      "plan": "Index Seek IX_Shipment_TrackingNumber, RID Lookup (heap).",
+      "avg_cpu_ms": 0.15,
+      "avg_logical_reads": 5.4
+    },
+    {
+      "id": "Q11",
+      "description": "ops.usp_PurgeOrders, nightly 01:30, about 20 batches of 2,000 orders",
+      "sql": [
+        "DELETE s FROM dbo.Shipment s WHERE s.OrderId IN (SELECT OrderId FROM #batch);",
+        "DELETE ol FROM dbo.OrderLine ol JOIN #batch b ON b.OrderId = ol.OrderId;",
+        "DELETE o FROM dbo.Orders o JOIN #batch b ON b.OrderId = o.OrderId;"
+      ],
+      "executions_per_day": 20,
+      "plan": "Shipment delete: Index Seek IX_Shipment_OrderId, RID Lookup, Table Delete. Orders delete: foreign key checks by Nested Loops (Left Semi) into PK_OrderLine and into IX_Shipment_OrderId, then Assert.",
+      "whole_job_minutes": "25-30"
+    }
+  ],
+  "facts": [
+    "dbo.Shipment: heap, 96.1M rows, 74.2 GB. FK_Shipment_Orders references dbo.Orders (OrderId).",
+    "All 372 seeks on IX_Shipment_OrderId come from the nightly purge; the last one was at 2026-09-24 01:52.",
+    "The purge deletes Shipment rows by OrderId and then deletes Orders rows; each Orders delete checks the foreign key with a seek on IX_Shipment_OrderId."
+  ],
+  "key": {
+    "decisions": [
+      {
+        "index": "IX_Shipment_OrderId",
+        "action": "keep",
+        "why": "It supports FK_Shipment_Orders. Without it each of about 20 purge batches a night scans the 74 GB heap twice: once for the Shipment delete and once for the foreign key check."
+      }
+    ],
+    "harmful_removals": [
+      {
+        "index": "IX_Shipment_OrderId",
+        "why": "The purge would run for hours, hit the log and IO limits, run into business hours and hold locks. The read/write ratio is the wrong measure for an index that supports a foreign key."
+      }
+    ]
+  }
+}

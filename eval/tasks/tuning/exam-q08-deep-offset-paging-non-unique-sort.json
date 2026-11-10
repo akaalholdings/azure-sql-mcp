@@ -1,0 +1,238 @@
+{
+  "format_version": 1,
+  "id": "exam-q08-deep-offset-paging-non-unique-sort",
+  "kind": "tuning",
+  "title": "Deep OFFSET paging on a sort key that is not unique",
+  "split": "public",
+  "source": "rewrite-exam-v1:Q08",
+  "tags": [
+    "deep-offset-paging",
+    "deterministic-order"
+  ],
+  "prompt": [
+    "Admin order grid with @Take = 50. Users page deep: @Skip of 100k to 500k is common for 'Shipped' (about 25M rows),",
+    "and the last-page button sends @Skip = total - 50. Typical deep pages take 6 to 40 s. The plan scans or sorts",
+    "millions of wide rows before it discards @Skip of them. Support staff report that rows appear twice or go missing",
+    "when they page through batch-imported orders, which share OrderDate values. The grid API takes Skip and Take today.",
+    "A change to a cursor API is possible, but it is a separate frontend project."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.Orders",
+      "qe.Customers"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "Orders: 30M rows, 2016 to now, ~12k per day now. The 25 partner customers own ~9M orders (30%), up to 1.2M each. Other customers average ~10 orders (max ~400). The density estimate for CustomerID is ~15 rows. Status: Shipped 83.8%, Cancelled 7%, Paid 6%, Returned 3%, Pending 0.2% (~60k rows, all from the last 72 hours). SalesChannel: Web 62%, Store 20%, Partner 12%, Phone 6%. PromoCode is NULL for 85%. ShipRegionID is NULL for Store pickups (~20%). OrderDate is datetime2(7); Partner and Store imports stamp one timestamp on a whole batch, so many orders of one customer share an OrderDate.",
+    "Customers: 2.0M rows. Tier S = 1.85M, G = ~150k, P = 25 partner accounts (CustomerID 1 to 25). IsActive = 1 for 88%. Email is NULL for ~9% (~180k rows, ~160k of them active). About 2% of non-NULL emails are shared by two or more customer rows (households). ReferredByCustomerID is non-NULL for 18%; 312 rows are self-referrals (ReferredByCustomerID = CustomerID, CustomerID 500001 to 500312). AccountNumber always matches 'AC' + 10 digits (CHECK constraint)."
+  ],
+  "baseline_kind": "select",
+  "baseline_sql": [
+    "SELECT o.OrderID, o.OrderDate, o.Status, o.TotalAmount, o.SalesChannel, o.PromoCode,",
+    "       c.AccountNumber, c.FirstName, c.LastName, c.Email",
+    "FROM qe.Orders o",
+    "JOIN qe.Customers c ON c.CustomerID = o.CustomerID",
+    "WHERE o.Status = @Status",
+    "ORDER BY o.OrderDate DESC",
+    "OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY;"
+  ],
+  "parameter_cases": [
+    {
+      "name": "deep_page",
+      "values": {
+        "Status": "Shipped",
+        "Skip": 300000,
+        "Take": 50
+      },
+      "types": {
+        "Status": "varchar(12)",
+        "Skip": "int",
+        "Take": "int"
+      },
+      "weight": 0.6
+    },
+    {
+      "name": "first_page",
+      "values": {
+        "Status": "Shipped",
+        "Skip": 0,
+        "Take": 50
+      },
+      "types": {
+        "Status": "varchar(12)",
+        "Skip": "int",
+        "Take": "int"
+      },
+      "weight": 0.3
+    },
+    {
+      "name": "pending_page",
+      "values": {
+        "Status": "Pending",
+        "Skip": 1000,
+        "Take": 50
+      },
+      "types": {
+        "Status": "varchar(12)",
+        "Skip": "int",
+        "Take": "int"
+      },
+      "weight": 0.1
+    }
+  ],
+  "key": {
+    "decision": "rewrite",
+    "correct_families": [
+      {
+        "id": "page_the_keys_then_join",
+        "description": "Page over a narrow ordered index of keys with a unique tiebreaker, then fetch the wide columns for the page only, in the same order.",
+        "signals": {
+          "all": [
+            "with\\s+\\w+\\s+as\\s*\\(|from\\s*\\(\\s*select",
+            "offset\\s+@Skip\\s+rows",
+            "OrderDate desc\\s*,\\s*\\w+\\.OrderID desc.*rows only\\s*\\).*OrderDate desc\\s*,\\s*\\w+\\.OrderID desc"
+          ]
+        },
+        "reference_sql": [
+          "WITH k AS (",
+          "    SELECT o.OrderID, o.OrderDate",
+          "    FROM qe.Orders o",
+          "    WHERE o.Status = @Status",
+          "    ORDER BY o.OrderDate DESC, o.OrderID DESC",
+          "    OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY",
+          ")",
+          "SELECT o.OrderID, o.OrderDate, o.Status, o.TotalAmount, o.SalesChannel, o.PromoCode,",
+          "       c.AccountNumber, c.FirstName, c.LastName, c.Email",
+          "FROM k",
+          "JOIN qe.Orders    o ON o.OrderID = k.OrderID",
+          "JOIN qe.Customers c ON c.CustomerID = o.CustomerID",
+          "ORDER BY k.OrderDate DESC, k.OrderID DESC;"
+        ]
+      }
+    ],
+    "traps": [
+      {
+        "id": "keyset_presented_as_drop_in",
+        "class": "not_equivalent",
+        "why": "Keyset paging needs the last key seen and cannot jump to page N. The grid API sends Skip and Take, so this is an interface change, not a replacement.",
+        "signals": {
+          "all": [
+            "@Last\\w+"
+          ],
+          "none": [
+            "\\boffset\\b"
+          ]
+        },
+        "told_apart_by": "The existing callers pass @Skip and @Take and have no last key to send.",
+        "example_sql": [
+          "SELECT TOP (@Take) o.OrderID, o.OrderDate, o.Status, o.TotalAmount, o.SalesChannel, o.PromoCode,",
+          "       c.AccountNumber, c.FirstName, c.LastName, c.Email",
+          "FROM qe.Orders o",
+          "JOIN qe.Customers c ON c.CustomerID = o.CustomerID",
+          "WHERE o.Status = @Status",
+          "  AND (o.OrderDate < @LastOrderDate OR (o.OrderDate = @LastOrderDate AND o.OrderID < @LastOrderID))",
+          "ORDER BY o.OrderDate DESC, o.OrderID DESC;"
+        ]
+      },
+      {
+        "id": "outer_order_missing",
+        "class": "not_equivalent",
+        "why": "The order of a CTE is not kept. Without the same ORDER BY on the outer query the page rows come back in any order.",
+        "signals": {
+          "all": [
+            "offset\\s+@Skip\\s+rows",
+            "with\\s+\\w+\\s+as\\s*\\(|from\\s*\\(\\s*select"
+          ],
+          "none": [
+            "rows only\\s*\\).*\\border by\\b"
+          ]
+        },
+        "told_apart_by": "Any page: the 50 rows are right but their order is not guaranteed.",
+        "example_sql": [
+          "WITH k AS (",
+          "    SELECT o.OrderID, o.OrderDate",
+          "    FROM qe.Orders o",
+          "    WHERE o.Status = @Status",
+          "    ORDER BY o.OrderDate DESC, o.OrderID DESC",
+          "    OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY",
+          ")",
+          "SELECT o.OrderID, o.OrderDate, o.Status, o.TotalAmount, o.SalesChannel, o.PromoCode,",
+          "       c.AccountNumber, c.FirstName, c.LastName, c.Email",
+          "FROM k",
+          "JOIN qe.Orders    o ON o.OrderID = k.OrderID",
+          "JOIN qe.Customers c ON c.CustomerID = o.CustomerID;"
+        ]
+      },
+      {
+        "id": "non_unique_order_kept",
+        "class": "ineffective",
+        "why": "With ORDER BY OrderDate alone, tied rows can change places between calls. The duplicate and missing rows stay.",
+        "signals": {
+          "all": [
+            "offset\\s+@Skip\\s+rows"
+          ],
+          "none": [
+            "OrderDate desc\\s*,\\s*\\w+\\.OrderID"
+          ]
+        },
+        "example_sql": [
+          "WITH k AS (",
+          "    SELECT o.OrderID, o.OrderDate",
+          "    FROM qe.Orders o",
+          "    WHERE o.Status = @Status",
+          "    ORDER BY o.OrderDate DESC",
+          "    OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY",
+          ")",
+          "SELECT o.OrderID, o.OrderDate, o.Status, o.TotalAmount, o.SalesChannel, o.PromoCode,",
+          "       c.AccountNumber, c.FirstName, c.LastName, c.Email",
+          "FROM k",
+          "JOIN qe.Orders    o ON o.OrderID = k.OrderID",
+          "JOIN qe.Customers c ON c.CustomerID = o.CustomerID",
+          "ORDER BY k.OrderDate DESC;"
+        ]
+      },
+      {
+        "id": "row_number_between",
+        "class": "ineffective",
+        "why": "ROW_NUMBER with a range filter still numbers every row up to the page.",
+        "signals": {
+          "all": [
+            "row_number\\s*\\("
+          ]
+        },
+        "example_sql": [
+          "SELECT t.OrderID, t.OrderDate, t.Status, t.TotalAmount, t.SalesChannel, t.PromoCode,",
+          "       t.AccountNumber, t.FirstName, t.LastName, t.Email",
+          "FROM (SELECT o.OrderID, o.OrderDate, o.Status, o.TotalAmount, o.SalesChannel, o.PromoCode,",
+          "       c.AccountNumber, c.FirstName, c.LastName, c.Email,",
+          "             ROW_NUMBER() OVER (ORDER BY o.OrderDate DESC, o.OrderID DESC) AS rn",
+          "      FROM qe.Orders o",
+          "      JOIN qe.Customers c ON c.CustomerID = o.CustomerID",
+          "      WHERE o.Status = @Status) t",
+          "WHERE t.rn > @Skip AND t.rn <= @Skip + @Take",
+          "ORDER BY t.rn;"
+        ]
+      }
+    ],
+    "index": {
+      "role": "required",
+      "accepted": [
+        {
+          "table": "qe.Orders",
+          "key_columns": [
+            "Status",
+            "OrderDate"
+          ]
+        }
+      ]
+    },
+    "min_improvement": {
+      "metric": "logical_reads",
+      "ratio": 5,
+      "basis": "A deep page reads @Skip narrow index rows instead of sorting or scanning millions of wide rows."
+    },
+    "reference_notes": "OrderID as a tiebreaker gives one of the orders the original allowed, and it fixes the reported duplicates. The Customers join can move after the paging because Orders.CustomerID is NOT NULL with a trusted foreign key."
+  }
+}

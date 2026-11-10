@@ -1,0 +1,192 @@
+{
+  "format_version": 1,
+  "id": "new-01-catch-all-support-lookup",
+  "kind": "tuning",
+  "title": "Catch-all customer lookup that runs twice a minute",
+  "split": "public",
+  "source": "s6-new:01",
+  "tags": [
+    "catch-all-parameters",
+    "option-recompile"
+  ],
+  "prompt": [
+    "Support lookup screen: about 2 calls per minute. 80% of calls pass only @Email and return 0 to 3 rows; the others",
+    "pass @RegionID with @Tier. Every call takes about 1.9 s: the cached plan is a Clustered Index Scan of PK_Customers",
+    "(2.0M rows, about 31,000 logical reads) with the three OR predicates as a residual filter. Measured compile time is",
+    "3 ms. IX_Customers_Email and IX_Customers_RegionID exist. A call with all three parameters NULL is allowed and",
+    "returns every customer, including those with no email address."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.Customers"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "Customers: 2.0M rows. Tier S = 1.85M, G = ~150k, P = 25 partner accounts (CustomerID 1 to 25). IsActive = 1 for 88%. Email is NULL for ~9% (~180k rows, ~160k of them active). About 2% of non-NULL emails are shared by two or more customer rows (households). ReferredByCustomerID is non-NULL for 18%; 312 rows are self-referrals (ReferredByCustomerID = CustomerID, CustomerID 500001 to 500312). AccountNumber always matches 'AC' + 10 digits (CHECK constraint)."
+  ],
+  "baseline_kind": "select",
+  "baseline_sql": [
+    "SELECT c.CustomerID, c.AccountNumber, c.Email, c.Tier",
+    "FROM qe.Customers c",
+    "WHERE (@RegionID IS NULL OR c.RegionID = @RegionID)",
+    "  AND (@Tier IS NULL OR c.Tier = @Tier)",
+    "  AND (@Email IS NULL OR c.Email = @Email);"
+  ],
+  "parameter_cases": [
+    {
+      "name": "email_only",
+      "values": {
+        "RegionID": null,
+        "Tier": null,
+        "Email": "pat.lee@example.org"
+      },
+      "types": {
+        "RegionID": "tinyint",
+        "Tier": "char(1)",
+        "Email": "varchar(254)"
+      },
+      "weight": 0.8
+    },
+    {
+      "name": "region_and_tier",
+      "values": {
+        "RegionID": 3,
+        "Tier": "G",
+        "Email": null
+      },
+      "types": {
+        "RegionID": "tinyint",
+        "Tier": "char(1)",
+        "Email": "varchar(254)"
+      },
+      "weight": 0.15
+    },
+    {
+      "name": "no_filter",
+      "values": {
+        "RegionID": null,
+        "Tier": null,
+        "Email": null
+      },
+      "types": {
+        "RegionID": "tinyint",
+        "Tier": "char(1)",
+        "Email": "varchar(254)"
+      },
+      "weight": 0.05
+    }
+  ],
+  "key": {
+    "decision": "rewrite",
+    "correct_families": [
+      {
+        "id": "option_recompile",
+        "description": "At 2 calls per minute and 3 ms per compile, a fresh plan per call is cheap. The optimizer then removes the predicates whose parameter is NULL and seeks on the one that is given.",
+        "signals": {
+          "all": [
+            "option\\s*\\(\\s*recompile\\s*\\)",
+            "@Email IS NULL OR c\\.Email = @Email"
+          ]
+        },
+        "reference_sql": [
+          "SELECT c.CustomerID, c.AccountNumber, c.Email, c.Tier",
+          "FROM qe.Customers c",
+          "WHERE (@RegionID IS NULL OR c.RegionID = @RegionID)",
+          "  AND (@Tier IS NULL OR c.Tier = @Tier)",
+          "  AND (@Email IS NULL OR c.Email = @Email)",
+          "OPTION (RECOMPILE);"
+        ]
+      },
+      {
+        "id": "parameterized_dynamic_sql",
+        "description": "Build only the predicates that are supplied and run the text with sp_executesql and real parameters.",
+        "signals": {
+          "all": [
+            "sp_executesql",
+            "c\\.Email = @Email"
+          ],
+          "none": [
+            "'\\s*\\+\\s*(cast\\(|convert\\(|quotename\\()?\\s*@(RegionID|Tier|Email)\\b"
+          ]
+        },
+        "reference_sql": [
+          "DECLARE @sql nvarchar(max) = N'SELECT c.CustomerID, c.AccountNumber, c.Email, c.Tier",
+          "FROM qe.Customers c",
+          "WHERE 1 = 1';",
+          "IF @RegionID IS NOT NULL SET @sql += N' AND c.RegionID = @RegionID';",
+          "IF @Tier     IS NOT NULL SET @sql += N' AND c.Tier = @Tier';",
+          "IF @Email    IS NOT NULL SET @sql += N' AND c.Email = @Email';",
+          "EXEC sys.sp_executesql @sql, N'@RegionID tinyint, @Tier char(1), @Email varchar(254)', @RegionID, @Tier, @Email;"
+        ]
+      }
+    ],
+    "traps": [
+      {
+        "id": "isnull_on_nullable_column",
+        "class": "not_equivalent",
+        "why": "c.Email = ISNULL(@Email, c.Email) is not an optional filter on a nullable column. With @Email NULL it is c.Email = c.Email, which drops every customer whose Email is NULL (about 9%).",
+        "signals": {
+          "any": [
+            "c\\.Email\\s*=\\s*(isnull|coalesce)\\(\\s*@Email\\s*,\\s*c\\.Email\\s*\\)"
+          ]
+        },
+        "told_apart_by": "Parameter case no_filter: the 180k customers with a NULL Email disappear.",
+        "example_sql": [
+          "SELECT c.CustomerID, c.AccountNumber, c.Email, c.Tier",
+          "FROM qe.Customers c",
+          "WHERE c.RegionID = ISNULL(@RegionID, c.RegionID)",
+          "  AND c.Tier = ISNULL(@Tier, c.Tier)",
+          "  AND c.Email = ISNULL(@Email, c.Email);"
+        ]
+      },
+      {
+        "id": "concatenated_values",
+        "class": "unsafe",
+        "why": "The email comes from a support agent's text box. Concatenating it into the statement allows SQL injection.",
+        "signals": {
+          "any": [
+            "'\\s*\\+\\s*(cast\\(|convert\\(|quotename\\()?\\s*@(RegionID|Tier|Email)\\b"
+          ]
+        },
+        "example_sql": [
+          "DECLARE @sql nvarchar(max) = N'SELECT c.CustomerID, c.AccountNumber, c.Email, c.Tier",
+          "FROM qe.Customers c",
+          "WHERE 1 = 1';",
+          "IF @RegionID IS NOT NULL SET @sql += N' AND c.RegionID = @RegionID';",
+          "IF @Tier     IS NOT NULL SET @sql += N' AND c.Tier = @Tier';",
+          "IF @Email    IS NOT NULL SET @sql += N' AND c.Email = ''' + @Email + N'''';",
+          "EXEC sys.sp_executesql @sql, N'@RegionID tinyint, @Tier char(1), @Email varchar(254)', @RegionID, @Tier, @Email;"
+        ]
+      },
+      {
+        "id": "optimize_for_unknown",
+        "class": "ineffective",
+        "why": "OPTIMIZE FOR UNKNOWN changes the estimates, not the shape: one plan must still be valid for every NULL combination, so it still scans.",
+        "signals": {
+          "all": [
+            "optimize for"
+          ]
+        },
+        "example_sql": [
+          "SELECT c.CustomerID, c.AccountNumber, c.Email, c.Tier",
+          "FROM qe.Customers c",
+          "WHERE (@RegionID IS NULL OR c.RegionID = @RegionID)",
+          "  AND (@Tier IS NULL OR c.Tier = @Tier)",
+          "  AND (@Email IS NULL OR c.Email = @Email)",
+          "OPTION (OPTIMIZE FOR UNKNOWN);"
+        ]
+      }
+    ],
+    "index": {
+      "role": "none"
+    },
+    "min_improvement": {
+      "metric": "logical_reads",
+      "ratio": 100,
+      "basis": "The scan reads about 31,000 pages. The dominant email path is a seek with a few lookups."
+    },
+    "reference_notes": "The same pattern at 40 calls per second needs dynamic SQL instead: see the task converted from rewrite exam Q02."
+  }
+}

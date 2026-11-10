@@ -1,0 +1,226 @@
+{
+  "format_version": 1,
+  "id": "exam-q11-row-goal-dispatch-queue",
+  "kind": "tuning",
+  "title": "Dispatch queue TOP (50): the row goal walks the whole date index",
+  "split": "public",
+  "source": "rewrite-exam-v1:Q11",
+  "tags": [
+    "row-goal",
+    "filtered-index"
+  ],
+  "prompt": [
+    "Warehouse dispatch screen: about 200 terminals poll, 6 calls per second in total. Average 2.8 s, CPU-bound, and",
+    "slower every week. Actual plan: ordered forward scan of IX_Orders_OrderDate with residual Status = 'Pending', then a",
+    "Key Lookup to PK_Orders for ShipRegionID and a Filter. The scan was estimated to read about 200k rows (row goal) and",
+    "read about 29.9M. Statistics are current (FULLSCAN last night): the estimate for Status = 'Pending' alone is right",
+    "(about 60k). All Pending orders are from the last 72 hours, so the oldest-first scan reads almost the whole index",
+    "before the first match. 'Pending' is always a literal in this statement; @RegionID comes from the terminal."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.Orders"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "Orders: 30M rows, 2016 to now, ~12k per day now. The 25 partner customers own ~9M orders (30%), up to 1.2M each. Other customers average ~10 orders (max ~400). The density estimate for CustomerID is ~15 rows. Status: Shipped 83.8%, Cancelled 7%, Paid 6%, Returned 3%, Pending 0.2% (~60k rows, all from the last 72 hours). SalesChannel: Web 62%, Store 20%, Partner 12%, Phone 6%. PromoCode is NULL for 85%. ShipRegionID is NULL for Store pickups (~20%). OrderDate is datetime2(7); Partner and Store imports stamp one timestamp on a whole batch, so many orders of one customer share an OrderDate."
+  ],
+  "baseline_kind": "select",
+  "baseline_sql": [
+    "SELECT TOP (50) o.OrderID, o.CustomerID, o.OrderDate, o.TotalAmount",
+    "FROM qe.Orders o",
+    "WHERE o.Status = 'Pending'",
+    "  AND o.ShipRegionID = @RegionID",
+    "ORDER BY o.OrderDate;"
+  ],
+  "parameter_cases": [
+    {
+      "name": "region_1",
+      "values": {
+        "RegionID": 1
+      },
+      "types": {
+        "RegionID": "tinyint"
+      },
+      "weight": 0.5
+    },
+    {
+      "name": "region_3",
+      "values": {
+        "RegionID": 3
+      },
+      "types": {
+        "RegionID": "tinyint"
+      },
+      "weight": 0.5
+    }
+  ],
+  "key": {
+    "decision": "index_only",
+    "accepted_decisions": [
+      "index_only",
+      "rewrite",
+      "plan_remedy"
+    ],
+    "correct_families": [
+      {
+        "id": "tiebreaker_only",
+        "description": "The statement stays the same; OrderID is added to ORDER BY so that ties at the 50th row are deterministic. This is allowed and optional.",
+        "signals": {
+          "all": [
+            "order by\\s+o\\.OrderDate\\s*,\\s*o\\.OrderID"
+          ],
+          "none": [
+            "with ties",
+            "Status\\s*=\\s*@"
+          ]
+        },
+        "reference_sql": [
+          "SELECT TOP (50) o.OrderID, o.CustomerID, o.OrderDate, o.TotalAmount",
+          "FROM qe.Orders o",
+          "WHERE o.Status = 'Pending'",
+          "  AND o.ShipRegionID = @RegionID",
+          "ORDER BY o.OrderDate, o.OrderID;"
+        ]
+      },
+      {
+        "id": "disable_row_goal_hint",
+        "description": "Fallback when an index cannot be added: turn the row goal off so the optimizer seeks the 60k Pending rows and sorts them.",
+        "signals": {
+          "all": [
+            "disable_optimizer_rowgoal"
+          ]
+        },
+        "reference_sql": [
+          "SELECT TOP (50) o.OrderID, o.CustomerID, o.OrderDate, o.TotalAmount",
+          "FROM qe.Orders o",
+          "WHERE o.Status = 'Pending'",
+          "  AND o.ShipRegionID = @RegionID",
+          "ORDER BY o.OrderDate",
+          "OPTION (USE HINT('DISABLE_OPTIMIZER_ROWGOAL'));"
+        ]
+      }
+    ],
+    "traps": [
+      {
+        "id": "update_statistics",
+        "class": "ineffective",
+        "why": "The per-column estimates are already right. Histograms cannot express that Pending rows sit only at the newest end.",
+        "signals": {
+          "all": [
+            "update statistics"
+          ]
+        },
+        "example_sql": "UPDATE STATISTICS qe.Orders WITH FULLSCAN;"
+      },
+      {
+        "id": "recompile_hint",
+        "class": "ineffective",
+        "why": "The row-goal estimate is the same on every compile.",
+        "signals": {
+          "all": [
+            "option\\s*\\(\\s*recompile"
+          ]
+        },
+        "example_sql": [
+          "SELECT TOP (50) o.OrderID, o.CustomerID, o.OrderDate, o.TotalAmount",
+          "FROM qe.Orders o",
+          "WHERE o.Status = 'Pending'",
+          "  AND o.ShipRegionID = @RegionID",
+          "ORDER BY o.OrderDate",
+          "OPTION (RECOMPILE);"
+        ]
+      },
+      {
+        "id": "status_as_parameter",
+        "class": "ineffective",
+        "why": "A parameter in place of the literal 'Pending' can no longer match a filtered index.",
+        "signals": {
+          "all": [
+            "Status\\s*=\\s*@\\w+"
+          ]
+        },
+        "example_sql": [
+          "SELECT TOP (50) o.OrderID, o.CustomerID, o.OrderDate, o.TotalAmount",
+          "FROM qe.Orders o",
+          "WHERE o.Status = @Status",
+          "  AND o.ShipRegionID = @RegionID",
+          "ORDER BY o.OrderDate;"
+        ]
+      },
+      {
+        "id": "with_ties",
+        "class": "not_equivalent",
+        "why": "WITH TIES returns more than 50 rows when orders share the 50th OrderDate.",
+        "signals": {
+          "all": [
+            "with ties"
+          ]
+        },
+        "told_apart_by": "Sixty Pending orders of one region with the same batch OrderDate.",
+        "example_sql": [
+          "SELECT TOP (50) WITH TIES o.OrderID, o.CustomerID, o.OrderDate, o.TotalAmount",
+          "FROM qe.Orders o",
+          "WHERE o.Status = 'Pending'",
+          "  AND o.ShipRegionID = @RegionID",
+          "ORDER BY o.OrderDate;"
+        ]
+      },
+      {
+        "id": "index_hint",
+        "class": "ineffective",
+        "why": "A hint on IX_Orders_Status is brittle and still needs about 60k lookups and a sort on every call.",
+        "signals": {
+          "any": [
+            "forceseek",
+            "with\\s*\\(\\s*index"
+          ]
+        },
+        "example_sql": [
+          "SELECT TOP (50) o.OrderID, o.CustomerID, o.OrderDate, o.TotalAmount",
+          "FROM qe.Orders o WITH (INDEX(IX_Orders_Status))",
+          "WHERE o.Status = 'Pending'",
+          "  AND o.ShipRegionID = @RegionID",
+          "ORDER BY o.OrderDate;"
+        ]
+      }
+    ],
+    "index": {
+      "role": "required",
+      "accepted": [
+        {
+          "table": "qe.Orders",
+          "key_columns": [
+            "ShipRegionID",
+            "OrderDate"
+          ],
+          "include_columns": [
+            "CustomerID",
+            "TotalAmount"
+          ],
+          "filter": "Status = 'Pending'"
+        },
+        {
+          "table": "qe.Orders",
+          "key_columns": [
+            "Status",
+            "ShipRegionID",
+            "OrderDate"
+          ],
+          "include_columns": [
+            "CustomerID",
+            "TotalAmount"
+          ]
+        }
+      ]
+    },
+    "min_improvement": {
+      "metric": "logical_reads",
+      "ratio": 1000,
+      "basis": "The scan reads about 29.9M rows per call. A seek in OrderDate order stops after 50 rows."
+    },
+    "reference_notes": "Before a filtered index is created, every session that modifies Orders must use the SET options that filtered indexes require."
+  }
+}

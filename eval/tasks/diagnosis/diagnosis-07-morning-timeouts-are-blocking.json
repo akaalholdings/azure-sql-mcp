@@ -1,0 +1,398 @@
+{
+  "format_version": 1,
+  "id": "diagnosis-07-morning-timeouts-are-blocking",
+  "kind": "diagnosis",
+  "title": "Timeouts between 07:00 and 09:30 on every business day",
+  "split": "public",
+  "source": "case-exam-v1:7",
+  "tags": [
+    "blocking",
+    "lock-escalation",
+    "timeouts"
+  ],
+  "prompt": [
+    "Client: Harbourline Commerce, a multi-tenant retail order platform with about 400 tenants. Database hlc-orders-prod: Azure SQL Database, Business Critical, Gen5, 16 vCores, compatibility level 160, READ_COMMITTED_SNAPSHOT ON. All times are UTC. Business hours are 07:30 to 18:00. The nightly batch must finish by 06:00. Evidence was collected from Mon 21 Sep to Sun 27 Sep 2026.",
+    "The application logs 287 to 451 command timeouts (30 s) between 07:00 and 09:30 on every business day, including",
+    "the days on which the rest of the day is fine. Batch step 4 applies about 6.2M inventory adjustments in one UPDATE",
+    "statement; since September it runs between about 07:00 and 09:00. Name the root cause of the morning timeouts."
+  ],
+  "evidence": [
+    {
+      "id": "sessions",
+      "tool": "get_active_sessions",
+      "arguments": {},
+      "result": {
+        "result_status": "ok",
+        "sampled_at": "2026-09-23T08:41:12Z",
+        "blocking_chains": [
+          {
+            "head_blocker_session_id": 412,
+            "head_blocker": {
+              "status": "suspended",
+              "wait_type": "LOG_RATE_GOVERNOR",
+              "wait_ms": 41,
+              "open_transaction_count": 1,
+              "elapsed": "00:36:08",
+              "statement": "Batch step 4: UPDATE i SET OnHand = i.OnHand - a.Qty FROM dbo.Inventory i JOIN stg.InventoryAdj a ON ... (about 6.2M rows)"
+            },
+            "blocked_session_ids": "77 sessions",
+            "blocked": {
+              "count": 77,
+              "wait_types": [
+                "LCK_M_IX",
+                "LCK_M_U"
+              ],
+              "wait_ms_min": 1200,
+              "wait_ms_max": 29410,
+              "statement": "dbo.usp_CreateOrder: UPDATE dbo.Inventory SET Reserved = Reserved + @q WHERE Sku = @sku"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "locks",
+      "tool": "get_lock_details",
+      "arguments": {},
+      "result": {
+        "result_status": "ok",
+        "locks": [
+          {
+            "session_id": 412,
+            "resource_type": "OBJECT",
+            "object": "dbo.Inventory",
+            "request_mode": "X",
+            "request_status": "GRANT"
+          }
+        ],
+        "lock_escalations": {
+          "object": "dbo.Inventory",
+          "index": "PK",
+          "index_lock_promotion_count_per_night": 1
+        }
+      }
+    },
+    {
+      "id": "waits_morning",
+      "tool": "get_wait_stats",
+      "arguments": {},
+      "result": {
+        "result_status": "ok",
+        "window": {
+          "mode": "delta",
+          "start": "2026-09-23T07:30Z",
+          "end": "2026-09-23T09:15Z"
+        },
+        "top_waits": [
+          {
+            "wait_type": "LOG_RATE_GOVERNOR",
+            "wait_time_s": 14930,
+            "avg_wait_ms": 41
+          },
+          {
+            "wait_type": "LCK_M_U",
+            "wait_time_s": 9870,
+            "avg_wait_ms": 6900
+          },
+          {
+            "wait_type": "LCK_M_IX",
+            "wait_time_s": 6140,
+            "avg_wait_ms": 11200
+          },
+          {
+            "wait_type": "WRITELOG",
+            "wait_time_s": 3420,
+            "avg_wait_ms": 2.6
+          },
+          {
+            "wait_type": "HADR_SYNC_COMMIT",
+            "wait_time_s": 2960,
+            "avg_wait_ms": 1.3
+          },
+          {
+            "wait_type": "PAGEIOLATCH_SH",
+            "wait_time_s": 2110,
+            "avg_wait_ms": 0.5
+          },
+          {
+            "wait_type": "CXPACKET",
+            "wait_time_s": 1640
+          },
+          {
+            "wait_type": "SOS_SCHEDULER_YIELD",
+            "wait_time_s": 980
+          },
+          {
+            "wait_type": "LCK_M_X",
+            "wait_time_s": 410,
+            "avg_wait_ms": 3100
+          }
+        ],
+        "signal_wait_pct": 5
+      }
+    },
+    {
+      "id": "wed_night",
+      "tool": "get_resource_stats_history",
+      "arguments": {
+        "window_minutes": 720
+      },
+      "result": {
+        "result_status": "ok",
+        "source": "sys.dm_db_resource_stats",
+        "history": [
+          {
+            "time": "2026-09-23T00:15Z",
+            "avg_cpu_percent": 9,
+            "avg_data_io_percent": 4,
+            "avg_log_write_percent": 3,
+            "max_worker_percent": 1,
+            "activity": "idle"
+          },
+          {
+            "time": "2026-09-23T00:45Z",
+            "avg_cpu_percent": 41,
+            "avg_data_io_percent": 38,
+            "avg_log_write_percent": 100,
+            "max_worker_percent": 2,
+            "activity": "index rebuild phase"
+          },
+          {
+            "time": "2026-09-23T02:15Z",
+            "avg_cpu_percent": 58,
+            "avg_data_io_percent": 61,
+            "avg_log_write_percent": 100,
+            "max_worker_percent": 3,
+            "activity": "rebuild and batch step 1"
+          },
+          {
+            "time": "2026-09-23T03:30Z",
+            "avg_cpu_percent": 62,
+            "avg_data_io_percent": 66,
+            "avg_log_write_percent": 100,
+            "max_worker_percent": 3,
+            "activity": "rebuild and batch step 1"
+          },
+          {
+            "time": "2026-09-23T05:30Z",
+            "avg_cpu_percent": 49,
+            "avg_data_io_percent": 63,
+            "avg_log_write_percent": 100,
+            "max_worker_percent": 3,
+            "activity": "rebuild and batch step 2"
+          },
+          {
+            "time": "2026-09-23T06:30Z",
+            "avg_cpu_percent": 47,
+            "avg_data_io_percent": 52,
+            "avg_log_write_percent": 92,
+            "max_worker_percent": 3,
+            "activity": "statistics phase and batch step 2"
+          },
+          {
+            "time": "2026-09-23T07:45Z",
+            "avg_cpu_percent": 43,
+            "avg_data_io_percent": 31,
+            "avg_log_write_percent": 97,
+            "max_worker_percent": 9,
+            "activity": "statistics phase and batch step 3"
+          },
+          {
+            "time": "2026-09-23T08:30Z",
+            "avg_cpu_percent": 46,
+            "avg_data_io_percent": 29,
+            "avg_log_write_percent": 100,
+            "max_worker_percent": 14,
+            "activity": "batch step 4 and OLTP"
+          },
+          {
+            "time": "2026-09-23T08:45Z",
+            "avg_cpu_percent": 44,
+            "avg_data_io_percent": 27,
+            "avg_log_write_percent": 100,
+            "max_worker_percent": 16,
+            "activity": "batch step 4 and OLTP"
+          },
+          {
+            "time": "2026-09-23T09:10Z",
+            "avg_cpu_percent": 31,
+            "avg_data_io_percent": 12,
+            "avg_log_write_percent": 47,
+            "max_worker_percent": 6,
+            "activity": "batch finished 09:06"
+          },
+          {
+            "time": "2026-09-23T10:30Z",
+            "avg_cpu_percent": 28,
+            "avg_data_io_percent": 7,
+            "avg_log_write_percent": 22,
+            "max_worker_percent": 5,
+            "activity": "normal day"
+          }
+        ]
+      }
+    },
+    {
+      "id": "daily",
+      "tool": "get_resource_stats_history",
+      "arguments": {
+        "window_minutes": 10080
+      },
+      "result": {
+        "result_status": "ok",
+        "source": "sys.resource_stats",
+        "granularity": "day",
+        "baseline_aug_17_28": {
+          "avg_cpu_percent": 24,
+          "max_cpu_percent": 71,
+          "avg_log_write_percent": 18,
+          "minutes_log_above_95": 95,
+          "minutes_cpu_above_95": 0,
+          "max_worker_percent": 9
+        },
+        "history": [
+          {
+            "day": "Mon 2026-09-21",
+            "avg_cpu_percent": 27,
+            "max_cpu_percent": 86,
+            "avg_log_write_percent": 31,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 18,
+            "max_worker_percent": 15,
+            "minutes_log_above_95": 455,
+            "minutes_cpu_above_95": 0
+          },
+          {
+            "day": "Tue 2026-09-22",
+            "avg_cpu_percent": 49,
+            "max_cpu_percent": 100,
+            "avg_log_write_percent": 29,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 17,
+            "max_worker_percent": 72,
+            "minutes_log_above_95": 410,
+            "minutes_cpu_above_95": 372
+          },
+          {
+            "day": "Wed 2026-09-23",
+            "avg_cpu_percent": 26,
+            "max_cpu_percent": 84,
+            "avg_log_write_percent": 33,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 19,
+            "max_worker_percent": 17,
+            "minutes_log_above_95": 480,
+            "minutes_cpu_above_95": 0
+          },
+          {
+            "day": "Thu 2026-09-24",
+            "avg_cpu_percent": 41,
+            "max_cpu_percent": 100,
+            "avg_log_write_percent": 30,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 18,
+            "max_worker_percent": 70,
+            "minutes_log_above_95": 395,
+            "minutes_cpu_above_95": 148
+          },
+          {
+            "day": "Fri 2026-09-25",
+            "avg_cpu_percent": 47,
+            "max_cpu_percent": 100,
+            "avg_log_write_percent": 29,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 17,
+            "max_worker_percent": 71,
+            "minutes_log_above_95": 400,
+            "minutes_cpu_above_95": 309
+          }
+        ],
+        "avg_memory_usage_percent": "96-99 on every day, baseline weeks included"
+      }
+    }
+  ],
+  "key": {
+    "root_cause": "lock_escalation_blocking",
+    "required_facts": [
+      {
+        "id": "table_lock_held_by_the_batch",
+        "evidence": "locks",
+        "description": "Session 412, batch step 4, holds an exclusive lock on the whole dbo.Inventory table.",
+        "signals": {
+          "all": [
+            "\\b412\\b|step 4",
+            "object|table",
+            "\\bX\\b|exclusive"
+          ]
+        },
+        "example": "Session 412 (batch step 4) holds an OBJECT X lock on dbo.Inventory."
+      },
+      {
+        "id": "order_sessions_wait_on_it",
+        "evidence": "sessions",
+        "description": "77 order sessions wait behind it, for up to 29.4 s.",
+        "signals": {
+          "all": [
+            "\\b77\\b",
+            "29[.,]4|29,?410|\\b412\\b"
+          ]
+        },
+        "example": "77 usp_CreateOrder sessions are blocked by session 412, waiting up to 29,410 ms."
+      },
+      {
+        "id": "cpu_is_not_the_limit",
+        "evidence": "wed_night",
+        "description": "CPU is not saturated in that window.",
+        "signals": {
+          "all": [
+            "\\bcpu\\b",
+            "\\b(4[3-9]|5[01])\\s?%|not (saturated|the limit|cpu[- ]bound)|\\b0 minutes\\b"
+          ]
+        },
+        "example": "CPU is 43 to 46% between 07:45 and 08:45 on Wed 23, while the timeouts happen."
+      }
+    ],
+    "harmful_conclusions": [
+      {
+        "id": "longer_timeout",
+        "description": "A longer timeout makes callers wait longer behind the same lock.",
+        "signals": {
+          "any": [
+            "(increase|raise|extend|lengthen)\\b[^.]*timeout",
+            "\\b(longer|higher|larger)\\s+(command\\s?)?timeout"
+          ]
+        },
+        "example": "Increase CommandTimeout to 120 seconds."
+      },
+      {
+        "id": "dirty_reads",
+        "description": "The blocked statements are writes. NOLOCK does not apply to them and would corrupt stock figures if it did.",
+        "signals": {
+          "any": [
+            "\\bnolock\\b",
+            "read\\s?uncommitted"
+          ]
+        },
+        "example": "Add WITH (NOLOCK) to the inventory statements."
+      },
+      {
+        "id": "kill_the_batch_session",
+        "description": "Killing a 36-minute update starts a rollback of about the same length, still under the lock.",
+        "signals": {
+          "any": [
+            "\\bkill\\b"
+          ]
+        },
+        "example": "Kill session 412 when blocking starts."
+      },
+      {
+        "id": "cpu_as_the_cause",
+        "description": "CPU is at 43 to 46% in the morning window.",
+        "root_causes": [
+          "cpu_capacity",
+          "worker_exhaustion"
+        ]
+      }
+    ]
+  }
+}

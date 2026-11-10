@@ -1,0 +1,272 @@
+{
+  "format_version": 1,
+  "id": "exam-q10-parameter-sniffing-two-populations",
+  "kind": "tuning",
+  "title": "Customer category spend on a skewed CustomerID: two populations, one statement",
+  "split": "public",
+  "source": "rewrite-exam-v1:Q10",
+  "tags": [
+    "parameter-sensitivity",
+    "plan-remedy"
+  ],
+  "prompt": [
+    "Called about 150 times per second at peak from the customer portal (normal customers, about 10 orders each) and about",
+    "300 times a day from the partner portal (25 partner accounts, Tier = 'P', up to 1.2M orders each). Query Store shows",
+    "two plans that alternate after each statistics update. Plan A, compiled for a normal customer: serial nested loops",
+    "with a 1 MB grant; 2 ms for normal customers, but partner calls take 60 to 90 s with millions of seeks and a spilling",
+    "sort. Plan B, compiled for a partner: parallel hash joins with a 1.8 GB grant; partner calls take 3 s, but each",
+    "normal-customer call requests the large grant and the portal sees RESOURCE_SEMAPHORE waits. Measured compile time is",
+    "about 11 ms of CPU. The database runs at about 65% CPU. sys.query_store_query_variant has no rows for this query. The",
+    "developers say the query text is correct; only speed is the problem."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.Orders",
+      "qe.OrderLines",
+      "qe.Products",
+      "qe.Customers"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "Orders: 30M rows, 2016 to now, ~12k per day now. The 25 partner customers own ~9M orders (30%), up to 1.2M each. Other customers average ~10 orders (max ~400). The density estimate for CustomerID is ~15 rows. Status: Shipped 83.8%, Cancelled 7%, Paid 6%, Returned 3%, Pending 0.2% (~60k rows, all from the last 72 hours). SalesChannel: Web 62%, Store 20%, Partner 12%, Phone 6%. PromoCode is NULL for 85%. ShipRegionID is NULL for Store pickups (~20%). OrderDate is datetime2(7); Partner and Store imports stamp one timestamp on a whole batch, so many orders of one customer share an OrderDate.",
+    "OrderLines: 120M rows, 4 per order on average. About 0.3% of orders have no lines.",
+    "Products: 40k rows. SKU prefixes group product families, 1-3 SKUs per prefix.",
+    "Customers: 2.0M rows. Tier S = 1.85M, G = ~150k, P = 25 partner accounts (CustomerID 1 to 25). IsActive = 1 for 88%. Email is NULL for ~9% (~180k rows, ~160k of them active). About 2% of non-NULL emails are shared by two or more customer rows (households). ReferredByCustomerID is non-NULL for 18%; 312 rows are self-referrals (ReferredByCustomerID = CustomerID, CustomerID 500001 to 500312). AccountNumber always matches 'AC' + 10 digits (CHECK constraint)."
+  ],
+  "baseline_kind": "procedure",
+  "baseline_sql": [
+    "CREATE OR ALTER PROCEDURE qe.usp_CustomerCategorySpend",
+    "    @CustomerID int,",
+    "    @From       datetime2(3),",
+    "    @To         datetime2(3)",
+    "AS",
+    "SELECT p.CategoryID,",
+    "       COUNT(DISTINCT o.OrderID) AS Orders,",
+    "       SUM(ol.Quantity * ol.UnitPrice) AS Spend",
+    "FROM qe.Orders o",
+    "JOIN qe.OrderLines ol ON ol.OrderID = o.OrderID",
+    "JOIN qe.Products   p  ON p.ProductID = ol.ProductID",
+    "WHERE o.CustomerID = @CustomerID",
+    "  AND o.OrderDate >= @From AND o.OrderDate < @To",
+    "GROUP BY p.CategoryID;"
+  ],
+  "parameter_cases": [
+    {
+      "name": "normal_customer",
+      "values": {
+        "CustomerID": 48213,
+        "From": "2026-01-01",
+        "To": "2026-10-01"
+      },
+      "types": {
+        "CustomerID": "int",
+        "From": "datetime2(3)",
+        "To": "datetime2(3)"
+      },
+      "weight": 0.98
+    },
+    {
+      "name": "partner_customer",
+      "values": {
+        "CustomerID": 7,
+        "From": "2026-01-01",
+        "To": "2026-10-01"
+      },
+      "types": {
+        "CustomerID": "int",
+        "From": "datetime2(3)",
+        "To": "datetime2(3)"
+      },
+      "weight": 0.02
+    }
+  ],
+  "key": {
+    "decision": "plan_remedy",
+    "correct_families": [
+      {
+        "id": "branch_by_population",
+        "description": "Keep the statement text and route the two populations to separate plans: the rare partner branch recompiles, the hot branch keeps one small cached plan that a partner call cannot poison.",
+        "signals": {
+          "all": [
+            "Tier\\s*=\\s*'P'",
+            "option\\s*\\(\\s*recompile\\s*\\)"
+          ],
+          "any": [
+            "optimize for\\s*\\(\\s*@CustomerID\\s+unknown\\s*\\)",
+            "exec(ute)?\\s+qe\\.usp_CustomerCategorySpend_\\w+"
+          ]
+        },
+        "reference_sql": [
+          "CREATE OR ALTER PROCEDURE qe.usp_CustomerCategorySpend",
+          "    @CustomerID int,",
+          "    @From       datetime2(3),",
+          "    @To         datetime2(3)",
+          "AS",
+          "SET NOCOUNT ON;",
+          "IF EXISTS (SELECT 1 FROM qe.Customers WHERE CustomerID = @CustomerID AND Tier = 'P')",
+          "BEGIN",
+          "SELECT p.CategoryID,",
+          "       COUNT(DISTINCT o.OrderID) AS Orders,",
+          "       SUM(ol.Quantity * ol.UnitPrice) AS Spend",
+          "FROM qe.Orders o",
+          "JOIN qe.OrderLines ol ON ol.OrderID = o.OrderID",
+          "JOIN qe.Products   p  ON p.ProductID = ol.ProductID",
+          "WHERE o.CustomerID = @CustomerID",
+          "  AND o.OrderDate >= @From AND o.OrderDate < @To",
+          "GROUP BY p.CategoryID",
+          "OPTION (RECOMPILE);",
+          "END",
+          "ELSE",
+          "BEGIN",
+          "SELECT p.CategoryID,",
+          "       COUNT(DISTINCT o.OrderID) AS Orders,",
+          "       SUM(ol.Quantity * ol.UnitPrice) AS Spend",
+          "FROM qe.Orders o",
+          "JOIN qe.OrderLines ol ON ol.OrderID = o.OrderID",
+          "JOIN qe.Products   p  ON p.ProductID = ol.ProductID",
+          "WHERE o.CustomerID = @CustomerID",
+          "  AND o.OrderDate >= @From AND o.OrderDate < @To",
+          "GROUP BY p.CategoryID",
+          "OPTION (OPTIMIZE FOR (@CustomerID UNKNOWN));",
+          "END"
+        ]
+      }
+    ],
+    "traps": [
+      {
+        "id": "recompile_on_every_call",
+        "class": "ineffective",
+        "why": "OPTION (RECOMPILE) for every caller costs 150 compiles per second at 11 ms each: about 1.65 vCores, on a database already at 65% CPU.",
+        "signals": {
+          "all": [
+            "option\\s*\\(\\s*recompile"
+          ],
+          "none": [
+            "\\bif\\b"
+          ]
+        },
+        "example_sql": [
+          "CREATE OR ALTER PROCEDURE qe.usp_CustomerCategorySpend",
+          "    @CustomerID int,",
+          "    @From       datetime2(3),",
+          "    @To         datetime2(3)",
+          "AS",
+          "SELECT p.CategoryID,",
+          "       COUNT(DISTINCT o.OrderID) AS Orders,",
+          "       SUM(ol.Quantity * ol.UnitPrice) AS Spend",
+          "FROM qe.Orders o",
+          "JOIN qe.OrderLines ol ON ol.OrderID = o.OrderID",
+          "JOIN qe.Products   p  ON p.ProductID = ol.ProductID",
+          "WHERE o.CustomerID = @CustomerID",
+          "  AND o.OrderDate >= @From AND o.OrderDate < @To",
+          "GROUP BY p.CategoryID",
+          "OPTION (RECOMPILE);"
+        ]
+      },
+      {
+        "id": "optimize_for_unknown_for_everyone",
+        "class": "ineffective",
+        "why": "OPTIMIZE FOR UNKNOWN for all callers gives partners the small nested-loops plan: the 60 to 90 s case.",
+        "signals": {
+          "all": [
+            "optimize for"
+          ],
+          "none": [
+            "\\bif\\b",
+            "recompile"
+          ]
+        },
+        "example_sql": [
+          "CREATE OR ALTER PROCEDURE qe.usp_CustomerCategorySpend",
+          "    @CustomerID int,",
+          "    @From       datetime2(3),",
+          "    @To         datetime2(3)",
+          "AS",
+          "SELECT p.CategoryID,",
+          "       COUNT(DISTINCT o.OrderID) AS Orders,",
+          "       SUM(ol.Quantity * ol.UnitPrice) AS Spend",
+          "FROM qe.Orders o",
+          "JOIN qe.OrderLines ol ON ol.OrderID = o.OrderID",
+          "JOIN qe.Products   p  ON p.ProductID = ol.ProductID",
+          "WHERE o.CustomerID = @CustomerID",
+          "  AND o.OrderDate >= @From AND o.OrderDate < @To",
+          "GROUP BY p.CategoryID",
+          "OPTION (OPTIMIZE FOR (@CustomerID UNKNOWN));"
+        ]
+      },
+      {
+        "id": "force_one_plan",
+        "class": "unsafe",
+        "why": "A forced plan is right for one population and wrong for the other, every time. Clearing the plan cache only restarts the problem.",
+        "signals": {
+          "any": [
+            "sp_query_store_force_plan",
+            "use plan",
+            "dbcc freeproccache",
+            "clear procedure_cache"
+          ]
+        },
+        "example_sql": "EXEC sys.sp_query_store_force_plan @query_id = 4711, @plan_id = 9001;"
+      },
+      {
+        "id": "unprotected_else_branch",
+        "class": "ineffective",
+        "why": "A procedure compiles every statement with the first caller's values. When a partner call compiles it, the ELSE branch also gets a partner-sized plan.",
+        "signals": {
+          "all": [
+            "\\bif\\b",
+            "option\\s*\\(\\s*recompile"
+          ],
+          "none": [
+            "optimize for",
+            "exec(ute)?\\s+qe\\.usp_CustomerCategorySpend_"
+          ]
+        },
+        "example_sql": [
+          "CREATE OR ALTER PROCEDURE qe.usp_CustomerCategorySpend",
+          "    @CustomerID int,",
+          "    @From       datetime2(3),",
+          "    @To         datetime2(3)",
+          "AS",
+          "SET NOCOUNT ON;",
+          "IF EXISTS (SELECT 1 FROM qe.Customers WHERE CustomerID = @CustomerID AND Tier = 'P')",
+          "BEGIN",
+          "SELECT p.CategoryID,",
+          "       COUNT(DISTINCT o.OrderID) AS Orders,",
+          "       SUM(ol.Quantity * ol.UnitPrice) AS Spend",
+          "FROM qe.Orders o",
+          "JOIN qe.OrderLines ol ON ol.OrderID = o.OrderID",
+          "JOIN qe.Products   p  ON p.ProductID = ol.ProductID",
+          "WHERE o.CustomerID = @CustomerID",
+          "  AND o.OrderDate >= @From AND o.OrderDate < @To",
+          "GROUP BY p.CategoryID",
+          "OPTION (RECOMPILE);",
+          "END",
+          "ELSE",
+          "BEGIN",
+          "SELECT p.CategoryID,",
+          "       COUNT(DISTINCT o.OrderID) AS Orders,",
+          "       SUM(ol.Quantity * ol.UnitPrice) AS Spend",
+          "FROM qe.Orders o",
+          "JOIN qe.OrderLines ol ON ol.OrderID = o.OrderID",
+          "JOIN qe.Products   p  ON p.ProductID = ol.ProductID",
+          "WHERE o.CustomerID = @CustomerID",
+          "  AND o.OrderDate >= @From AND o.OrderDate < @To",
+          "GROUP BY p.CategoryID;",
+          "END"
+        ]
+      }
+    ],
+    "index": {
+      "role": "optional"
+    },
+    "min_improvement": {
+      "metric": "cpu_ms",
+      "ratio": 2,
+      "basis": "Provisional. Measure each population against the baseline run with the plan compiled for the other population. Neither population may get worse than with its own plan."
+    },
+    "reference_notes": "Memory grant feedback turns itself off when grants oscillate. An index on (CustomerID, OrderDate) helps the normal customer but does not make one plan right for 10 rows and for 1.2M rows."
+  }
+}

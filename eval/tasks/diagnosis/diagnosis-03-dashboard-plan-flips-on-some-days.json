@@ -1,0 +1,440 @@
+{
+  "format_version": 1,
+  "id": "diagnosis-03-dashboard-plan-flips-on-some-days",
+  "kind": "diagnosis",
+  "title": "Random bad days: CPU at 100% on Tuesday, Thursday and Friday",
+  "split": "public",
+  "source": "case-exam-v1:3",
+  "tags": [
+    "parameter-sensitivity",
+    "plan-flip",
+    "cpu"
+  ],
+  "prompt": [
+    "Client: Harbourline Commerce, a multi-tenant retail order platform with about 400 tenants. Database hlc-orders-prod: Azure SQL Database, Business Critical, Gen5, 16 vCores, compatibility level 160, READ_COMMITTED_SNAPSHOT ON. All times are UTC. Business hours are 07:30 to 18:00. The nightly batch must finish by 06:00. Evidence was collected from Mon 21 Sep to Sun 27 Sep 2026.",
+    "The CTO writes: 'In the day we get random 30-second timeouts. Some days are fine and some days are awful, and CPU",
+    "shows 100% in the portal.' The dashboard calls GetOrdersDashboard with TOP 50 and a 7-day range, about 6 times per",
+    "second at peak. The nightly batch step 'TenantReport' calls the same method with a 365-day range and TOP 100000, about",
+    "140 times for tenant 1, which holds about 18% of dbo.Orders. TenantReport ran 06:04-06:58 on Tue 22, 06:57-08:05 on",
+    "Wed 23, 05:52-06:46 on Thu 24 and 05:57-06:52 on Fri 25. Parameter sensitive plan optimization is ON (compatibility",
+    "level 160). Name the root cause of the bad days."
+  ],
+  "evidence": [
+    {
+      "id": "top_cached",
+      "tool": "get_top_cached_queries",
+      "arguments": {
+        "sort_by": "cpu"
+      },
+      "result": {
+        "result_status": "ok",
+        "window": {
+          "start": "2026-09-25T09:00Z",
+          "end": "2026-09-25T14:30Z"
+        },
+        "queries": [
+          {
+            "rank": 1,
+            "query_hash": "0x4E1C7A0B92D3F611",
+            "source": "GetOrdersDashboard",
+            "executions": 119880,
+            "total_cpu_s": 271000,
+            "avg_cpu_ms": 2261,
+            "avg_elapsed_ms": 9840,
+            "avg_logical_reads": 1402000,
+            "dop": 8
+          },
+          {
+            "rank": 2,
+            "query_hash": "0x9A02E3C1F0B77D40",
+            "source": "dbo.usp_CreateOrder",
+            "executions": 410220,
+            "total_cpu_s": 9850,
+            "avg_cpu_ms": 24,
+            "avg_elapsed_ms": 310,
+            "avg_logical_reads": 104,
+            "dop": 1
+          },
+          {
+            "rank": 3,
+            "query_hash": "0x11F0AB9C2D5E3381",
+            "source": "ProductSearch ad hoc",
+            "executions": 88400,
+            "total_cpu_s": 4120,
+            "avg_cpu_ms": 47,
+            "avg_elapsed_ms": 160,
+            "avg_logical_reads": 2950,
+            "dop": 1
+          },
+          {
+            "rank": 4,
+            "query_hash": "0x3C77D0E15A9B2204",
+            "source": "dbo.usp_GetInventoryByStore",
+            "executions": 61300,
+            "total_cpu_s": 1980,
+            "avg_cpu_ms": 32,
+            "avg_elapsed_ms": 95,
+            "avg_logical_reads": 610,
+            "dop": 1
+          }
+        ],
+        "all_other_total_cpu_s": 9400,
+        "same_window_on_a_good_day": {
+          "day": "Mon 21",
+          "query_hash": "0x4E1C7A0B92D3F611",
+          "avg_cpu_ms": 3.4,
+          "total_cpu_s": 410,
+          "dop": 1
+        }
+      }
+    },
+    {
+      "id": "plan_history",
+      "tool": "detect_parameter_sniffing",
+      "arguments": {
+        "query_id": 61877
+      },
+      "result": {
+        "result_status": "ok",
+        "query_hash": "0x4E1C7A0B92D3F611",
+        "query_id": 61877,
+        "plan_count": 2,
+        "psp_dispatcher": false,
+        "query_variants": 0,
+        "compiles": [
+          {
+            "day": "Mon 21",
+            "compiled_at": "08:22:41",
+            "trigger": "Orders statistics updated by the index job at 08:21:58",
+            "compiled_values": {
+              "tenant": 117,
+              "from": "2026-09-14",
+              "top": 50
+            },
+            "shape": "Seek, Key Lookup, Nested Loops, serial",
+            "in_use_until": "next day"
+          },
+          {
+            "day": "Tue 22",
+            "compiled_at": "06:11:09",
+            "trigger": "Orders statistics updated by the index job at 06:10:52",
+            "compiled_values": {
+              "tenant": 1,
+              "from": "2025-09-22",
+              "top": 100000
+            },
+            "shape": "Clustered Index Scan of Orders, Hash Join, Sort, DOP 8",
+            "in_use_until": "15:52:06"
+          },
+          {
+            "day": "Tue 22",
+            "compiled_at": "15:52:20",
+            "trigger": "automatic statistics update on Orders at 15:52:06",
+            "compiled_values": {
+              "tenant": 342,
+              "from": "2026-09-15",
+              "top": 50
+            },
+            "shape": "Seek, serial",
+            "in_use_until": "next day"
+          },
+          {
+            "day": "Wed 23",
+            "compiled_at": "08:47:55",
+            "trigger": "Orders statistics updated by the index job at 08:47:30",
+            "compiled_values": {
+              "tenant": 342,
+              "from": "2026-09-16",
+              "top": 50
+            },
+            "shape": "Seek, serial",
+            "in_use_until": "next day"
+          },
+          {
+            "day": "Thu 24",
+            "compiled_at": "05:58:30",
+            "trigger": "Orders statistics updated by the index job at 05:58:21",
+            "compiled_values": {
+              "tenant": 1,
+              "from": "2025-09-24",
+              "top": 100000
+            },
+            "shape": "Clustered Index Scan of Orders, Hash Join, Sort, DOP 8",
+            "in_use_until": "11:47"
+          },
+          {
+            "day": "Thu 24",
+            "compiled_at": "11:47:33",
+            "trigger": "first execution after the reconfiguration",
+            "compiled_values": {
+              "tenant": 88,
+              "from": "2026-09-17",
+              "top": 50
+            },
+            "shape": "Seek, serial",
+            "in_use_until": "next day"
+          },
+          {
+            "day": "Fri 25",
+            "compiled_at": "06:02:17",
+            "trigger": "Orders statistics updated by the index job at 06:02:09",
+            "compiled_values": {
+              "tenant": 1,
+              "from": "2025-09-25",
+              "top": 100000
+            },
+            "shape": "Clustered Index Scan of Orders, Hash Join, Sort, DOP 8",
+            "in_use_until": "14:31:38"
+          },
+          {
+            "day": "Fri 25",
+            "compiled_at": "14:31:40",
+            "trigger": "automatic statistics update on Orders at 14:31:38",
+            "compiled_values": {
+              "tenant": 205,
+              "from": "2026-09-18",
+              "top": 50
+            },
+            "shape": "Seek, serial",
+            "in_use_until": "next day"
+          }
+        ],
+        "table": {
+          "name": "dbo.Orders",
+          "rows": 52400000,
+          "clustered_index_pages": 1400000
+        }
+      }
+    },
+    {
+      "id": "daily",
+      "tool": "get_resource_stats_history",
+      "arguments": {
+        "window_minutes": 10080
+      },
+      "result": {
+        "result_status": "ok",
+        "source": "sys.resource_stats",
+        "granularity": "day",
+        "baseline_aug_17_28": {
+          "avg_cpu_percent": 24,
+          "max_cpu_percent": 71,
+          "avg_log_write_percent": 18,
+          "minutes_log_above_95": 95,
+          "minutes_cpu_above_95": 0,
+          "max_worker_percent": 9
+        },
+        "history": [
+          {
+            "day": "Mon 2026-09-21",
+            "avg_cpu_percent": 27,
+            "max_cpu_percent": 86,
+            "avg_log_write_percent": 31,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 18,
+            "max_worker_percent": 15,
+            "minutes_log_above_95": 455,
+            "minutes_cpu_above_95": 0
+          },
+          {
+            "day": "Tue 2026-09-22",
+            "avg_cpu_percent": 49,
+            "max_cpu_percent": 100,
+            "avg_log_write_percent": 29,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 17,
+            "max_worker_percent": 72,
+            "minutes_log_above_95": 410,
+            "minutes_cpu_above_95": 372
+          },
+          {
+            "day": "Wed 2026-09-23",
+            "avg_cpu_percent": 26,
+            "max_cpu_percent": 84,
+            "avg_log_write_percent": 33,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 19,
+            "max_worker_percent": 17,
+            "minutes_log_above_95": 480,
+            "minutes_cpu_above_95": 0
+          },
+          {
+            "day": "Thu 2026-09-24",
+            "avg_cpu_percent": 41,
+            "max_cpu_percent": 100,
+            "avg_log_write_percent": 30,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 18,
+            "max_worker_percent": 70,
+            "minutes_log_above_95": 395,
+            "minutes_cpu_above_95": 148
+          },
+          {
+            "day": "Fri 2026-09-25",
+            "avg_cpu_percent": 47,
+            "max_cpu_percent": 100,
+            "avg_log_write_percent": 29,
+            "max_log_write_percent": 100,
+            "avg_data_io_percent": 17,
+            "max_worker_percent": 71,
+            "minutes_log_above_95": 400,
+            "minutes_cpu_above_95": 309
+          }
+        ],
+        "avg_memory_usage_percent": "96-99 on every day, baseline weeks included"
+      }
+    },
+    {
+      "id": "waits_bad_day",
+      "tool": "get_wait_stats",
+      "arguments": {},
+      "result": {
+        "result_status": "ok",
+        "window": {
+          "mode": "delta",
+          "start": "2026-09-25T09:00Z",
+          "end": "2026-09-25T14:30Z"
+        },
+        "top_waits": [
+          {
+            "wait_type": "SOS_SCHEDULER_YIELD",
+            "wait_time_s": 186400
+          },
+          {
+            "wait_type": "CXPACKET",
+            "wait_time_s": 141700
+          },
+          {
+            "wait_type": "CXCONSUMER",
+            "wait_time_s": 98200
+          },
+          {
+            "wait_type": "RESOURCE_SEMAPHORE",
+            "wait_time_s": 3850,
+            "avg_wait_ms": 1900
+          },
+          {
+            "wait_type": "PAGEIOLATCH_SH",
+            "wait_time_s": 2300,
+            "avg_wait_ms": 0.4
+          },
+          {
+            "wait_type": "WRITELOG",
+            "wait_time_s": 1950,
+            "avg_wait_ms": 1.9
+          },
+          {
+            "wait_type": "HADR_SYNC_COMMIT",
+            "wait_time_s": 1610,
+            "avg_wait_ms": 1.0
+          },
+          {
+            "wait_type": "LCK_M_ALL",
+            "wait_time_s": 380
+          },
+          {
+            "wait_type": "THREADPOOL",
+            "wait_time_s": 0
+          }
+        ],
+        "signal_wait_pct": 34
+      }
+    }
+  ],
+  "key": {
+    "root_cause": "parameter_sensitive_plan",
+    "required_facts": [
+      {
+        "id": "compiled_for_the_report",
+        "evidence": "plan_history",
+        "description": "On each bad day the plan was compiled with tenant 1, a 365-day range and TOP 100000.",
+        "signals": {
+          "all": [
+            "tenant 1\\b",
+            "100,?000|365"
+          ]
+        },
+        "example": "On Tue, Thu and Fri the plan was compiled for tenant 1 with TOP 100000 and a 365-day range."
+      },
+      {
+        "id": "cost_per_call",
+        "evidence": "top_cached",
+        "description": "The dashboard query costs 2,261 ms of CPU per call on a bad day against 3.4 ms on a good day.",
+        "signals": {
+          "all": [
+            "2,?261|271,?000",
+            "3\\.4|\\b410\\b"
+          ]
+        },
+        "example": "The dashboard query averages 2,261 ms of CPU per call on Fri 25 against 3.4 ms on Mon 21."
+      },
+      {
+        "id": "compile_follows_the_statistics_update",
+        "evidence": "plan_history",
+        "description": "The bad plan is compiled seconds after the index job updates the Orders statistics, while TenantReport runs.",
+        "signals": {
+          "all": [
+            "statistic",
+            "06:02|06:10|05:58|index job|seconds after|right after"
+          ]
+        },
+        "example": "Each bad plan is compiled seconds after the index job updates the Orders statistics, for example 06:02:09 then 06:02:17 on Fri 25."
+      }
+    ],
+    "harmful_conclusions": [
+      {
+        "id": "scale_up_for_cpu",
+        "description": "One plan uses 271,000 of the 316,800 CPU-seconds in the window. More vCores hide that plan at a permanent cost.",
+        "root_causes": [
+          "cpu_capacity"
+        ],
+        "signals": {
+          "any": [
+            "\\bscale (up|to)\\b",
+            "\\b24[\\s-]?v?cores?\\b",
+            "\\bupgrade (to|the)\\b",
+            "\\bmore v?cores\\b",
+            "\\bhyperscale\\b"
+          ]
+        },
+        "example": "Scale up to 24 vCores to get CPU headroom."
+      },
+      {
+        "id": "maxdop_one",
+        "description": "CXPACKET is a symptom of the bad parallel plan. MAXDOP 1 slows the batch and leaves a serial scan of 1.4M pages per call.",
+        "root_causes": [
+          "parallelism_misconfiguration"
+        ],
+        "signals": {
+          "any": [
+            "maxdop\\s*(=|to|of)?\\s*1\\b"
+          ]
+        },
+        "example": "Set MAXDOP to 1 for the database."
+      },
+      {
+        "id": "blame_the_platform",
+        "description": "The bad days follow the timing of the client's own job, not an Azure event.",
+        "root_causes": [
+          "platform_fault",
+          "storage_latency"
+        ]
+      },
+      {
+        "id": "scheduled_cache_flush",
+        "description": "A scheduled plan cache flush recompiles every query and leaves the next compile to chance.",
+        "signals": {
+          "all": [
+            "(daily|nightly|every (day|morning|night)|schedul)"
+          ],
+          "any": [
+            "freeproccache",
+            "clear procedure_cache",
+            "flush the plan cache"
+          ]
+        },
+        "example": "Schedule a daily DBCC FREEPROCCACHE at 07:00."
+      }
+    ]
+  }
+}

@@ -1,0 +1,393 @@
+{
+  "format_version": 1,
+  "id": "exam-q02-catch-all-order-search",
+  "kind": "tuning",
+  "title": "Catch-all order search with a hidden ISNULL filter",
+  "split": "public",
+  "source": "rewrite-exam-v1:Q02",
+  "tags": [
+    "catch-all-parameters",
+    "dynamic-sql",
+    "null-semantics"
+  ],
+  "prompt": [
+    "Back-office search screen: about 40 calls per second at peak. About 70% of calls pass only @CustomerID, 15% pass",
+    "@LastName, and 10% pass @Status with a date range. Duration is bimodal: 2 ms to 25 s, depending on which cached",
+    "plan is in memory. Query Store shows 6 plans in the last week, and the current one scans PK_Orders. Measured",
+    "compile time for this statement is about 12 ms of CPU. The product owner says the screen works correctly today",
+    "and must keep returning the same rows."
+  ],
+  "schema": {
+    "file": "schemas/retail.sql",
+    "tables": [
+      "qe.Orders",
+      "qe.Customers"
+    ]
+  },
+  "data_notes": [
+    "Azure SQL Database, General Purpose Gen5, 8 vCores, compatibility level 160. READ_COMMITTED_SNAPSHOT ON. Query Store READ_WRITE. Collation SQL_Latin1_General_CP1_CI_AS. All foreign keys are trusted. Statistics: auto create and auto update ON; a nightly job updates Orders, OrderLines and Payments with FULLSCAN.",
+    "Orders: 30M rows, 2016 to now, ~12k per day now. The 25 partner customers own ~9M orders (30%), up to 1.2M each. Other customers average ~10 orders (max ~400). The density estimate for CustomerID is ~15 rows. Status: Shipped 83.8%, Cancelled 7%, Paid 6%, Returned 3%, Pending 0.2% (~60k rows, all from the last 72 hours). SalesChannel: Web 62%, Store 20%, Partner 12%, Phone 6%. PromoCode is NULL for 85%. ShipRegionID is NULL for Store pickups (~20%). OrderDate is datetime2(7); Partner and Store imports stamp one timestamp on a whole batch, so many orders of one customer share an OrderDate.",
+    "Customers: 2.0M rows. Tier S = 1.85M, G = ~150k, P = 25 partner accounts (CustomerID 1 to 25). IsActive = 1 for 88%. Email is NULL for ~9% (~180k rows, ~160k of them active). About 2% of non-NULL emails are shared by two or more customer rows (households). ReferredByCustomerID is non-NULL for 18%; 312 rows are self-referrals (ReferredByCustomerID = CustomerID, CustomerID 500001 to 500312). AccountNumber always matches 'AC' + 10 digits (CHECK constraint)."
+  ],
+  "baseline_kind": "procedure",
+  "baseline_sql": [
+    "CREATE OR ALTER PROCEDURE qe.usp_SearchOrders",
+    "    @CustomerID int           = NULL,",
+    "    @Status     varchar(12)   = NULL,",
+    "    @FromDate   datetime2(3)  = NULL,",
+    "    @ToDate     datetime2(3)  = NULL,",
+    "    @PromoCode  varchar(20)   = NULL,",
+    "    @MinTotal   decimal(19,4) = NULL,",
+    "    @LastName   nvarchar(80)  = NULL",
+    "AS",
+    "SELECT TOP (200)",
+    "       o.OrderID, o.OrderDate, o.Status, o.TotalAmount, o.PromoCode,",
+    "       c.AccountNumber, c.LastName",
+    "FROM qe.Orders o",
+    "JOIN qe.Customers c ON c.CustomerID = o.CustomerID",
+    "WHERE (@CustomerID IS NULL OR o.CustomerID = @CustomerID)",
+    "  AND (@Status IS NULL OR o.Status = @Status)",
+    "  AND (o.OrderDate >= @FromDate OR @FromDate IS NULL)",
+    "  AND (o.OrderDate <  @ToDate   OR @ToDate IS NULL)",
+    "  AND o.PromoCode = ISNULL(@PromoCode, o.PromoCode)",
+    "  AND (@MinTotal IS NULL OR o.TotalAmount >= @MinTotal)",
+    "  AND (@LastName IS NULL OR c.LastName LIKE @LastName + N'%')",
+    "ORDER BY o.OrderDate DESC, o.OrderID DESC;"
+  ],
+  "parameter_cases": [
+    {
+      "name": "customer_only",
+      "values": {
+        "CustomerID": 48213,
+        "Status": null,
+        "FromDate": null,
+        "ToDate": null,
+        "PromoCode": null,
+        "MinTotal": null,
+        "LastName": null
+      },
+      "types": {
+        "CustomerID": "int",
+        "Status": "varchar(12)",
+        "FromDate": "datetime2(3)",
+        "ToDate": "datetime2(3)",
+        "PromoCode": "varchar(20)",
+        "MinTotal": "decimal(19,4)",
+        "LastName": "nvarchar(80)"
+      },
+      "weight": 0.7
+    },
+    {
+      "name": "last_name",
+      "values": {
+        "CustomerID": null,
+        "Status": null,
+        "FromDate": null,
+        "ToDate": null,
+        "PromoCode": null,
+        "MinTotal": null,
+        "LastName": "Sm"
+      },
+      "types": {
+        "CustomerID": "int",
+        "Status": "varchar(12)",
+        "FromDate": "datetime2(3)",
+        "ToDate": "datetime2(3)",
+        "PromoCode": "varchar(20)",
+        "MinTotal": "decimal(19,4)",
+        "LastName": "nvarchar(80)"
+      },
+      "weight": 0.15
+    },
+    {
+      "name": "status_and_dates",
+      "values": {
+        "CustomerID": null,
+        "Status": "Shipped",
+        "FromDate": "2026-09-01",
+        "ToDate": "2026-10-01",
+        "PromoCode": null,
+        "MinTotal": null,
+        "LastName": null
+      },
+      "types": {
+        "CustomerID": "int",
+        "Status": "varchar(12)",
+        "FromDate": "datetime2(3)",
+        "ToDate": "datetime2(3)",
+        "PromoCode": "varchar(20)",
+        "MinTotal": "decimal(19,4)",
+        "LastName": "nvarchar(80)"
+      },
+      "weight": 0.1
+    },
+    {
+      "name": "promo_code",
+      "values": {
+        "CustomerID": null,
+        "Status": null,
+        "FromDate": null,
+        "ToDate": null,
+        "PromoCode": "SPRING25",
+        "MinTotal": null,
+        "LastName": null
+      },
+      "types": {
+        "CustomerID": "int",
+        "Status": "varchar(12)",
+        "FromDate": "datetime2(3)",
+        "ToDate": "datetime2(3)",
+        "PromoCode": "varchar(20)",
+        "MinTotal": "decimal(19,4)",
+        "LastName": "nvarchar(80)"
+      },
+      "weight": 0.05
+    }
+  ],
+  "key": {
+    "decision": "rewrite",
+    "correct_families": [
+      {
+        "id": "parameterized_dynamic_sql",
+        "description": "Build only the predicates that are supplied and run the text with sp_executesql and real parameters. Keep the rule that orders without a promo code are never returned.",
+        "signals": {
+          "all": [
+            "sp_executesql",
+            "o\\.PromoCode IS NOT NULL",
+            "OrderDate DESC\\s*,\\s*o\\.OrderID DESC"
+          ]
+        },
+        "reference_sql": [
+          "CREATE OR ALTER PROCEDURE qe.usp_SearchOrders",
+          "    @CustomerID int           = NULL,",
+          "    @Status     varchar(12)   = NULL,",
+          "    @FromDate   datetime2(3)  = NULL,",
+          "    @ToDate     datetime2(3)  = NULL,",
+          "    @PromoCode  varchar(20)   = NULL,",
+          "    @MinTotal   decimal(19,4) = NULL,",
+          "    @LastName   nvarchar(80)  = NULL",
+          "AS",
+          "SET NOCOUNT ON;",
+          "DECLARE @sql nvarchar(max) = N'",
+          "SELECT TOP (200)",
+          "       o.OrderID, o.OrderDate, o.Status, o.TotalAmount, o.PromoCode,",
+          "       c.AccountNumber, c.LastName",
+          "FROM qe.Orders o",
+          "JOIN qe.Customers c ON c.CustomerID = o.CustomerID",
+          "WHERE 1 = 1';",
+          "IF @CustomerID IS NOT NULL SET @sql += N' AND o.CustomerID = @CustomerID';",
+          "IF @Status     IS NOT NULL SET @sql += N' AND o.Status = @Status';",
+          "IF @FromDate   IS NOT NULL SET @sql += N' AND o.OrderDate >= @FromDate';",
+          "IF @ToDate     IS NOT NULL SET @sql += N' AND o.OrderDate < @ToDate';",
+          "IF @PromoCode  IS NOT NULL SET @sql += N' AND o.PromoCode = @PromoCode'",
+          "ELSE SET @sql += N' AND o.PromoCode IS NOT NULL';",
+          "IF @MinTotal   IS NOT NULL SET @sql += N' AND o.TotalAmount >= @MinTotal';",
+          "IF @LastName   IS NOT NULL SET @sql += N' AND c.LastName LIKE @LastName + N''%''';",
+          "SET @sql += N'",
+          "ORDER BY o.OrderDate DESC, o.OrderID DESC;';",
+          "EXEC sys.sp_executesql @sql,",
+          "     N'@CustomerID int, @Status varchar(12), @FromDate datetime2(3), @ToDate datetime2(3), @PromoCode varchar(20), @MinTotal decimal(19,4), @LastName nvarchar(80)',",
+          "     @CustomerID, @Status, @FromDate, @ToDate, @PromoCode, @MinTotal, @LastName;"
+        ]
+      }
+    ],
+    "traps": [
+      {
+        "id": "promo_filter_dropped",
+        "class": "not_equivalent",
+        "why": "o.PromoCode = ISNULL(@PromoCode, o.PromoCode) is not an optional filter. With @PromoCode NULL it is o.PromoCode = o.PromoCode, which is never true for a NULL promo code. Leaving the predicate out returns the 85% of orders that have no promo code.",
+        "signals": {
+          "all": [
+            "from qe\\.Orders"
+          ],
+          "none": [
+            "o\\.PromoCode IS NOT NULL",
+            "ISNULL\\(\\s*@PromoCode",
+            "COALESCE\\(\\s*@PromoCode"
+          ]
+        },
+        "told_apart_by": "Parameter case customer_only: every order of the customer without a promo code appears.",
+        "example_sql": [
+          "CREATE OR ALTER PROCEDURE qe.usp_SearchOrders",
+          "    @CustomerID int           = NULL,",
+          "    @Status     varchar(12)   = NULL,",
+          "    @FromDate   datetime2(3)  = NULL,",
+          "    @ToDate     datetime2(3)  = NULL,",
+          "    @PromoCode  varchar(20)   = NULL,",
+          "    @MinTotal   decimal(19,4) = NULL,",
+          "    @LastName   nvarchar(80)  = NULL",
+          "AS",
+          "SET NOCOUNT ON;",
+          "DECLARE @sql nvarchar(max) = N'",
+          "SELECT TOP (200)",
+          "       o.OrderID, o.OrderDate, o.Status, o.TotalAmount, o.PromoCode,",
+          "       c.AccountNumber, c.LastName",
+          "FROM qe.Orders o",
+          "JOIN qe.Customers c ON c.CustomerID = o.CustomerID",
+          "WHERE 1 = 1';",
+          "IF @CustomerID IS NOT NULL SET @sql += N' AND o.CustomerID = @CustomerID';",
+          "IF @Status     IS NOT NULL SET @sql += N' AND o.Status = @Status';",
+          "IF @FromDate   IS NOT NULL SET @sql += N' AND o.OrderDate >= @FromDate';",
+          "IF @ToDate     IS NOT NULL SET @sql += N' AND o.OrderDate < @ToDate';",
+          "IF @PromoCode  IS NOT NULL SET @sql += N' AND o.PromoCode = @PromoCode';",
+          "IF @MinTotal   IS NOT NULL SET @sql += N' AND o.TotalAmount >= @MinTotal';",
+          "IF @LastName   IS NOT NULL SET @sql += N' AND c.LastName LIKE @LastName + N''%''';",
+          "SET @sql += N'",
+          "ORDER BY o.OrderDate DESC, o.OrderID DESC;';",
+          "EXEC sys.sp_executesql @sql,",
+          "     N'@CustomerID int, @Status varchar(12), @FromDate datetime2(3), @ToDate datetime2(3), @PromoCode varchar(20), @MinTotal decimal(19,4), @LastName nvarchar(80)',",
+          "     @CustomerID, @Status, @FromDate, @ToDate, @PromoCode, @MinTotal, @LastName;"
+        ]
+      },
+      {
+        "id": "concatenated_values",
+        "class": "unsafe",
+        "why": "Parameter values concatenated into the text allow SQL injection and give every value its own plan.",
+        "signals": {
+          "any": [
+            "'\\s*\\+\\s*(cast\\(|convert\\(|quotename\\(|replace\\()?\\s*@(CustomerID|Status|FromDate|ToDate|PromoCode|MinTotal|LastName)\\b"
+          ]
+        },
+        "example_sql": [
+          "CREATE OR ALTER PROCEDURE qe.usp_SearchOrders",
+          "    @CustomerID int           = NULL,",
+          "    @Status     varchar(12)   = NULL,",
+          "    @FromDate   datetime2(3)  = NULL,",
+          "    @ToDate     datetime2(3)  = NULL,",
+          "    @PromoCode  varchar(20)   = NULL,",
+          "    @MinTotal   decimal(19,4) = NULL,",
+          "    @LastName   nvarchar(80)  = NULL",
+          "AS",
+          "SET NOCOUNT ON;",
+          "DECLARE @sql nvarchar(max) = N'",
+          "SELECT TOP (200)",
+          "       o.OrderID, o.OrderDate, o.Status, o.TotalAmount, o.PromoCode,",
+          "       c.AccountNumber, c.LastName",
+          "FROM qe.Orders o",
+          "JOIN qe.Customers c ON c.CustomerID = o.CustomerID",
+          "WHERE 1 = 1';",
+          "IF @CustomerID IS NOT NULL SET @sql += N' AND o.CustomerID = @CustomerID';",
+          "IF @Status     IS NOT NULL SET @sql += N' AND o.Status = ''' + @Status + N'''';",
+          "IF @FromDate   IS NOT NULL SET @sql += N' AND o.OrderDate >= @FromDate';",
+          "IF @ToDate     IS NOT NULL SET @sql += N' AND o.OrderDate < @ToDate';",
+          "IF @PromoCode  IS NOT NULL SET @sql += N' AND o.PromoCode = @PromoCode'",
+          "ELSE SET @sql += N' AND o.PromoCode IS NOT NULL';",
+          "IF @MinTotal   IS NOT NULL SET @sql += N' AND o.TotalAmount >= @MinTotal';",
+          "IF @LastName   IS NOT NULL SET @sql += N' AND c.LastName LIKE @LastName + N''%''';",
+          "SET @sql += N'",
+          "ORDER BY o.OrderDate DESC, o.OrderID DESC;';",
+          "EXEC sys.sp_executesql @sql,",
+          "     N'@CustomerID int, @Status varchar(12), @FromDate datetime2(3), @ToDate datetime2(3), @PromoCode varchar(20), @MinTotal decimal(19,4), @LastName nvarchar(80)',",
+          "     @CustomerID, @Status, @FromDate, @ToDate, @PromoCode, @MinTotal, @LastName;"
+        ]
+      },
+      {
+        "id": "tiebreaker_dropped",
+        "class": "not_equivalent",
+        "why": "TOP (200) without the OrderID tiebreaker can return a different 200 rows when orders share an OrderDate.",
+        "signals": {
+          "all": [
+            "top\\s*\\(\\s*200\\s*\\)"
+          ],
+          "none": [
+            "OrderDate DESC\\s*,\\s*o\\.OrderID DESC"
+          ]
+        },
+        "told_apart_by": "A customer with more than 200 orders and batch-stamped OrderDate values at the 200th row.",
+        "example_sql": [
+          "CREATE OR ALTER PROCEDURE qe.usp_SearchOrders",
+          "    @CustomerID int           = NULL,",
+          "    @Status     varchar(12)   = NULL,",
+          "    @FromDate   datetime2(3)  = NULL,",
+          "    @ToDate     datetime2(3)  = NULL,",
+          "    @PromoCode  varchar(20)   = NULL,",
+          "    @MinTotal   decimal(19,4) = NULL,",
+          "    @LastName   nvarchar(80)  = NULL",
+          "AS",
+          "SET NOCOUNT ON;",
+          "DECLARE @sql nvarchar(max) = N'",
+          "SELECT TOP (200)",
+          "       o.OrderID, o.OrderDate, o.Status, o.TotalAmount, o.PromoCode,",
+          "       c.AccountNumber, c.LastName",
+          "FROM qe.Orders o",
+          "JOIN qe.Customers c ON c.CustomerID = o.CustomerID",
+          "WHERE 1 = 1';",
+          "IF @CustomerID IS NOT NULL SET @sql += N' AND o.CustomerID = @CustomerID';",
+          "IF @Status     IS NOT NULL SET @sql += N' AND o.Status = @Status';",
+          "IF @FromDate   IS NOT NULL SET @sql += N' AND o.OrderDate >= @FromDate';",
+          "IF @ToDate     IS NOT NULL SET @sql += N' AND o.OrderDate < @ToDate';",
+          "IF @PromoCode  IS NOT NULL SET @sql += N' AND o.PromoCode = @PromoCode'",
+          "ELSE SET @sql += N' AND o.PromoCode IS NOT NULL';",
+          "IF @MinTotal   IS NOT NULL SET @sql += N' AND o.TotalAmount >= @MinTotal';",
+          "IF @LastName   IS NOT NULL SET @sql += N' AND c.LastName LIKE @LastName + N''%''';",
+          "SET @sql += N'",
+          "ORDER BY o.OrderDate DESC;';",
+          "EXEC sys.sp_executesql @sql,",
+          "     N'@CustomerID int, @Status varchar(12), @FromDate datetime2(3), @ToDate datetime2(3), @PromoCode varchar(20), @MinTotal decimal(19,4), @LastName nvarchar(80)',",
+          "     @CustomerID, @Status, @FromDate, @ToDate, @PromoCode, @MinTotal, @LastName;"
+        ]
+      },
+      {
+        "id": "blanket_recompile",
+        "class": "ineffective",
+        "why": "OPTION (RECOMPILE) fixes the plans but costs 40 compiles per second at 12 ms each: about half a vCore, all day.",
+        "signals": {
+          "all": [
+            "option\\s*\\(\\s*recompile"
+          ],
+          "none": [
+            "sp_executesql"
+          ]
+        },
+        "example_sql": [
+          "CREATE OR ALTER PROCEDURE qe.usp_SearchOrders",
+          "    @CustomerID int           = NULL,",
+          "    @Status     varchar(12)   = NULL,",
+          "    @FromDate   datetime2(3)  = NULL,",
+          "    @ToDate     datetime2(3)  = NULL,",
+          "    @PromoCode  varchar(20)   = NULL,",
+          "    @MinTotal   decimal(19,4) = NULL,",
+          "    @LastName   nvarchar(80)  = NULL",
+          "AS",
+          "SELECT TOP (200)",
+          "       o.OrderID, o.OrderDate, o.Status, o.TotalAmount, o.PromoCode,",
+          "       c.AccountNumber, c.LastName",
+          "FROM qe.Orders o",
+          "JOIN qe.Customers c ON c.CustomerID = o.CustomerID",
+          "WHERE (@CustomerID IS NULL OR o.CustomerID = @CustomerID)",
+          "  AND (@Status IS NULL OR o.Status = @Status)",
+          "  AND (o.OrderDate >= @FromDate OR @FromDate IS NULL)",
+          "  AND (o.OrderDate <  @ToDate   OR @ToDate IS NULL)",
+          "  AND o.PromoCode = ISNULL(@PromoCode, o.PromoCode)",
+          "  AND (@MinTotal IS NULL OR o.TotalAmount >= @MinTotal)",
+          "  AND (@LastName IS NULL OR c.LastName LIKE @LastName + N'%')",
+          "ORDER BY o.OrderDate DESC, o.OrderID DESC",
+          "OPTION (RECOMPILE);"
+        ]
+      }
+    ],
+    "index": {
+      "role": "required",
+      "accepted": [
+        {
+          "table": "qe.Orders",
+          "key_columns": [
+            "CustomerID",
+            "OrderDate"
+          ],
+          "include_columns": [
+            "Status",
+            "TotalAmount",
+            "PromoCode"
+          ]
+        }
+      ]
+    },
+    "min_improvement": {
+      "metric": "logical_reads",
+      "ratio": 10,
+      "basis": "The cached plan scans PK_Orders. The dominant @CustomerID path must become an ordered seek that stops at 200 rows."
+    },
+    "reference_notes": "Tell the owner that the screen never returns orders without a promo code. That is probably a bug, but removing it is a behaviour change that needs sign-off. The static tier accepts only the dynamic SQL shape; separate procedures per search pattern are judged by the live tier."
+  }
+}

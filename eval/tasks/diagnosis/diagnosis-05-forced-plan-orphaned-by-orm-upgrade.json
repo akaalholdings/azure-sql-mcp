@@ -1,0 +1,210 @@
+{
+  "format_version": 1,
+  "id": "diagnosis-05-forced-plan-orphaned-by-orm-upgrade",
+  "kind": "diagnosis",
+  "title": "The June regression came back in September",
+  "split": "public",
+  "source": "case-exam-v1:5",
+  "tags": [
+    "forced-plan",
+    "query-identity",
+    "orm-upgrade"
+  ],
+  "prompt": [
+    "Client: Harbourline Commerce, a multi-tenant retail order platform with about 400 tenants. Database hlc-orders-prod: Azure SQL Database, Business Critical, Gen5, 16 vCores, compatibility level 160, READ_COMMITTED_SNAPSHOT ON. All times are UTC. Business hours are 07:30 to 18:00. The nightly batch must finish by 06:00. Evidence was collected from Mon 21 Sep to Sun 27 Sep 2026.",
+    "In June, automatic tuning fixed a regression of the dashboard query by forcing a plan, and the problem went away.",
+    "The same slow plan shape is back since September.",
+    "Client change log: 2025-03-11 a developer added OPTION (MAX_GRANT_PERCENT = 5) to etl.LoadFactSales, then a daytime job. 2026-01-20 etl.LoadFactSales moved into the nightly pipeline. 2026-08-30 release 5.2: ORM upgrade from version 7 to 8, new ProductSearch endpoint. 2026-09-01 tenant 'MegaMart' onboarded; nightly volume about doubled. 2026-09-04 the nightly index job was changed: rebuild threshold 30% to 5%, reorganize removed, ONLINE = ON, MAXDOP = 0, and UPDATE STATISTICS WITH FULLSCAN on every user table added. 2026-09-16 hotfix 5.2.3: an outer retry policy on every database call and Max Pool Size 100 to 400. 2026-09-24 11:47 planned maintenance reconfiguration, completed 11:48.",
+    "Name the reason why the June fix no longer protects the dashboard query."
+  ],
+  "evidence": [
+    {
+      "id": "forced_plans",
+      "tool": "get_forced_plans",
+      "arguments": {},
+      "result": {
+        "result_status": "ok",
+        "forced_plans": [
+          {
+            "query_id": 48213,
+            "plan_id": 7741,
+            "is_forced_plan": true,
+            "force_failure_count": 0,
+            "shape": "Seek IX_Orders_Tenant_Created, Key Lookup, Nested Loops, serial",
+            "avg_cpu_ms": 3.2,
+            "last_execution": "2026-08-30T21:58Z",
+            "forced_by": "automatic tuning, 2026-06-16 08:02"
+          }
+        ],
+        "other_plans": [
+          {
+            "query_id": 48213,
+            "plan_id": 9902,
+            "is_forced_plan": false,
+            "shape": "Clustered Index Scan of Orders, Hash Join, Sort, DOP 8",
+            "avg_cpu_ms": 2190,
+            "first_seen": "2026-06-16T05:40Z",
+            "last_execution": "2026-06-16T08:01Z"
+          }
+        ],
+        "tuning_recommendations": [
+          {
+            "name": "PR_48213_9902",
+            "type": "FORCE_LAST_GOOD_PLAN",
+            "reason": "Average query CPU time changed from 3.2ms to 2190.4ms",
+            "state": "Success",
+            "valid_since": "2026-06-16T07:55Z"
+          }
+        ],
+        "recommendations_after": "none after 2026-06-16"
+      }
+    },
+    {
+      "id": "query_store_top",
+      "tool": "get_top_queries",
+      "arguments": {
+        "sort_by": "cpu"
+      },
+      "result": {
+        "result_status": "ok",
+        "requested_range": "last 30 days",
+        "data_ends": "2026-09-09T14:00Z",
+        "queries": [
+          {
+            "query_id": 70112,
+            "source": "etl.LoadFactSales INSERT ... SELECT",
+            "plans": 1,
+            "executions": 14,
+            "avg_cpu_ms": 1402000,
+            "last_execution": "2026-09-09T04:31Z"
+          },
+          {
+            "query_id": 61877,
+            "source": "GetOrdersDashboard (ORM 8 text: StatusId IN (SELECT value FROM OPENJSON(@statuses)))",
+            "plans": 1,
+            "plan_ids": [
+              1201
+            ],
+            "executions": 1912400,
+            "avg_cpu_ms": 3.1,
+            "first_execution": "2026-08-30T22:14Z",
+            "last_execution": "2026-09-09T13:59Z",
+            "is_forced_plan": false
+          },
+          {
+            "query_id": 55120,
+            "source": "dbo.usp_CreateOrder",
+            "plans": 1,
+            "executions": 3880100,
+            "avg_cpu_ms": 1.9,
+            "last_execution": "2026-09-09T13:59Z"
+          },
+          {
+            "query_id": 48213,
+            "source": "GetOrdersDashboard (ORM 7 text: StatusId IN (1, 2, 5))",
+            "plans": 2,
+            "plan_ids": [
+              7741,
+              9902
+            ],
+            "executions": 371900,
+            "avg_cpu_ms": 3.3,
+            "last_execution": "2026-08-30T21:58Z"
+          }
+        ],
+        "regressed_queries_report": []
+      }
+    },
+    {
+      "id": "query_store",
+      "tool": "get_database_configuration",
+      "arguments": {},
+      "result": {
+        "result_status": "ok",
+        "query_store": {
+          "desired_state": "READ_WRITE",
+          "actual_state": "READ_ONLY",
+          "readonly_reason": 65536,
+          "current_storage_size_mb": 1024,
+          "max_storage_size_mb": 1024,
+          "query_capture_mode": "ALL",
+          "size_based_cleanup_mode": "OFF",
+          "stale_query_threshold_days": 367,
+          "last_runtime_stats_interval": "2026-09-09T13:00Z to 14:00Z",
+          "query_count": 1184330,
+          "single_use_product_search_queries": 1121900
+        },
+        "automatic_tuning": [
+          {
+            "name": "FORCE_LAST_GOOD_PLAN",
+            "desired_state": "ON",
+            "actual_state": "OFF",
+            "reason": "QUERY_STORE_READ_ONLY"
+          },
+          {
+            "name": "CREATE_INDEX",
+            "desired_state": "OFF",
+            "actual_state": "OFF"
+          },
+          {
+            "name": "DROP_INDEX",
+            "desired_state": "OFF",
+            "actual_state": "OFF"
+          }
+        ],
+        "read_committed_snapshot": true
+      }
+    }
+  ],
+  "key": {
+    "root_cause": "forced_plan_orphaned",
+    "required_facts": [
+      {
+        "id": "old_query_stopped",
+        "evidence": "forced_plans",
+        "description": "The forced plan belongs to query 48213, which last ran on 2026-08-30 at 21:58.",
+        "signals": {
+          "all": [
+            "48213",
+            "(30[\\s-]aug|aug(ust)? 30|2026-08-30|21:58)"
+          ]
+        },
+        "example": "Plan 7741 is forced for query 48213, and query 48213 last ran on 2026-08-30 at 21:58."
+      },
+      {
+        "id": "new_query_id_not_forced",
+        "evidence": "query_store_top",
+        "description": "The same statement now runs as query 61877, first seen on 2026-08-30 at 22:14, with no forced plan.",
+        "signals": {
+          "all": [
+            "61877",
+            "22:14|not forced|no forced|new (query[_ ]id|text|identity)|openjson"
+          ]
+        },
+        "example": "After release 5.2 the statement runs as query 61877 (OPENJSON text), first seen 2026-08-30 22:14, with no forced plan."
+      }
+    ],
+    "harmful_conclusions": [
+      {
+        "id": "clear_query_store",
+        "description": "Clearing Query Store removes the plan that should be forced for the new query.",
+        "signals": {
+          "any": [
+            "query_store\\s+clear",
+            "clear (the )?query store"
+          ]
+        },
+        "example": "Clear Query Store and let automatic tuning start again."
+      },
+      {
+        "id": "wrong_cause",
+        "description": "Statistics and the platform did not change the query text.",
+        "root_causes": [
+          "stale_statistics",
+          "platform_fault",
+          "cpu_capacity"
+        ]
+      }
+    ]
+  }
+}
