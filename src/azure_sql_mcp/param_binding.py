@@ -35,6 +35,15 @@ _STATEMENT_KEYWORD_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _DECLARATOR_NAME_PATTERN = re.compile(r"\s*@(?P<name>\w+)\s+\S")
+_SP_EXECUTESQL_CALL_PATTERN = re.compile(
+    r"\bEXEC(?:UTE)?\s+(?:sys\s*\.\s*)?sp_executesql\b", re.IGNORECASE
+)
+_ARGUMENT_LIST_END_PATTERN = re.compile(
+    r";|\b(?:ELSE|END|SELECT|WITH|INSERT|UPDATE|DELETE|MERGE|EXEC(?:UTE)?|IF|BEGIN|SET|"
+    r"DECLARE|WHILE|RETURN|PRINT)\b",
+    re.IGNORECASE,
+)
+_NAMED_ARGUMENT_PATTERN = re.compile(r",\s*(@\w+)\s*=")
 
 # Type names come from the catalog and are embedded into DECLARE statements, so
 # they must look like a plain (optionally parameterized) type. Anything else,
@@ -854,21 +863,42 @@ def _is_identifier_character(character: str) -> bool:
     return character.isalnum() or character in "_@#$"
 
 
+def _named_argument_positions(code: str) -> set[int]:
+    """Offsets of ``@name`` in the ``, @name = value`` arguments of sp_executesql.
+
+    In ``EXEC sys.sp_executesql N'...', N'@u int', @u = @UserId`` the name
+    ``@u`` belongs to the called statement. It is not a variable of the batch,
+    so no caller value exists for it. ``code`` is masked SQL.
+    """
+
+    positions: set[int] = set()
+    for call in _SP_EXECUTESQL_CALL_PATTERN.finditer(code):
+        end = _ARGUMENT_LIST_END_PATTERN.search(code, call.end())
+        stop = len(code) if end is None else end.start()
+        for argument in _NAMED_ARGUMENT_PATTERN.finditer(code, call.end(), stop):
+            positions.add(argument.start(1))
+    return positions
+
+
 def detect_parameters(sql: str) -> list[str]:
     """18.1: Detect @param style placeholders in T-SQL query text.
 
     Returns unique parameter names in order of first appearance.
-    Excludes known system variables (@@ROWCOUNT, @@IDENTITY, etc.) and the
-    variables the text declares itself.
+    Excludes known system variables (@@ROWCOUNT, @@IDENTITY, etc.), the
+    variables the text declares itself, and the argument names of an
+    sp_executesql call.
     """
     code = _mask_parameter_non_code(sql)
     declared = _declared_variable_names(code)
+    argument_names = _named_argument_positions(code)
     params: list[str] = []
     seen: set[str] = set()
     for match in PARAM_PATTERN.finditer(code):
         name = match.group(1)
         # Skip system @@ variables captured as single @
         if match.start() > 0 and code[match.start() - 1] == "@":
+            continue
+        if match.start() in argument_names:
             continue
         if name.casefold() in declared:
             continue

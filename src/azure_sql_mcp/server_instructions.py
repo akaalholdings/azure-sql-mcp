@@ -46,18 +46,19 @@ Every tool result has result_status:
   widen, consolidate, drop, and heap recommendations with inert DDL and rollback;
   include_change_plan=true orders them into steps. get_columnstore_health and
   get_object_details (included columns, filters, declared types) give the detail.
-  Prove a candidate with benchmark_index_candidate (sandbox profile, a policy
-  environment that is a known non-production label) before any production change.
-- One slow query: analyze_query_plan (Query Store plan_id or query_id) or explain_query
-  (both return a plan digest and rule findings), get_query_store_trend for its history,
-  get_column_statistics for skew and parameter values to test,
-  check_equivalence_preflight, start_performance_case,
-  start_tuning_session, add_tuning_candidate, benchmark_tuning_candidate,
-  finalize_tuning_session. Measured claims come only from these results. Benchmark
-  results are compact (detail=full adds spread and digests); get_tuning_session is a
-  summary (view=full adds evidence). A rewrite is deployment_ready only when
-  finalize_tuning_session verified its logical_preconditions in the catalog.
-  Parameter values use one shape everywhere: {name, values, types, weight}.
+  Prove a candidate with benchmark_index_candidate (sandbox profile, non-production
+  policy) before any production change.
+- One slow query (profile null is a valid server): explain_query or analyze_query_plan
+  (digest and findings; analyze=true for time), get_query_store_trend,
+  get_column_statistics for values to test, then start_performance_case with cases
+  {name, values, types, weight}, start_tuning_session, add_tuning_candidate,
+  benchmark_tuning_candidate (read decision; detail=full adds spread),
+  finalize_tuning_session. Report only numbers these return. A rewrite into
+  IF / ELSE branches is one candidate (get_tool_guide branching_batch). An index:
+  benchmark_index_candidate with indexes=[...] tests 1 to 4 as one leased set (guide
+  index_set_experiment; sandbox profile). A baseline too slow to repeat:
+  slow_baseline_cases={case: seconds}. deployment_ready needs the
+  logical_preconditions that finalize_tuning_session verified in the catalog.
 - Plan stability: plan_health_review, review_plan_enforcement, prepare_plan_action
   (returns force_precheck and guardrails). Applying a plan action is a separate,
   explicitly authorized step; on a production database it needs the confirmation_token

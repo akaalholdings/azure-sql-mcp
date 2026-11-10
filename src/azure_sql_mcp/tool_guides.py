@@ -17,7 +17,7 @@ MAX_GUIDE_CHARS = 2500
 @dataclass(frozen=True, slots=True)
 class ToolGuide:
     name: str
-    kind: str  # "tool" or "topic"
+    kind: str  # "tool", "topic", or "workflow" (several tools used in a fixed order)
     title: str
     text: str
     next_tools: tuple[str, ...] = ()
@@ -34,22 +34,29 @@ _GUIDES: tuple[ToolGuide, ...] = (
         "First call for an incident or broad slowness",
         """
 Use when: a database is slow or an incident is open and the cause is not known.
-One call reads resource history, resource limits, waits, sessions, top queries,
-regressions and the version store.
+One call reads resource history against the limits and the database's own
+baseline, waits, sessions, memory and pool pressure, failed executions, top
+queries, regressions and the version store.
 Read:
 - verdict: findings, no_findings, or partial. partial means a source could not
   be read, so the result is not an all-clear.
-- findings: ordered by severity. Each one has a code, the evidence (metric,
-  value, window) and next_tools with ready arguments.
+- conclusion: one sentence. It names the top story and its confidence, or
+  says that no cause is established.
+- stories: a cause, the ids of the facts that support it, a confidence, a fix
+  and next_tools with ready arguments. leads: a fact with no second fact to
+  corroborate it. A lead is not a cause.
+- facts: id, code, severity, the value against its bar, the window, and a
+  basis of verified (read in this call) or inferred (derived or cumulative).
+- findings: the actionable facts, each with next_tools.
 - sources: the result_status of each source. gaps: why a source is missing.
-- facts: the numbers behind the findings, for the report.
 Avoid:
 - Do not report "healthy" when verdict is partial. Name each gap.
+- Do not present a lead as the cause. Say which fact would confirm it.
 - Do not blame a query for a database-level peak without query or wait
   evidence for the same window.
 - window_minutes over 60 needs the master database in the allowlist. Without
   it the resource history covers about one hour.
-Next: call the next_tools of the top finding. For a live incident use
+Next: call the next_tools of the top story. For a live incident use
 get_wait_stats with sample_seconds=15 and get_active_sessions.
 """,
         "get_wait_stats",
@@ -72,6 +79,10 @@ Read:
 - aborted_executions and exception_executions: timeouts and errors. Their
   cost is real but the query never returned.
 - One query_id with several plan_id rows changed plan in the window.
+- group_by=query_hash folds the literal variants of one statement into one
+  row. replica_role limits the read to one replica role.
+- Statements the benchmark tools ran are left out: they are not the
+  application's load.
 Avoid:
 - A field name that ends in _us holds microseconds (total_cpu_us,
   avg_duration_us). Convert before you report.
@@ -135,10 +146,14 @@ Read:
 - summary.estimated_plan_basis: for parameters, the estimate is compiled from
   typed local variables with OPTIMIZE FOR the values. It does not model
   parameter-sensitive plan variants or parameter embedding.
-- headline: statement, operator, warning and missing-index counts.
+- summary.actual_metrics.actual_logical_reads and server_elapsed_ms: what the
+  engine measured. execution_ms is the client clock.
+- A read-only IF / ELSE batch is one statement here. analyze=false returns
+  branches: per branch its condition, digest and findings. analyze=true
+  names the branch that ran in summary.batch.executed_branch.
 Avoid:
-- analyze=true executes the statement. Use it only for a read-only SELECT and
-  within the database policy.
+- analyze=true executes the statement. Use it only for a read-only SELECT or
+  batch and within the database policy.
 - An estimated plan cannot show what was slow.
 - A missing-index hint is a lead. Design the index with
   review_workload_indexes.
@@ -169,6 +184,8 @@ Read:
 - aborted_executions and exception_executions: failures in the bucket.
 - bucket_size_adjusted: the server changed bucket_minutes to keep the
   response bounded.
+- replica_role: only the runs of one replica role. Default: every replica
+  blended.
 Avoid:
 - Query Store records a run when it ends. A statement that is still running
   is not in the trend.
@@ -262,6 +279,9 @@ Read:
   ranks options; it is not a measured saving.
 - rewrite_opportunities: non-sargable predicates and implicit conversions.
   No index fixes them.
+- With query_ids: requested_queries says how many recommendations serve
+  those queries, and they come first (serves_requested_query). Zero means the
+  review found no index change for the query you tune.
 Avoid:
 - Pass query_ids with the query you tune. Without it the review may cover
   only the top workload queries.
@@ -269,7 +289,8 @@ Avoid:
   reset on failover and scaling, and readable replicas are not observed.
 - The DDL is inert advice. Never run it from a read-only profile.
 Next: prove a create, extend or widen with benchmark_index_candidate on a
-non-production copy (sandbox profile) before any production change.
+non-production copy (sandbox profile) before any production change. Pass
+replaces with the name of the index an extend or widen would replace.
 """,
         "benchmark_index_candidate",
         "analyze_query_plan",
@@ -312,8 +333,8 @@ Use when: a case and a tuning session are open and a candidate is registered
 with add_tuning_candidate. phase=screening ranks several candidates;
 phase=finalist measures one and proves result equivalence.
 Read:
-- headline: classification, objective, metric, relative_improvement_pct,
-  parameter_case_count and executions.
+- decision: classification, the equivalence status and, per parameter case,
+  the verdict, the speedup and the medians of each side. Read it first.
 - classification: improved, neutral, regressed, equivalence_failed,
   performance_only, inconclusive or proof_contract_required.
 - parameter_results: baseline and candidate per parameter case. Check each
@@ -322,6 +343,11 @@ Read:
   screening result cannot be a winner.
 - proof_scope: what the equality rests on. A match on the tested cases alone
   (snapshot_matched) is a test result that a reviewer must confirm.
+- slow_baseline_cases={"case": seconds}: for a baseline too slow to repeat.
+  It runs once (baseline_source single_run) and later candidates reuse it
+  (session_single_run). Only a gain of 50% or more then counts as improved.
+- candidate_sql may be a read-only IF / ELSE batch: see the branching_batch
+  guide.
 Avoid:
 - Do not rerun a lost response with a new idempotency key. Read it back with
   get_tuning_session.
@@ -342,20 +368,25 @@ deployment_ready and deployment_blockers decide what goes to change control.
         "Prove an index on a non-production copy",
         """
 Use when: an index or rewrite-plus-index candidate must be measured. The tool
-creates a leased temporary index, measures before, with and after the index,
-and removes it. It needs the sandbox profile and a policy that allows test
-indexes.
+creates 1 to 4 leased temporary indexes as one candidate, measures before,
+with and after them, and removes them. It needs the sandbox profile and a
+policy that allows test indexes. Pass one index with schema_name, table_name
+and key_columns, or several with indexes: see the index_set_experiment guide.
 Read:
-- classification and parameter_results, as for a rewrite benchmark.
-- The plan evidence that the candidate plan used the test index. A faster
-  run that did not use the index is not evidence for it.
-- The result fingerprints before, with and after the index. Data that moved
-  between phases makes the result inconclusive.
-- cleanup state. cleanup_required means the temporary index may still exist:
-  give the user the statement that removes it and stop sandbox work.
+- decision and classification, as for a rewrite benchmark.
+- indexes: per index what was built, size_mb, index_depth, row_count and
+  used_in_cases. data_compression ROW or PAGE can make an index one level
+  shallower: compare index_depth.
+- parameter_results: per case, how many runs used a test index. A faster run
+  that used none is not evidence for the index.
+- lease.status: cleanup_required means a test index may still exist. Give
+  the user rollback_ddl and stop sandbox work in that database.
+- proof_scope hinted_evidence (with replaces): what the index costs when
+  used. It does not show that the optimizer will choose it.
 Avoid:
 - Never run this on production. Use a copy with production-like data.
-- The SQL stays unchanged. An index test cannot prove a rewrite.
+- Never create or drop a test index with other DDL. The lease is what
+  guarantees the cleanup.
 - One query cannot justify a production index: state the write cost and the
   size, and check the other queries on the table.
 - Take keys and includes from review_workload_indexes, not from a
@@ -705,6 +736,88 @@ measurement.
 """,
     ),
 )
+
+_WORKFLOW_GUIDES: tuple[ToolGuide, ...] = (
+    _guide(
+        "branching_batch",
+        "workflow",
+        "A rewrite into IF / ELSE branches or dynamic SQL",
+        """
+Use when: one statement serves several parameter shapes, for example
+(@p IS NULL OR col = @p), and the fix is one SELECT per shape. The proof tools
+take such a batch as one candidate.
+Read:
+- The admitted form: optional DECLARE and SET of scalar variables, then IF /
+  ELSE over parameters and literals only, with one SELECT per branch, or EXEC
+  sys.sp_executesql of one string literal with a parameter list. At most 16
+  branches. Anything else is refused with the reason.
+- explain_query with analyze=false: branches, one estimated plan per branch
+  with its condition. With analyze=true: one run, and
+  summary.batch.executed_branch names the branch the values selected.
+- check_equivalence_preflight: risks and total-order gaps carry the branch
+  number. Every branch must keep the baseline's outer ORDER BY.
+- compare_query_results and benchmark_tuning_candidate: baseline_sql is the
+  single statement, candidate_sql is the batch. Register one parameter case
+  per branch, so that every branch is run and compared.
+Avoid:
+- Do not send the batch to execute_sql. That tool takes one statement.
+- A case set that never reaches a branch proves nothing about that branch.
+- Pass parameter_types for every parameter of a batch. A type that is not
+  given is read from the compared column and can be missing.
+- Do not add OPTIMIZE FOR hints to the branches. Measure first.
+Next: start_performance_case with the baseline and one case per branch,
+start_tuning_session, add_tuning_candidate with the batch, then
+benchmark_tuning_candidate with phase=finalist.
+""",
+        "explain_query",
+        "check_equivalence_preflight",
+        "start_performance_case",
+        "add_tuning_candidate",
+        "benchmark_tuning_candidate",
+    ),
+    _guide(
+        "index_set_experiment",
+        "workflow",
+        "Measure one or several test indexes as one candidate",
+        """
+Use when: a design needs an index you must measure before you recommend it:
+one index, two indexes on one table, or one index on each of two tables.
+Read:
+- check_capabilities first: local_tuning_policy must show allow_test_indexes
+  true and a non-production environment, and the server must run the sandbox
+  profile. test_index_name_prefixes lists the name prefixes you may pass.
+- start_performance_case, start_tuning_session, then add_tuning_candidate
+  with strategy=index and the unchanged SQL.
+- benchmark_index_candidate with indexes=[{table_name, key_columns,
+  include_columns, filter_definition, is_unique, data_compression}, ...].
+  A key column may end in DESC. One lease covers the set: every index is
+  created or none is left, and every one is dropped on every path.
+- index_name_prefix: only when the engagement needs its own prefix. The tool
+  generates the rest of each name.
+- replaces: the existing index a one-index candidate would replace. The
+  candidate arm is hinted and the result is hinted_evidence.
+- slow_baseline_cases={"case": seconds}: a baseline too slow to repeat runs
+  once and later index candidates of the session reuse it.
+- Result: indexes (size_mb, index_depth, used_in_cases) and unused_indexes,
+  the indexes of the set that no measured case used.
+Avoid:
+- Do not test the indexes of one design one at a time when the plan needs
+  them together. The set is the candidate.
+- Do not fall back to other DDL when the tool refuses. Report the refusal.
+- A set with an unused index is larger than the design needs. Test it again
+  without that index.
+Next: get_tuning_session, then finalize_tuning_session. For a rewrite that
+also needs the indexes, add a rewrite_plus_index candidate whose parent is
+the measured rewrite.
+""",
+        "check_capabilities",
+        "start_performance_case",
+        "add_tuning_candidate",
+        "benchmark_index_candidate",
+        "finalize_tuning_session",
+    ),
+)
+_GUIDES = (*_GUIDES, *_WORKFLOW_GUIDES)
 
 _BY_NAME = {guide.name: guide for guide in _GUIDES}
 

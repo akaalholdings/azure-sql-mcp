@@ -15,6 +15,9 @@ Version 1 documents a small, database-scoped allowlist::
           "allow_read": true,
           "allow_benchmark": false,
           "allow_test_indexes": false,
+          "test_index_name_prefixes": ["IX_Testing_"],
+          "test_index_maxdop": 0,
+          "allow_offline_test_index": false,
           "allow_view_apply": false,
           "allow_plan_apply": false,
           "allow_index_history_write": false,
@@ -27,6 +30,12 @@ Version 1 documents a small, database-scoped allowlist::
         }
       }
     }
+
+``test_index_name_prefixes`` lists the name prefixes a test index may take;
+the workflow prefix ``IX_Testing_`` is the default and is always valid. The
+tool generates the rest of the name. ``test_index_maxdop`` caps the build
+(0 leaves the database default). ``allow_offline_test_index`` permits an
+offline build, which blocks every writer of the table while it runs.
 
 ``application_intent`` is optional. ``read_only`` connects with
 ApplicationIntent=ReadOnly, so a read scale-out replica is the diagnosis
@@ -57,6 +66,9 @@ _DATABASE_FIELDS = frozenset(
         "allow_read",
         "allow_benchmark",
         "allow_test_indexes",
+        "test_index_name_prefixes",
+        "test_index_maxdop",
+        "allow_offline_test_index",
         "allow_view_apply",
         "allow_plan_apply",
         "allow_index_history_write",
@@ -70,6 +82,12 @@ _DATABASE_FIELDS = frozenset(
     }
 )
 APPLICATION_INTENTS = ("read_write", "read_only")
+# The prefix of every test index the workflow names by default.
+WORKFLOW_TEST_INDEX_PREFIX = "IX_Testing_"
+MAX_TEST_INDEX_NAME_PREFIXES = 8
+MAX_TEST_INDEX_MAXDOP = 64
+# Long enough that a generated name cannot be taken for an application index.
+_TEST_INDEX_NAME_PREFIX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{3,31}$")
 _REQUIRED_DATABASE_FIELDS = frozenset({"environment", "allow_read"})
 _UNKNOWN_ENVIRONMENTS = frozenset({"", "none", "null", "unknown"})
 
@@ -178,6 +196,9 @@ class DatabasePolicy:
     max_tuning_session_minutes: int = 0
     configured: bool = True
     application_intent: str = "read_write"
+    test_index_name_prefixes: tuple[str, ...] = (WORKFLOW_TEST_INDEX_PREFIX,)
+    test_index_maxdop: int = 0
+    allow_offline_test_index: bool = False
     # Recorders this database's history can be read from: source name -> its
     # validated binding (history_sources.py). Empty when none is mapped.
     history_sources: Mapping[str, Any] = field(
@@ -208,9 +229,34 @@ class DatabasePolicy:
             "allow_view_apply",
             "allow_plan_apply",
             "allow_index_history_write",
+            "allow_offline_test_index",
         ):
             if not isinstance(getattr(self, field_name), bool):
                 raise DatabasePolicyValidationError(f"{field_name} must be a boolean.")
+        prefixes = self.test_index_name_prefixes
+        if (
+            not isinstance(prefixes, tuple)
+            or not 1 <= len(prefixes) <= MAX_TEST_INDEX_NAME_PREFIXES
+            or any(
+                not isinstance(prefix, str) or not _TEST_INDEX_NAME_PREFIX.fullmatch(prefix)
+                for prefix in prefixes
+            )
+            or len({prefix.casefold() for prefix in prefixes}) != len(prefixes)
+        ):
+            raise DatabasePolicyValidationError(
+                "test_index_name_prefixes must be a list of 1 to "
+                f"{MAX_TEST_INDEX_NAME_PREFIXES} different plain identifiers of 4 to 32 "
+                "characters (letters, digits, underscores)."
+            )
+        if (
+            not isinstance(self.test_index_maxdop, int)
+            or isinstance(self.test_index_maxdop, bool)
+            or not 0 <= self.test_index_maxdop <= MAX_TEST_INDEX_MAXDOP
+        ):
+            raise DatabasePolicyValidationError(
+                f"test_index_maxdop must be an integer from 0 to {MAX_TEST_INDEX_MAXDOP}; "
+                "0 leaves the database default."
+            )
         for field_name in (
             "max_benchmark_executions",
             "max_tuning_candidates",
@@ -244,6 +290,11 @@ class DatabasePolicy:
         )
         allow_benchmark = value.get("allow_benchmark", False)
         per_request_limit = value.get("max_benchmark_executions", 0)
+        prefixes = value.get("test_index_name_prefixes", [WORKFLOW_TEST_INDEX_PREFIX])
+        if not isinstance(prefixes, list):
+            raise DatabasePolicyValidationError(
+                f"database {database_name!r} test_index_name_prefixes must be a list."
+            )
         return cls(
             database_name=database_name,
             environment=value["environment"],
@@ -268,6 +319,9 @@ class DatabasePolicy:
             ),
             business_cycle_extension_days=value.get("business_cycle_extension_days", 0),
             application_intent=value.get("application_intent", "read_write"),
+            test_index_name_prefixes=tuple(prefixes),
+            test_index_maxdop=value.get("test_index_maxdop", 0),
+            allow_offline_test_index=value.get("allow_offline_test_index", False),
             history_sources=_parse_history_sources(
                 database_name, value.get("history_sources")
             ),
@@ -595,6 +649,7 @@ def _validate_environment(value: object) -> None:
 __all__ = [
     "ENVIRONMENT_CLASSES",
     "POLICY_VERSION",
+    "WORKFLOW_TEST_INDEX_PREFIX",
     "DatabasePolicy",
     "DatabasePolicyError",
     "DatabasePolicyLoadError",

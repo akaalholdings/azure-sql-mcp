@@ -3514,8 +3514,12 @@ async def test_capability_check_publishes_tuning_contract(
     result = await app._check_database_capabilities("appdb")
 
     assert result["mcp_contract"] == {
-        "contract_version": "2.6.3",
+        # The package version, never a literal that can fall behind it.
+        "contract_version": app._runtime_status()["package_version"],
         "performance_tuning": 1,
+        "branching_batch": 1,
+        "index_set_experiment": 1,
+        "slow_baseline_cases": 1,
         "durable_view_change": 1,
         "prepared_plan_action": 1,
         "index_portfolio_review": 1,
@@ -3534,6 +3538,10 @@ async def test_capability_check_publishes_tuning_contract(
         "allow_read": False,
         "allow_benchmark": False,
         "allow_test_indexes": False,
+        # What an index experiment may name and how it may build.
+        "test_index_name_prefixes": ["IX_Testing_"],
+        "test_index_maxdop": 0,
+        "allow_offline_test_index": False,
         "allow_view_apply": False,
         "allow_plan_apply": False,
         "allow_index_history_write": False,
@@ -3704,7 +3712,12 @@ async def test_query_store_time_tools_forward_their_windows(app: AzureSqlMcpAppl
     assert trend["result_status"] == "empty"
     assert regressions["result_status"] == "empty"
     app.query_store_trends.trend.assert_awaited_once_with(
-        "appdb", query_id=42, window_minutes=720, bucket_minutes=30, as_of_utc="2026-09-30"
+        "appdb",
+        query_id=42,
+        window_minutes=720,
+        bucket_minutes=30,
+        as_of_utc="2026-09-30",
+        replica_role=None,
     )
     app.query_store_trends.regressions.assert_awaited_once_with(
         "appdb",
@@ -3715,6 +3728,7 @@ async def test_query_store_time_tools_forward_their_windows(app: AzureSqlMcpAppl
         min_executions=10,
         min_regression_pct=25.0,
         top=5,
+        replica_role=None,
     )
 
 

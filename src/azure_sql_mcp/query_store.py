@@ -91,6 +91,35 @@ _HISTORY_OUTCOME_COLUMNS = (
 
 
 _RELATIVE_WINDOW_PREDICATE = "rsi.end_time >= DATEADD(MINUTE, -?, SYSUTCDATETIME())"
+# The comment the benchmark tools put before every statement they send
+# (performance_workflows.mark_benchmark_sql). The literal is repeated here
+# because that module imports this one; a unit test keeps the two equal.
+BENCHMARK_MARKER_PREFIX = "/* azure-sql-mcp:bench:"
+
+
+def benchmark_statement_predicate(text_column: str, *, negate: bool = False) -> str:
+    """SQL predicate: the stored text is a statement a benchmark tool sent.
+
+    Those runs are the tool's own load, not the application's. Query Store
+    stores a parameterized statement behind its ``(@p type, ...)`` block, so
+    the marker is matched at the start of the text and after that block.
+    """
+
+    patterns = (f"{BENCHMARK_MARKER_PREFIX}%", f"(@%){BENCHMARK_MARKER_PREFIX}%")
+    if negate:
+        return "(" + " AND ".join(f"{text_column} NOT LIKE N'{item}'" for item in patterns) + ")"
+    return "(" + " OR ".join(f"{text_column} LIKE N'{item}'" for item in patterns) + ")"
+
+
+# Leaves the benchmark tools' statements out of a ranking keyed by p.query_id.
+_NOT_A_BENCHMARK_QUERY = f"""AND NOT EXISTS (
+                  SELECT 1
+                  FROM sys.query_store_query AS bench_q
+                  INNER JOIN sys.query_store_query_text AS bench_qt
+                      ON bench_qt.query_text_id = bench_q.query_text_id
+                  WHERE bench_q.query_id = p.query_id
+                    AND {benchmark_statement_predicate("bench_qt.query_sql_text")}
+              )"""
 _ABSOLUTE_WINDOW_PREDICATE = (
     "rsi.end_time > TODATETIMEOFFSET(CAST(? AS datetime2), 0) "
     "AND rsi.start_time < TODATETIMEOFFSET(CAST(? AS datetime2), 0)"
@@ -951,6 +980,7 @@ FROM (
     FROM sys.query_store_query_text AS qt
     INNER JOIN sys.query_store_query AS q
         ON q.query_text_id = qt.query_text_id
+       AND {benchmark_statement_predicate("qt.query_sql_text", negate=True)}
     {{hash_filter}}
 ) AS m
 {{match_filter}}
@@ -2293,6 +2323,7 @@ class QueryStoreService:
             {grouping["inner_join"]}
             WHERE {_RELATIVE_WINDOW_PREDICATE}
               {replica_predicate}
+              {_NOT_A_BENCHMARK_QUERY}
             GROUP BY {grouping["group_by"]}"""
         if blend:
             ranked = f"""
