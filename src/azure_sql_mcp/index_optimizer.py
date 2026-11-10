@@ -1943,6 +1943,30 @@ def classify_create_index_failure(error: BaseException) -> dict[str, Any]:
     }
 
 
+def is_connection_failure(error: BaseException) -> bool:
+    """True when the connection failed and not the statement.
+
+    The transport rule of ``classify_create_index_failure``: SQLSTATE class
+    08, a communication link or TCP provider message, a login timeout. A
+    query timeout and a cancel are left out: the statement ran for the whole
+    limit, and one more try would run it as long again.
+    """
+
+    if classify_create_index_failure(error)["reason"] != "connection_or_timeout":
+        return False
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (TimeoutError, asyncio.CancelledError)):
+            return False
+        for value in (*getattr(current, "args", ()), getattr(current, "ddbc_error", None)):
+            if isinstance(value, str) and "query timeout" in value.lower():
+                return False
+        current = current.__cause__ or current.__context__
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Replacement experiment: prove an extend, widen or consolidate recommendation
 # ---------------------------------------------------------------------------

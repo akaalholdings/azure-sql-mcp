@@ -805,31 +805,37 @@ _WORKFLOW_GUIDES: tuple[ToolGuide, ...] = (
         "workflow",
         "A rewrite into IF / ELSE branches or dynamic SQL",
         """
-Use when: one statement serves several parameter shapes, for example
-(@p IS NULL OR col = @p), and the fix is one SELECT per shape. The proof tools
-take such a batch as one candidate.
+Use when: the fix is one SELECT per parameter shape, as for
+(@p IS NULL OR col = @p), or a key or a row count read into a variable in
+front of the main statement. The proof tools take the batch as one candidate.
 Read:
-- The admitted form: optional DECLARE and SET of scalar variables, then IF /
-  ELSE with one SELECT per branch, or EXEC sys.sp_executesql of one string
-  literal with a parameter list. At most 16 branches. A guard or value holds
-  parameters, literals, operators, LIKE, COLLATE <name> and the functions
-  CAST, CONVERT, TRY_CAST, TRY_CONVERT, PATINDEX, CHARINDEX, LEN, ISNULL,
-  COALESCE, NULLIF: no subquery, no object name, no other function.
-  Anything else is refused with the reason.
-- explain_query with analyze=false: branches, one estimated plan per branch
-  with its condition. With analyze=true: one run, and
-  summary.batch.executed_branch names the branch the values selected.
-- check_equivalence_preflight: risks and total-order gaps carry the branch
-  number. Every branch must keep the baseline's outer ORDER BY.
-- compare_query_results and benchmark_tuning_candidate: baseline_sql is the
-  single statement, candidate_sql is the batch. Register one parameter case
-  per branch, so that every branch is run and compared.
+- The admitted form, in this order. First DECLARE @v type [= value], SET
+  @v = value, and at most 8 statements that read data into a variable:
+  SELECT @v = expr [, @w = expr] FROM ... ; (every item assigns a declared
+  variable, no rows are returned, a semicolon ends it) or a scalar subquery
+  as the value of DECLARE or SET. Then one SELECT, or IF / ELSE with one
+  SELECT per branch (at most 16), or EXEC sys.sp_executesql of one string
+  literal with a parameter list.
+- Example: DECLARE @k int; SELECT @k = t.TypeKey FROM dbo.DimType AS t
+  WHERE t.TypeName = @type; SELECT ... WHERE f.TypeKey = @k;
+- A guard or plain value holds parameters, variables, literals, operators,
+  LIKE, COLLATE <name> and CAST, CONVERT, TRY_CAST, TRY_CONVERT, PATINDEX,
+  CHARINDEX, LEN, ISNULL, COALESCE, NULLIF: no subquery, no object name, no
+  other function. Anything else is refused with the reason.
+- explain_query with analyze=false: one estimated plan per branch with its
+  condition. With analyze=true: one run; summary.batch.executed_branch names
+  the branch that ran. The cost of a case is the whole batch: the assignment
+  statements count (summary.batch.statements_executed).
+- check_equivalence_preflight: risks carry the branch number. Every branch
+  must keep the baseline's outer ORDER BY.
+- compare_query_results and the benchmark tools: baseline_sql is the single
+  statement, candidate_sql is the batch; its one result set is compared.
+  Register one parameter case per branch.
 Avoid:
 - Do not send the batch to execute_sql. That tool takes one statement.
 - A case set that never reaches a branch proves nothing about that branch.
-- Pass parameter_types for every parameter of a batch. A type that is not
-  given is read from the compared column and can be missing.
-- Do not add OPTIMIZE FOR hints to the branches. Measure first.
+- Pass parameter_types for every parameter of a batch.
+- No temp table, table variable, DML, SET option or EXEC of user code.
 Next: start_performance_case with the baseline and one case per branch,
 start_tuning_session, add_tuning_candidate with the batch, then
 benchmark_tuning_candidate with phase=finalist.

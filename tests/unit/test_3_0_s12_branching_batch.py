@@ -191,7 +191,8 @@ def test_a_single_select_is_validated_exactly_as_before() -> None:
         ("IF SELECT 1", "IF condition"),
         # Prefix statements are scalar DECLARE and SET @variable only.
         ("DECLARE @t TABLE (Id int); IF @a = 1 SELECT 1 ELSE SELECT 2", "DECLARE"),
-        ("DECLARE @x int = (SELECT MAX(Id) FROM dbo.Posts); IF @a = 1 SELECT 1", "DECLARE"),
+        # S15 admits a scalar subquery as a DECLARE value; user code is still refused.
+        ("DECLARE @x int = dbo.fn_MaxId(); IF @a = 1 SELECT 1", "DECLARE"),
         ("DECLARE @x int = dbo.Fn(1); IF @a = 1 SELECT 1", "DECLARE"),
         ("SET NOCOUNT ON; IF @a = 1 SELECT 1 ELSE SELECT 2", "SET"),
         ("SET @x = NEXT VALUE FOR dbo.Seq; IF @a = 1 SELECT 1", "SET"),
@@ -257,8 +258,18 @@ def test_attack_corpus_admits_nothing_new_outside_the_grammar() -> None:
 
     assert len(inputs) > 1000
     assert changed_verdict == []
-    # Every corpus input the gate refused before stream S12 is still refused.
-    assert newly_admitted == []
+    # Every corpus input the gate refused before stream S12 is still refused,
+    # except the form S15 admits on purpose: a variable read by an assignment
+    # SELECT or a scalar subquery, then one SELECT. Each is read-only.
+    assert newly_admitted == [
+        "DECLARE @x INT; SELECT @x = col FROM dbo.t; SELECT @x",
+        "DECLARE @x int = (SELECT COUNT(*) FROM t) SELECT @x",
+        "DECLARE @x int = (SELECT TOP 1 id FROM t ORDER BY id) SELECT @x",
+        "DECLARE @x INT = (SELECT TOP 1 c FROM t)\nSELECT @x",
+    ]
+    for sql in newly_admitted:
+        admitted = validator.validate_read_only_candidate(sql)
+        assert admitted.assignment_statements and len(admitted.branches) == 1, sql
 
 
 # --- The proof, comparison and plan paths take the batch as one candidate. ---

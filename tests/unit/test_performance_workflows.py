@@ -3288,6 +3288,8 @@ def test_classification_accepts_large_separation_despite_relative_candidate_nois
         "noise_threshold": pytest.approx(15_803.5),
         "superiority_probability": 1.0,
         "median_shift_ratio": pytest.approx(156_437.0 / 158_035.0),
+        "noise_floor": 50.0,
+        "noise_floor_applied": False,
         "bucket_verdict": "improved",
     }
 
@@ -3431,7 +3433,8 @@ def test_classification_uses_the_selected_objective() -> None:
             ]
         )
 
-    parameter_results = [{"baseline": side(100.0, 20.0), "candidate": side(50.0, 40.0)}]
+    # Above the 50 ms noise floor on both metrics (S15).
+    parameter_results = [{"baseline": side(1000.0, 200.0), "candidate": side(500.0, 400.0)}]
     equivalence = [{"status": "match"}]
 
     elapsed, _ = classify_benchmark(

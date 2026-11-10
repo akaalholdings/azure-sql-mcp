@@ -98,7 +98,8 @@ def test_a_declared_variable_may_take_a_converted_parameter() -> None:
     assert validated.local_variables == ("@code_v",)
     with pytest.raises(ValueError):
         SafeSqlValidator().validate_read_only_candidate(
-            batch.replace("TRY_CONVERT(varchar(20), @code)", "(SELECT TOP (1) AccountCode FROM dbo.Accounts)")
+            # S15 admits a scalar subquery here; a call of user code is still refused.
+            batch.replace("TRY_CONVERT(varchar(20), @code)", "dbo.fn_AccountCode(@code)")
         )
 
 

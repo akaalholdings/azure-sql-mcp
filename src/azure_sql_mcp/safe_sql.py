@@ -678,6 +678,11 @@ class BatchBranch:
 
 MAX_BATCH_DEPTH = 8
 MAX_BATCH_BRANCHES = 16
+# Statements in front of the result-producing statement that read data into a
+# variable: an assignment SELECT, or a DECLARE or SET from a scalar subquery.
+MAX_BATCH_ASSIGNMENTS = 8
+# A word that starts the next statement: it cannot stand inside a SELECT.
+_BATCH_NEXT_STATEMENT_WORDS = frozenset({"IF", "DECLARE", "SET", "BEGIN", "EXEC", "EXECUTE"})
 _BATCH_STATEMENT_WORDS = frozenset({"IF", "SELECT", "WITH", "EXEC", "EXECUTE", "BEGIN"})
 _BATCH_PREFIX_WORDS = frozenset({"DECLARE", "SET"})
 _BATCH_CONDITION_WORDS = frozenset(
@@ -717,9 +722,13 @@ class _BatchGrammarError(ValueError):
 class _BranchingBatchParser:
     """Recursive-descent parser for the one multi-statement form the gate admits.
 
-    batch      := { declare | set } statement <end>
-    declare    := DECLARE @v [AS] type [= value] { , @v [AS] type [= value] } [;]
-    set        := SET @v = value [;]
+    batch      := { declare | set | assign } result <end>
+    declare    := DECLARE @v [AS] type [= value | = subquery] { , @v ... } [;]
+    set        := SET @v = ( value | subquery ) [;]
+    assign     := SELECT @v = expression { , @v = expression } [ FROM ... ] ;
+    subquery   := ( text that validate_read_only admits as exactly one SELECT )
+    result     := statement
+                | select [;]        only after an assign or a subquery
     statement  := IF condition statement [ ELSE statement ]
                 | BEGIN statement END [;]
                 | select [;]
@@ -734,8 +743,18 @@ class _BranchingBatchParser:
     argument   := [ @name = ] ( @variable | literal )
     select     := text that validate_read_only admits as exactly one SELECT
 
-    The top statement is IF, BEGIN or EXEC: one SELECT alone is the ordinary
-    form. Outside a select there is no subquery, no object name and no
+    Declarations and assignments come first, then the one result-producing
+    part: an IF / ELSE tree, or one SELECT. One SELECT behind a prefix that
+    reads no data is the ordinary form (validate_read_only), not a batch.
+
+    An assign statement returns no rows: every select-list item assigns to a
+    local variable the batch declared, and the statement ends with a
+    semicolon. Its text, and the text of a subquery, pass validate_read_only
+    like any SELECT (no DML, no INTO, no temporary table, no blocked
+    function, no locking hint). A batch holds at most MAX_BATCH_ASSIGNMENTS
+    statements that read data into a variable.
+
+    In a condition or a value there is no subquery, no object name and no
     function other than the deterministic scalar functions above, which take
     @variables and literals only.
     """
@@ -747,24 +766,40 @@ class _BranchingBatchParser:
         self.position = 0
         self.branches: list[BatchBranch] = []
         self.locals: list[str] = []
+        # The statements that read data into a variable, in order.
+        self.assignments: list[str] = []
         self.prefix_end = 0
 
     def parse(self) -> None:
         if not self.tokens:
             raise _BatchGrammarError("the batch is empty")
         self.prefix_end = self.tokens[0].start
-        while self._word() in _BATCH_PREFIX_WORDS:
-            if self._word() == "DECLARE":
+        while True:
+            word = self._word()
+            if word == "DECLARE":
                 self._declare()
-            else:
+            elif word == "SET":
                 self._set()
+            elif word == "SELECT" and self._assigns_next():
+                self._assignment_select()
+            else:
+                break
             self.prefix_end = (
                 self.tokens[self.position].start if self._peek() else len(self.sql)
             )
-        if self._word() not in {"IF", "BEGIN", "EXEC", "EXECUTE"}:
+        word = self._word()
+        if word in {"SELECT", "WITH"} and self.assignments:
+            # One result-producing SELECT behind assignments that read data.
+            pass
+        elif word not in {"IF", "BEGIN", "EXEC", "EXECUTE"}:
             raise _BatchGrammarError(
                 "after DECLARE and SET @variable, a branching batch starts with IF, BEGIN "
                 "or EXEC sys.sp_executesql"
+                + (
+                    f"; a statement that starts with {word} is not allowed"
+                    if word is not None
+                    else ""
+                )
             )
         self._statement((), "", 0, "the batch")
         if self._peek() is not None:
@@ -893,7 +928,12 @@ class _BranchingBatchParser:
             self._type("DECLARE")
             if self._punct("="):
                 self.position += 1
-                self._expression("a DECLARE value", frozenset({"NULL"}), _BATCH_VALUE_PUNCT, ",;")
+                if self._subquery_next():
+                    self._scalar_subquery("a DECLARE value")
+                else:
+                    self._expression(
+                        "a DECLARE value", frozenset({"NULL"}), _BATCH_VALUE_PUNCT, ",;"
+                    )
             self.locals.append(name)
             if not self._punct(","):
                 break
@@ -906,8 +946,101 @@ class _BranchingBatchParser:
         if not self._punct("="):
             raise _BatchGrammarError("only SET @variable = value is allowed, not a SET option")
         self.position += 1
-        self._expression("a SET value", frozenset({"NULL"}), _BATCH_VALUE_PUNCT, ";")
+        if self._subquery_next():
+            self._scalar_subquery("a SET value")
+        else:
+            self._expression("a SET value", frozenset({"NULL"}), _BATCH_VALUE_PUNCT, ";")
         self._skip_semicolon()
+
+    # -- assignments that read data
+    def _word_at(self, offset: int) -> str | None:
+        index = self.position + offset
+        token = self.tokens[index] if index < len(self.tokens) else None
+        return token.text if token is not None and token.kind == "word" else None
+
+    def _subquery_next(self) -> bool:
+        return self._punct("(") and self._word_at(1) in {"SELECT", "WITH"}
+
+    def _assigns_next(self) -> bool:
+        """True at ``SELECT @variable =``: an assignment, not a result set."""
+
+        name = self._word_at(1)
+        following = (
+            self.tokens[self.position + 2] if self.position + 2 < len(self.tokens) else None
+        )
+        return (
+            name is not None
+            and _OPTIMIZE_FOR_VARIABLE.fullmatch(name) is not None
+            and following is not None
+            and _is_punct(following, "=")
+        )
+
+    def _count_assignment(self, text: str) -> None:
+        if len(self.assignments) >= MAX_BATCH_ASSIGNMENTS:
+            raise _BatchGrammarError(
+                f"a batch may hold at most {MAX_BATCH_ASSIGNMENTS} statements that read "
+                "data into a variable"
+            )
+        self.assignments.append(text)
+
+    def _read_only_select(self, what: str, text: str) -> None:
+        # The ordinary single-SELECT gate decides whether the text is read-only.
+        try:
+            self.validator.validate_read_only(text)
+        except ValueError as exc:
+            raise _BatchGrammarError(f"{what} is refused: {exc}") from exc
+
+    def _scalar_subquery(self, what: str) -> None:
+        opening = self.position
+        closing = _matching_close(self.tokens, opening)
+        if closing is None:
+            raise _BatchGrammarError(f"{what} has an unbalanced parenthesis")
+        inner = self.sql[self.tokens[opening + 1].start : self.tokens[closing - 1].end]
+        self._read_only_select(f"the subquery of {what}", inner)
+        self.position = closing + 1
+        self._count_assignment(self.sql[self.tokens[opening].start : self.tokens[closing].end])
+
+    def _assignment_select(self) -> None:
+        start = self.position
+        depth = 0
+        while (token := self._peek()) is not None:
+            if token.kind == "punct":
+                if token.text == ";" and depth == 0:
+                    break
+                depth += (token.text == "(") - (token.text == ")")
+            elif depth == 0 and self.position > start and (
+                self._word() in _BATCH_NEXT_STATEMENT_WORDS or self._word() == "SELECT"
+            ):
+                token = None
+                break
+            self.position += 1
+        if token is None:
+            raise _BatchGrammarError(
+                "an assignment SELECT must end with a semicolon before the next statement"
+            )
+        text = self.sql[self.tokens[start].start : self.tokens[self.position - 1].end]
+        self._skip_semicolon()
+        self._read_only_select("an assignment SELECT", text)
+        try:
+            parsed = parse(text, read="tsql")
+        except ParseError:
+            parsed = self.validator._parse_under_trailing_option(text) or []
+        statement = parsed[0] if len(parsed) == 1 else None
+        if not isinstance(statement, exp.Select):
+            raise _BatchGrammarError("an assignment SELECT must be one plain SELECT statement")
+        declared = {name.lstrip("@").casefold() for name in self.locals}
+        for item in statement.expressions:
+            if not isinstance(item, exp.EQ) or not isinstance(item.this, exp.Parameter):
+                raise _BatchGrammarError(
+                    "every select-list item of an assignment SELECT must be @variable = "
+                    "expression; a statement that also returns a column is refused"
+                )
+            if item.this.name.casefold() not in declared:
+                raise _BatchGrammarError(
+                    "an assignment SELECT may assign only to a declared local variable; "
+                    f"@{item.this.name} is not declared in this batch"
+                )
+        self._count_assignment(text)
 
     # -- statements
     def _statement(
@@ -1188,6 +1321,9 @@ class ValidatedQuery:
     branches: tuple[BatchBranch, ...] = ()
     parameters: tuple[str, ...] = ()
     local_variables: tuple[str, ...] = ()
+    # The statements of a batch that read data into a variable, in order:
+    # each assignment SELECT, and each scalar subquery of a DECLARE or SET.
+    assignment_statements: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         submitted = self.submitted_sql or self.normalized_sql
@@ -1359,6 +1495,11 @@ class SafeSqlValidator:
     def validate_read_only_batch(self, sql: str) -> ValidatedQuery:
         """Validate a read-only branching batch (see _BranchingBatchParser).
 
+        Declarations and assignments come first; an assignment SELECT and a
+        scalar subquery each pass validate_read_only. Then one SELECT, or one
+        IF / ELSE tree. ``branches`` lists each result-producing SELECT (one
+        entry for a batch with one final SELECT).
+
         Each branch is one SELECT that passes validate_read_only on its own, or
         sys.sp_executesql of a string literal that does. The whole text also
         passes every text rule of the single-SELECT gate except the two that
@@ -1407,6 +1548,7 @@ class SafeSqlValidator:
             branches=tuple(parser.branches),
             parameters=tuple(by_fold.values()),
             local_variables=tuple(dict.fromkeys(parser.locals)),
+            assignment_statements=tuple(parser.assignments),
         )
 
     def validate_read_only_candidate(self, sql: str) -> ValidatedQuery:

@@ -399,10 +399,11 @@ async def test_a_lock_wait_abort_is_named_with_its_wait_limits(
 
 
 @pytest.mark.asyncio
-async def test_a_failed_measurement_names_its_step_without_engine_text(
+async def test_a_failed_measurement_names_its_step_and_the_redacted_engine_text(
     server_config_factory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The measured statement is the caller's SQL: its engine text is not returned.
+    # S15: the engine text of a failed measured statement is returned, so an
+    # overflow can be told from a deadlock. The value the engine quotes is not.
     app = _sandbox_app(server_config_factory)
     _table_facts(app)
     session_id, candidate_id = _candidate(app, SQL)
@@ -416,7 +417,9 @@ async def test_a_failed_measurement_names_its_step_without_engine_text(
 
     diagnostic = result["failure_diagnostic"]
     assert diagnostic["failed_step"] == "baseline_before"
-    assert "engine_message" not in diagnostic
+    assert diagnostic["engine_message"] == (
+        "Conversion failed when converting the value '[REDACTED]'."
+    )
     app._create_test_index.assert_not_awaited()
 
 

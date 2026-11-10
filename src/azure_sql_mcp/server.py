@@ -114,6 +114,7 @@ from .index_optimizer import ReplacementExperiment
 from .index_optimizer import bounded_table_lock_probe_sql
 from .index_optimizer import build_test_index_statement
 from .index_optimizer import TRANSIENT_BUILD_ERRORS
+from .index_optimizer import is_connection_failure
 from .index_optimizer import classify_create_index_failure
 from .index_optimizer import columnstore_index_blockers
 from .index_optimizer import columnstore_order_column_names
@@ -162,6 +163,8 @@ from .performance_store import PerformanceStore
 from .performance_store import PerformanceStoreError
 from .performance_store import ReservationError
 from .performance_workflows import COMPARISON_DECISION_BASIS
+from .performance_workflows import ConnectionRetryBudget
+from .performance_workflows import RERUN_NOTE
 from .performance_workflows import TESTED_PROOF_SCOPE
 from .performance_workflows import PerformanceWorkflowService
 from .performance_workflows import aba_result_status
@@ -171,6 +174,7 @@ from .performance_workflows import classify_branching_benchmark
 from .performance_workflows import compact_benchmark_result
 from .performance_workflows import compact_evidence_result
 from .performance_workflows import compare_plan_summaries_payload
+from .performance_workflows import comparison_did_not_run
 from .performance_workflows import database_fingerprint
 from .performance_workflows import decisive_mismatch
 from .performance_workflows import database_fingerprint_matches
@@ -181,6 +185,7 @@ from .performance_workflows import fingerprint_text_matches
 from .performance_workflows import label_comparison
 from .performance_workflows import order_contract_removed
 from .performance_workflows import mark_benchmark_sql
+from .performance_workflows import measured_failure_diagnostic
 from .performance_workflows import parameter_case_fingerprint
 from .performance_workflows import parameter_case_mismatch
 from .performance_workflows import parameter_case_receipt
@@ -947,11 +952,13 @@ def _index_experiment_failure(
     candidate_measure, baseline_after or drop_index. ``cause_class`` is
     timeout (with the limit and the setting that holds it), lock_wait_abort,
     connection_lost, definition_mismatch, engine_error or internal_error. The
-    engine message is returned for the DDL steps only: that DDL is built here,
-    the measured statement is the caller's.
+    engine's error number and its message are returned for every step, a
+    measured statement too, through ``engine_error_message``: quoted values,
+    key values, server names and addresses are redacted, so an overflow can be
+    told from a deadlock or a compile error without a row value in the result.
     """
 
-    diagnostic = extract_failure_diagnostic(exc, engine_text=step in _INDEX_DDL_STEPS)
+    diagnostic = extract_failure_diagnostic(exc, engine_text=True)
     diagnostic["failed_step"] = step
     if diagnostic["diagnostic_code"] != "sql_execution_failed":
         return diagnostic
@@ -971,7 +978,7 @@ def _index_experiment_failure(
         if step == "create_index" and online_build:
             # WAIT_AT_LOW_PRIORITY with ABORT_AFTER_WAIT = SELF ends the build.
             diagnostic["low_priority_wait_seconds"] = TEST_INDEX_LOW_PRIORITY_WAIT_MINUTES * 60
-    elif failure.get("reason") == "connection_or_timeout":
+    elif failure.get("reason") == "connection_or_timeout" or is_connection_failure(exc):
         diagnostic["cause_class"] = "connection_lost"
     elif "engine_message" in diagnostic or _driver_exception(exc) is not None:
         diagnostic["cause_class"] = "engine_error"
@@ -1030,6 +1037,207 @@ class _IndexSetMember:
     @property
     def fingerprint(self) -> str:
         return self.candidate.definition_fingerprint
+def _index_set_report(
+    members: Sequence[_IndexSetMember],
+    measurements: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """``indexes`` of an index benchmark result: each index as built, and the cases that used it."""
+
+    index_report: list[dict[str, Any]] = []
+    for member in members:
+        index_report.append(
+            {
+                "index_name": member.index_name,
+                "schema": member.schema,
+                "table": member.table,
+                "key_columns": list(member.key_columns),
+                "include_columns": list(member.include_columns or ()),
+                "filter_definition": member.filter_definition,
+                "is_unique": member.is_unique,
+                "index_kind": member.candidate.index_kind,
+                **(
+                    {"order_columns": list(member.candidate.order_columns)}
+                    if member.candidate.order_columns
+                    else {}
+                ),
+                **(
+                    {"partition_aligned": member.table_facts.data_space is None}
+                    if member.table_facts.data_space is not None
+                    or member.table_facts.partitioned
+                    else {}
+                ),
+                "data_compression": member.data_compression
+                or (
+                    "COLUMNSTORE"
+                    if member.candidate.index_kind == INDEX_KIND_NONCLUSTERED_COLUMNSTORE
+                    else "NONE"
+                ),
+                "online": member.online,
+                "built": member.ownership_recorded,
+                **(member.built or {}),
+                "used_in_cases": [
+                    measurement["parameter_case"]
+                    for measurement in measurements
+                    if any(
+                        member.index_name in _indexes_used(use)
+                        for use in measurement["plan_use"]
+                    )
+                ],
+            }
+        )
+    return index_report
+
+
+def _index_parameter_results(
+    measurements: Sequence[dict[str, Any]],
+    *,
+    plan_reuse: str,
+    objects_remain: bool,
+    keep_for_session: bool,
+    compare_order: bool,
+    baseline_sql: str,
+    pool_allowed: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+    """``parameter_results`` of an index benchmark, and the baselines it keeps for the session.
+
+    Returns the per-case results, the one-run baselines of slow cases
+    (``slow_baselines``) and the baselines measured with no test object in
+    place (``baselines_before_hold``).
+    """
+
+    parameter_results: list[dict[str, Any]] = []
+    slow_baselines_kept: dict[str, Any] = {}
+    baselines_before_hold_kept: dict[str, Any] = {}
+    for measurement in measurements:
+        pooled = measurement["pooled_baseline"]
+        baseline_samples = (
+            [dict(sample) for sample in pooled.get("samples") or [pooled["sample"]]]
+            if pooled is not None
+            else [
+                *measurement["baseline_before_samples"],
+                *measurement["baseline_after_samples"],
+            ]
+        )
+        parameter_result: dict[str, Any] = {
+            "parameter_case": measurement["parameter_case"],
+            "weight": measurement["weight"],
+            "baseline": aggregate_samples(baseline_samples),
+            "candidate": aggregate_samples(measurement["candidate_samples"]),
+            "plan_delta": plan_delta_from_profiles(
+                measurement["baseline_before_profile"],
+                measurement["candidate_profile"],
+            ),
+            "baseline_after_plan_delta": plan_delta_from_profiles(
+                measurement["baseline_before_profile"],
+                measurement["baseline_after_profile"],
+            ),
+            "plan_use": measurement["plan_use"],
+            "runs": dict(measurement["runs"]),
+            "plan_compiled_for": str(
+                measurement["parameter_case"]
+                if plan_reuse == "per_case"
+                else measurements[0]["parameter_case"]
+            ),
+        }
+        if measurement.get("executed_branch"):
+            parameter_result["executed_branch"] = measurement["executed_branch"]
+            parameter_result["test_object_in_executed_branch"] = all(
+                item.get("used") is True for item in measurement["plan_use"]
+            )
+        if measurement["runs"]["candidate"] == 1:
+            # Ran once by rule (slow, runs=1 or the time left): the 2x rule applies.
+            parameter_result["candidate_single_sample"] = True
+        if len(baseline_samples) == 1 and (measurement["decisive"] or objects_remain):
+            # One baseline run by rule: the 2x rule applies to it too.
+            parameter_result["baseline_single_sample"] = True
+        if measurement["decisive"]:
+            parameter_result["run_rule"] = _DECISIVE_RUN_RULE
+            parameter_result["run_rule_note"] = _decisive_run_note(
+                *measurement["decisive_seconds"]
+            )
+        if (
+            keep_for_session
+            and pooled is None
+            and measurement["baseline_before_samples"]
+            and all(
+                item.get("complete") is True
+                for item in measurement["baseline_before_results"]
+            )
+        ):
+            # Measured with no test object in place: the baseline of every
+            # later call of the session while the objects of this one are held.
+            baselines_before_hold_kept[str(measurement["parameter_case"])] = {
+                "sample": measurement["baseline_before_samples"][0],
+                "samples": list(measurement["baseline_before_samples"]),
+                "result": measurement["baseline_before_results"][0],
+                "plan": parameter_result["plan_delta"]["baseline"],
+                "order_compared": compare_order,
+                "plan_reuse": plan_reuse,
+                "case_order": [str(item["parameter_case"]) for item in measurements],
+                "sql_fingerprint": fingerprint_json({"baseline_sql": baseline_sql}),
+            }
+        if pooled is not None and pooled.get("before_hold"):
+            parameter_result["baseline_single_sample"] = len(baseline_samples) == 1
+            parameter_result["baseline_source"] = "session_before_hold"
+            parameter_result["baseline_evidence_id"] = pooled["evidence_id"]
+            parameter_result["baseline_note"] = (
+                "baseline measured earlier in this session, before the held test "
+                "objects were built. It was not run again: the statement cannot "
+                "run clean while they exist."
+            )
+            delta = parameter_result["plan_delta"]
+            if delta["baseline"] is None and isinstance(pooled.get("plan"), Mapping):
+                delta["baseline"] = dict(pooled["plan"])
+                delta["plan_changed"] = (
+                    delta["baseline"].get("plan_fingerprint")
+                    != delta["candidate"]["plan_fingerprint"]
+                    if delta["candidate"] is not None
+                    else None
+                )
+        elif measurement["slow_seconds"] is not None:
+            parameter_result["baseline_single_sample"] = len(baseline_samples) == 1
+            parameter_result["baseline_source"] = (
+                "session_single_run" if pooled is not None else "single_run"
+            )
+            parameter_result["baseline_note"] = (
+                (
+                    f"baseline took {measurement['slow_seconds']:g} seconds on its first "
+                    "run, so it was not repeated (10 seconds or more runs once). "
+                )
+                if measurement["slow_auto"]
+                else f"baseline too slow to repeat: {measurement['slow_seconds']:g} seconds. "
+            ) + (
+                "It ran once in the session; the index was measured against that one "
+                "sample, and the baseline was not run again after the index was dropped."
+            )
+            delta = parameter_result["plan_delta"]
+            if pooled is not None:
+                parameter_result["baseline_evidence_id"] = pooled["evidence_id"]
+                if delta["baseline"] is None and isinstance(pooled.get("plan"), Mapping):
+                    delta["baseline"] = dict(pooled["plan"])
+                    delta["plan_changed"] = (
+                        delta["baseline"].get("plan_fingerprint")
+                        != delta["candidate"]["plan_fingerprint"]
+                        if delta["candidate"] is not None
+                        else None
+                    )
+            elif (
+                pool_allowed
+                and measurement["baseline_before_samples"]
+                and measurement["baseline_before_results"][0].get("complete") is True
+            ):
+                # Kept with the evidence, so the next index candidate of the
+                # session does not run this statement again.
+                slow_baselines_kept[str(measurement["parameter_case"])] = {
+                    "sample": measurement["baseline_before_samples"][0],
+                    "result": measurement["baseline_before_results"][0],
+                    "plan": delta["baseline"],
+                    "order_compared": compare_order,
+                }
+        parameter_results.append(parameter_result)
+    return parameter_results, slow_baselines_kept, baselines_before_hold_kept
+
+
 # Rows of a table: its heap or clustered index, all partitions.
 _TABLE_ROW_COUNT_SQL = """
 SELECT SUM(ps.row_count) AS row_count
@@ -10163,6 +10371,69 @@ class AzureSqlMcpApplication:
             )
         return pool
 
+    def _bind_index_benchmark_request(
+        self,
+        candidate: Any,
+        phase: str,
+        request_identity: Mapping[str, Any],
+        idempotency_key: str,
+    ) -> tuple[Any, str, Callable[[], None]]:
+        """Bind one index benchmark request to its candidate and phase.
+
+        An earlier run that gave no verdict (a refusal, a failed build, a tool
+        error) leaves the candidate open: a request under a new key is then
+        bound as a request of its own, and the candidate is reopened. Returns
+        the candidate, the fingerprint bound to the key, and a function that
+        frees the binding of a request that stops before it reserved (such a
+        request ran nothing).
+        """
+
+        session_id, candidate_id = candidate.session_id, candidate.candidate_id
+        rerun = self.performance_workflows.rerun_allowed(candidate)
+        try:
+            binding = self.performance_store.bind_index_benchmark_request(
+                session_id,
+                candidate_id,
+                phase,
+                fingerprint_json(request_identity),
+                idempotency_key=idempotency_key,
+                # The same request under a new key is a request of its own.
+                rerun_fingerprint=fingerprint_json(
+                    {
+                        **request_identity,
+                        "rerun_key": fingerprint_json(
+                            {"operation": "index-benchmark-rerun-key", "key": idempotency_key}
+                        ),
+                    }
+                ),
+                rerun_after_failure=rerun,
+            )
+        except IdempotencyConflictError as exc:
+            if candidate.state in MEASURED_VERDICT_STATES and candidate.executions > 0:
+                raise IdempotencyConflictError(
+                    f"{exc} This candidate has its verdict ({candidate.state}): for a "
+                    "further run on it pass measurement_only=true or "
+                    "plan_reuse='first_case' with a new idempotency_key."
+                ) from None
+            raise
+        request_fingerprint = str(binding["request_fingerprint"])
+        if rerun and not binding["replayed"]:
+            candidate = self.tuning_sessions.reopen_candidate_for_rerun(
+                session_id, candidate_id, phase=phase
+            )
+
+        def release_unreserved_binding() -> None:
+            if not binding["replayed"]:
+                self.performance_store.release_index_benchmark_request(
+                    session_id,
+                    candidate_id,
+                    phase,
+                    request_fingerprint,
+                    idempotency_key=idempotency_key,
+                )
+
+        return candidate, request_fingerprint, release_unreserved_binding
+
     def _recover_index_benchmark_result(
         self,
         *,
@@ -10335,6 +10606,12 @@ class AzureSqlMcpApplication:
         failure_diagnostic = metadata.get("failure_diagnostic")
         if isinstance(failure_diagnostic, Mapping):
             result["failure_diagnostic"] = dict(failure_diagnostic)
+        if metadata.get("connection_retries"):
+            result["connection_retries"] = metadata["connection_retries"]
+        if self.performance_workflows.rerun_allowed(
+            self.tuning_sessions.get_candidate(candidate_id)
+        ):
+            result["rerun_allowed"] = True
         return result
 
     async def _benchmark_index_candidate(
@@ -11151,22 +11428,11 @@ class AzureSqlMcpApplication:
                     f"measured verdict; this candidate is in state {candidate.state}. "
                     "Benchmark it without measurement_only."
                 )
-        try:
-            self.performance_store.bind_index_benchmark_request(
-                session_id,
-                candidate_id,
-                phase,
-                request_fingerprint,
-                idempotency_key=idempotency_key,
+        candidate, request_fingerprint, release_unreserved_binding = (
+            self._bind_index_benchmark_request(
+                candidate, phase, request_identity, idempotency_key
             )
-        except IdempotencyConflictError as exc:
-            if candidate.state in MEASURED_VERDICT_STATES and candidate.executions > 0:
-                raise IdempotencyConflictError(
-                    f"{exc} This candidate has its verdict ({candidate.state}): for a "
-                    "further run on it pass measurement_only=true or "
-                    "plan_reuse='first_case' with a new idempotency_key."
-                ) from None
-            raise
+        )
         existing_reservation = (
             self.performance_store.get_idempotent_execution_reservation(
                 session_id,
@@ -11192,6 +11458,7 @@ class AzureSqlMcpApplication:
                     "session_continues": candidate.state != "cleanup_required",
                     "replayed_zero_execution_result": True,
                 }
+            release_unreserved_binding()
             raise ValueError(
                 f"Index candidate already has a terminal benchmark result ({candidate.state}); "
                 "a candidate gets its verdict once. "
@@ -11213,6 +11480,7 @@ class AzureSqlMcpApplication:
             and phase == "screening"
             and candidate.screen_runs
         ):
+            release_unreserved_binding()
             raise ValueError("Index candidate screening has already been measured.")
         if (
             existing_reservation is None
@@ -11220,6 +11488,7 @@ class AzureSqlMcpApplication:
             and phase == "finalist"
             and candidate.finalist_runs
         ):
+            release_unreserved_binding()
             raise ValueError("Index candidate finalist validation has already been measured.")
 
         if existing_reservation is not None:
@@ -11339,6 +11608,7 @@ class AzureSqlMcpApplication:
                     "unowned observed definition."
                 ),
                 "failure_code": "name_conflict",
+                "rerun_allowed": True,
                 "existing_index": name_conflict.as_dict(),
                 "executions": 0,
                 "index_ddl": index_ddl,
@@ -11359,7 +11629,8 @@ class AzureSqlMcpApplication:
         if leftover_test_indexes:
             # No lease of this database is open here, so these belong to a lost
             # run. They change the baseline plan; measuring against them is wrong.
-            # Nothing durable is recorded: the same request works after cleanup.
+            # Nothing durable is recorded: any request works after cleanup.
+            release_unreserved_binding()
             return {
                 "session_id": session_id,
                 "candidate_id": candidate_id,
@@ -11416,9 +11687,11 @@ class AzureSqlMcpApplication:
                         f"{member.schema}.{member.table} ({', '.join(member.key_columns)})"
                         for member in covered_members
                     )
-                    + ". Add a candidate with only the indexes the table lacks."
+                    + ". Call again with only the indexes the table lacks and a new "
+                    "idempotency_key."
                 ),
                 "failure_code": "index_set_partly_covered",
+                "rerun_allowed": True,
                 "existing_indexes": [index.as_dict() for index in covering_indexes],
                 "executions": 0,
                 "index_ddl": index_ddl,
@@ -11651,6 +11924,10 @@ class AzureSqlMcpApplication:
             raise
 
         measured_executions = 0
+        # A run made again after a lost connection extends the reservation of the call.
+        retry_budget = ConnectionRetryBudget(
+            self.performance_store, str(execution_reservation["reservation_id"]), execution_owner
+        )
         measurements: list[dict[str, Any]] = [
             {
                 "parameter_case": bound_case["name"],
@@ -12018,14 +12295,17 @@ class AzureSqlMcpApplication:
             measured_executions += 1
             run_started = clock.start()
             try:
-                profiled = await self.performance_workflows._profile_execution_contract(
+                profiled = await self.performance_workflows.profile_with_connection_retry(
                     database_name,
                     measurement[
                         "candidate_contract" if phase_name == "candidate" else "execution_contract"
                     ],
+                    step="candidate_measure" if phase_name == "candidate" else phase_name,
+                    retry_budget=retry_budget,
                     max_result_rows=self.config.comparison_row_limit,
                 )
             finally:
+                measured_executions += retry_budget.take()
                 clock.add(
                     "candidate_runs" if phase_name == "candidate" else "baseline_runs",
                     run_started,
@@ -12361,8 +12641,10 @@ class AzureSqlMcpApplication:
                             max_seconds=(
                                 remaining_seconds if math.isfinite(remaining_seconds) else None
                             ),
+                            retry_budget=retry_budget,
                         )
                     finally:
+                        measured_executions += retry_budget.take()
                         clock.add("comparison", compare_started)
                     measured_executions -= 2 - int(comparison.get("executions", 0))
                     if "rows_match" in comparison:
@@ -12579,136 +12861,17 @@ class AzureSqlMcpApplication:
                 }
             )
 
-        parameter_results: list[dict[str, Any]] = []
-        slow_baselines_kept: dict[str, Any] = {}
-        baselines_before_hold_kept: dict[str, Any] = {}
-        for measurement in measurements:
-            pooled = measurement["pooled_baseline"]
-            baseline_samples = (
-                [dict(sample) for sample in pooled.get("samples") or [pooled["sample"]]]
-                if pooled is not None
-                else [
-                    *measurement["baseline_before_samples"],
-                    *measurement["baseline_after_samples"],
-                ]
+        parameter_results, slow_baselines_kept, baselines_before_hold_kept = (
+            _index_parameter_results(
+                measurements,
+                plan_reuse=plan_reuse,
+                objects_remain=objects_remain,
+                keep_for_session=keep_for_session,
+                compare_order=compare_order,
+                baseline_sql=normalized_sql,
+                pool_allowed=pool_allowed,
             )
-            parameter_result: dict[str, Any] = {
-                "parameter_case": measurement["parameter_case"],
-                "weight": measurement["weight"],
-                "baseline": aggregate_samples(baseline_samples),
-                "candidate": aggregate_samples(measurement["candidate_samples"]),
-                "plan_delta": plan_delta_from_profiles(
-                    measurement["baseline_before_profile"],
-                    measurement["candidate_profile"],
-                ),
-                "baseline_after_plan_delta": plan_delta_from_profiles(
-                    measurement["baseline_before_profile"],
-                    measurement["baseline_after_profile"],
-                ),
-                "plan_use": measurement["plan_use"],
-                "runs": dict(measurement["runs"]),
-                "plan_compiled_for": str(
-                    measurement["parameter_case"]
-                    if plan_reuse == "per_case"
-                    else measurements[0]["parameter_case"]
-                ),
-            }
-            if measurement.get("executed_branch"):
-                parameter_result["executed_branch"] = measurement["executed_branch"]
-                parameter_result["test_object_in_executed_branch"] = all(
-                    item.get("used") is True for item in measurement["plan_use"]
-                )
-            if measurement["runs"]["candidate"] == 1:
-                # Ran once by rule (slow, runs=1 or the time left): the 2x rule applies.
-                parameter_result["candidate_single_sample"] = True
-            if len(baseline_samples) == 1 and (measurement["decisive"] or objects_remain):
-                # One baseline run by rule: the 2x rule applies to it too.
-                parameter_result["baseline_single_sample"] = True
-            if measurement["decisive"]:
-                parameter_result["run_rule"] = _DECISIVE_RUN_RULE
-                parameter_result["run_rule_note"] = _decisive_run_note(
-                    *measurement["decisive_seconds"]
-                )
-            if (
-                keep_for_session
-                and pooled is None
-                and measurement["baseline_before_samples"]
-                and all(
-                    item.get("complete") is True
-                    for item in measurement["baseline_before_results"]
-                )
-            ):
-                # Measured with no test object in place: the baseline of every
-                # later call of the session while the objects of this one are held.
-                baselines_before_hold_kept[str(measurement["parameter_case"])] = {
-                    "sample": measurement["baseline_before_samples"][0],
-                    "samples": list(measurement["baseline_before_samples"]),
-                    "result": measurement["baseline_before_results"][0],
-                    "plan": parameter_result["plan_delta"]["baseline"],
-                    "order_compared": compare_order,
-                    "plan_reuse": plan_reuse,
-                    "case_order": [str(item["parameter_case"]) for item in measurements],
-                    "sql_fingerprint": fingerprint_json({"baseline_sql": normalized_sql}),
-                }
-            if pooled is not None and pooled.get("before_hold"):
-                parameter_result["baseline_single_sample"] = len(baseline_samples) == 1
-                parameter_result["baseline_source"] = "session_before_hold"
-                parameter_result["baseline_evidence_id"] = pooled["evidence_id"]
-                parameter_result["baseline_note"] = (
-                    "baseline measured earlier in this session, before the held test "
-                    "objects were built. It was not run again: the statement cannot "
-                    "run clean while they exist."
-                )
-                delta = parameter_result["plan_delta"]
-                if delta["baseline"] is None and isinstance(pooled.get("plan"), Mapping):
-                    delta["baseline"] = dict(pooled["plan"])
-                    delta["plan_changed"] = (
-                        delta["baseline"].get("plan_fingerprint")
-                        != delta["candidate"]["plan_fingerprint"]
-                        if delta["candidate"] is not None
-                        else None
-                    )
-            elif measurement["slow_seconds"] is not None:
-                parameter_result["baseline_single_sample"] = len(baseline_samples) == 1
-                parameter_result["baseline_source"] = (
-                    "session_single_run" if pooled is not None else "single_run"
-                )
-                parameter_result["baseline_note"] = (
-                    (
-                        f"baseline took {measurement['slow_seconds']:g} seconds on its first "
-                        "run, so it was not repeated (10 seconds or more runs once). "
-                    )
-                    if measurement["slow_auto"]
-                    else f"baseline too slow to repeat: {measurement['slow_seconds']:g} seconds. "
-                ) + (
-                    "It ran once in the session; the index was measured against that one "
-                    "sample, and the baseline was not run again after the index was dropped."
-                )
-                delta = parameter_result["plan_delta"]
-                if pooled is not None:
-                    parameter_result["baseline_evidence_id"] = pooled["evidence_id"]
-                    if delta["baseline"] is None and isinstance(pooled.get("plan"), Mapping):
-                        delta["baseline"] = dict(pooled["plan"])
-                        delta["plan_changed"] = (
-                            delta["baseline"].get("plan_fingerprint")
-                            != delta["candidate"]["plan_fingerprint"]
-                            if delta["candidate"] is not None
-                            else None
-                        )
-                elif (
-                    pool_allowed
-                    and measurement["baseline_before_samples"]
-                    and measurement["baseline_before_results"][0].get("complete") is True
-                ):
-                    # Kept with the evidence, so the next index candidate of the
-                    # session does not run this statement again.
-                    slow_baselines_kept[str(measurement["parameter_case"])] = {
-                        "sample": measurement["baseline_before_samples"][0],
-                        "result": measurement["baseline_before_results"][0],
-                        "plan": delta["baseline"],
-                        "order_compared": compare_order,
-                    }
-            parameter_results.append(parameter_result)
+        )
         if cleanup_error:
             state, reason = (
                 "cleanup_required",
@@ -12726,7 +12889,9 @@ class AzureSqlMcpApplication:
         ):
             state, reason = (
                 "inconclusive",
-                "index candidate failed; reject this candidate and continue",
+                "the index benchmark failed at step "
+                + str((benchmark_failure_diagnostic or {}).get("failed_step") or step)
+                + " before it gave a verdict",
             )
         else:
             classify_options: dict[str, Any] = {
@@ -12770,6 +12935,13 @@ class AzureSqlMcpApplication:
                 "equivalence_failed",
                 "at least one parameter case returned different results",
             )
+        # A run that failed, or a comparison that did not run, measured nothing
+        # about the candidate: it stays open for a request under a new key.
+        run_failed = state == "inconclusive" and (
+            bool(benchmark_error) or comparison_did_not_run(equivalence)
+        )
+        if run_failed:
+            reason = f"{reason}. {RERUN_NOTE}"
         performance_classification = state
         performance_reason = reason
         candidate_state = state
@@ -12808,48 +12980,7 @@ class AzureSqlMcpApplication:
                 )
             )
 
-        index_report: list[dict[str, Any]] = []
-        for member in members:
-            index_report.append(
-                {
-                    "index_name": member.index_name,
-                    "schema": member.schema,
-                    "table": member.table,
-                    "key_columns": list(member.key_columns),
-                    "include_columns": list(member.include_columns or ()),
-                    "filter_definition": member.filter_definition,
-                    "is_unique": member.is_unique,
-                    "index_kind": member.candidate.index_kind,
-                    **(
-                        {"order_columns": list(member.candidate.order_columns)}
-                        if member.candidate.order_columns
-                        else {}
-                    ),
-                    **(
-                        {"partition_aligned": member.table_facts.data_space is None}
-                        if member.table_facts.data_space is not None
-                        or member.table_facts.partitioned
-                        else {}
-                    ),
-                    "data_compression": member.data_compression
-                    or (
-                        "COLUMNSTORE"
-                        if member.candidate.index_kind == INDEX_KIND_NONCLUSTERED_COLUMNSTORE
-                        else "NONE"
-                    ),
-                    "online": member.online,
-                    "built": member.ownership_recorded,
-                    **(member.built or {}),
-                    "used_in_cases": [
-                        measurement["parameter_case"]
-                        for measurement in measurements
-                        if any(
-                            member.index_name in _indexes_used(use)
-                            for use in measurement["plan_use"]
-                        )
-                    ],
-                }
-            )
+        index_report = _index_set_report(members, measurements)
         unused_indexes = [
             item["index_name"]
             for item in index_report
@@ -12959,6 +13090,12 @@ class AzureSqlMcpApplication:
                     "reason": reason,
                     "performance_reason": performance_reason,
                     "failure_diagnostic": benchmark_failure_diagnostic,
+                    **({"rerun_allowed": True} if run_failed else {}),
+                    **(
+                        {"connection_retries": retry_budget.retries}
+                        if retry_budget.retries
+                        else {}
+                    ),
                     "execution_protocol": {
                         "measured_runs": runs,
                         "plan_reuse": plan_reuse,
@@ -13069,6 +13206,10 @@ class AzureSqlMcpApplication:
             result["leftovers_dropped"] = leftovers_dropped
         if benchmark_error == "call_time_cap":
             result["partial"] = True
+        if run_failed:
+            result["rerun_allowed"] = True
+        if retry_budget.retries:
+            result["connection_retries"] = retry_budget.retries
         if build_estimate is not None:
             result["build_estimate"] = build_estimate
         if build_rate is not None:
@@ -13583,19 +13724,46 @@ class AzureSqlMcpApplication:
             }
             if isinstance(stored.get("failure_diagnostic"), Mapping):
                 result["failure_diagnostic"] = dict(stored["failure_diagnostic"])
+            if stored.get("connection_retries"):
+                result["connection_retries"] = stored["connection_retries"]
+            if stored.get("rerun_allowed") is True and self.performance_workflows.rerun_allowed(
+                candidate
+            ):
+                result["rerun_allowed"] = True
             return result
 
-        if (
-            self.performance_store.get_idempotent_execution_reservation(
+        def reservation_of(fingerprint: str) -> dict[str, Any] | None:
+            return self.performance_store.get_idempotent_execution_reservation(
                 session_id,
                 candidate_id,
-                request_fingerprint,
+                fingerprint,
                 idempotency_key=idempotency_key,
                 owner_reference=execution_owner,
             )
-            is not None
-        ):
+
+        rerun = self.performance_workflows.rerun_allowed(candidate)
+        try:
+            existing_reservation = reservation_of(request_fingerprint)
+        except IdempotencyConflictError:
+            # The request of another key. For a candidate whose run gave no
+            # verdict it is a request of its own, made distinct by its key.
+            request_fingerprint = fingerprint_json(
+                {
+                    "request": request_fingerprint,
+                    "rerun_key": fingerprint_json(
+                        {"operation": "indexed-view-rerun-key", "key": idempotency_key}
+                    ),
+                }
+            )
+            existing_reservation = reservation_of(request_fingerprint)
+            if existing_reservation is None and not rerun:
+                raise
+        if existing_reservation is not None:
             return stored_result()
+        if rerun:
+            candidate = self.tuning_sessions.reopen_candidate_for_rerun(
+                session_id, candidate_id, phase=phase
+            )
         if candidate.is_terminal or (candidate.screen_runs if phase == "screening" else candidate.finalist_runs):
             raise ValueError(f"This candidate already has a {phase} result; add a new candidate.")
         bound_cases = [
@@ -13760,6 +13928,10 @@ class AzureSqlMcpApplication:
             for bound in bound_cases
         ]
         measured_executions = 0
+        # A run made again after a lost connection extends the reservation of the call.
+        retry_budget = ConnectionRetryBudget(
+            self.performance_store, str(reservation["reservation_id"]), execution_owner
+        )
         arms_left = len(measurements) * INDEX_ABA_PHASES
 
         async def measure_arm(measurement: dict[str, Any], arm: str, count: int | None = None) -> None:
@@ -13775,14 +13947,17 @@ class AzureSqlMcpApplication:
                 measured_executions += 1
                 run_started = clock.start()
                 try:
-                    profiled = await self.performance_workflows._profile_execution_contract(
+                    profiled = await self.performance_workflows.profile_with_connection_retry(
                         database_name,
                         measurement[
                             "candidate_contract" if arm == "candidate" else "execution_contract"
                         ],
+                        step="candidate_measure" if arm == "candidate" else arm,
+                        retry_budget=retry_budget,
                         max_result_rows=self.config.comparison_row_limit,
                     )
                 finally:
+                    measured_executions += retry_budget.take()
                     clock.add(
                         "candidate_runs" if arm == "candidate" else "baseline_runs", run_started
                     )
@@ -13998,8 +14173,10 @@ class AzureSqlMcpApplication:
                             max_seconds=(
                                 remaining_seconds if math.isfinite(remaining_seconds) else None
                             ),
+                            retry_budget=retry_budget,
                         )
                     finally:
+                        measured_executions += retry_budget.take()
                         clock.add("comparison", compare_started)
                     measured_executions -= 2 - int(comparison.get("executions", 0))
                     if "rows_match" in comparison:
@@ -14017,8 +14194,8 @@ class AzureSqlMcpApplication:
             failure = {"diagnostic_code": "benchmark_cancelled", "failed_step": step}
         except Exception as exc:
             note_exception(exc, "server.indexed_view_benchmark")
-            failure = extract_failure_diagnostic(exc, engine_text=step == "build_view")
-            failure["failed_step"] = step
+            # The engine's number and redacted message, for a measured statement too.
+            failure = measured_failure_diagnostic(exc, step)
             if step == "build_view":
                 build_failure = view_build_failure(exc)
                 failure["build_outcome"] = build_failure["outcome"]
@@ -14120,7 +14297,7 @@ class AzureSqlMcpApplication:
                 failure = {"diagnostic_code": "benchmark_cancelled", "failed_step": step}
             except Exception as exc:
                 note_exception(exc, "server.indexed_view_benchmark_after")
-                failure = {**extract_failure_diagnostic(exc), "failed_step": step}
+                failure = measured_failure_diagnostic(exc, step)
 
         equivalence: list[dict[str, Any]] = []
         parameter_results: list[dict[str, Any]] = []
@@ -14286,8 +14463,8 @@ class AzureSqlMcpApplication:
         elif failure is not None:
             state_name, reason = (
                 "inconclusive",
-                f"the indexed-view experiment failed at step {failure.get('failed_step')}; "
-                "reject this candidate and continue",
+                f"the indexed-view experiment failed at step {failure.get('failed_step')} "
+                "before it gave a verdict",
             )
         else:
             classify_options: dict[str, Any] = {
@@ -14322,6 +14499,13 @@ class AzureSqlMcpApplication:
                 "equivalence_failed",
                 "at least one parameter case returned different results",
             )
+        # A run that failed, or a comparison that did not run, measured nothing
+        # about the candidate: it stays open for a request under a new key.
+        run_failed = state_name == "inconclusive" and (
+            failure is not None or comparison_did_not_run(equivalence)
+        )
+        if run_failed:
+            reason = f"{reason}. {RERUN_NOTE}"
         performance_classification = state_name
         tested_selection = (
             phase == "finalist"
@@ -14446,6 +14630,12 @@ class AzureSqlMcpApplication:
                     "phase": phase,
                     "reason": reason,
                     "failure_diagnostic": failure,
+                    **({"rerun_allowed": True} if run_failed else {}),
+                    **(
+                        {"connection_retries": retry_budget.retries}
+                        if retry_budget.retries
+                        else {}
+                    ),
                 },
             ),
             idempotency_key=evidence_key,
@@ -14520,6 +14710,10 @@ class AzureSqlMcpApplication:
             result["partial"] = True
         if failure is not None:
             result["failure_diagnostic"] = failure
+        if run_failed:
+            result["rerun_allowed"] = True
+        if retry_budget.retries:
+            result["connection_retries"] = retry_budget.retries
         if lease["status"] == "cleanup_required":
             result["remediation"] = "\n".join(plan.teardown_statements())
         if cancelled:

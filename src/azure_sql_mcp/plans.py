@@ -21,7 +21,9 @@ from .plan_diagnostics import summarize_statistics_io_samples
 from .plan_tree import child_relops
 from .plan_tree import describe_result_shape
 from .plan_tree import is_true
+from .plan_tree import merge_showplans
 from .plan_tree import showplan_from_results
+from .plan_tree import showplans_from_results
 from .plan_tree import statements
 from .safe_sql import BatchBranch
 from .safe_sql import SafeSqlValidator
@@ -523,6 +525,7 @@ class PlansService:
             database_name=database_name,
             sql=validated_query.normalized_sql,
             analyze=analyze,
+            whole_batch=bool(validated_query.branches),
         )
         summary = self.summarize_showplan_xml(raw_xml)
         self._note_batch(summary, raw_xml, validated_query.branches)
@@ -681,11 +684,51 @@ class PlansService:
         raw_xml: str,
         branches: Sequence[BatchBranch],
     ) -> None:
-        if branches:
-            summary["batch"] = {
-                "branch_count": len(branches),
-                "executed_branch": executed_batch_branch(branches, raw_xml),
+        if not branches:
+            return
+        summary["batch"] = {
+            "branch_count": len(branches),
+            "executed_branch": executed_batch_branch(branches, raw_xml),
+        }
+        metrics = summary.get("actual_metrics")
+        executed = [
+            statement
+            for statement, query_plan in statements(ET.fromstring(raw_xml))
+            if query_plan is not None
+        ]
+        timed = [
+            item
+            for item in (metrics or {}).get("statement_metrics") or []
+            if item.get("cpu_ms") is not None and item.get("elapsed_ms") is not None
+        ]
+        if not isinstance(metrics, dict) or len(executed) < 2 or len(timed) != len(executed):
+            return
+        # Assignment statements ran in front of the result-producing one. The
+        # caller runs them too, so the cost of the batch is the sum.
+        metrics["actual_cpu_ms"] = sum(item["cpu_ms"] for item in timed)
+        metrics["actual_elapsed_ms"] = sum(item["elapsed_ms"] for item in timed)
+        metrics["query_metric_source"] = "showplan_query_time_stats"
+        metrics["metric_scope"] = "whole_batch"
+        roots = metrics.get("root_operator_metrics") or []
+        if roots:
+            metrics["actual_rows"] = roots[-1].get("actual_rows")
+            metrics["actual_executions"] = roots[-1].get("actual_executions")
+        reads = metrics.get("statement_reads") or []
+        if len(reads) == len(executed):
+            for key in ("logical_reads", "lob_logical_reads", "physical_reads"):
+                metrics[f"actual_{key}"] = sum(item[key] for item in reads)
+            metrics["read_metric_source"] = "showplan_operator_runtime_counters"
+        summary["batch"].update(
+            {
+                "statements_executed": len(executed),
+                "result_statement": len(executed),
+                "metric_note": (
+                    f"The batch ran {len(executed)} statements: the assignment statements, "
+                    "then the result-producing statement, which is the last one. CPU time, "
+                    "elapsed time and reads are the totals of all of them."
+                ),
             }
+        )
 
     async def _profile_execution(
         self,
@@ -713,7 +756,7 @@ class PlansService:
             execution_sql,
             **execution_kwargs,
         )
-        raw_xml = self._extract_plan_xml(execution.result_sets)
+        raw_xml = self._extract_plan_xml(execution.result_sets, whole_batch=bool(branches))
         summary = self.summarize_showplan_xml(raw_xml)
         self._note_batch(summary, raw_xml, branches)
         statistics_io_messages = getattr(execution, "statistics_io_messages", None)
@@ -775,6 +818,7 @@ class PlansService:
         analyze: bool,
         params: tuple[Any, ...] = (),
         input_sizes: Sequence[Any] | None = None,
+        whole_batch: bool = False,
     ) -> str:
         # SET SHOWPLAN_XML ON must be in its own batch — SQL Server rejects it
         # when combined with other statements — but the SET option is also
@@ -828,7 +872,7 @@ class PlansService:
                     "SQL Server returns no actual plan for a constant-only SELECT; "
                     "use analyze=false for this statement."
                 )
-        return self._extract_plan_xml(plan_results)
+        return self._extract_plan_xml(plan_results, whole_batch=whole_batch and analyze)
 
     def summarize_showplan_xml(self, raw_xml: str) -> dict[str, Any]:
         root = ET.fromstring(raw_xml)
@@ -1528,8 +1572,19 @@ class PlansService:
     def _result_contains_plan_xml(result: QueryResult) -> bool:
         return showplan_from_results([result]) is not None
 
-    def _extract_plan_xml(self, results) -> str:
+    def _extract_plan_xml(self, results, *, whole_batch: bool = False) -> str:
+        """The plan in the result sets of one execution.
+
+        ``whole_batch``: the statement is a read-only batch, whose actual plan
+        is one document per executed statement. They are merged in the order
+        they ran, so the plan is the plan of the batch and the
+        result-producing statement is its last statement.
+        """
+
         results = list(results)
+        documents = showplans_from_results(results) if whole_batch else []
+        if len(documents) > 1:
+            return merge_showplans(documents)
         plan_xml = showplan_from_results(results)
         if plan_xml is None:
             # The shape names kinds only, so it is safe in errors and incident

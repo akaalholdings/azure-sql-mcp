@@ -783,6 +783,66 @@ class TuningSessionStateMachine:
         )
         return updated_candidate
 
+    def reopen_candidate_for_rerun(
+        self,
+        session_id: str,
+        candidate_id: str,
+        *,
+        phase: str,
+    ) -> TuningCandidateV1:
+        """Reopen a candidate whose benchmark run ended without a verdict.
+
+        The caller has established that the last run was refused or failed
+        (a failed build, a tool or connection error) and measured no verdict.
+        The executions that ran and their evidence stay with the candidate, so
+        the session budget still counts them. The run count of ``phase``
+        starts again: that phase gave no result.
+        """
+
+        if phase not in {"screening", "finalist"}:
+            raise ValueError("phase must be screening or finalist.")
+        session = self._active_session(
+            session_id,
+            allowed={"created", "screening", "finalist_validation"},
+        )
+        candidate = self._candidate_in_session(session, candidate_id)
+        if candidate.state != "inconclusive":
+            raise InvalidTransitionError(
+                "Only a candidate whose run gave no verdict can be benchmarked again."
+            )
+        self._check_deadline(session)
+        updated_candidate = self._next_candidate(
+            candidate,
+            state="proposed",
+            failure_code=None,
+            screen_runs=0 if phase == "screening" else candidate.screen_runs,
+            finalist_runs=0,
+        )
+        _session, updated_candidate = self.store.save_session_and_candidate(
+            # The failed run was no finalist validation: the new run marks it again.
+            self._next_session(
+                session,
+                finalist_candidate_ids=tuple(
+                    item for item in session.finalist_candidate_ids if item != candidate_id
+                ),
+            ),
+            updated_candidate,
+            expected_session_version=session.version,
+            expected_candidate_version=candidate.version,
+            idempotency_key=None,
+            request_fingerprint=request_fingerprint(
+                "tuning-session.reopen-candidate-for-rerun",
+                {
+                    "session_id": session_id,
+                    "candidate_id": candidate_id,
+                    "candidate_version": candidate.version,
+                },
+            ),
+            event_type="candidate.reopened",
+            event_payload={"candidate_id": candidate_id, "phase": phase},
+        )
+        return updated_candidate
+
     def recover_candidate_for_finalist(
         self,
         session_id: str,

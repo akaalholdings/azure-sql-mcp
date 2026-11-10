@@ -72,7 +72,8 @@ def test_a_zero_cpu_case_that_now_costs_cpu_is_a_regression() -> None:
     """The rewrite must not buy its win on the big case with new work on the free case."""
 
     month = _case("october", {"cpu_ms": [2900, 2950, 2900]}, {"cpu_ms": [50, 51, 50]})
-    empty = _case("empty_day", {"cpu_ms": [0, 0, 0]}, {"cpu_ms": [40, 41, 40]})
+    # At or above the stated floor of 50 ms CPU (S15).
+    empty = _case("empty_day", {"cpu_ms": [0, 0, 0]}, {"cpu_ms": [60, 61, 60]})
 
     state, reason = classify_benchmark(
         [month, empty], [], objective="cpu", require_equivalence=False
@@ -84,7 +85,7 @@ def test_a_zero_cpu_case_that_now_costs_cpu_is_a_regression() -> None:
 
 
 def test_a_candidate_within_the_noise_floor_of_a_zero_baseline_is_not_a_regression() -> None:
-    """1 ms CPU against 0 ms is timer resolution, not a regression (floor: 5 ms)."""
+    """1 ms CPU against 0 ms is timer resolution, not a regression (floor: 50 ms)."""
 
     month = _case("october", {"cpu_ms": [2900, 2950, 2900]}, {"cpu_ms": [50, 51, 50]})
     empty = _case("empty_day", {"cpu_ms": [0, 0, 0]}, {"cpu_ms": [1, 0, 2]})

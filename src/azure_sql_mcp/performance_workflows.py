@@ -36,6 +36,7 @@ from .equivalence_contract import order_contract_risk
 from .equivalence_contract import rewrite_requirements
 from .equivalence_contract import statement_hint_profile
 from .incident_log import note_exception
+from .index_optimizer import is_connection_failure
 from .observability import extract_failure_diagnostic
 from .performance_contracts import (
     EvidenceEnvelopeV1,
@@ -103,6 +104,16 @@ MIN_ABSOLUTE_IMPROVEMENT = {
     "cpu": 5.0,
     "logical_reads": 100.0,
     "physical_reads": 10.0,
+}
+# Below this a measured median is noise: timer resolution, the cost of plan
+# profiling, a page that was not in memory. A case whose candidate median
+# stays under the floor of its metric is never a regression, in every
+# benchmark tool. Milliseconds for the two times, pages for the reads.
+REGRESSION_NOISE_FLOOR = {
+    "elapsed_time": 50.0,
+    "cpu": 50.0,
+    "logical_reads": 200.0,
+    "physical_reads": 200.0,
 }
 MAD_TO_SIGMA = 1.4826
 NOISE_SIGMA_MULTIPLIER = 2.0
@@ -1145,6 +1156,26 @@ def label_comparison(
 
 
 TESTED_PROOF_SCOPE = "snapshot_test"
+# Said in the result of a run that gave no verdict through no fault of the candidate.
+RERUN_NOTE = (
+    "The candidate was not measured, so it is still open: call the tool again for it "
+    "with a new idempotency_key. The executions that ran stay counted in the session "
+    "budget."
+)
+
+
+def comparison_did_not_run(equivalence: Sequence[Mapping[str, Any]]) -> bool:
+    """True when a result comparison stopped on a tool, connection or time-cap failure.
+
+    Such a case has no comparison result: that is a failure of the run, not a
+    finding about the candidate.
+    """
+
+    return any(
+        item.get("status") == "timed_out"
+        or (item.get("status") == "inconclusive" and bool(item.get("error_type")))
+        for item in equivalence
+    )
 
 
 def tested_ordered_match(equivalence: Sequence[Mapping[str, Any]]) -> bool:
@@ -1199,6 +1230,66 @@ def tested_ordered_reason(subject: str, gaps: Sequence[str]) -> str:
         "selection_scope 'tested'; it is not deployment-ready until a reviewer "
         "settles the gap."
     )
+
+
+def measured_failure_diagnostic(exc: Exception, step: str | None = None) -> dict[str, Any]:
+    """Why a measured statement or a result comparison failed.
+
+    ``failed_step`` names the step. For a failed statement the diagnostic
+    carries the engine's error number and its message (``engine_message``,
+    through ``engine_error_message``: quoted values, key values, server names
+    and addresses are redacted), and ``cause_class``: ``connection_lost`` for
+    a failure of the connection, ``engine_error`` for an error the engine
+    reported. A statement error can so be told from a lost connection.
+    """
+
+    diagnostic = session_failure_diagnostic(exc) or extract_failure_diagnostic(
+        exc, engine_text=True
+    )
+    if step is not None:
+        diagnostic["failed_step"] = step
+    if diagnostic.get("diagnostic_code") == "sql_execution_failed":
+        if is_connection_failure(exc):
+            diagnostic["cause_class"] = "connection_lost"
+        elif "engine_message" in diagnostic:
+            diagnostic["cause_class"] = "engine_error"
+    return diagnostic
+
+
+class ConnectionRetryBudget:
+    """The executions a benchmark call spends on runs made again after a lost connection.
+
+    A benchmark call reserves its executions before it starts. A run that is
+    made again is one execution more than was reserved, so each retry first
+    extends the reservation of the call, which the store allows only while
+    the session budget has room. When it has none the retry is refused and
+    the run fails as it would without a retry.
+
+    ``retries`` is the record of each retry for the result. ``take`` returns
+    the executions granted since the last call: the caller adds them to its
+    count of dispatched executions.
+    """
+
+    def __init__(self, store: PerformanceStore, reservation_id: str, owner_reference: str) -> None:
+        self._store = store
+        self._reservation_id = reservation_id
+        self._owner_reference = owner_reference
+        self._granted = 0
+        self.retries: list[dict[str, Any]] = []
+
+    def reserve(self, attempts: int) -> bool:
+        """Extend the reservation by ``attempts``; False when the budget refuses them."""
+
+        granted = self._store.extend_execution_reservation(
+            self._reservation_id, attempts, owner_reference=self._owner_reference
+        )
+        if granted:
+            self._granted += attempts
+        return granted
+
+    def take(self) -> int:
+        granted, self._granted = self._granted, 0
+        return granted
 
 
 def _time_spent(call_started: float, phase_seconds: Mapping[str, float]) -> dict[str, float]:
@@ -1658,8 +1749,17 @@ def _bucket_decision(
             }
         )
     decision["median_shift_ratio"] = relative_gain
+    # Worse than the baseline, but the candidate median is under the floor.
+    floor = REGRESSION_NOISE_FLOOR[objective]
+    under_floor = bool(regressed) and candidate_median < floor
+    decision["noise_floor"] = floor
+    decision["noise_floor_applied"] = under_floor
     decision["bucket_verdict"] = (
-        "regressed" if regressed else "improved" if improved else "no_material_difference"
+        "regressed"
+        if regressed and not under_floor
+        else "improved"
+        if improved
+        else "no_material_difference"
     )
     return decision
 
@@ -1717,8 +1817,11 @@ def classify_benchmark(
     A case whose baseline median on the objective is zero (below the
     resolution of the measurement: 1 ms, 1 page) has no relative gain. It is
     judged on the absolute floor alone: ``unchanged_at_zero`` while the
-    candidate median stays under ``MIN_ABSOLUTE_IMPROVEMENT``, ``regressed``
-    at or above it. The other cases decide the candidate. When every case is
+    candidate median stays under ``REGRESSION_NOISE_FLOOR``, ``regressed``
+    at or above it. A case with a baseline above zero follows the same floor:
+    it is never ``regressed`` while its candidate median stays under it. Each
+    ``comparison_margin`` names the floor (``noise_floor``) and says whether
+    it decided the case (``noise_floor_applied``). The other cases decide the candidate. When every case is
     at zero the candidate is ``neutral`` on this objective.
 
     Each case gets its ``comparison_margin`` even when the result comparison
@@ -1815,7 +1918,7 @@ def classify_benchmark(
         ):
             return "inconclusive", "at least two measured samples per side are required"
         if before <= 0:
-            floor = MIN_ABSOLUTE_IMPROVEMENT[objective]
+            floor = REGRESSION_NOISE_FLOOR[objective]
             candidate_median = float(statistics.median(candidate_values))
             at_zero_verdict = "regressed" if candidate_median >= floor else "unchanged_at_zero"
             if isinstance(result, dict):
@@ -1832,6 +1935,8 @@ def classify_benchmark(
                     "median_shift": -candidate_median,
                     "comparison": "absolute_floor_at_zero_baseline",
                     "noise_threshold": floor,
+                    "noise_floor": floor,
+                    "noise_floor_applied": 0 < candidate_median < floor,
                     "bucket_verdict": at_zero_verdict,
                 }
                 result["decision_basis"] = COMPARISON_DECISION_BASIS
@@ -2376,6 +2481,10 @@ def compact_benchmark_result(result: Mapping[str, Any]) -> dict[str, Any]:
             case["baseline_note"] = item["baseline_note"]
         if item.get("executed_branch"):
             case["executed_branch"] = item["executed_branch"]
+        if margin.get("noise_floor_applied") is True:
+            # The case is worse than the baseline and stays under the floor.
+            case["noise_floor"] = margin.get("noise_floor")
+            case["noise_floor_metric"] = margin.get("metric")
         cases.append(case)
     preflight = result.get("equivalence_preflight")
     risk_codes = list(
@@ -3668,11 +3777,19 @@ class PerformanceWorkflowService:
         compare_order: bool,
         before_dispatch: Callable[[], Any] | None = None,
         max_seconds: float | None = None,
+        retry_budget: ConnectionRetryBudget | None = None,
     ) -> dict[str, Any]:
         """Run both statements in one snapshot transaction and compare their results.
 
         ``max_seconds`` cancels the comparison when it is spent. The result is
         then ``timed_out`` with the arm that was running.
+
+        A comparison that lost its connection is run once more on a new
+        connection when ``retry_budget`` grants its two executions; the
+        result then holds ``connection_retry``. ``executions`` counts the
+        first attempt only: the caller takes the second from ``retry_budget``.
+        A comparison that failed carries ``cause_class`` and the engine's
+        number and redacted message.
         """
 
         self._require_benchmark_policy(database_name, 2)
@@ -3760,13 +3877,42 @@ class PerformanceWorkflowService:
                 None,
             ]
         cap = asyncio.timeout(max_seconds)
+        connection_retry: dict[str, Any] | None = None
         try:
             async with cap:
-                per_statement = await self.executor.execute_session_exactly_once(
-                    database_name,
-                    statements,
-                    **session_kwargs,
-                )
+                try:
+                    per_statement = await self.executor.execute_session_exactly_once(
+                        database_name,
+                        statements,
+                        **session_kwargs,
+                    )
+                except Exception as lost:
+                    if (
+                        retry_budget is None
+                        or not is_connection_failure(lost)
+                        or not retry_budget.reserve(2)
+                    ):
+                        raise
+                    note_exception(lost, "performance_workflows.snapshot_comparison_retry")
+                    connection_retry = {
+                        "step": "compare_results",
+                        "cause_class": "connection_lost",
+                        "retried": True,
+                        "succeeded": False,
+                    }
+                    # What the lost attempt dispatched is the count of this call;
+                    # the second attempt is charged to the retry budget.
+                    first_attempt = (last_statement_index, dispatched_query_count)
+                    await self._discard_idle_connections(database_name)
+                    try:
+                        per_statement = await self.executor.execute_session_exactly_once(
+                            database_name,
+                            statements,
+                            **session_kwargs,
+                        )
+                    finally:
+                        last_statement_index, dispatched_query_count = first_attempt
+                    connection_retry["succeeded"] = True
         except TimeoutError as exc:
             if not cap.expired() or 2 not in arm_started:
                 # Not the cap: a driver or server timeout is reported as before.
@@ -3819,10 +3965,18 @@ class PerformanceWorkflowService:
         except Exception as exc:
             note_exception(exc, "performance_workflows.snapshot_comparison")
             execution_count_is_conservative = last_statement_index is None
+            diagnostic = measured_failure_diagnostic(exc)
             return {
                 "status": "inconclusive",
                 "reason": "snapshot comparison could not complete",
                 "error_type": type(exc).__name__,
+                # The class of the cause, the engine's number and its redacted message.
+                **{
+                    key: diagnostic[key]
+                    for key in ("cause_class", "sqlstate", "native_error_code", "engine_message")
+                    if key in diagnostic
+                },
+                **({"connection_retry": connection_retry} if connection_retry else {}),
                 "same_snapshot": False,
                 "snapshot_isolation_verified": False,
                 "proven_for_parameter_case": False,
@@ -3847,6 +4001,13 @@ class PerformanceWorkflowService:
         comparison["snapshot_isolation_verified"] = True
         comparison["executions"] = 2
         comparison["execution_count_is_conservative"] = False
+        if connection_retry is not None:
+            comparison["connection_retry"] = connection_retry
+            # The lost attempt: what it dispatched, or both when that is not known.
+            comparison["executions"] = (
+                2 if last_statement_index is None else dispatched_query_count
+            )
+            comparison["execution_count_is_conservative"] = last_statement_index is None
         return comparison
 
     def _recover_benchmark_result(
@@ -4073,6 +4234,10 @@ class PerformanceWorkflowService:
             "session_continues": True,
             "candidate": updated_candidate.to_dict(),
         }
+        if self.rerun_allowed(self.sessions.get_candidate(candidate_id)):
+            result["rerun_allowed"] = True
+        if metadata.get("connection_retries"):
+            result["connection_retries"] = metadata["connection_retries"]
         if benchmark_failed:
             result["state"] = "inconclusive"
             result["failure_code"] = failure_code
@@ -4104,8 +4269,9 @@ class PerformanceWorkflowService:
         benchmark_operation_key: str | None,
         objective: str,
         should_prove_equivalence: bool,
+        connection_retries: Sequence[Mapping[str, Any]] = (),
     ) -> dict[str, Any]:
-        reason = "candidate benchmark failed; continue with the next candidate"
+        reason = f"the benchmark run failed before it gave a verdict. {RERUN_NOTE}"
         envelope = EvidenceEnvelopeV1(
             source="azure-sql-mcp",
             kind=f"tuning_{phase}_failure",
@@ -4146,6 +4312,11 @@ class PerformanceWorkflowService:
                 "reason": reason,
                 "failure_code": failure_code,
                 "failure_diagnostic": dict(failure_diagnostic or {}),
+                **(
+                    {"connection_retries": [dict(item) for item in connection_retries]}
+                    if connection_retries
+                    else {}
+                ),
                 "benchmark_failed": True,
                 "completed_parameter_cases": completed_parameter_cases,
                 "execution_count_is_conservative": False,
@@ -4656,6 +4827,11 @@ class PerformanceWorkflowService:
                 evidence_operation_key=evidence_operation_key,
                 benchmark_operation_key=benchmark_operation_key,
             )
+        if self.rerun_allowed(candidate):
+            # The earlier run gave no verdict; this key is a new request for it.
+            candidate = self.sessions.reopen_candidate_for_rerun(
+                session_id, candidate_id, phase=phase
+            )
         if candidate.is_terminal:
             raise ValueError(
                 f"Candidate already has a terminal benchmark result ({candidate.state}); a "
@@ -4731,17 +4907,28 @@ class PerformanceWorkflowService:
         call_started = time.monotonic()
         phase_seconds = {"baseline_runs": 0.0, "candidate_runs": 0.0, "comparison": 0.0}
 
+        # A run made again after a lost connection is charged to its own reservation.
+        retry_budget = ConnectionRetryBudget(
+            self.store, str(reservation["reservation_id"]), reservation_owner
+        )
+        # The step a failure diagnostic names.
+        step = "bind_parameters"
+
         async def run_once(contract: ParameterExecutionContract) -> ProfiledPlanResult:
-            nonlocal measured_executions
+            nonlocal measured_executions, step
             self.sessions.ensure_dispatch_allowed(session_id)
+            step = "candidate_measure" if contract.provenance == "candidate" else "baseline_measure"
             # Charge the attempt before awaiting it. A timeout may occur after
             # SQL Server executed the query, and the hard budget must never
             # under-count uncertain work.
             measured_executions += 1
             run_started = time.monotonic()
             try:
-                profiled = await self._profile_execution_contract(database_name, contract)
+                profiled = await self.profile_with_connection_retry(
+                    database_name, contract, step=step, retry_budget=retry_budget
+                )
             finally:
+                measured_executions += retry_budget.take()
                 phase_seconds[
                     "candidate_runs" if contract.provenance == "candidate" else "baseline_runs"
                 ] += time.monotonic() - run_started
@@ -4971,6 +5158,7 @@ class PerformanceWorkflowService:
                 parameter_results.append(parameter_result)
                 if compare_equivalence or test_equivalence:
                     self.sessions.ensure_dispatch_allowed(session_id)
+                    step = "compare_results"
                     measured_executions += 2
                     compare_started = time.monotonic()
                     try:
@@ -4982,8 +5170,10 @@ class PerformanceWorkflowService:
                             before_dispatch=lambda: self.sessions.ensure_dispatch_allowed(
                                 session_id
                             ),
+                            retry_budget=retry_budget,
                         )
                     finally:
+                        measured_executions += retry_budget.take()
                         phase_seconds["comparison"] += time.monotonic() - compare_started
                     comparison_executions = int(comparison.get("executions", 0))
                     if comparison_executions not in {0, 1, 2}:
@@ -5077,6 +5267,7 @@ class PerformanceWorkflowService:
                 failure_diagnostic={
                     "diagnostic_code": "benchmark_cancelled",
                 },
+                connection_retries=retry_budget.retries,
                 reservation=reservation,
                 reservation_owner=reservation_owner,
                 benchmark_request_fingerprint=benchmark_request_fingerprint,
@@ -5100,9 +5291,8 @@ class PerformanceWorkflowService:
                 completed_parameter_cases=completed_parameter_cases,
                 measured_executions=measured_executions,
                 failure_code=type(exc).__name__,
-                failure_diagnostic=(
-                    session_failure_diagnostic(exc) or extract_failure_diagnostic(exc)
-                ),
+                failure_diagnostic=measured_failure_diagnostic(exc, step),
+                connection_retries=retry_budget.retries,
                 reservation=reservation,
                 reservation_owner=reservation_owner,
                 benchmark_request_fingerprint=benchmark_request_fingerprint,
@@ -5155,6 +5345,10 @@ class PerformanceWorkflowService:
                 "SQL shape has no deterministic semantic proof input; the result "
                 "is performance-only."
             )
+        # A comparison that did not run measured nothing about the candidate.
+        run_failed = state == "inconclusive" and comparison_did_not_run(equivalence)
+        if run_failed:
+            reason = f"{reason}. {RERUN_NOTE}"
 
         envelope = EvidenceEnvelopeV1(
             source="azure-sql-mcp",
@@ -5204,6 +5398,8 @@ class PerformanceWorkflowService:
                 "performance_reason": performance_reason,
                 "execution_reservation_id": reservation["reservation_id"],
                 "sql_persisted": False,
+                **({"rerun_allowed": True} if run_failed else {}),
+                **({"connection_retries": retry_budget.retries} if retry_budget.retries else {}),
             },
         )
         envelope = self.store.create_evidence(
@@ -5263,6 +5459,7 @@ class PerformanceWorkflowService:
             "phase": phase,
             "runs_per_parameter_case": runs,
             "executions": measured_executions,
+            **({"connection_retries": retry_budget.retries} if retry_budget.retries else {}),
             "execution_protocol": execution_protocol,
             "time_spent": _time_spent(call_started, phase_seconds),
             "parameter_results": parameter_results,
@@ -5288,8 +5485,25 @@ class PerformanceWorkflowService:
             "evidence_id": envelope.evidence_id,
             "execution_reservation_id": reservation["reservation_id"],
             "session_continues": True,
+            **({"rerun_allowed": True} if run_failed else {}),
             "candidate": updated_candidate.to_dict(),
         }
+
+    def rerun_allowed(self, candidate: Any) -> bool:
+        """True when the last benchmark of ``candidate`` ended without a verdict.
+
+        A refusal before any measurement, a failed build, or a tool or
+        connection error measured nothing, so a call with a new idempotency
+        key may measure the candidate. A measured result is final, also an
+        inconclusive one (noise, an index no plan used, a result mismatch).
+        """
+
+        if candidate.state != "inconclusive":
+            return False
+        if not candidate.evidence_ids:
+            return candidate.executions == 0
+        metadata = self.store.get_evidence(candidate.evidence_ids[-1]).metadata
+        return metadata.get("benchmark_failed") is True or metadata.get("rerun_allowed") is True
 
     def measurement_candidate(self, candidate: Any, idempotency_key: str | None) -> Any:
         """The session candidate that carries one further run of ``candidate``.
@@ -6142,6 +6356,58 @@ class PerformanceWorkflowService:
             bucket.for_sql(baseline_sql, provenance="baseline"),
             bucket.for_sql(candidate_sql, provenance="candidate"),
         )
+
+    async def _discard_idle_connections(self, database_name: str) -> None:
+        """Close the idle pooled connections of the database before a retry.
+
+        An idle connection that was released a moment ago is reused without a
+        check, and it can be as dead as the one that just failed.
+        """
+
+        pool = getattr(self.executor, "pool", None)
+        if pool is not None:
+            await pool.discard_idle(database_name)
+
+    async def profile_with_connection_retry(
+        self,
+        database_name: str,
+        contract: ParameterExecutionContract,
+        *,
+        step: str,
+        retry_budget: ConnectionRetryBudget,
+        max_result_rows: int | None = None,
+    ) -> ProfiledPlanResult:
+        """One measured run; a run that lost its connection is made once more.
+
+        Only a failure of the connection is retried (``is_connection_failure``):
+        a statement error and a query timeout would fail the same way again.
+        The retry runs on a new connection when ``retry_budget`` grants its
+        execution, and is recorded in ``retry_budget.retries`` with its step
+        and case.
+        """
+
+        try:
+            return await self._profile_execution_contract(
+                database_name, contract, max_result_rows=max_result_rows
+            )
+        except Exception as exc:
+            if not is_connection_failure(exc) or not retry_budget.reserve(1):
+                raise
+            note_exception(exc, "performance_workflows.connection_retry")
+        entry: dict[str, Any] = {
+            "step": step,
+            "parameter_case": contract.bucket_id,
+            "cause_class": "connection_lost",
+            "retried": True,
+            "succeeded": False,
+        }
+        retry_budget.retries.append(entry)
+        await self._discard_idle_connections(database_name)
+        profiled = await self._profile_execution_contract(
+            database_name, contract, max_result_rows=max_result_rows
+        )
+        entry["succeeded"] = True
+        return profiled
 
     async def _profile_execution_contract(
         self,

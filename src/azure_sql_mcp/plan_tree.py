@@ -22,6 +22,7 @@ import math
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from dataclasses import field
+from collections.abc import Sequence
 from typing import Any
 
 NS = "http://schemas.microsoft.com/sqlserver/2004/07/showplan"
@@ -150,6 +151,40 @@ def showplan_from_results(results: Any) -> str | None:
     A plan split across the rows of a one-column result set is joined.
     """
 
+    candidates = showplans_from_results(results)
+    return max(candidates, key=len) if candidates else None
+
+
+def merge_showplans(plans: Sequence[str]) -> str:
+    """One showplan document with the statements of several, in the order given.
+
+    SET STATISTICS XML returns one document per executed statement of a
+    batch. A batch that assigns variables first and then returns its rows so
+    has several documents; merged, they read as the plan of the batch, with
+    the result-producing statement last.
+    """
+
+    if len(plans) == 1:
+        return plans[0]
+    roots = [ET.fromstring(plan) for plan in plans]
+    path = f"{_Q}BatchSequence/{_Q}Batch/{_Q}Statements"
+    target = roots[0].find(path)
+    if target is None:
+        raise ValueError("The first showplan document holds no statement list.")
+    for root in roots[1:]:
+        source = root.find(path)
+        if source is not None:
+            target.extend(list(source))
+    ET.register_namespace("", _Q[1:-1])
+    return ET.tostring(roots[0], encoding="unicode")
+
+
+def showplans_from_results(results: Any) -> list[str]:
+    """Every showplan in driver result sets, in the order the statements ran.
+
+    A plan split across the rows of a one-column result set is joined.
+    """
+
     candidates: list[str] = []
     for result in results:
         values = [value for row in result.rows for value in row.values()]
@@ -161,7 +196,7 @@ def showplan_from_results(results: Any) -> str | None:
                 if joined is not None and joined.rstrip().endswith("</ShowPlanXML>"):
                     found = [joined]
         candidates.extend(found)
-    return max(candidates, key=len) if candidates else None
+    return candidates
 
 
 def describe_result_shape(results: Any) -> str:

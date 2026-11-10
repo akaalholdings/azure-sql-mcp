@@ -489,8 +489,8 @@ def test_index_benchmark_request_binding_requires_exact_key_and_shape() -> None:
         idempotency_key="caller-key",
     )
 
-    assert first == {"replayed": False}
-    assert replay == {"replayed": True}
+    assert first == {"replayed": False, "request_fingerprint": "request-shape-v1"}
+    assert replay == {"replayed": True, "request_fingerprint": "request-shape-v1"}
     binding = store._connection.execute(
         """
         SELECT idempotency_key, request_fingerprint
@@ -531,7 +531,61 @@ def test_index_benchmark_request_binding_requires_exact_key_and_shape() -> None:
         "request-finalist-v1",
         idempotency_key="finalist-key",
     )
-    assert finalist == {"replayed": False}
+    assert finalist == {"replayed": False, "request_fingerprint": "request-finalist-v1"}
+    store.close()
+
+
+def test_a_new_key_binds_a_rerun_request_only_when_no_request_can_still_give_a_verdict() -> None:
+    """S15: a candidate whose request gave no verdict takes a request under a new key.
+
+    The rerun is bound under its own fingerprint, because a reservation is one
+    per request fingerprint. A request that is still running keeps the phase.
+    """
+
+    store = PerformanceStore(db_path=":memory:")
+    case = store.create_performance_case(
+        PerformanceCaseV1(case_id="case-index-rerun", query_fingerprint="query-hash")
+    )
+    session = store.create_session(
+        TuningSessionV1(session_id="session-index-rerun", performance_case_id=case.case_id)
+    )
+    candidate = store.create_candidate_and_attach(
+        session,
+        TuningCandidateV1(candidate_id="candidate-index-rerun", session_id=session.session_id),
+    )
+    arguments = (session.session_id, candidate.candidate_id, "screening", "request-v1")
+    store.bind_index_benchmark_request(*arguments, idempotency_key="first-key")
+    reservation = store.reserve_execution_attempts(
+        session.session_id,
+        candidate.candidate_id,
+        3,
+        "request-v1",
+        owner_reference="owner-first",
+        idempotency_key="first-key",
+    )
+
+    # The first request is running: another key is refused, rerun or not.
+    with pytest.raises(IdempotencyConflictError, match="different idempotency key"):
+        store.bind_index_benchmark_request(
+            *arguments, idempotency_key="second-key", rerun_fingerprint="request-v1-rerun"
+        )
+
+    store.release_execution_attempts(
+        reservation["reservation_id"],
+        owner_reference="owner-first",
+        expected_version=reservation["version"],
+    )
+    rerun = store.bind_index_benchmark_request(
+        *arguments, idempotency_key="second-key", rerun_fingerprint="request-v1-rerun"
+    )
+    assert rerun == {"replayed": False, "request_fingerprint": "request-v1-rerun"}
+    # Each key replays its own request.
+    assert store.bind_index_benchmark_request(
+        *arguments, idempotency_key="second-key", rerun_fingerprint="request-v1-rerun"
+    ) == {"replayed": True, "request_fingerprint": "request-v1-rerun"}
+    assert store.bind_index_benchmark_request(
+        *arguments, idempotency_key="first-key", rerun_fingerprint="other"
+    ) == {"replayed": True, "request_fingerprint": "request-v1"}
     store.close()
 
 
@@ -577,7 +631,7 @@ def test_index_benchmark_binding_release_keeps_reserved_requests_bound() -> None
 
     bind("request-refused", "refused-key")
     assert release("request-refused", "refused-key") is True
-    assert bind("request-corrected", "corrected-key") == {"replayed": False}
+    assert bind("request-corrected", "corrected-key")["replayed"] is False
     store.reserve_execution_attempts(
         session.session_id,
         candidate.candidate_id,

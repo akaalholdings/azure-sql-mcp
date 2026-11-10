@@ -1655,53 +1655,8 @@ class PerformanceStore:
             candidate = cast(TuningCandidateV1, self._get_locked("candidate", candidate_id))
             if candidate.session_id != session_id:
                 raise ValueError("Candidate does not belong to this tuning session.")
-            candidates = self._list_candidates_locked(session_id)
-            actual_by_candidate = {
-                item.candidate_id: int(item.executions) for item in candidates
-            }
-            reservation_rows = self._connection.execute(
-                """
-                SELECT candidate_id, status,
-                       COALESCE(
-                           SUM(
-                               CASE
-                                   WHEN status IN ('reserved', 'expired')
-                                       THEN attempt_count
-                                   ELSE dispatched_attempt_count
-                               END
-                           ),
-                           0
-                       ) AS attempts
-                FROM execution_reservations
-                WHERE session_id = ?
-                  AND status IN ('reserved', 'completed', 'released', 'expired')
-                GROUP BY candidate_id, status
-                """,
-                (session_id,),
-            ).fetchall()
-            reserved = sum(
-                int(row["attempts"])
-                for row in reservation_rows
-                if row["status"] == "reserved"
-            )
-            finalized_by_candidate: dict[str, int] = {}
-            for row in reservation_rows:
-                if row["status"] in {"completed", "released", "expired"}:
-                    candidate_key = str(row["candidate_id"])
-                    finalized_by_candidate[candidate_key] = (
-                        finalized_by_candidate.get(candidate_key, 0)
-                        + int(row["attempts"])
-                    )
-            consumed = sum(
-                max(
-                    actual_by_candidate.get(candidate_key, 0),
-                    finalized_by_candidate.get(candidate_key, 0),
-                )
-                for candidate_key in (
-                    set(actual_by_candidate) | set(finalized_by_candidate)
-                )
-            )
-            if consumed + reserved + attempt_count > session.execution_limit:
+            committed = self._committed_executions_locked(session_id)
+            if committed + attempt_count > session.execution_limit:
                 raise ReservationError("Execution budget has been reserved.")
             if hashed_idempotency_key is not None:
                 self._record_idempotency_locked(
@@ -1741,6 +1696,102 @@ class PerformanceStore:
             result = self._execution_reservation_dict(row)
             result["replayed"] = False
             return result
+
+    def _committed_executions_locked(self, session_id: str) -> int:
+        """Executions of a session that ran or are reserved: what its budget has left is the rest."""
+
+        candidates = self._list_candidates_locked(session_id)
+        actual_by_candidate = {
+            item.candidate_id: int(item.executions) for item in candidates
+        }
+        reservation_rows = self._connection.execute(
+            """
+            SELECT candidate_id, status,
+                   COALESCE(
+                       SUM(
+                           CASE
+                               WHEN status IN ('reserved', 'expired')
+                                   THEN attempt_count
+                               ELSE dispatched_attempt_count
+                           END
+                       ),
+                       0
+                   ) AS attempts
+            FROM execution_reservations
+            WHERE session_id = ?
+              AND status IN ('reserved', 'completed', 'released', 'expired')
+            GROUP BY candidate_id, status
+            """,
+            (session_id,),
+        ).fetchall()
+        reserved = sum(
+            int(row["attempts"])
+            for row in reservation_rows
+            if row["status"] == "reserved"
+        )
+        finalized_by_candidate: dict[str, int] = {}
+        for row in reservation_rows:
+            if row["status"] in {"completed", "released", "expired"}:
+                candidate_key = str(row["candidate_id"])
+                finalized_by_candidate[candidate_key] = (
+                    finalized_by_candidate.get(candidate_key, 0)
+                    + int(row["attempts"])
+                )
+        consumed = sum(
+            max(
+                actual_by_candidate.get(candidate_key, 0),
+                finalized_by_candidate.get(candidate_key, 0),
+            )
+            for candidate_key in (
+                set(actual_by_candidate) | set(finalized_by_candidate)
+            )
+        )
+        return consumed + reserved
+
+    def extend_execution_reservation(
+        self,
+        reservation_id: str,
+        extra_attempts: int,
+        *,
+        owner_reference: str,
+    ) -> bool:
+        """Add executions to an active reservation when the session budget has them.
+
+        For a run that a benchmark call makes again after a lost connection:
+        the call then dispatches one statement more than it reserved. The
+        check and the update are one transaction, so the session limit holds.
+        Returns False, and changes nothing, when the budget has no room. The
+        reservation version is not changed: the count only grows, under the
+        owner check, and the caller finalizes with the version it holds.
+        """
+
+        if not isinstance(extra_attempts, int) or isinstance(extra_attempts, bool) or extra_attempts <= 0:
+            raise ValueError("extra_attempts must be greater than 0.")
+        with self._transaction():
+            row = self._connection.execute(
+                "SELECT * FROM execution_reservations WHERE reservation_id = ?",
+                (reservation_id,),
+            ).fetchone()
+            if row is None:
+                raise ContractNotFoundError(f"Unknown execution reservation: {reservation_id}.")
+            self._check_owner(
+                row["owner_token"], owner_reference, f"execution reservation {reservation_id}"
+            )
+            if row["status"] != "reserved":
+                return False
+            session = cast(TuningSessionV1, self._get_locked("session", str(row["session_id"])))
+            committed = self._committed_executions_locked(str(row["session_id"]))
+            if committed + extra_attempts > session.execution_limit:
+                return False
+            self._connection.execute(
+                """
+                UPDATE execution_reservations
+                SET attempt_count = attempt_count + ?, updated_at_utc = ?
+                WHERE reservation_id = ? AND status = 'reserved'
+                """,
+                (extra_attempts, utc_now(), reservation_id),
+            )
+            return True
 
     def append_performance_case_evidence(
         self,
@@ -1917,14 +1968,34 @@ class PerformanceStore:
         request_fingerprint: str,
         *,
         idempotency_key: str,
-    ) -> dict[str, bool]:
-        """Bind one candidate phase to one exact index benchmark request."""
+        rerun_fingerprint: str | None = None,
+        rerun_after_failure: bool = False,
+    ) -> dict[str, Any]:
+        """Bind one candidate phase to one exact index benchmark request.
+
+        A phase of a candidate takes one request: another key, or another
+        request, is refused. The exception is a candidate whose earlier
+        request gave no verdict: ``rerun_after_failure`` (its last result was
+        a refusal or a failed run), or a candidate that is open with no run in
+        this phase and no request in flight (it was reopened, or its earlier
+        request stopped before it reserved). A new key then binds
+        ``rerun_fingerprint`` (the same request made distinct for that key)
+        beside the old binding, and every key still replays its own request.
+
+        Returns ``replayed`` and ``request_fingerprint``, the fingerprint
+        that is bound to the key.
+        """
 
         if phase not in {"screening", "finalist"}:
             raise ValueError("phase must be screening or finalist.")
         if not isinstance(idempotency_key, str) or not idempotency_key.strip():
             raise ValueError("idempotency_key is required.")
         fingerprint = self._require_fingerprint(request_fingerprint)
+        rerun = (
+            self._require_fingerprint(rerun_fingerprint, "rerun_fingerprint")
+            if rerun_fingerprint is not None
+            else None
+        )
         scope = f"index-benchmark.request.{phase}"
         hashed_idempotency_key = self._hashed_idempotency_key(
             scope,
@@ -1938,13 +2009,28 @@ class PerformanceStore:
             if candidate.session_id != session_id:
                 raise ValueError("Candidate does not belong to this tuning session.")
 
+            own_binding = self._connection.execute(
+                """
+                SELECT request_fingerprint
+                FROM operation_idempotency
+                WHERE scope = ? AND idempotency_key = ?
+                """,
+                (scope, hashed_idempotency_key),
+            ).fetchone()
+            bound = (
+                rerun
+                if rerun is not None
+                and own_binding is not None
+                and own_binding["request_fingerprint"] == rerun
+                else fingerprint
+            )
             try:
                 existing_id = self._idempotent_aggregate_locked(
                     scope,
                     hashed_idempotency_key,
                     "candidate",
                     requested_id=candidate_id,
-                    request_fingerprint=fingerprint,
+                    request_fingerprint=bound,
                 )
             except IdempotencyConflictError as exc:
                 raise IdempotencyConflictError(
@@ -1952,38 +2038,65 @@ class PerformanceStore:
                     "The supplied request is a different request."
                 ) from exc
             if existing_id is not None:
-                return {"replayed": True}
+                return {"replayed": True, "request_fingerprint": bound}
 
-            conflicting_binding = self._connection.execute(
+            other_bindings = self._connection.execute(
                 """
                 SELECT request_fingerprint
                 FROM operation_idempotency
                 WHERE scope = ?
                   AND aggregate_type = 'candidate'
                   AND aggregate_id = ?
-                LIMIT 1
                 """,
                 (scope, candidate_id),
-            ).fetchone()
-            if conflicting_binding is not None:
-                if conflicting_binding["request_fingerprint"] != fingerprint:
+            ).fetchall()
+            if other_bindings:
+                if rerun is None or not (
+                    rerun_after_failure
+                    or self._open_without_request_in_flight_locked(session_id, candidate, phase)
+                ):
+                    if other_bindings[0]["request_fingerprint"] != fingerprint:
+                        raise IdempotencyConflictError(
+                            f"{_INDEX_BENCHMARK_REPLAY_GUIDANCE} "
+                            "The supplied request is a different request."
+                        )
                     raise IdempotencyConflictError(
                         f"{_INDEX_BENCHMARK_REPLAY_GUIDANCE} "
-                        "The supplied request is a different request."
+                        "The supplied key is a different idempotency key."
                     )
-                raise IdempotencyConflictError(
-                    f"{_INDEX_BENCHMARK_REPLAY_GUIDANCE} "
-                    "The supplied key is a different idempotency key."
-                )
+                # Reservations are one per request fingerprint.
+                bound = rerun
 
             self._record_idempotency_locked(
                 scope,
                 hashed_idempotency_key,
                 "candidate",
                 candidate_id,
-                request_fingerprint=fingerprint,
+                request_fingerprint=bound,
             )
-            return {"replayed": False}
+            return {"replayed": False, "request_fingerprint": bound}
+
+    def _open_without_request_in_flight_locked(
+        self,
+        session_id: str,
+        candidate: TuningCandidateV1,
+        phase: str,
+    ) -> bool:
+        """True when the candidate has no result in ``phase`` and no request of it is running."""
+
+        if candidate.is_terminal or (
+            candidate.screen_runs if phase == "screening" else candidate.finalist_runs
+        ):
+            return False
+        in_flight = self._connection.execute(
+            """
+            SELECT 1 FROM execution_reservations
+            WHERE session_id = ? AND candidate_id = ? AND status = 'reserved'
+            LIMIT 1
+            """,
+            (session_id, candidate.candidate_id),
+        ).fetchone()
+        return in_flight is None
 
     def release_index_benchmark_request(
         self,
