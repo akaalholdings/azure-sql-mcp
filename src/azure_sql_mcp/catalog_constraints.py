@@ -22,7 +22,12 @@ _COLUMNS_QUERY = f"""
 SELECT
     o.type_desc AS object_type,
     c.name AS column_name,
-    c.is_nullable
+    c.is_nullable,
+    c.system_type_id,
+    c.max_length,
+    c.precision,
+    c.scale,
+    c.collation_name
 FROM sys.objects AS o
 INNER JOIN sys.columns AS c
     ON c.object_id = o.object_id
@@ -135,6 +140,10 @@ class TableConstraintFacts:
     foreign_keys: tuple[ForeignKey, ...] = ()
     check_constraints: tuple[CheckConstraint, ...] = ()
     read_error: str | None = None
+    # casefolded column name -> declared type and collation. Two columns with
+    # the same signature compare without a conversion, so equality between
+    # them matches at most one value of a unique key.
+    column_types: Mapping[str, str] | None = None
 
     @property
     def qualified_name(self) -> str:
@@ -180,6 +189,14 @@ class CatalogConstraintService:
                 str(row["column_name"]).casefold(): bool(row.get("is_nullable"))
                 for row in columns
                 if row.get("column_name") is not None
+            },
+            column_types={
+                str(row["column_name"]).casefold(): "/".join(
+                    str(row.get(part) if row.get(part) is not None else "")
+                    for part in ("system_type_id", "max_length", "precision", "scale", "collation_name")
+                )
+                for row in columns
+                if row.get("column_name") is not None and row.get("system_type_id") is not None
             },
             unique_keys=_unique_keys(key_rows),
             foreign_keys=_foreign_keys(foreign_key_rows),

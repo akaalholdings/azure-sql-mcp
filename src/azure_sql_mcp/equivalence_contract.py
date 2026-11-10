@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
+from collections.abc import Iterator
+from collections.abc import Mapping
+from collections.abc import Sequence
 from dataclasses import dataclass
 from dataclasses import field
 from typing import Any
@@ -10,6 +14,8 @@ from sqlglot import parse
 from sqlglot.errors import ParseError
 
 from .param_binding import _mask_parameter_non_code
+from .safe_sql import read_only_batch_branches
+from .safe_sql import extract_hint_inventory
 
 
 _CLOCK_FUNCTIONS = frozenset(
@@ -60,6 +66,9 @@ class EquivalencePreflight:
     window_order_without_total_order_count: int = 0
     risk_codes: tuple[str, ...] = ()
     details: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+    # The outer ORDER BY of each statement that has no row limit. A tie there
+    # is not a risk (the same rows come back); it explains an order-only mismatch.
+    result_orders: tuple[dict[str, Any], ...] = field(default_factory=tuple)
 
     @property
     def direct_snapshot_supported(self) -> bool:
@@ -145,14 +154,59 @@ def _parse_statements(sql: str) -> list[exp.Expr]:
     return [statement for statement in parse(parseable_sql(sql), read="tsql") if statement]
 
 
+def _batch_selects(sql: str) -> list[str] | None:
+    """The SELECT of each branch when the text is a read-only branching batch."""
+
+    branches = read_only_batch_branches(sql)
+    return [branch.select_sql for branch in branches] if branches else None
+
+
+def _merged_branch_preflights(selects: list[str]) -> EquivalencePreflight:
+    """One preflight for a branching batch: a risk in any branch is a risk of the batch."""
+
+    parts = [analyze_equivalence_preflight(select) for select in selects]
+
+    def merged(name: str) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(item for part in parts for item in getattr(part, name)))
+
+    return EquivalencePreflight(
+        volatile_functions=merged("volatile_functions"),
+        statement_stable_clock_functions=merged("statement_stable_clock_functions"),
+        row_volatile_functions=merged("row_volatile_functions"),
+        nonrepeatable_table_sample_count=sum(part.nonrepeatable_table_sample_count for part in parts),
+        unordered_row_limit_count=sum(part.unordered_row_limit_count for part in parts),
+        ordered_row_limit_without_total_order_count=sum(
+            part.ordered_row_limit_without_total_order_count for part in parts
+        ),
+        window_order_without_total_order_count=sum(
+            part.window_order_without_total_order_count for part in parts
+        ),
+        risk_codes=merged("risk_codes"),
+        details=tuple(
+            {**detail, "branch": ordinal}
+            for ordinal, part in enumerate(parts, start=1)
+            for detail in part.details
+        ),
+        result_orders=tuple(
+            {**detail, "branch": ordinal}
+            for ordinal, part in enumerate(parts, start=1)
+            for detail in part.result_orders
+        ),
+    )
+
+
 def analyze_equivalence_preflight(sql: str) -> EquivalencePreflight:
     """Detect SQL shapes that cannot prove semantics by sequential snapshots.
 
     This intentionally does not rewrite SQL. A performance run must continue to
     measure the production-shaped statement, while any deterministic proof is a
-    separately declared and scoped contract.
+    separately declared and scoped contract. A read-only branching batch is
+    analyzed branch by branch.
     """
 
+    selects = _batch_selects(sql)
+    if selects is not None:
+        return _merged_branch_preflights(selects)
     statements = _parse_statements(sql)
 
     clock_functions: set[str] = set()
@@ -163,15 +217,34 @@ def analyze_equivalence_preflight(sql: str) -> EquivalencePreflight:
     window_orders_without_total_order: list[dict[str, Any]] = []
 
     isolation_hints: set[str] = set()
+    result_orders: list[dict[str, Any]] = []
 
     for statement_ordinal, statement in enumerate(statements, start=1):
         select_ordinal = 0
         window_ordinal = 0
-        cte_names = {
-            cte.alias_or_name.casefold()
-            for cte in statement.find_all(exp.CTE)
-            if cte.alias_or_name
-        }
+        cte_names = _statement_ctes(statement)
+        result_select = _set_leaves(statement)[-1]
+        if (
+            isinstance(statement, exp.Query)
+            and isinstance(result_select, exp.Select)
+            and result_select.args.get("order") is not None
+            and result_select.args.get("limit") is None
+            and result_select.args.get("offset") is None
+        ):
+            result_order = _total_order_requirement(
+                result_select,
+                result_select.args["order"].expressions,
+                cte_names,
+                resolve_projection=True,
+            )
+            if result_order is not None:
+                result_orders.append(
+                    {
+                        "statement_ordinal": statement_ordinal,
+                        "risk": "result_order_ties",
+                        "total_order": result_order,
+                    }
+                )
         for node in statement.walk():
             function_name = _function_name(node)
             if function_name in _CLOCK_FUNCTIONS:
@@ -329,6 +402,7 @@ def analyze_equivalence_preflight(sql: str) -> EquivalencePreflight:
         ),
         risk_codes=tuple(risk_codes),
         details=tuple(details),
+        result_orders=tuple(result_orders),
     )
 
 
@@ -347,7 +421,7 @@ def _window_is_tie_safe(window: exp.Window) -> bool:
 
 def _select_sources(
     select: exp.Select,
-    cte_names: set[str],
+    cte_names: Mapping[str, Any] | set[str],
 ) -> tuple[list[dict[str, str]], str | None]:
     """Base tables of one SELECT, and why its rows cannot be keyed from the catalog."""
 
@@ -412,10 +486,418 @@ def _source_of(column: exp.Column, sources: list[dict[str, str]]) -> dict[str, s
     )
 
 
+class _NoRowKey(Exception):
+    """The rows of a relation cannot be tied to a key the proof can check."""
+
+
+@dataclass(slots=True)
+class _FromItem:
+    """One FROM or JOIN item of a SELECT, as the total-order proof sees it."""
+
+    names: frozenset[str]  # casefolded names a column can be qualified with
+    paths: set[str]  # every source under this item
+    resolve: Callable[[str], tuple[str, str] | None]  # column name -> (source, column)
+    label: str  # how a reason names this item
+    selects_star: bool = False
+
+
+@dataclass(slots=True)
+class _RowIdentity:
+    """What identifies one row of a SELECT.
+
+    A plain SELECT returns one row per combination of one row from each FROM
+    item, so its rows are identified by the base-table rows under it. A derived
+    table or CTE that is a plain SELECT is flattened into its own base tables;
+    one that returns distinct rows (UNION, INTERSECT, EXCEPT, SELECT DISTINCT)
+    is one source whose key is all of its columns.
+    """
+
+    tables: list[dict[str, Any]] = field(default_factory=list)
+    unique_relations: list[dict[str, Any]] = field(default_factory=list)
+    equalities: list[dict[str, Any]] = field(default_factory=list)
+    items: list[_FromItem] = field(default_factory=list)
+
+    def item_for(self, column: exp.Column) -> _FromItem | None:
+        qualifier = column.table.casefold()
+        if not qualifier:
+            return self.items[0] if len(self.items) == 1 else None
+        return next((item for item in self.items if qualifier in item.names), None)
+
+    def resolve(self, column: exp.Column) -> tuple[str, str] | None:
+        item = self.item_for(column)
+        return item.resolve(column.name) if item is not None else None
+
+    def base_column(self, target: tuple[str, str] | None) -> dict[str, str] | None:
+        """The base-table column a resolved source column is a direct copy of."""
+
+        if target is None:
+            return None
+        path, column = target
+        for table in self.tables:
+            if table["alias"] == path:
+                return {"schema": table["schema"], "table": table["table"], "column": column}
+        for relation in self.unique_relations:
+            if relation["alias"] == path:
+                return relation["lineage"].get(column.casefold())
+        return None
+
+    def why_unresolved(self, column: exp.Column) -> str:
+        item = self.item_for(column)
+        if item is None or not item.label:
+            return f"ordering column {column.name} is not qualified with its table alias"
+        name = f"{column.table}.{column.name}" if column.table else column.name
+        if item.selects_star:
+            return (
+                f"{item.label} selects *, so ordering column {name} cannot be traced to a "
+                "base table column"
+            )
+        return (
+            f"ordering column {name} of {item.label} is an expression or is not in its "
+            "select list, so it cannot be traced to a base table column"
+        )
+
+
+def _statement_ctes(statement: exp.Expr) -> dict[str, exp.CTE | None]:
+    """Casefolded CTE name -> its definition; None when the name is defined twice."""
+
+    ctes: dict[str, exp.CTE | None] = {}
+    for cte in statement.find_all(exp.CTE):
+        name = (cte.alias_or_name or "").casefold()
+        if name:
+            ctes[name] = None if name in ctes else cte
+    return ctes
+
+
+def _set_leaves(query: exp.Expr) -> list[exp.Expr]:
+    """The SELECT blocks of a query, left to right through its set operations."""
+
+    if isinstance(query, (exp.Subquery, exp.Paren)) and not query.args.get("alias"):
+        return _set_leaves(query.this)
+    if isinstance(query, exp.SetOperation):
+        return [*_set_leaves(query.this), *_set_leaves(query.expression)]
+    return [query]
+
+
+def _selects_star(select: exp.Select) -> bool:
+    return any(
+        isinstance(item, exp.Star) or isinstance(item.this, exp.Star)
+        for item in select.expressions
+    )
+
+
+def _output_names(select: exp.Select, declared: Sequence[exp.Expr]) -> list[str | None]:
+    if declared:
+        return [identifier.name for identifier in declared]
+    return [
+        item.alias if isinstance(item, exp.Alias) else item.name if isinstance(item, exp.Column) else None
+        for item in select.expressions
+    ]
+
+
+def _column_equalities(condition: exp.Expr | None) -> Iterator[tuple[exp.Column, exp.Column]]:
+    """Column = column terms that every row passing the condition satisfies."""
+
+    pending = [condition] if condition is not None else []
+    while pending:
+        node = pending.pop()
+        if isinstance(node, exp.Paren):
+            pending.append(node.this)
+        elif isinstance(node, exp.And):
+            pending.extend((node.this, node.expression))
+        elif (
+            isinstance(node, exp.EQ)
+            and isinstance(node.this, exp.Column)
+            and isinstance(node.expression, exp.Column)
+        ):
+            yield node.this, node.expression
+
+
+def _distinct_rows_relation(
+    query: exp.Expr,
+    declared: Sequence[exp.Expr],
+    path: str,
+    label: str,
+    ctes: Mapping[str, exp.CTE | None],
+    active: frozenset[str],
+) -> dict[str, Any]:
+    """A relation that returns distinct rows: all of its columns are its key."""
+
+    leaves = [leaf for leaf in _set_leaves(query) if isinstance(leaf, exp.Select)]
+    if len(leaves) != len(_set_leaves(query)):
+        raise _NoRowKey(f"{label} is not a SELECT, so its rows have no key")
+    if any(_selects_star(leaf) for leaf in leaves):
+        raise _NoRowKey(f"{label} selects *, so the columns that make its rows distinct cannot be named")
+    names = _output_names(leaves[0], declared)
+    if any(name is None for name in names) or len({str(name).casefold() for name in names}) != len(names):
+        raise _NoRowKey(
+            f"{label} has an unnamed or repeated column, so the ORDER BY cannot name "
+            "every column that makes its rows distinct"
+        )
+    copies: list[list[dict[str, str] | None]] = []
+    for ordinal, leaf in enumerate(leaves):
+        try:
+            identity = _row_identity(leaf, ctes, f"{path}#{ordinal}.", active)
+        except _NoRowKey:
+            copies.append([None] * len(names))
+            continue
+        copies.append(
+            [
+                identity.base_column(identity.resolve(item.unalias()))
+                if isinstance(item.unalias(), exp.Column)
+                else None
+                for item in leaf.expressions
+            ]
+        )
+    lineage: dict[str, dict[str, str]] = {}
+    for position, name in enumerate(names):
+        column_copies = [
+            leaf_copies[position] if position < len(leaf_copies) else None
+            for leaf_copies in copies
+        ]
+        first = column_copies[0]
+        if first is not None and all(
+            copy is not None
+            and {key: value.casefold() for key, value in copy.items()}
+            == {key: value.casefold() for key, value in first.items()}
+            for copy in column_copies
+        ):
+            lineage[str(name).casefold()] = first
+    return {
+        "alias": path,
+        "relation": label,
+        "kind": "distinct_rows",
+        "key_columns": [str(name) for name in names],
+        "order_columns": [],
+        "lineage": lineage,
+    }
+
+
+def _from_item(
+    node: exp.Expr,
+    identity: _RowIdentity,
+    ctes: Mapping[str, exp.CTE | None],
+    prefix: str,
+    active: frozenset[str],
+    outer_label: str,
+) -> _FromItem:
+    query: exp.Expr | None = None
+    declared: Sequence[exp.Expr] = ()
+    alias = node.alias_or_name or ""
+    label = ""
+    if isinstance(node, exp.Table):
+        if node.args.get("pivots"):
+            raise _NoRowKey("a PIVOT or UNPIVOT in FROM has no catalog key")
+        if isinstance(node.this, exp.Parameter):
+            raise _NoRowKey("a table variable in FROM has no catalog key the proof can read")
+        if not isinstance(node.this, exp.Identifier):
+            raise _NoRowKey("a table function in FROM has no catalog key")
+        if node.this.args.get("temporary") or node.name.startswith("#"):
+            raise _NoRowKey("a temporary table in FROM has no catalog key the proof can read")
+        if node.catalog:
+            raise _NoRowKey("a table in another database is not inspected")
+        name = node.name.casefold()
+        if not node.db and name in ctes:
+            cte = ctes[name]
+            label = f"common table expression {node.name}"
+            if cte is None:
+                raise _NoRowKey(f"{label} is defined more than once in the statement")
+            if name in active:
+                raise _NoRowKey(f"{label} is recursive, so its rows have no catalog key")
+            active = active | {name}
+            query = cte.this
+            cte_alias = cte.args.get("alias")
+            declared = cte_alias.args.get("columns") or () if cte_alias is not None else ()
+        elif not node.db:
+            raise _NoRowKey(f"table {node.name} is not schema-qualified")
+        elif node.args.get("version") or node.args.get("when"):
+            raise _NoRowKey(
+                f"{node.db}.{node.name} is read FOR SYSTEM_TIME, which can return several "
+                "versions of one key"
+            )
+        else:
+            path = f"{prefix}{alias or node.name}"
+            identity.tables.append(
+                {
+                    "schema": node.db,
+                    "table": node.name,
+                    "alias": path,
+                    **({"relation": outer_label} if outer_label else {}),
+                }
+            )
+            return _FromItem(
+                names=frozenset({alias.casefold(), name}),
+                paths={path},
+                resolve=lambda column: (path, column),
+                label="",
+            )
+    elif isinstance(node, exp.Subquery) and alias:
+        label = f"derived table {alias}"
+        query = node.this
+        table_alias = node.args.get("alias")
+        declared = table_alias.args.get("columns") or () if table_alias is not None else ()
+    if query is None:
+        kind = "table function" if isinstance(node, exp.Lateral) else "derived table"
+        raise _NoRowKey(f"a {kind} in FROM has no catalog key")
+
+    path = f"{prefix}{alias}"
+    top = query
+    while isinstance(top, (exp.Subquery, exp.Paren)) and not top.args.get("alias"):
+        top = top.this
+    if isinstance(top, exp.SetOperation) and not top.args.get("distinct"):
+        raise _NoRowKey(
+            f"{label} uses UNION ALL, which can return the same row twice, so no column "
+            "of it is a key"
+        )
+    if isinstance(top, exp.SetOperation) or (
+        isinstance(top, exp.Select) and top.args.get("distinct") is not None
+    ):
+        relation = _distinct_rows_relation(query, declared, path, label, ctes, active)
+        identity.unique_relations.append(relation)
+        names = {str(name).casefold(): str(name) for name in relation["key_columns"]}
+        return _FromItem(
+            names=frozenset({alias.casefold()}),
+            paths={path},
+            resolve=lambda column: (path, names[column.casefold()])
+            if column.casefold() in names
+            else None,
+            label=label,
+        )
+    if not isinstance(top, exp.Select):
+        raise _NoRowKey(f"{label} is not a SELECT, so its rows have no key")
+
+    inner = _row_identity(top, ctes, f"{path}.", active, label)
+    identity.tables.extend(inner.tables)
+    identity.unique_relations.extend(inner.unique_relations)
+    identity.equalities.extend(inner.equalities)
+    star = _selects_star(top)
+    outputs: dict[str, tuple[str, str] | None] = {}
+    if not star:
+        for name, item in zip(_output_names(top, declared), top.expressions):
+            expression = item.unalias()
+            if name is not None:
+                outputs[name.casefold()] = (
+                    inner.resolve(expression) if isinstance(expression, exp.Column) else None
+                )
+    return _FromItem(
+        names=frozenset({alias.casefold()}),
+        paths={source["alias"] for source in (*inner.tables, *inner.unique_relations)},
+        resolve=lambda column: outputs.get(column.casefold()),
+        label=label,
+        selects_star=star,
+    )
+
+
+def _row_identity(
+    select: exp.Select,
+    ctes: Mapping[str, exp.CTE | None],
+    prefix: str = "",
+    active: frozenset[str] = frozenset(),
+    label: str = "",
+) -> _RowIdentity:
+    """Sources that identify one row of a SELECT, or raise _NoRowKey with the reason."""
+
+    identity = _RowIdentity()
+    from_clause = select.args.get("from") or select.args.get("from_")
+    entries: list[tuple[exp.Expr, exp.Join | None]] = (
+        [(from_clause.this, None)] if from_clause is not None else []
+    )
+    entries += [(join.this, join) for join in select.args.get("joins") or []]
+    joined: list[tuple[exp.Join, _FromItem]] = []
+    for node, join in entries:
+        if isinstance(node, exp.Lateral) and _is_single_row_subquery(node.this):
+            continue  # APPLY (SELECT TOP (1) ...) adds at most one row per outer row
+        item = _from_item(node, identity, ctes, prefix, active, label)
+        identity.items.append(item)
+        if join is not None:
+            joined.append((join, item))
+    if not identity.items:
+        raise _NoRowKey("the SELECT reads no base table")
+
+    def add(left: exp.Column, right: exp.Column, joined_item: _FromItem | None) -> None:
+        source, target = identity.resolve(left), identity.resolve(right)
+        if source is None or target is None:
+            return
+        text = f"{left.sql(dialect='tsql')} = {right.sql(dialect='tsql')}"
+        direction = "both"
+        if joined_item is not None:
+            # LEFT JOIN: a row of the preserved side fixes the joined column,
+            # but unmatched rows all carry NULL there, so not the reverse.
+            if (source[0] in joined_item.paths) == (target[0] in joined_item.paths):
+                return
+            if source[0] in joined_item.paths:
+                source, target = target, source
+            direction = "forward"
+        identity.equalities.append(
+            {
+                "left": {"alias": source[0], "column": source[1]},
+                "right": {"alias": target[0], "column": target[1]},
+                "direction": direction,
+                "text": text,
+            }
+        )
+
+    sides = {str(join.side or "").upper() for join, _item in joined}
+    # RIGHT and FULL joins NULL-extend the earlier sources: no ON equality is used.
+    if not sides & {"RIGHT", "FULL"}:
+        for join, item in joined:
+            for left, right in _column_equalities(join.args.get("on")):
+                add(left, right, item if str(join.side or "").upper() == "LEFT" else None)
+    where = select.args.get("where")
+    for left, right in _column_equalities(where.this if where is not None else None):
+        add(left, right, None)
+    return identity
+
+
+def _set_operation_order(
+    select: exp.Select,
+    keys: list[exp.Expr],
+    ctes: Mapping[str, exp.CTE | None],
+) -> dict[str, Any]:
+    """Total-order requirement for an ORDER BY that applies to a whole set operation."""
+
+    top: exp.Expr = select
+    while isinstance(top.parent, exp.SetOperation):
+        top = top.parent
+    limit = select.args.get("limit")
+    if _set_leaves(top)[-1] is not select or isinstance(limit, exp.Limit):
+        return {
+            "provable": False,
+            "unprovable_reason": (
+                "the row limit applies to one branch of a set operation, whose rows have "
+                "no catalog key"
+            ),
+        }
+    if not top.args.get("distinct"):
+        return {
+            "provable": False,
+            "unprovable_reason": (
+                "the row limit applies to a set operation with UNION ALL, which can return "
+                "the same row twice, so no column of it is a key"
+            ),
+        }
+    try:
+        relation = _distinct_rows_relation(top, (), "", "the set operation", ctes, frozenset())
+    except _NoRowKey as exc:
+        return {"provable": False, "unprovable_reason": str(exc)}
+    names = relation["key_columns"]
+    folded = {name.casefold(): name for name in names}
+    for key in keys:
+        expression = key.this if isinstance(key, exp.Ordered) else key
+        name: str | None = None
+        if isinstance(expression, exp.Literal) and expression.is_int:
+            position = int(expression.name)
+            name = names[position - 1] if 1 <= position <= len(names) else None
+        elif isinstance(expression, exp.Column) and not expression.table:
+            name = folded.get(expression.name.casefold())
+        if name is not None and name not in relation["order_columns"]:
+            relation["order_columns"].append(name)
+    return {"provable": True, "tables": [], "unique_relations": [relation]}
+
+
 def _total_order_requirement(
     select: exp.Select,
     keys: list[exp.Expr],
-    cte_names: set[str],
+    cte_names: Mapping[str, exp.CTE | None],
     *,
     resolve_projection: bool,
 ) -> dict[str, Any] | None:
@@ -423,9 +905,15 @@ def _total_order_requirement(
 
     Returns None when the ordering is deterministic from the SQL alone: the
     SELECT is grouped and the keys cover every grouping column. Otherwise the
-    result lists, for each base table, the plain columns the keys contribute;
-    the catalog decides whether they cover a unique NOT NULL key.
+    result lists the sources that identify a row (base tables, and relations
+    that return distinct rows) with the plain columns the keys contribute to
+    each, and the column equalities that hold in every row. The catalog decides
+    whether those cover a unique NOT NULL key of every base table.
     """
+
+    if resolve_projection and isinstance(select.parent, exp.SetOperation):
+        # T-SQL applies a trailing ORDER BY to the whole set operation.
+        return _set_operation_order(select, keys, cte_names)
 
     projections = list(select.expressions)
     resolved: list[exp.Expr] = []
@@ -468,28 +956,26 @@ def _total_order_requirement(
             ),
         }
 
-    sources, reason = _select_sources(select, cte_names)
-    if reason is not None:
-        return {"provable": False, "unprovable_reason": reason}
-    columns_by_alias: dict[str, list[str]] = {source["alias"]: [] for source in sources}
+    try:
+        identity = _row_identity(select, cte_names)
+    except _NoRowKey as exc:
+        return {"provable": False, "unprovable_reason": str(exc)}
+    sources = [*identity.tables, *identity.unique_relations]
+    for source in sources:
+        source["order_columns"] = []
+    by_alias = {source["alias"]: source for source in sources}
     for column in key_columns:
-        source = _source_of(column, sources)
-        if source is None:
-            return {
-                "provable": False,
-                "unprovable_reason": (
-                    f"ordering column {column.name} is not qualified with its table alias"
-                ),
-            }
-        if column.name not in columns_by_alias[source["alias"]]:
-            columns_by_alias[source["alias"]].append(column.name)
-    return {
-        "provable": True,
-        "tables": [
-            {**source, "order_columns": columns_by_alias[source["alias"]]}
-            for source in sources
-        ],
-    }
+        target = identity.resolve(column)
+        if target is None:
+            return {"provable": False, "unprovable_reason": identity.why_unresolved(column)}
+        if target[1] not in by_alias[target[0]]["order_columns"]:
+            by_alias[target[0]]["order_columns"].append(target[1])
+    requirement: dict[str, Any] = {"provable": True, "tables": identity.tables}
+    if identity.unique_relations:
+        requirement["unique_relations"] = identity.unique_relations
+    if identity.equalities:
+        requirement["equalities"] = identity.equalities
+    return requirement
 
 
 def _hint_items(code: str, opening: int) -> list[str]:
@@ -519,41 +1005,11 @@ def statement_hint_profile(sql: str) -> dict[str, Any]:
     A candidate with a plan-forcing hint is ``hinted``: its gain belongs to the
     hint, so it is a plan-enforcement proposal and not a plain rewrite winner.
     RECOMPILE and OPTIMIZE FOR are compile options and do not mark it hinted.
+    The read-only validator's scanner is the single source, so the proof gate
+    and the admission gate cannot disagree about a hint.
     """
 
-    code = _mask_parameter_non_code(sql).upper()
-    plan_forcing: set[str] = set()
-    isolation: set[str] = set()
-    compile_options: set[str] = set()
-    for match in re.finditer(r"\bOPTION\s*\(", code):
-        for item in _hint_items(code, match.end() - 1):
-            name = " ".join(re.match(r"[A-Z_ ]*", item).group(0).split())  # type: ignore[union-attr]
-            compile_option = next(
-                (option for option in _COMPILE_OPTIONS if name.startswith(option)),
-                None,
-            )
-            if compile_option is not None:
-                compile_options.add(compile_option)
-            elif name:
-                plan_forcing.add(name)
-    for match in re.finditer(r"\bWITH\s*\(", code):
-        for item in _hint_items(code, match.end() - 1):
-            word = re.match(r"[A-Z_]*", item).group(0)  # type: ignore[union-attr]
-            if word in _ISOLATION_TABLE_HINTS:
-                isolation.add(word)
-            elif word in _PLAN_FORCING_TABLE_HINTS:
-                plan_forcing.add(word)
-    # The deprecated form: FROM dbo.T (NOLOCK), without WITH.
-    for match in re.finditer(r"\(\s*(NOLOCK|READUNCOMMITTED|READPAST)\s*\)", code):
-        isolation.add(match.group(1))
-    for match in re.finditer(r"\b(LOOP|HASH|MERGE|REMOTE)\s+JOIN\b", code):
-        plan_forcing.add(f"{match.group(1)} JOIN")
-    return {
-        "hinted": bool(plan_forcing),
-        "plan_forcing_hints": sorted(plan_forcing),
-        "isolation_table_hints": sorted(isolation),
-        "compile_options": sorted(compile_options),
-    }
+    return extract_hint_inventory(sql).as_profile()
 
 
 def _statement_sources(statement: exp.Expr, select: exp.Select | None) -> list[dict[str, str]]:
@@ -663,6 +1119,23 @@ def rewrite_requirements(baseline_sql: str, candidate_sql: str) -> list[dict[str
     The list is a floor, not a ceiling: an empty list does not prove a rewrite safe.
     """
 
+    candidate_selects = _batch_selects(candidate_sql)
+    baseline_selects = _batch_selects(baseline_sql)
+    if candidate_selects is not None or baseline_selects is not None:
+        # Each branch replaces the whole baseline statement for some parameter values.
+        if baseline_selects is None:
+            pairs = [(baseline_sql, select) for select in candidate_selects or ()]
+        elif candidate_selects is None:
+            pairs = [(select, candidate_sql) for select in baseline_selects]
+        elif len(baseline_selects) == len(candidate_selects):
+            pairs = list(zip(baseline_selects, candidate_selects))
+        else:
+            pairs = []
+        by_code: dict[str, dict[str, Any]] = {}
+        for baseline_select, candidate_select in pairs:
+            for requirement in rewrite_requirements(baseline_select, candidate_select):
+                by_code.setdefault(requirement["code"], requirement)
+        return list(by_code.values())
     baseline = _shape(_parse_statements(baseline_sql))
     candidate = _shape(_parse_statements(candidate_sql))
 
@@ -732,6 +1205,8 @@ def has_outer_literal_top_zero(sql: str) -> bool:
     occur only inside a nested query are not accepted.
     """
 
+    if _batch_selects(sql) is not None:
+        return False
     statements = _parse_statements(sql)
     if not statements:
         return False
@@ -757,9 +1232,13 @@ def outer_order_by_keys(sql: str) -> tuple[OrderKeys | None, ...]:
 
     Each entry is ``None`` when that statement has no outer ORDER BY. An
     ORDER BY inside a derived table, CTE, TOP, or window does not count:
-    only the outermost one promises an order to the caller.
+    only the outermost one promises an order to the caller. A read-only
+    branching batch has one entry per branch.
     """
 
+    selects = _batch_selects(sql)
+    if selects is not None:
+        return tuple(keys for select in selects for keys in outer_order_by_keys(select))
     statements = _parse_statements(sql)
     orders: list[OrderKeys | None] = []
     for statement in statements:
@@ -776,8 +1255,9 @@ def outer_order_by_keys(sql: str) -> tuple[OrderKeys | None, ...]:
             orders.append(None)
             continue
         scope = last_member if isinstance(last_member, exp.Select) and last_member is statement else None
+        ctes = _statement_ctes(statement)
         orders.append(
-            tuple(_order_key(ordered, scope) for ordered in order.expressions)
+            tuple(_order_key(ordered, scope, ctes) for ordered in order.expressions)
         )
     return tuple(orders)
 
@@ -813,8 +1293,46 @@ def order_contract_risk(
     """
 
     candidate_orders = outer_order_by_keys(candidate_sql)
+    baseline_orders = outer_order_by_keys(baseline_sql)
+    if _batch_selects(candidate_sql) is not None or _batch_selects(baseline_sql) is not None:
+        # Any branch can be the one that runs, so every candidate branch must
+        # keep the order every baseline branch promises.
+        required = list(dict.fromkeys(keys for keys in baseline_orders if keys is not None))
+        if not required:
+            return None
+        reason = None
+        branch = None
+        if len(required) > 1:
+            reason = (
+                "baseline branches have different outer ORDER BY keys, so the order "
+                "contract of the batch cannot be compared"
+            )
+        for ordinal, candidate_keys in enumerate(candidate_orders, start=1):
+            if reason is not None:
+                break
+            if candidate_keys is None:
+                reason = f"candidate branch {ordinal} removes the baseline outer ORDER BY"
+            elif candidate_keys[: len(required[0])] != required[0]:
+                reason = (
+                    f"candidate branch {ordinal} outer ORDER BY does not start with the "
+                    "baseline keys"
+                )
+            branch = ordinal if reason is not None else None
+        if reason is None:
+            return None
+        return {
+            "risk": "order_contract_changed",
+            "source": "baseline_vs_candidate",
+            "result_set_ordinal": 1,
+            **({"branch": branch} if branch is not None else {}),
+            "reason": reason,
+            "proof_requirement": (
+                "keep the baseline outer ORDER BY keys and directions as a "
+                "prefix of the outer ORDER BY of every candidate branch"
+            ),
+        }
     for ordinal, baseline_keys in enumerate(
-        outer_order_by_keys(baseline_sql),
+        baseline_orders,
         start=1,
     ):
         if baseline_keys is None:
@@ -865,13 +1383,20 @@ def _order_sources(select: exp.Select) -> dict[str, str] | None:
     return sources
 
 
-def _resolve_order_expression(expression: exp.Expr, select: exp.Select) -> exp.Expr:
+def _resolve_order_expression(
+    expression: exp.Expr,
+    select: exp.Select,
+    ctes: Mapping[str, exp.CTE | None],
+) -> exp.Expr:
     """Rewrite an ORDER BY key to the column it binds to, when that is certain.
 
     T-SQL binds an ORDER BY ordinal to the select list, an unqualified name to a
-    select-list alias first, and a qualifier to its FROM source. Anything that
-    cannot be resolved for certain is returned unchanged, so the comparison
-    stays at least as strict as plain text.
+    select-list name first, and a qualifier to its FROM source. A column of a
+    derived table or CTE that is a direct copy of a base-table column resolves
+    to that base column, so a rewrite that only moves the rows through such a
+    relation keeps the same key. Anything that cannot be resolved for certain
+    is returned unchanged, so the comparison stays at least as strict as plain
+    text.
     """
 
     projections = list(select.expressions)
@@ -884,18 +1409,32 @@ def _resolve_order_expression(expression: exp.Expr, select: exp.Select) -> exp.E
         else:
             return expression
     elif isinstance(expression, exp.Column) and not expression.table:
-        for item in projections:
-            if isinstance(item, exp.Alias) and item.alias.casefold() == expression.name.casefold():
-                expression = item.this.copy()
-                break
+        named = [
+            item
+            for item in projections
+            if isinstance(item, (exp.Alias, exp.Column))
+            and item.alias_or_name.casefold() == expression.name.casefold()
+        ]
+        if len(named) == 1:
+            expression = named[0].unalias().copy()
     sources = _order_sources(select)
     if not sources:
         return expression
     targets = set(sources.values())
+    try:
+        identity: _RowIdentity | None = _row_identity(select, ctes)
+    except _NoRowKey:
+        identity = None
 
     def qualify(node: exp.Expr) -> exp.Expr:
         if not isinstance(node, exp.Column) or isinstance(node.this, exp.Star):
             return node
+        base = identity.base_column(identity.resolve(node)) if identity is not None else None
+        if base is not None:
+            return exp.Column(
+                this=exp.to_identifier(base["column"]),
+                table=exp.to_identifier(f"{base['schema']}.{base['table']}".casefold()),
+            )
         qualifier = ".".join(
             part.casefold() for part in (node.catalog, node.db, node.table) if part
         )
@@ -911,10 +1450,14 @@ def _resolve_order_expression(expression: exp.Expr, select: exp.Select) -> exp.E
     return expression.transform(qualify)
 
 
-def _order_key(ordered: exp.Expr, select: exp.Select | None = None) -> tuple[str, bool]:
+def _order_key(
+    ordered: exp.Expr,
+    select: exp.Select | None = None,
+    ctes: Mapping[str, exp.CTE | None] | None = None,
+) -> tuple[str, bool]:
     expression = ordered.this.copy() if isinstance(ordered, exp.Ordered) else ordered.copy()
     if select is not None:
-        expression = _resolve_order_expression(expression, select)
+        expression = _resolve_order_expression(expression, select, ctes or {})
     # Identifier case and quoting do not change T-SQL name resolution.
     for identifier in expression.find_all(exp.Identifier):
         identifier.set("this", identifier.name.casefold())

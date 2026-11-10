@@ -277,6 +277,8 @@ def _statement_digest(
         entry["thread_skew"] = _thread_skew(nodes, top_n, cited, in_flight)
     else:
         entry["estimate_fingerprints"] = _fingerprints(nodes, top_n)
+    if runtime:
+        entry["io"] = _io(nodes)
     entry["eager_index_spools"] = spools
     entry["waits"] = _waits(query_plan, bool(spools), parallelism, entry.get("time"))
     requests, note = _missing_indexes(query_plan, spools)
@@ -287,6 +289,30 @@ def _statement_digest(
     entry["tree"] = tree
     entry["tree_truncated"] = truncated
     return _compact(entry)
+
+
+def _io(nodes: list[PlanNode]) -> dict[str, Any]:
+    """Logical reads of the statement from its operators' runtime counters, by object."""
+
+    by_object: dict[str, float] = {}
+    counted = False
+    for node in nodes:
+        reads = [counter.logical_reads for counter in node.threads if counter.logical_reads is not None]
+        if not reads:
+            continue
+        counted = True
+        label = (_first(_objects(node)) or f"node {node.node_id} ({node.label})").split(" AS ")[0]
+        by_object[label] = by_object.get(label, 0.0) + sum(reads)
+    if not counted:
+        return {"note": "The plan has no I/O counters on its operators."}
+    ranked = sorted(by_object.items(), key=lambda item: -item[1])
+    return {
+        "logical_reads": int(sum(by_object.values())),
+        "by_object": [
+            {"object": name, "logical_reads": int(value)} for name, value in ranked[:5] if value > 0
+        ],
+        "source": "operator runtime counters (ActualLogicalReads); LOB reads are not included",
+    }
 
 
 def _parallelism(query_plan: ET.Element, nodes: list[PlanNode], runtime: bool) -> dict[str, Any]:
@@ -932,8 +958,14 @@ def _tree(nodes: list[PlanNode], runtime: bool, budget: int) -> tuple[list[str],
             executions = node.logical_executions or 1.0
             detail = (
                 f"est {_rows(node.estimate_rows)}/exec, actual {_rows(node.actual_rows / max(1.0, executions))}/exec"
-                f" x{_rows(node.actual_executions)}"
             )
+            # Each worker thread counts one execution of a parallel operator:
+            # those are threads, not repeated executions.
+            if executions > 1:
+                detail += f" x{_rows(executions)} executions"
+            workers = len([counter for counter in node.threads if counter.thread > 0])
+            if workers > 1:
+                detail += f", {workers} threads"
             if node.self_elapsed_ms:
                 detail += f", self {node.self_elapsed_ms:,.0f} ms"
         else:

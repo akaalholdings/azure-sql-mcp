@@ -15,6 +15,7 @@ from .artifacts import ExplainPlanArtifact
 from .connection import AzureSqlExecutor
 from .connection import QueryResult
 from .param_binding import ParameterExecutionContract
+from .param_binding import detect_parameters
 from .plan_diagnostics import parse_statistics_io_messages
 from .plan_diagnostics import summarize_statistics_io_samples
 from .plan_tree import child_relops
@@ -22,6 +23,7 @@ from .plan_tree import describe_result_shape
 from .plan_tree import is_true
 from .plan_tree import showplan_from_results
 from .plan_tree import statements
+from .safe_sql import BatchBranch
 from .safe_sql import SafeSqlValidator
 
 SHOWPLAN_NAMESPACE = {"sp": "http://schemas.microsoft.com/sqlserver/2004/07/showplan"}
@@ -80,6 +82,34 @@ def require_compiled_plan(raw_xml: str) -> str:
         f"{', '.join(sorted(set(statement_types))) or 'none'}. "
         "It has no operators, so it is not returned as a plan."
     )
+
+
+_BATCH_ESTIMATE_REFUSAL = (
+    "A branching batch has one estimated plan per branch: call explain_batch_branches, "
+    "or use analyze=true to run the batch once and read the plan of the branch that ran."
+)
+
+
+def executed_batch_branch(
+    branches: Sequence[BatchBranch],
+    raw_xml: str,
+) -> dict[str, Any] | None:
+    """The branch of a batch whose SELECT the actual plan belongs to, or None.
+
+    Matched on statement text, ignoring white space. Two branches with the
+    same SELECT text cannot be told apart, so they return None.
+    """
+
+    def squeezed(text: str | None) -> str:
+        return " ".join((text or "").split()).rstrip("; ").casefold()
+
+    ran = {
+        squeezed(statement.attrib.get("StatementText"))
+        for statement, query_plan in statements(ET.fromstring(raw_xml))
+        if query_plan is not None
+    }
+    matches = [branch for branch in branches if squeezed(branch.select_sql) in ran]
+    return matches[0].as_dict() if len(matches) == 1 else None
 
 
 def compact_plan_summary(
@@ -480,12 +510,14 @@ class PlansService:
         analyze: bool,
         hypothetical_indexes: list[dict[str, Any]] | None = None,
     ) -> ExplainPlanArtifact:
-        validated_query = self.validator.validate_read_only(sql)
+        validated_query = self.validator.validate_read_only_candidate(sql)
         if hypothetical_indexes:
             raise ValueError(
                 "Hypothetical index analysis is disabled on explain_query for safety. "
                 "Use analyze_query_indexes/analyze_workload_indexes for read-only index insights."
             )
+        if validated_query.branches and not analyze:
+            raise ValueError(_BATCH_ESTIMATE_REFUSAL)
 
         raw_xml = await self._get_plan_xml(
             database_name=database_name,
@@ -493,6 +525,7 @@ class PlansService:
             analyze=analyze,
         )
         summary = self.summarize_showplan_xml(raw_xml)
+        self._note_batch(summary, raw_xml, validated_query.branches)
         return ExplainPlanArtifact(
             database_name=database_name,
             analyze=analyze,
@@ -511,12 +544,13 @@ class PlansService:
     ) -> ProfiledPlanResult:
         """Capture rows and actual plan while executing the user SQL once."""
 
-        validated_query = self.validator.validate_read_only(sql)
+        validated_query = self.validator.validate_read_only_candidate(sql)
         return await self._profile_execution(
             database_name,
             execution_sql=validated_query.execution_sql,
             execution_params=(),
             max_result_rows=max_result_rows,
+            branches=validated_query.branches,
         )
 
     async def profile_parameterized_query(
@@ -528,13 +562,14 @@ class PlansService:
     ) -> ProfiledPlanResult:
         """Profile one typed ``sp_executesql`` execution without local variables."""
 
-        self.validator.validate_read_only(contract.sql_text)
+        validated_query = self.validator.validate_read_only_candidate(contract.sql_text)
         return await self._profile_execution(
             database_name,
             execution_sql=contract.sp_executesql_sql,
             execution_params=contract.sp_executesql_values,
             execution_input_sizes=contract.sp_executesql_input_sizes,
             max_result_rows=max_result_rows,
+            branches=validated_query.branches,
         )
 
     async def explain_parameterized_query(
@@ -546,13 +581,15 @@ class PlansService:
     ) -> ExplainPlanArtifact:
         """Explain one typed parameter execution without local-variable semantics."""
 
-        self.validator.validate_read_only(contract.sql_text)
+        validated_query = self.validator.validate_read_only_candidate(contract.sql_text)
         if analyze:
             profiled = await self.profile_parameterized_query(
                 database_name,
                 contract,
             )
             return profiled.plan
+        if validated_query.branches:
+            raise ValueError(_BATCH_ESTIMATE_REFUSAL)
         raw_xml = require_compiled_plan(
             await self._get_plan_xml(
                 database_name=database_name,
@@ -571,6 +608,85 @@ class PlansService:
             query_executed=False,
         )
 
+    async def explain_batch_branches(
+        self,
+        database_name: str,
+        sql: str,
+        *,
+        contract: ParameterExecutionContract | None = None,
+    ) -> list[dict[str, Any]]:
+        """Estimated plan of every branch of a read-only branching batch.
+
+        Nothing is executed. Each branch SELECT is compiled alone, with the
+        DECLARE and SET prefix of the batch. With a typed ``contract`` a plain
+        branch is compiled for the parameter values it uses (the same basis as
+        a single SELECT). A branch behind local variables, or one that runs
+        through sp_executesql, is compiled with typed variables and no values:
+        its estimates come from average density, not from the values.
+        """
+
+        validated_query = self.validator.validate_read_only_candidate(sql)
+        if not validated_query.branches:
+            raise ValueError("explain_batch_branches needs a read-only branching batch.")
+        typed = contract.parameters if contract is not None else ()
+        plans: list[dict[str, Any]] = []
+        for branch in validated_query.branches:
+            text = branch.standalone_sql
+            basis: dict[str, Any] = {"basis": "typed_variables_without_values"}
+            used = {name.casefold() for name in detect_parameters(text)}
+            subset = tuple(
+                parameter
+                for parameter in typed
+                if parameter.name.lstrip("@").casefold() in used
+            )
+            if contract is not None and subset:
+                if branch.kind == "select" and not validated_query.local_variables:
+                    branch_contract = ParameterExecutionContract(
+                        sql_text=branch.select_sql,
+                        bucket_id=contract.bucket_id,
+                        parameters=subset,
+                        provenance=contract.provenance,
+                    )
+                    text = branch_contract.estimated_showplan_sql
+                    basis = branch_contract.estimated_showplan_basis
+                else:
+                    declarations = ", ".join(
+                        f"{parameter.name} {parameter.sql_type.sql_declaration}"
+                        for parameter in subset
+                    )
+                    text = f"DECLARE {declarations};\n{text}"
+            raw_xml = require_compiled_plan(
+                await self._get_plan_xml(database_name=database_name, sql=text, analyze=False)
+            )
+            summary = self.summarize_showplan_xml(raw_xml)
+            summary["estimated_plan_basis"] = basis
+            plans.append(
+                {
+                    "branch": branch.as_dict(),
+                    "plan": ExplainPlanArtifact(
+                        database_name=database_name,
+                        analyze=False,
+                        summary=summary,
+                        raw_xml=raw_xml,
+                        plan_kind="estimated",
+                        query_executed=False,
+                    ),
+                }
+            )
+        return plans
+
+    @staticmethod
+    def _note_batch(
+        summary: dict[str, Any],
+        raw_xml: str,
+        branches: Sequence[BatchBranch],
+    ) -> None:
+        if branches:
+            summary["batch"] = {
+                "branch_count": len(branches),
+                "executed_branch": executed_batch_branch(branches, raw_xml),
+            }
+
     async def _profile_execution(
         self,
         database_name: str,
@@ -579,6 +695,7 @@ class PlansService:
         execution_params: tuple[Any, ...],
         execution_input_sizes: Sequence[Any] | None = None,
         max_result_rows: int | None,
+        branches: Sequence[BatchBranch] = (),
     ) -> ProfiledPlanResult:
         row_limit = (
             self.executor.config.row_limit
@@ -598,6 +715,7 @@ class PlansService:
         )
         raw_xml = self._extract_plan_xml(execution.result_sets)
         summary = self.summarize_showplan_xml(raw_xml)
+        self._note_batch(summary, raw_xml, branches)
         statistics_io_messages = getattr(execution, "statistics_io_messages", None)
         if statistics_io_messages is None:
             statistics_io_messages = getattr(execution, "messages", None)
@@ -1130,6 +1248,14 @@ class PlansService:
                 }
             )
 
+        statement_reads = [
+            reads
+            for ordinal, statement in enumerate(
+                root.findall(".//sp:StmtSimple", SHOWPLAN_NAMESPACE),
+                start=1,
+            )
+            if (reads := self._statement_reads(ordinal, statement)) is not None
+        ]
         user_select_ordinals = {
             ordinal
             for ordinal, statement in enumerate(
@@ -1139,6 +1265,14 @@ class PlansService:
             if statement.attrib.get("StatementType", "").casefold() == "select"
         }
         single_user_select = len(user_select_ordinals) == 1
+        single_reads = next(
+            (
+                reads
+                for reads in statement_reads
+                if single_user_select and reads["statement_ordinal"] in user_select_ordinals
+            ),
+            None,
+        )
         single_statement = next(
             (
                 metric
@@ -1179,10 +1313,82 @@ class PlansService:
             "actual_executions": single_root.get("actual_executions")
             if single_root
             else None,
-            "actual_logical_reads": None,
-            "actual_physical_reads": None,
+            # Summed from the operators' own counters. Reads inside a scalar
+            # UDF belong to no operator of this plan and are not counted.
+            "actual_logical_reads": single_reads["logical_reads"] if single_reads else None,
+            "actual_lob_logical_reads": (
+                single_reads["lob_logical_reads"] if single_reads else None
+            ),
+            "actual_physical_reads": single_reads["physical_reads"] if single_reads else None,
+            "statement_reads": statement_reads,
             "query_metric_source": query_metric_source,
-            "read_metric_source": "not_available_as_reliable_query_total",
+            "read_metric_source": (
+                "showplan_operator_runtime_counters"
+                if single_reads
+                else "not_available_as_reliable_query_total"
+            ),
+            **(
+                {}
+                if statement_reads or not all_counters
+                else {
+                    "read_metric_note": (
+                        "This actual plan has no I/O counters (ActualLogicalReads) on its "
+                        "operators. Read logical reads from the benchmark tools or Query Store."
+                    )
+                }
+            ),
+        }
+
+    def _statement_reads(self, ordinal: int, statement: ET.Element) -> dict[str, Any] | None:
+        """Logical reads of one statement, summed over its operators and threads, by object."""
+
+        totals = {"logical_reads": 0, "lob_logical_reads": 0, "physical_reads": 0}
+        by_object: dict[str, dict[str, int]] = {}
+        counted = False
+        for operator in statement.findall(".//sp:RelOp", SHOWPLAN_NAMESPACE):
+            counters = [
+                counter
+                for counter in operator.findall(
+                    "sp:RunTimeInformation/sp:RunTimeCountersPerThread",
+                    SHOWPLAN_NAMESPACE,
+                )
+                if counter.attrib.get("ActualLogicalReads") is not None
+            ]
+            if not counters:
+                continue
+            counted = True
+            logical = sum(self._to_int(counter.attrib.get("ActualLogicalReads")) for counter in counters)
+            lob = sum(self._to_int(counter.attrib.get("ActualLobLogicalReads")) for counter in counters)
+            totals["logical_reads"] += logical
+            totals["lob_logical_reads"] += lob
+            totals["physical_reads"] += sum(
+                self._to_int(counter.attrib.get("ActualPhysicalReads")) for counter in counters
+            )
+            target = operator.find("*/sp:Object", SHOWPLAN_NAMESPACE)
+            name = (
+                ".".join(
+                    str(target.attrib.get(part, "")).strip("[]")
+                    for part in ("Schema", "Table", "Index")
+                    if target.attrib.get(part)
+                )
+                if target is not None
+                else f"node {operator.attrib.get('NodeId')}"
+            )
+            entry = by_object.setdefault(name, {"logical_reads": 0, "lob_logical_reads": 0})
+            entry["logical_reads"] += logical
+            entry["lob_logical_reads"] += lob
+        if not counted:
+            return None
+        return {
+            "statement_ordinal": ordinal,
+            **totals,
+            "objects": [
+                {"object": name, **values}
+                for name, values in sorted(
+                    by_object.items(), key=lambda item: -item[1]["logical_reads"]
+                )
+                if values["logical_reads"] or values["lob_logical_reads"]
+            ],
         }
 
     def _extract_compile_metrics(self, root: ET.Element) -> dict[str, Any]:

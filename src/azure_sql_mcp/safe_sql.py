@@ -648,6 +648,472 @@ def _admitted_option_body(sql: str) -> str | None:
 
 
 @dataclass(frozen=True)
+class BatchBranch:
+    """One SELECT of a read-only branching batch, and the conditions that select it."""
+
+    ordinal: int
+    path: str  # for example "if.else.if.then"
+    conditions: tuple[tuple[str, bool], ...]  # (IF condition text, value it must have)
+    kind: str  # "select" or "sp_executesql"
+    select_sql: str  # the SELECT this branch runs; for sp_executesql, the string's value
+    standalone_sql: str  # DECLARE/SET prefix plus the SELECT: passes validate_read_only
+    dynamic_parameters: tuple[tuple[str, str], ...] = ()  # (name, declared type)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "ordinal": self.ordinal,
+            "path": self.path,
+            "conditions": [
+                {"condition": text, "is_true": expected} for text, expected in self.conditions
+            ],
+            "kind": self.kind,
+        }
+
+
+MAX_BATCH_DEPTH = 8
+MAX_BATCH_BRANCHES = 16
+_BATCH_STATEMENT_WORDS = frozenset({"IF", "SELECT", "WITH", "EXEC", "EXECUTE", "BEGIN"})
+_BATCH_PREFIX_WORDS = frozenset({"DECLARE", "SET"})
+_BATCH_CONDITION_WORDS = frozenset({"AND", "OR", "NOT", "IS", "NULL", "IN", "BETWEEN", "LIKE"})
+_BATCH_CONDITION_PUNCT = frozenset("()=<>!+-*/%,.")
+_BATCH_VALUE_PUNCT = frozenset("()+-*/%.")
+_BATCH_SCALAR_TYPES = frozenset(
+    {
+        "BIGINT", "BINARY", "BIT", "CHAR", "DATE", "DATETIME", "DATETIME2",
+        "DATETIMEOFFSET", "DECIMAL", "FLOAT", "INT", "MONEY", "NCHAR", "NUMERIC",
+        "NVARCHAR", "REAL", "SMALLDATETIME", "SMALLINT", "SMALLMONEY", "SYSNAME",
+        "TIME", "TINYINT", "UNIQUEIDENTIFIER", "VARBINARY", "VARCHAR",
+    }
+)
+_BATCH_NUMBER = re.compile(r"\d+(?:E\d+)?|0X[0-9A-F]*")
+# The lexer ends a line comment at these; SQL Server only at CR or LF. In a
+# batch that difference could move a string literal into or out of a comment.
+_FOREIGN_LINE_SEPARATORS = frozenset(_LINE_COMMENT_ENDS) - {"\r", "\n"}
+
+
+class _BatchGrammarError(ValueError):
+    """The text is not the closed read-only branching batch form."""
+
+
+class _BranchingBatchParser:
+    """Recursive-descent parser for the one multi-statement form the gate admits.
+
+    batch      := { declare | set } statement <end>
+    declare    := DECLARE @v [AS] type [= value] { , @v [AS] type [= value] } [;]
+    set        := SET @v = value [;]
+    statement  := IF condition statement [ ELSE statement ]
+                | BEGIN statement END [;]
+                | select [;]
+                | EXEC[UTE] [sys.]sp_executesql 'select' [ , 'declarations' { , argument } ] [;]
+    condition  := @variables, literals, comparison and arithmetic operators,
+                  AND OR NOT IS NULL IN BETWEEN LIKE, parentheses
+    value      := @variables, literals, arithmetic operators, parentheses
+    argument   := [ @name = ] ( @variable | literal )
+    select     := text that validate_read_only admits as exactly one SELECT
+
+    The top statement is IF, BEGIN or EXEC: one SELECT alone is the ordinary
+    form. No function call, subquery or object name can occur outside a select.
+    """
+
+    def __init__(self, sql: str, validator: SafeSqlValidator) -> None:
+        self.sql = sql
+        self.validator = validator
+        self.tokens = _tokenize(_lex(sql))
+        self.position = 0
+        self.branches: list[BatchBranch] = []
+        self.locals: list[str] = []
+        self.prefix_end = 0
+
+    def parse(self) -> None:
+        if not self.tokens:
+            raise _BatchGrammarError("the batch is empty")
+        self.prefix_end = self.tokens[0].start
+        while self._word() in _BATCH_PREFIX_WORDS:
+            if self._word() == "DECLARE":
+                self._declare()
+            else:
+                self._set()
+            self.prefix_end = (
+                self.tokens[self.position].start if self._peek() else len(self.sql)
+            )
+        if self._word() not in {"IF", "BEGIN", "EXEC", "EXECUTE"}:
+            raise _BatchGrammarError(
+                "after DECLARE and SET @variable, a branching batch starts with IF, BEGIN "
+                "or EXEC sys.sp_executesql"
+            )
+        self._statement((), "", 0, "the batch")
+        if self._peek() is not None:
+            raise _BatchGrammarError(
+                "text after the batch is not allowed: the batch is one IF / ELSE statement"
+            )
+
+    # -- token helpers
+    def _peek(self) -> _Token | None:
+        return self.tokens[self.position] if self.position < len(self.tokens) else None
+
+    def _word(self) -> str | None:
+        token = self._peek()
+        if token is None or token.kind != "word":
+            return None
+        # A keyword written with non-ASCII look-alike letters is not a keyword here.
+        return token.text if self.sql[token.start : token.end].isascii() else None
+
+    def _punct(self, text: str) -> bool:
+        token = self._peek()
+        return token is not None and _is_punct(token, text)
+
+    def _take(self) -> _Token:
+        token = self.tokens[self.position]
+        self.position += 1
+        return token
+
+    def _skip_semicolon(self) -> None:
+        if self._punct(";"):
+            self.position += 1
+
+    def _variable(self, what: str) -> str:
+        word = self._word()
+        if word is None or _OPTIMIZE_FOR_VARIABLE.fullmatch(word) is None:
+            raise _BatchGrammarError(f"{what} needs a @variable name")
+        token = self._take()
+        return self.sql[token.start : token.end]
+
+    def _expression(self, what: str, words: frozenset[str], punct: frozenset[str], stops: str) -> str:
+        """Consume a condition or value; refuse any token outside its closed set."""
+
+        start = self.position
+        depth = 0
+        while (token := self._peek()) is not None:
+            if depth == 0 and (
+                (token.kind == "punct" and token.text in stops)
+                or self._word() in _BATCH_STATEMENT_WORDS | _BATCH_PREFIX_WORDS | {"ELSE", "END"}
+            ):
+                break
+            word = self._word()
+            allowed = (
+                token.kind == "string"
+                or (token.kind == "punct" and token.text in punct)
+                or (
+                    word is not None
+                    and (
+                        word in words
+                        or _OPTIMIZE_FOR_VARIABLE.fullmatch(word) is not None
+                        or _BATCH_NUMBER.fullmatch(word) is not None
+                    )
+                )
+            )
+            if not allowed:
+                raise _BatchGrammarError(
+                    f"{what} may hold only @variables, literals and operators; "
+                    "no function, subquery or object name"
+                )
+            depth += _is_punct(token, "(") - _is_punct(token, ")")
+            if depth < 0:
+                raise _BatchGrammarError(f"{what} has an unbalanced parenthesis")
+            self.position += 1
+        if self.position == start or depth:
+            raise _BatchGrammarError(f"{what} is empty or has an unbalanced parenthesis")
+        return self.sql[self.tokens[start].start : self.tokens[self.position - 1].end]
+
+    def _type(self, what: str) -> str:
+        word = self._word()
+        if word not in _BATCH_SCALAR_TYPES:
+            raise _BatchGrammarError(f"{what} needs a scalar type; table and cursor variables are refused")
+        start = self._take()
+        end = start
+        if self._punct("("):
+            self.position += 1
+            shape: list[str] = []
+            while (token := self._peek()) is not None and not _is_punct(token, ")"):
+                shape.append("#" if _UNSIGNED_INTEGER.fullmatch(token.text) else token.text)
+                self.position += 1
+            if self._peek() is None or shape not in (["#"], ["MAX"], ["#", ",", "#"]):
+                raise _BatchGrammarError(f"{what} has a type length that is not a number or MAX")
+            end = self._take()
+        return self.sql[start.start : end.end]
+
+    # -- prefix
+    def _declare(self) -> None:
+        self.position += 1
+        while True:
+            name = self._variable("DECLARE")
+            if self._word() == "AS":
+                self.position += 1
+            self._type("DECLARE")
+            if self._punct("="):
+                self.position += 1
+                self._expression("a DECLARE value", frozenset({"NULL"}), _BATCH_VALUE_PUNCT, ",;")
+            self.locals.append(name)
+            if not self._punct(","):
+                break
+            self.position += 1
+        self._skip_semicolon()
+
+    def _set(self) -> None:
+        self.position += 1
+        self._variable("SET")
+        if not self._punct("="):
+            raise _BatchGrammarError("only SET @variable = value is allowed, not a SET option")
+        self.position += 1
+        self._expression("a SET value", frozenset({"NULL"}), _BATCH_VALUE_PUNCT, ";")
+        self._skip_semicolon()
+
+    # -- statements
+    def _statement(
+        self,
+        conditions: tuple[tuple[str, bool], ...],
+        path: str,
+        depth: int,
+        where: str,
+    ) -> None:
+        if depth > MAX_BATCH_DEPTH:
+            raise _BatchGrammarError(f"IF is nested more than {MAX_BATCH_DEPTH} levels deep")
+        word = self._word()
+        if word == "IF":
+            self.position += 1
+            condition = self._expression(
+                "an IF condition", _BATCH_CONDITION_WORDS, _BATCH_CONDITION_PUNCT, ";"
+            )
+            prefix = f"{path}." if path else ""
+            self._statement((*conditions, (condition, True)), f"{prefix}if.then", depth + 1, "an IF branch")
+            if self._word() == "ELSE":
+                self.position += 1
+                self._statement(
+                    (*conditions, (condition, False)), f"{prefix}if.else", depth + 1, "an ELSE branch"
+                )
+        elif word == "BEGIN":
+            self.position += 1
+            if self._word() not in _BATCH_STATEMENT_WORDS:
+                raise _BatchGrammarError(
+                    "BEGIN must open a block of one SELECT, IF or EXEC sys.sp_executesql"
+                )
+            self._statement(conditions, path, depth + 1, where)
+            if self._word() != "END":
+                raise _BatchGrammarError("a BEGIN ... END block may hold only one statement")
+            self.position += 1
+            self._skip_semicolon()
+        elif word in {"SELECT", "WITH"}:
+            self._select(conditions, path)
+        elif word in {"EXEC", "EXECUTE"}:
+            self._execute(conditions, path)
+        else:
+            raise _BatchGrammarError(
+                f"{where} must be one SELECT, a nested IF, or EXEC sys.sp_executesql of a "
+                "string literal"
+            )
+
+    def _add_branch(
+        self,
+        conditions: tuple[tuple[str, bool], ...],
+        path: str,
+        kind: str,
+        select_sql: str,
+        standalone_sql: str,
+        dynamic_parameters: tuple[tuple[str, str], ...] = (),
+    ) -> None:
+        if len(self.branches) >= MAX_BATCH_BRANCHES:
+            raise _BatchGrammarError(f"a batch may hold at most {MAX_BATCH_BRANCHES} branches")
+        self.branches.append(
+            BatchBranch(
+                ordinal=len(self.branches) + 1,
+                path=path or "batch",
+                conditions=conditions,
+                kind=kind,
+                select_sql=select_sql,
+                standalone_sql=standalone_sql,
+                dynamic_parameters=dynamic_parameters,
+            )
+        )
+
+    def _select(self, conditions: tuple[tuple[str, bool], ...], path: str) -> None:
+        start = self.position
+        depth = case_depth = 0
+        while (token := self._peek()) is not None:
+            if token.kind == "punct":
+                if token.text == ";" and depth == 0:
+                    break
+                depth += (token.text == "(") - (token.text == ")")
+            elif token.kind == "word" and token.text == "CASE":
+                case_depth += 1
+            elif token.kind == "word" and token.text == "END" and case_depth:
+                case_depth -= 1
+            elif token.kind == "word" and token.text in {"ELSE", "END"} and not case_depth:
+                break
+            self.position += 1
+        select_sql = self.sql[self.tokens[start].start : self.tokens[self.position - 1].end]
+        self._skip_semicolon()
+        # The ordinary single-SELECT gate decides whether the branch is read-only.
+        self.validator.validate_read_only(select_sql)
+        self._add_branch(
+            conditions,
+            path,
+            "select",
+            select_sql,
+            self.sql[self.tokens[0].start : self.prefix_end] + select_sql,
+        )
+
+    def _string(self, what: str) -> str:
+        token = self._peek()
+        if token is None or token.kind != "string":
+            raise _BatchGrammarError(
+                f"{what} of sp_executesql must be one string literal, not a variable or "
+                "a concatenation"
+            )
+        self.position += 1
+        return _string_literal_value(self.sql, token)
+
+    def _statement_ends(self) -> bool:
+        return self._peek() is None or self._punct(";") or self._word() in {"ELSE", "END"}
+
+    def _execute(self, conditions: tuple[tuple[str, bool], ...], path: str) -> None:
+        self.position += 1
+        if self._word() == "SYS":
+            self.position += 1
+            if not self._punct("."):
+                raise _BatchGrammarError("only sys.sp_executesql may be executed")
+            self.position += 1
+        if self._word() != "SP_EXECUTESQL":
+            raise _BatchGrammarError(
+                "only sys.sp_executesql of a string literal may be executed"
+            )
+        self.position += 1
+        if self._word() in {"@STMT", "@STATEMENT"}:
+            self.position += 1
+            if not self._punct("="):
+                raise _BatchGrammarError("the statement of sp_executesql must be one string literal")
+            self.position += 1
+        statement = self._string("the statement")
+        declared: list[tuple[str, str]] = []
+        if self._punct(","):
+            self.position += 1
+            if self._word() == "@PARAMS":
+                self.position += 1
+                if not self._punct("="):
+                    raise _BatchGrammarError("the parameter list of sp_executesql must be one string literal")
+                self.position += 1
+            declared = _dynamic_parameter_list(self._string("the parameter list"), self.validator)
+            names = {name.casefold() for name, _type in declared}
+            arguments = 0
+            while self._punct(","):
+                self.position += 1
+                arguments += 1
+                following = self.tokens[self.position + 1 : self.position + 2]
+                if following and _is_punct(following[0], "="):
+                    if self._variable("an sp_executesql argument").casefold() not in names:
+                        raise _BatchGrammarError(
+                            "an sp_executesql argument names a parameter its parameter list "
+                            "does not declare"
+                        )
+                    self.position += 1
+                self._argument_value()
+            if arguments > len(declared):
+                raise _BatchGrammarError(
+                    "sp_executesql has more arguments than its parameter list declares"
+                )
+        if not self._statement_ends():
+            raise _BatchGrammarError(
+                "text after the sp_executesql arguments is not allowed (no OUTPUT, no WITH, "
+                "no concatenation): the statement must be one string literal"
+            )
+        self._skip_semicolon()
+        try:
+            self.validator.validate_read_only(statement)
+        except ValueError as exc:
+            raise _BatchGrammarError(
+                f"the dynamic statement of sp_executesql is not one read-only SELECT: {exc}"
+            ) from exc
+        first = (_code_words(statement) or [""])[0]
+        if first not in {"SELECT", "WITH"}:
+            raise _BatchGrammarError(
+                "the dynamic statement of sp_executesql is not one read-only SELECT"
+            )
+        names = {name.casefold() for name, _type in declared}
+        for word in _tokenize(_lex(statement)):
+            if (
+                word.kind == "word"
+                and word.text.startswith("@")
+                and not word.text.startswith("@@")
+                and statement[word.start : word.end].casefold() not in names
+            ):
+                raise _BatchGrammarError(
+                    f"the dynamic statement uses {statement[word.start : word.end]}, which its "
+                    "parameter list does not declare"
+                )
+        declarations = ", ".join(f"{name} {type_text}" for name, type_text in declared)
+        self._add_branch(
+            conditions,
+            path,
+            "sp_executesql",
+            statement,
+            f"DECLARE {declarations};\n{statement}" if declared else statement,
+            tuple(declared),
+        )
+
+    def _argument_value(self) -> None:
+        token = self._peek()
+        if token is not None and token.kind == "string":
+            self.position += 1
+            return
+        word = self._word()
+        if word is not None and (
+            word == "NULL" or _OPTIMIZE_FOR_VARIABLE.fullmatch(word) is not None
+        ):
+            self.position += 1
+            return
+        if self._punct("+") or self._punct("-"):
+            self.position += 1
+        word = self._word()
+        if word is None or _BATCH_NUMBER.fullmatch(word) is None:
+            raise _BatchGrammarError(
+                "an sp_executesql argument must be a @variable or a literal"
+            )
+        self.position += 1
+        if self._punct("."):
+            self.position += 1
+            if _UNSIGNED_INTEGER.fullmatch(self._word() or "") is None:
+                raise _BatchGrammarError("an sp_executesql argument must be a @variable or a literal")
+            self.position += 1
+
+
+def _dynamic_parameter_list(text: str, validator: SafeSqlValidator) -> list[tuple[str, str]]:
+    """Parse the @params string of sp_executesql: scalar input parameters only."""
+
+    parser = _BranchingBatchParser(text, validator)
+    declared: list[tuple[str, str]] = []
+    try:
+        while True:
+            name = parser._variable("the parameter list")
+            if parser._word() == "AS":
+                parser.position += 1
+            declared.append((name, parser._type("the parameter list")))
+            if not parser._punct(","):
+                break
+            parser.position += 1
+    except _BatchGrammarError as exc:
+        raise _BatchGrammarError(f"the sp_executesql parameter list is not valid: {exc}") from exc
+    if parser._peek() is not None:
+        raise _BatchGrammarError(
+            "the sp_executesql parameter list may declare only scalar input parameters "
+            "(no OUTPUT, no default)"
+        )
+    return declared
+
+
+def read_only_batch_branches(sql: str) -> tuple[BatchBranch, ...] | None:
+    """Branches when the text is a read-only branching batch, else None."""
+
+    if not isinstance(sql, str):
+        return None
+    first = (_code_words(sql) or [""])[0]
+    if first not in {"IF", "BEGIN", "EXEC", "EXECUTE", "DECLARE", "SET"}:
+        return None
+    try:
+        return SafeSqlValidator().validate_read_only_batch(sql).branches
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True)
 class ValidatedQuery:
     """A read-only query with both exact and compatibility SQL spellings.
 
@@ -667,6 +1133,10 @@ class ValidatedQuery:
     analysis_status: str = "supported"
     admission_status: str = "admitted"
     statement_hints: tuple[str, ...] = ()
+    # Set only for a read-only branching batch (validate_read_only_batch).
+    branches: tuple[BatchBranch, ...] = ()
+    parameters: tuple[str, ...] = ()
+    local_variables: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         submitted = self.submitted_sql or self.normalized_sql
@@ -762,6 +1232,87 @@ class SafeSqlValidator:
             analysis_sql=analysis_sql,
             statement_hints=extract_hint_inventory(candidate).query_hints,
         )
+
+    def validate_read_only_batch(self, sql: str) -> ValidatedQuery:
+        """Validate a read-only branching batch (see _BranchingBatchParser).
+
+        Each branch is one SELECT that passes validate_read_only on its own, or
+        sys.sp_executesql of a string literal that does. The whole text also
+        passes every text rule of the single-SELECT gate except the two that
+        refuse EXEC and sp_executesql, whose only admitted place is that form.
+        """
+
+        if not isinstance(sql, str):
+            raise ValueError("SQL must be a string.")
+        candidate = sql.strip()
+        if not candidate:
+            raise ValueError("SQL cannot be empty.")
+        if _FOREIGN_LINE_SEPARATORS.intersection(candidate):
+            raise ValueError(
+                "A branching batch may not hold a line separator other than CR or LF."
+            )
+        self._check_text_rules(candidate, allow_dynamic_sql=True)
+        parser = _BranchingBatchParser(candidate, self)
+        parser.parse()
+        declared = {name.casefold() for name in parser.locals}
+        parameters = list(
+            dict.fromkeys(
+                candidate[token.start : token.end]
+                for token in parser.tokens
+                if token.kind == "word"
+                and token.text.startswith("@")
+                and not token.text.startswith("@@")
+                and candidate[token.start : token.end].casefold() not in declared
+            )
+        )
+        by_fold: dict[str, str] = {}
+        for name in parameters:
+            by_fold.setdefault(name.casefold(), name)
+        hints = tuple(
+            dict.fromkeys(
+                hint
+                for branch in parser.branches
+                for hint in extract_hint_inventory(branch.select_sql).query_hints
+            )
+        )
+        return ValidatedQuery(
+            normalized_sql=candidate,
+            submitted_sql=sql,
+            execution_sql=sql,
+            analysis_sql=";\n".join(branch.select_sql for branch in parser.branches),
+            statement_hints=hints,
+            branches=tuple(parser.branches),
+            parameters=tuple(by_fold.values()),
+            local_variables=tuple(dict.fromkeys(parser.locals)),
+        )
+
+    def validate_read_only_candidate(self, sql: str) -> ValidatedQuery:
+        """Validate one SELECT, or a read-only branching batch, as one candidate.
+
+        For the explain, comparison and benchmark paths. A text that is one
+        SELECT gets exactly the validate_read_only result. A text refused there
+        is admitted only when it is the closed branching-batch grammar; when it
+        does not start like a batch, the original refusal is raised unchanged.
+        """
+
+        try:
+            return self.validate_read_only(sql)
+        except ValueError as single_error:
+            words = _code_words(sql) if isinstance(sql, str) else []
+            first = next(
+                (word for word in words if not word.startswith("@")),
+                "",
+            )
+            if first not in {"IF", "BEGIN", "EXEC", "EXECUTE", "DECLARE", "SET"}:
+                raise
+            try:
+                return self.validate_read_only_batch(sql)
+            except _BatchGrammarError as exc:
+                raise ValueError(f"Not a read-only branching batch: {exc}.") from single_error
+            except ValueError as exc:
+                if first in {"DECLARE", "SET"} and "IF" not in words:
+                    raise single_error from None
+                raise exc from single_error
 
     @staticmethod
     def _parse_under_trailing_option(candidate: str) -> list[Any] | None:
@@ -862,7 +1413,7 @@ class SafeSqlValidator:
             key=lambda ref: positions[(ref.get("schema"), str(ref["table"]))],
         )
 
-    def _check_text_rules(self, sql: str) -> None:
+    def _check_text_rules(self, sql: str, *, allow_dynamic_sql: bool = False) -> None:
         # Scan with literals and comments removed: a WHERE clause comparing
         # against 'go home' or 'item#1' is data, not a batch separator or a
         # temp table. Actual EXEC/DML in code positions is still caught here
@@ -877,7 +1428,7 @@ class SafeSqlValidator:
             raise ValueError("DBCC commands are not allowed in restricted mode.")
         if EXECUTE_AS_PATTERN.search(candidate):
             raise ValueError("EXECUTE AS is not allowed in restricted mode (privilege escalation risk).")
-        if EXEC_PATTERN.search(candidate):
+        if EXEC_PATTERN.search(candidate) and not allow_dynamic_sql:
             raise ValueError("EXEC is not allowed in restricted mode.")
         if OPENROWSET_PATTERN.search(candidate):
             raise ValueError("External rowset access is not allowed in restricted mode.")
@@ -885,7 +1436,7 @@ class SafeSqlValidator:
             raise ValueError("Temporary table references are not allowed in restricted mode.")
         if WAITFOR_PATTERN.search(candidate):
             raise ValueError("WAITFOR is not allowed in restricted mode (DoS risk).")
-        if SP_EXECUTESQL_PATTERN.search(candidate):
+        if SP_EXECUTESQL_PATTERN.search(candidate) and not allow_dynamic_sql:
             raise ValueError("sp_executesql is not allowed in restricted mode (dynamic SQL risk).")
         # Quoted hint names ([UPDLOCK], "TABLOCK") count too: fail closed.
         code_words = _code_words(sql, include_quoted=True)

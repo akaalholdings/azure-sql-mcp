@@ -186,6 +186,7 @@ def analyze_plan(
     in_flight: bool = False,
     partition_columns: Mapping[str, str] | None = None,
     statement_indexes: Collection[int] | None = None,
+    unique_keys: Mapping[str, Collection[Collection[str]]] | None = None,
 ) -> dict[str, Any]:
     """Run every rule over a showplan and return sorted findings.
 
@@ -195,6 +196,10 @@ def analyze_plan(
     ``partition_columns`` maps ``schema.table`` to its partitioning column (from
     the catalog); the plan does not name it. ``statement_indexes`` limits the
     analysis to those statements of a batch plan; their indexes are kept.
+    ``unique_keys`` maps ``schema.table`` to the column lists of its unique keys
+    (from the catalog; the plan does not say an index is unique). With it, a
+    sniffed parameter used only for an equality seek of a whole unique key is
+    not reported: that seek returns one row whatever the value.
     """
 
     try:
@@ -222,6 +227,10 @@ def analyze_plan(
     statements_out: list[dict[str, Any]] = []
     seen_statements: set[int] = set()
     partitioning = {key.strip().lower(): value for key, value in (partition_columns or {}).items()}
+    unique = {
+        key.strip().lower(): [frozenset(str(column).lower() for column in columns) for columns in keys]
+        for key, keys in (unique_keys or {}).items()
+    }
     for (index, item), size in zip(wanted, sizes):
         weight = size / total if total > 0 else 1.0
         accesses = access_summary.statements[index].accesses if index < len(access_summary.statements) else []
@@ -238,6 +247,7 @@ def analyze_plan(
                 weight=weight,
                 partition_columns=partitioning,
                 first_plan=id(item.statement) not in seen_statements,
+                unique_keys=unique,
             )
             statement_findings = rules.run()
         seen_statements.add(id(item.statement))
@@ -299,6 +309,7 @@ def read_plan(
     pin_plan_hash: str | None = None,
     top_n: int = TOP_OPERATORS,
     tree_budget: int = TREE_BUDGET,
+    unique_keys: Mapping[str, Collection[Collection[str]]] | None = None,
 ) -> dict[str, Any]:
     """Parse a showplan once, then run the rules and build the digest from that one parse.
 
@@ -316,7 +327,11 @@ def read_plan(
     return {
         "parsed": parsed,
         "analysis": analyze_plan(
-            source, in_flight=in_flight, partition_columns=partition_columns, statement_indexes=statement_indexes
+            source,
+            in_flight=in_flight,
+            partition_columns=partition_columns,
+            statement_indexes=statement_indexes,
+            unique_keys=unique_keys,
         ),
         "digest": (
             build_plan_digest(
@@ -374,6 +389,7 @@ class _StatementRules:
         weight: float,
         partition_columns: Mapping[str, str],
         first_plan: bool,
+        unique_keys: Mapping[str, list[frozenset[str]]] | None = None,
     ) -> None:
         self.index = index
         self.statement = statement
@@ -384,6 +400,7 @@ class _StatementRules:
         self.in_flight = in_flight
         self.weight = weight
         self.partition_columns = partition_columns
+        self.unique_keys = unique_keys or {}
         # A cursor statement has one plan per operation: text rules run once.
         self.first_plan = first_plan
         self.findings: list[PlanFinding] = []
@@ -520,19 +537,37 @@ def _access_rules(rules: _StatementRules) -> None:
             column_name = clean_text(column, 128)
             implicit = kind == "convert_implicit"
             wildcard = kind == "leading_wildcard"
+            identity = kind == "arithmetic_identity"
             wrapper = (
                 "an implicit conversion"
                 if implicit
                 else "a leading-wildcard LIKE"
                 if wildcard
+                else "an identity expression (+ 0, - 0 or * 1)"
+                if identity
                 else clean_text(kind.replace("function:", "").upper(), 60)
             )
+            # ``column + 0`` beside a seek on another column is written on purpose:
+            # it keeps a sniffed plan from seeking an index on this column.
+            steering = identity and column not in seek_columns and bool(seek_columns)
             # A dynamic seek (CAST to date via GetRangeThroughConvert, an implicit
             # conversion via GetRangeWithMismatchedTypes) still seeks a range on
             # the column and re-checks the wrapped predicate as a residual.
             dynamic = column in access.dynamic_seek_columns
             seeked = dynamic or column in seek_columns
-            if dynamic:
+            if steering:
+                seek_on = ", ".join(clean_text(item, 128) or "" for item in sorted(seek_columns))
+                message = (
+                    f"{table}.{column_name} is wrapped in {wrapper}, so no index can seek it; this access "
+                    f"seeks on {seek_on} instead. That is the usual purpose of such an expression: it steers "
+                    f"the plan away from an index on {column_name}."
+                )
+                fix = (
+                    "Keep it only if it is there on purpose. It disables every index seek and the histogram "
+                    f"estimate on {column_name} for this predicate, for every parameter value. To test "
+                    "whether it is still needed, benchmark the statement without it across the parameter cases."
+                )
+            elif dynamic:
                 message = (
                     f"{table}.{column_name} is wrapped in {wrapper}, but the index still seeks a range on it "
                     "(dynamic seek) and re-checks the wrapped predicate."
@@ -591,7 +626,7 @@ def _access_rules(rules: _StatementRules) -> None:
                 )
             add(
                 "implicit_conversion_on_column" if implicit else "non_sargable_predicate",
-                "low" if seeked else _share_severity(share, high=0.3, medium=0.05),
+                "low" if seeked or steering else _share_severity(share, high=0.3, medium=0.05),
                 "predicates",
                 message,
                 fix,
@@ -601,6 +636,7 @@ def _access_rules(rules: _StatementRules) -> None:
                     "table": table,
                     "column": column_name,
                     "wrapper": kind,
+                    **({"deliberate_steering": steering} if identity else {}),
                     "operation": access.operation,
                     "dynamic_seek": dynamic,
                     "rewrite_pattern": (
@@ -742,6 +778,46 @@ def _access_rules(rules: _StatementRules) -> None:
             )
 
 
+def _value_cannot_change_plan(rules: _StatementRules, parameter: str) -> bool:
+    """Whether no value of this parameter could have given another plan.
+
+    A trivial plan was not chosen by cost, so no sniffed value shaped it. And
+    an equality seek of a whole unique key returns one row for any value: when
+    every use of the parameter is such a seek, the estimate cannot differ.
+    Uniqueness comes from the catalog (``unique_keys``), never from the plan.
+    """
+
+    if (rules.statement.get("StatementOptmLevel") or "").upper() == "TRIVIAL":
+        return True
+    if not rules.unique_keys or not parameter:
+        return False
+    uses = [
+        reference
+        for reference in rules.query_plan.iter(f"{_Q}ColumnReference")
+        if reference.get("Column") == parameter and not reference.get("ParameterCompiledValue")
+    ]
+    seek_uses = 0
+    for access in rules.accesses:
+        node = rules.by_id.get(access.node_id)
+        if node is None:
+            continue
+        in_equality_seek = [
+            reference
+            for prefix in node.element.iter(f"{_Q}Prefix")
+            if (prefix.get("ScanType") or "").upper() == "EQ"
+            for reference in prefix.iter(f"{_Q}ColumnReference")
+            if reference.get("Column") == parameter
+        ]
+        if not in_equality_seek:
+            continue
+        sought = {column.lower() for column in access.seek_eq_columns}
+        keys = rules.unique_keys.get(f"{access.schema}.{access.table}".lower(), [])
+        if not any(key and key <= sought for key in keys):
+            return False
+        seek_uses += len(in_equality_seek)
+    return bool(uses) and seek_uses == len(uses)
+
+
 def _statement_warning_rules(rules: _StatementRules) -> None:
     statement, query_plan, add, actual = rules.statement, rules.query_plan, rules.add, rules.actual
     for convert in query_plan.findall(f"{_Q}Warnings/{_Q}PlanAffectingConvert"):
@@ -866,7 +942,13 @@ def _statement_warning_rules(rules: _StatementRules) -> None:
         compiled = clean_text(parameter.get("ParameterCompiledValue"), 100)
         runtime = clean_text(parameter.get("ParameterRuntimeValue"), 100)
         name = clean_text(parameter.get("Column"), 128)
-        if actual and compiled is not None and runtime is not None and compiled != runtime:
+        if (
+            actual
+            and compiled is not None
+            and runtime is not None
+            and compiled != runtime
+            and not _value_cannot_change_plan(rules, parameter.get("Column") or "")
+        ):
             add(
                 "sniffed_parameter_differs",
                 "info",

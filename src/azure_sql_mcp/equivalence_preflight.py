@@ -16,6 +16,7 @@ from sqlglot.errors import ParseError
 
 from .catalog_constraints import CatalogConstraintService
 from .catalog_constraints import TableConstraintFacts
+from .catalog_constraints import _folded
 from .catalog_constraints import deterministic_order_key
 from .catalog_constraints import order_tiebreaker
 from .equivalence_contract import EquivalencePreflight
@@ -23,6 +24,7 @@ from .equivalence_contract import _CLOCK_FUNCTIONS
 from .equivalence_contract import _ROW_VOLATILE_FUNCTIONS
 from .equivalence_contract import analyze_equivalence_preflight
 from .equivalence_contract import parseable_sql
+from .safe_sql import read_only_batch_branches
 
 MAX_VIEW_DEPENDENCY_DEPTH = 8
 
@@ -137,6 +139,10 @@ class DatabaseEquivalencePreflight:
     unresolved_dependencies: tuple[Mapping[str, Any], ...] = ()
     total_order_proofs: tuple[Mapping[str, Any], ...] = ()
     total_order_gaps: tuple[Mapping[str, Any], ...] = ()
+    # The outer ORDER BY of a statement without a row limit. A tie there is
+    # not a risk; it is why an order-only mismatch can be noise.
+    result_order_proofs: tuple[Mapping[str, Any], ...] = ()
+    result_order_ties: tuple[Mapping[str, Any], ...] = ()
     contract_version: int = 2
 
     @property
@@ -173,6 +179,8 @@ class DatabaseEquivalencePreflight:
             ],
             "total_order_proofs": [dict(item) for item in self.total_order_proofs],
             "total_order_gaps": [dict(item) for item in self.total_order_gaps],
+            "result_order_proofs": [dict(item) for item in self.result_order_proofs],
+            "result_order_ties": [dict(item) for item in self.result_order_ties],
         }
 
 
@@ -250,12 +258,24 @@ class EquivalencePreflightService:
         database_name: str,
         sql: str,
     ) -> DatabaseEquivalencePreflight:
+        branches = read_only_batch_branches(sql)
+        if branches:
+            return _merge_branch_preflights(
+                [await self.analyze(database_name, branch.select_sql) for branch in branches]
+            )
         sql = parseable_sql(sql)
         direct = analyze_equivalence_preflight(sql)
         observations = _collect_function_observations(sql, "query")
+        facts_by_table: dict[tuple[str, str], TableConstraintFacts] = {}
         total_order_proofs, total_order_gaps = await self._prove_total_orders(
             database_name,
-            direct,
+            direct.details,
+            facts_by_table,
+        )
+        result_order_proofs, result_order_ties = await self._prove_total_orders(
+            database_name,
+            direct.result_orders,
+            facts_by_table,
         )
         unproven_orders = {str(gap["risk"]) for gap in total_order_gaps}
         risk_codes: list[str] = [
@@ -310,19 +330,28 @@ class EquivalencePreflightService:
             unresolved_dependencies=tuple(unique_unresolved),
             total_order_proofs=tuple(total_order_proofs),
             total_order_gaps=tuple(total_order_gaps),
+            result_order_proofs=tuple(result_order_proofs),
+            result_order_ties=tuple(result_order_ties),
         )
 
     async def _prove_total_orders(
         self,
         database_name: str,
-        direct: EquivalencePreflight,
+        details: Sequence[Mapping[str, Any]],
+        facts_by_table: dict[tuple[str, str], TableConstraintFacts],
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Split each ordered row limit and window order into proven or still tied."""
+        """Split each ordered row limit, window order and result order into proven or still tied.
+
+        The ordering is total when it fixes one row of every source under the
+        SELECT. A base table is fixed when the known columns cover a unique NOT
+        NULL key; a relation of distinct rows when they cover all its columns.
+        A column equality that holds in every row carries a fixed column to the
+        other side, which is how a join back on the key is proven.
+        """
 
         proofs: list[dict[str, Any]] = []
         gaps: list[dict[str, Any]] = []
-        facts_by_table: dict[tuple[str, str], TableConstraintFacts] = {}
-        for detail in direct.details:
+        for detail in details:
             requirement = detail.get("total_order")
             if not isinstance(requirement, Mapping):
                 continue
@@ -336,31 +365,35 @@ class EquivalencePreflightService:
                 if detail["risk"] == "window_order_total_order_unproven"
                 else "ORDER BY"
             )
+            consequence = {
+                "window_order_total_order_unproven": "so their order inside the window is not defined",
+                "result_order_ties": "so their order in the result is not defined",
+            }.get(str(detail["risk"]), "so which of them the row limit keeps is not defined")
             if not requirement.get("provable"):
                 gaps.append({**instance, "tie": str(requirement.get("unprovable_reason"))})
                 continue
-            if self.catalog is None:
+            tables = [dict(table) for table in requirement["tables"]]
+            relations = [dict(item) for item in requirement.get("unique_relations") or ()]
+            if tables and self.catalog is None:
                 gaps.append({**instance, "tie": "no catalog reader is configured"})
                 continue
-            keys: list[dict[str, Any]] = []
             instance_gaps: list[dict[str, Any]] = []
-            for table in requirement["tables"]:
+            facts_by_alias: dict[str, TableConstraintFacts] = {}
+            for table in tables:
                 identity = (str(table["schema"]).casefold(), str(table["table"]).casefold())
                 if identity not in facts_by_table:
-                    facts_by_table[identity] = await self.catalog.table_facts(
+                    facts_by_table[identity] = await self.catalog.table_facts(  # type: ignore[union-attr]
                         database_name,
                         table["schema"],
                         table["table"],
                     )
                 facts = facts_by_table[identity]
                 name = f"{table['schema']}.{table['table']}"
-                columns = list(table["order_columns"])
                 if not facts.exists:
                     instance_gaps.append(
                         {**instance, "table": name, "tie": f"{name} could not be read from the catalog"}
                     )
-                    continue
-                if facts.object_type != "USER_TABLE":
+                elif facts.object_type != "USER_TABLE":
                     instance_gaps.append(
                         {
                             **instance,
@@ -368,42 +401,186 @@ class EquivalencePreflightService:
                             "tie": f"{name} is not a base table, so it has no key to order by",
                         }
                     )
+                else:
+                    facts_by_alias[table["alias"]] = facts
+            if instance_gaps:
+                gaps.extend(instance_gaps)
+                continue
+
+            known: dict[str, list[str]] = {
+                source["alias"]: list(source["order_columns"]) for source in (*tables, *relations)
+            }
+            ordered_directly = {alias: _folded(columns) for alias, columns in known.items()}
+            fixed: dict[str, Any] = {}
+
+            def base(endpoint: Mapping[str, Any]) -> tuple[str, str, str] | None:
+                alias = endpoint["alias"]
+                table = next((item for item in tables if item["alias"] == alias), None)
+                if table is not None:
+                    return (table["schema"], table["table"], endpoint["column"])
+                relation = next(item for item in relations if item["alias"] == alias)
+                copy = relation["lineage"].get(str(endpoint["column"]).casefold())
+                return (copy["schema"], copy["table"], copy["column"]) if copy else None
+
+            def type_of(column: tuple[str, str, str]) -> str | None:
+                facts = facts_by_table.get((column[0].casefold(), column[1].casefold()))
+                return (facts.column_types or {}).get(column[2].casefold()) if facts else None
+
+            usable: list[Mapping[str, Any]] = []
+            unusable: dict[str, str] = {}  # source alias -> why its join could not be used
+            for equality in requirement.get("equalities") or ():
+                left, right = base(equality["left"]), base(equality["right"])
+                if left is None or right is None:
+                    why = "a joined column is not a direct copy of a base table column"
+                elif tuple(part.casefold() for part in left) == tuple(
+                    part.casefold() for part in right
+                ):
+                    why = ""  # the same column of the same table: no conversion
+                elif type_of(left) is None or type_of(right) is None:
+                    why = "the column types could not be read"
+                elif type_of(left) != type_of(right):
+                    why = (
+                        "the column types differ, so an implicit conversion can match "
+                        "several key values"
+                    )
+                else:
+                    why = ""
+                if not why:
+                    usable.append(equality)
                     continue
-                key = deterministic_order_key(facts, columns)
-                if key is not None:
+                for endpoint in (equality["left"], equality["right"]):
+                    unusable.setdefault(
+                        endpoint["alias"], f"join {equality['text']} was not used: {why}"
+                    )
+
+            def is_known(endpoint: Mapping[str, Any]) -> bool:
+                return endpoint["alias"] in fixed or str(endpoint["column"]).casefold() in _folded(
+                    known[endpoint["alias"]]
+                )
+
+            progress = True
+            while progress:
+                progress = False
+                for table in tables:
+                    alias = table["alias"]
+                    key = (
+                        None
+                        if alias in fixed
+                        else deterministic_order_key(facts_by_alias[alias], known[alias])
+                    )
+                    if key is not None:
+                        fixed[alias] = key
+                        progress = True
+                for relation in relations:
+                    alias = relation["alias"]
+                    if alias not in fixed and _folded(relation["key_columns"]) <= _folded(known[alias]):
+                        fixed[alias] = relation
+                        progress = True
+                for equality in usable:
+                    pairs = [(equality["left"], equality["right"])]
+                    if equality["direction"] == "both":
+                        pairs.append((equality["right"], equality["left"]))
+                    for source, target in pairs:
+                        if is_known(source) and not is_known(target):
+                            known[target["alias"]].append(target["column"])
+                            progress = True
+
+            keys: list[dict[str, Any]] = []
+            for table in tables:
+                alias = table["alias"]
+                facts = facts_by_alias[alias]
+                name = f"{table['schema']}.{table['table']}"
+                relation_label = table.get("relation")
+                nested = {"relation": relation_label} if relation_label else {}
+                if alias in fixed:
+                    key = fixed[alias]
                     keys.append(
                         {
                             "table": name,
                             "key_name": key.name,
                             "key_kind": key.kind,
                             "key_columns": list(key.columns),
+                            **nested,
+                            **(
+                                {}
+                                if _folded(key.columns) <= ordered_directly[alias]
+                                else {"reached_through_join": True}
+                            ),
                         }
                     )
                     continue
+                columns = known[alias]
+                shown = (
+                    f"{name} (read as {alias.rsplit('.', 1)[-1]} in {relation_label})"
+                    if relation_label
+                    else name
+                )
                 tiebreaker = order_tiebreaker(facts, columns)
+                if tiebreaker is None:
+                    fix = f"{name} has no unique NOT NULL key; no ordering of its columns is deterministic"
+                elif relation_label:
+                    fix = (
+                        f"select {', '.join(tiebreaker['missing_columns'])} "
+                        f"({tiebreaker['key_kind']} {tiebreaker['key_name']}) in {relation_label} "
+                        f"and append it to the {clause}"
+                    )
+                else:
+                    fix = (
+                        f"append {', '.join(tiebreaker['missing_columns'])} "
+                        f"({tiebreaker['key_kind']} {tiebreaker['key_name']}) to the {clause}"
+                    )
                 instance_gaps.append(
                     {
                         **instance,
                         "table": name,
+                        **nested,
                         "tie": (
-                            f"rows of {name} with the same ({', '.join(columns)}) are tied, "
-                            "so which of them the row limit keeps is not defined"
-                            if columns and clause == "ORDER BY"
-                            else f"rows of {name} with the same ({', '.join(columns)}) are tied, "
-                            "so their order inside the window is not defined"
+                            f"rows of {shown} with the same ({', '.join(columns)}) are tied, "
+                            f"{consequence}"
                             if columns
-                            else f"the ordering has no column of {name}, so its rows are tied"
+                            else f"the ordering has no column of {shown}, so its rows are tied"
                         ),
-                        "tiebreaker": (
-                            f"append {', '.join(tiebreaker['missing_columns'])} "
-                            f"({tiebreaker['key_kind']} {tiebreaker['key_name']}) to the {clause}"
-                            if tiebreaker is not None
-                            else f"{name} has no unique NOT NULL key; "
-                            "no ordering of its columns is deterministic"
-                        ),
+                        "tiebreaker": fix,
                         "tiebreaker_columns": (
                             tiebreaker["missing_columns"] if tiebreaker is not None else []
                         ),
+                        **({"join_not_used": unusable[alias]} if alias in unusable else {}),
+                    }
+                )
+            for relation in relations:
+                alias = relation["alias"]
+                label = relation["relation"]
+                if alias in fixed:
+                    keys.append(
+                        {
+                            "relation": label,
+                            "key_kind": relation["kind"],
+                            "key_columns": list(relation["key_columns"]),
+                            **(
+                                {}
+                                if _folded(relation["key_columns"]) <= ordered_directly[alias]
+                                else {"reached_through_join": True}
+                            ),
+                        }
+                    )
+                    continue
+                missing = [
+                    column
+                    for column in relation["key_columns"]
+                    if column.casefold() not in _folded(known[alias])
+                ]
+                instance_gaps.append(
+                    {
+                        **instance,
+                        "relation": label,
+                        "tie": (
+                            f"{label} returns distinct rows, so only all of its columns "
+                            f"({', '.join(relation['key_columns'])}) form a key; the ordering "
+                            f"fixes ({', '.join(known[alias])})"
+                        ),
+                        "tiebreaker": f"append {', '.join(missing)} of {label} to the {clause}",
+                        "tiebreaker_columns": missing,
+                        **({"join_not_used": unusable[alias]} if alias in unusable else {}),
                     }
                 )
             if instance_gaps:
@@ -646,6 +823,54 @@ async def analyze_database_equivalence_preflight(
         executor=executor,
         max_depth=max_depth,
     ).analyze(database_name, sql)
+
+
+def _merge_branch_preflights(
+    parts: Sequence[DatabaseEquivalencePreflight],
+) -> DatabaseEquivalencePreflight:
+    """One preflight for a branching batch: a risk in any branch is a risk of the batch."""
+
+    def tagged(name: str) -> tuple[Mapping[str, Any], ...]:
+        return tuple(
+            {**item, "branch": ordinal}
+            for ordinal, part in enumerate(parts, start=1)
+            for item in getattr(part, name)
+        )
+
+    counts = (
+        "referenced_object_count",
+        "resolved_view_count",
+        "analyzed_view_count",
+        "unresolved_dependency_count",
+    )
+    complete = all(part.analysis_coverage.get("complete") for part in parts)
+    return DatabaseEquivalencePreflight(
+        analysis_coverage={
+            "status": "complete" if complete else "incomplete",
+            "complete": complete,
+            "max_depth": max(int(part.analysis_coverage.get("max_depth") or 0) for part in parts),
+            **{
+                name: sum(int(part.analysis_coverage.get(name) or 0) for part in parts)
+                for name in counts
+            },
+            "branch_count": len(parts),
+        },
+        risk_codes=tuple(_unique_strings([code for part in parts for code in part.risk_codes])),
+        risks=tagged("risks"),
+        function_verdicts=tuple(
+            dict.fromkeys(verdict for part in parts for verdict in part.function_verdicts)
+        ),
+        resolved_view_dependencies=tuple(
+            _unique_mappings([item for part in parts for item in part.resolved_view_dependencies])
+        ),
+        unresolved_dependencies=tuple(
+            _unique_mappings([item for part in parts for item in part.unresolved_dependencies])
+        ),
+        total_order_proofs=tagged("total_order_proofs"),
+        total_order_gaps=tagged("total_order_gaps"),
+        result_order_proofs=tagged("result_order_proofs"),
+        result_order_ties=tagged("result_order_ties"),
+    )
 
 
 _TOTAL_ORDER_RISKS = frozenset(

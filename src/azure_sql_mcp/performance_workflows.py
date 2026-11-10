@@ -102,6 +102,8 @@ MIN_ABSOLUTE_IMPROVEMENT = {
 MAD_TO_SIGMA = 1.4826
 NOISE_SIGMA_MULTIPLIER = 2.0
 COMPARISON_DECISION_BASIS = "per_bucket_median_shift_v2"
+# A baseline that ran once has no measured noise: only a 2x gain counts.
+SINGLE_BASELINE_MIN_GAIN = 0.5
 EXECUTION_PROTOCOL_VERSION = 2
 # Sections that describe the case's own query. The others describe the whole
 # database: they are context and do not decide the case's outcome.
@@ -1110,8 +1112,13 @@ def _bucket_decision(
     candidate_values: Sequence[float],
     *,
     paired: bool,
+    single_baseline: bool = False,
 ) -> dict[str, Any]:
     """Judge one parameter case from its measured samples.
+
+    ``single_baseline``: the baseline ran once because it is too slow to
+    repeat. One sample has no measured noise, so a gain counts only when the
+    candidate median is at most half of it. A regression needs no such margin.
 
     Interleaved samples are judged as pairs: run i of the candidate against
     run i of the baseline, so drift that moves both sides cancels. A gain
@@ -1170,10 +1177,14 @@ def _bucket_decision(
         ) / (len(baseline_values) * len(candidate_values))
         relative_gain = shift / baseline_median
         improved = shift >= threshold and superiority > 0.5
+        if single_baseline:
+            improved = improved and relative_gain >= SINGLE_BASELINE_MIN_GAIN
         regressed = -shift >= threshold
         decision.update(
             {
-                "comparison": "independent_samples",
+                "comparison": (
+                    "single_baseline_sample" if single_baseline else "independent_samples"
+                ),
                 "noise_threshold": threshold,
                 "superiority_probability": superiority,
             }
@@ -1298,7 +1309,8 @@ def classify_benchmark(
                 )
         baseline_values = _run_values(baseline, metric_name)
         candidate_values = _run_values(candidate, metric_name)
-        if min(len(baseline_values), len(candidate_values)) < 2:
+        single_baseline = result.get("baseline_single_sample") is True and len(baseline_values) == 1
+        if len(candidate_values) < 2 or (len(baseline_values) < 2 and not single_baseline):
             return "inconclusive", "at least two measured samples per side are required"
         if before <= 0:
             return (
@@ -1307,7 +1319,13 @@ def classify_benchmark(
                 "relative gain is not defined; use the logical_reads objective",
             )
         paired = result.get("paired") is True
-        decision = _bucket_decision(objective, baseline_values, candidate_values, paired=paired)
+        decision = _bucket_decision(
+            objective,
+            baseline_values,
+            candidate_values,
+            paired=paired,
+            single_baseline=single_baseline,
+        )
         comparison_margin = {
             "objective": objective,
             "metric": metric_name,
@@ -1645,6 +1663,127 @@ def _evidence_summary(evidence: EvidenceEnvelopeV1) -> dict[str, Any]:
     return {key: value for key, value in summary.items() if value not in (None, [])}
 
 
+def _equivalence_status(result: Mapping[str, Any]) -> str:
+    comparisons = [item for item in result.get("equivalence") or () if isinstance(item, Mapping)]
+    statuses = {str(item.get("status")) for item in comparisons}
+    if not comparisons:
+        return "not_compared"
+    for status in ("mismatch", "order_only_mismatch", "inconclusive"):
+        if status in statuses:
+            return status
+    return "match" if statuses == {"match"} else "inconclusive"
+
+
+def compact_benchmark_result(result: Mapping[str, Any]) -> dict[str, Any]:
+    """Lead a benchmark result with the decision; move the bulk under ``detail``.
+
+    ``decision`` holds what an agent acts on: the classification, the
+    equivalence verdict, and per parameter case the verdict, the speedup on the
+    objective metric and the median elapsed time, CPU and logical reads of each
+    side. Spread, coverage, run values, plan deltas, the preflight and the
+    receipts are unchanged under ``detail``, which a caller can drop.
+    """
+
+    cases: list[dict[str, Any]] = []
+    for item in result.get("parameter_results") or ():
+        if not isinstance(item, Mapping):
+            continue
+        margin = item.get("comparison_margin")
+        margin = margin if isinstance(margin, Mapping) else {}
+        before, after = margin.get("baseline_median"), margin.get("candidate_median")
+        case: dict[str, Any] = {
+            "parameter_case": item.get("parameter_case"),
+            "verdict": margin.get("bucket_verdict"),
+            "speedup": (
+                round(float(before) / float(after), 2)
+                if isinstance(before, (int, float)) and isinstance(after, (int, float)) and after > 0
+                else None
+            ),
+        }
+        for side in ("baseline", "candidate"):
+            aggregate = item.get(side)
+            case[side] = {
+                name: aggregate.get(name) if isinstance(aggregate, Mapping) else None
+                for name in ("elapsed_ms", "cpu_ms", "logical_reads")
+            }
+        if item.get("baseline_note"):
+            case["baseline_note"] = item["baseline_note"]
+        cases.append(case)
+    preflight = result.get("equivalence_preflight")
+    risk_codes = list(
+        dict.fromkeys(
+            str(code)
+            for side in (preflight.values() if isinstance(preflight, Mapping) else ())
+            if isinstance(side, Mapping)
+            for code in side.get("risk_codes") or ()
+        )
+    )
+    decision = {
+        "classification": result.get("classification"),
+        "performance_classification": result.get("performance_classification"),
+        "reason": result.get("reason"),
+        "objective": result.get("objective"),
+        "phase": result.get("phase"),
+        "executions": result.get("executions"),
+        "equivalence": {
+            "status": _equivalence_status(result),
+            "proof_scope": result.get("proof_scope"),
+            "deferred": bool(result.get("equivalence_deferred")),
+            "risk_codes": risk_codes,
+            "rewrite_requirements": [
+                item.get("code")
+                for item in result.get("rewrite_requirements") or ()
+                if isinstance(item, Mapping)
+            ],
+        },
+        "cases": cases,
+    }
+    lead = ("session_id", "candidate_id", "evidence_id", "durable_state", "session_continues")
+    return {
+        "decision": decision,
+        **{key: result[key] for key in lead if key in result},
+        "detail": {key: value for key, value in result.items() if key not in lead},
+    }
+
+
+def compact_evidence_result(result: Mapping[str, Any]) -> dict[str, Any]:
+    """Lead an evidence result with counts and ids; the sections go under ``detail``."""
+
+    sections = result.get("sections")
+    sections = sections if isinstance(sections, Mapping) else {}
+    evidence = result.get("evidence")
+    profile = result.get("profile")
+    profile = profile if isinstance(profile, Mapping) else {}
+    metrics = profile.get("metrics")
+    findings = profile.get("plan_findings")
+    summary: dict[str, Any] = {
+        "performance_case_id": result.get("performance_case_id"),
+        "evidence_id": evidence.get("evidence_id") if isinstance(evidence, Mapping) else None,
+        "outcome": result.get("outcome"),
+        "sections_total": len(sections),
+        "sections_available": sum(
+            1 for item in sections.values() if isinstance(item, Mapping) and item.get("available") is True
+        ),
+        "sections_complete": sum(
+            1 for item in sections.values() if isinstance(item, Mapping) and item.get("complete") is True
+        ),
+        "sections_unavailable": sorted(
+            str(name)
+            for name, item in sections.items()
+            if not (isinstance(item, Mapping) and item.get("available") is True)
+        ),
+    }
+    if profile:
+        summary["profile_findings"] = len(
+            findings.get("findings") or () if isinstance(findings, Mapping) else ()
+        )
+        summary["profile_metrics"] = {
+            name: metrics.get(name) if isinstance(metrics, Mapping) else None
+            for name in ("elapsed_ms", "cpu_ms", "logical_reads")
+        }
+    return {"summary": summary, "detail": dict(result)}
+
+
 def compare_plan_summaries_payload(
     baseline: Mapping[str, Any],
     candidate: Mapping[str, Any],
@@ -1743,7 +1882,7 @@ class PerformanceWorkflowService:
         query_store_query_id: int | None = None,
         idempotency_key: str | None = None,
     ) -> PerformanceCaseV1:
-        normalized = self.validator.validate_read_only(sql).execution_sql
+        normalized = self.validator.validate_read_only_candidate(sql).execution_sql
         cases = self._normalize_parameter_cases(parameter_cases)
         expected_parameters = {
             name.casefold() for name in detect_parameters(normalized)
@@ -1887,7 +2026,7 @@ class PerformanceWorkflowService:
         effective_query_store_query_id = (
             case.query_store_query_id or supplied_query_store_query_id
         )
-        normalized = self.validator.validate_read_only(sql).execution_sql
+        normalized = self.validator.validate_read_only_candidate(sql).execution_sql
         if not fingerprint_text_matches(
             case.query_fingerprint,
             normalized,
@@ -2533,7 +2672,8 @@ class PerformanceWorkflowService:
         artifact_ref: str | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        normalized = self.validator.validate_read_only(candidate_sql).execution_sql
+        validated = self.validator.validate_read_only_candidate(candidate_sql)
+        normalized = validated.execution_sql
         normalized_strategy = strategy.strip().casefold()
         allowed_strategies = {
             "predicate",
@@ -2552,6 +2692,10 @@ class PerformanceWorkflowService:
         rewrite_fingerprint = fingerprint_text(normalized)
         request_metadata: dict[str, Any] = {"sql_persisted": False}
         candidate_metadata = dict(request_metadata)
+        if validated.statement_hints:
+            # Hint keywords only, never their values: the session must show
+            # which candidate is a hint after the SQL text is gone.
+            candidate_metadata["statement_hints"] = list(validated.statement_hints)
         replay = self.sessions.replay_candidate_creation(
             session_id,
             strategy=normalized_strategy,
@@ -2619,8 +2763,8 @@ class PerformanceWorkflowService:
         compare_order: bool | None = None,
         parameter_case: ParameterCase | None = None,
     ) -> dict[str, Any]:
-        baseline = self.validator.validate_read_only(baseline_sql).execution_sql
-        candidate = self.validator.validate_read_only(candidate_sql).execution_sql
+        baseline = self.validator.validate_read_only_candidate(baseline_sql).execution_sql
+        candidate = self.validator.validate_read_only_candidate(candidate_sql).execution_sql
         preflight = with_order_contract(
             {
                 "baseline": await self._analyze_equivalence(database_name, baseline),
@@ -3298,6 +3442,7 @@ class PerformanceWorkflowService:
         prove_equivalence: bool | None = None,
         idempotency_key: str | None = None,
         cross_case: Mapping[str, Any] | None = None,
+        slow_baseline_cases: Mapping[str, float] | None = None,
     ) -> dict[str, Any]:
         """Measure one rewrite against the baseline for each parameter case.
 
@@ -3307,6 +3452,13 @@ class PerformanceWorkflowService:
         parameter-sensitivity test on purpose: ``{"compile_case": A,
         "run_case": B}`` compiles a plan with the values of A and measures B
         on it; a candidate that regresses there is rejected.
+
+        ``slow_baseline_cases`` maps a parameter case name to the seconds its
+        baseline takes, for a baseline too slow to repeat. That baseline runs
+        once in the session, with no warm-up, and is kept with its plan; the
+        candidate is measured alone against that one sample, and the case is
+        labelled as such. A finalist still runs the baseline once more per
+        candidate, inside the snapshot comparison that proves the results.
         """
 
         if phase not in {"screening", "finalist"}:
@@ -3336,8 +3488,8 @@ class PerformanceWorkflowService:
                 "Index and lineage-backed candidates must use "
                 "benchmark_index_candidate."
             )
-        baseline = self.validator.validate_read_only(baseline_sql).execution_sql
-        rewrite = self.validator.validate_read_only(candidate_sql).execution_sql
+        baseline = self.validator.validate_read_only_candidate(baseline_sql).execution_sql
+        rewrite = self.validator.validate_read_only_candidate(candidate_sql).execution_sql
         case = self.store.get_performance_case(session.performance_case_id)
         if not fingerprint_text_matches(
             case.query_fingerprint,
@@ -3465,10 +3617,38 @@ class PerformanceWorkflowService:
                     "cross_case needs compile_case and run_case: two different "
                     "parameter cases of this benchmark call."
                 )
+        slow_cases: dict[str, float] = {}
+        for name, seconds in (slow_baseline_cases or {}).items():
+            if (
+                str(name) not in {parameter_case["name"] for parameter_case in cases}
+                or not isinstance(seconds, (int, float))
+                or isinstance(seconds, bool)
+                or seconds <= 0
+            ):
+                raise ValueError(
+                    "slow_baseline_cases maps a parameter case of this benchmark call "
+                    "to the seconds its baseline takes."
+                )
+            slow_cases[str(name)] = float(seconds)
+        if cross_names is not None and set(cross_names) & set(slow_cases):
+            raise ValueError(
+                "cross_case reruns the baseline, so it cannot use a slow_baseline_cases case."
+            )
+        single_pool = (
+            self._session_baseline_pool(session_id, minimum_samples=1) if slow_cases else {}
+        )
         comparison_executions = len(cases) * 2 if compare_equivalence else 0
         # The worst case is reserved: a reused session baseline needs fewer.
+        # A slow baseline is exact: one run, or none when the session has it.
         requested_executions = (
-            len(cases) * (runs + WARMUP_RUNS_PER_SIDE) * 2
+            sum(
+                (0 if parameter_case["name"] in single_pool else 1)
+                + runs
+                + WARMUP_RUNS_PER_SIDE
+                if parameter_case["name"] in slow_cases
+                else (runs + WARMUP_RUNS_PER_SIDE) * 2
+                for parameter_case in cases
+            )
             + comparison_executions
             + ((runs + WARMUP_RUNS_PER_SIDE) * 2 if cross_names else 0)
         )
@@ -3478,6 +3658,7 @@ class PerformanceWorkflowService:
             "measured_runs": runs,
             "comparison_executions": comparison_executions,
             "expected_executions": requested_executions,
+            **({"slow_baseline_cases": dict(slow_cases)} if slow_cases else {}),
         }
         self._require_benchmark_policy(database_name, requested_executions)
         benchmark_request_fingerprint = request_fingerprint(
@@ -3496,6 +3677,7 @@ class PerformanceWorkflowService:
                 "compare_equivalence": compare_equivalence,
                 "equivalence_preflight": equivalence_preflight,
                 "idempotency_key": idempotency_key or new_id("benchmark-call"),
+                **({"slow_baseline_cases": dict(slow_cases)} if slow_cases else {}),
             },
         )
         benchmark_operation_key = (
@@ -3586,6 +3768,7 @@ class PerformanceWorkflowService:
         parameter_results: list[dict[str, Any]] = []
         equivalence: list[dict[str, Any]] = []
         baseline_samples_by_case: dict[str, list[dict[str, Any]]] = {}
+        baseline_plans_by_case: dict[str, Any] = {}
         cross_case_result: dict[str, Any] | None = None
         objective = normalize_tuning_objective(case.metadata.get("objective"))
         objective_metric = OBJECTIVE_METRICS[objective]
@@ -3642,7 +3825,25 @@ class PerformanceWorkflowService:
                         extract_profile_metrics(profiled)
                     )
 
-                if pooled is None:
+                slow_seconds = slow_cases.get(case_name)
+                single = single_pool.get(case_name)
+                baseline_plan: Any = None
+                if slow_seconds is not None:
+                    if single is None:
+                        # The one baseline run is also its own cold run: it is
+                        # kept as the sample, and the label says so.
+                        await measure("baseline")
+                        baseline_source = "single_run"
+                        baseline_plan = _plan_brief(last_profiles.get("baseline"))
+                        baseline_plans_by_case[case_name] = baseline_plan
+                    else:
+                        baseline_source = "session_single_run"
+                        baseline_samples = [dict(item) for item in single["samples"]]
+                        baseline_plan = single.get("plan")
+                    await run_once(case_rewrite)
+                    for _run_number in range(runs):
+                        await measure("candidate")
+                elif pooled is None:
                     # The discarded first execution compiles the plan and warms
                     # the pages. Which side goes first alternates by case.
                     warmup_order = (
@@ -3678,7 +3879,7 @@ class PerformanceWorkflowService:
                     else:
                         baseline_source = "session_pool"
                         baseline_samples = [dict(item) for item in pooled["samples"]]
-                if baseline_source != "session_pool":
+                if baseline_source not in {"session_pool", "session_single_run"}:
                     baseline_samples_by_case[case_name] = baseline_samples
                 parameter_result: dict[str, Any] = {
                     "parameter_case": case_name,
@@ -3701,7 +3902,24 @@ class PerformanceWorkflowService:
                         last_profiles.get("candidate"),
                     ),
                 }
-                if pooled is not None:
+                if slow_seconds is not None:
+                    parameter_result["baseline_single_sample"] = len(baseline_samples) == 1
+                    parameter_result["baseline_note"] = (
+                        f"baseline too slow to repeat: {slow_seconds:g} seconds. It ran once; "
+                        "the candidate was measured alone and compared with that one sample."
+                    )
+                    if single is not None:
+                        parameter_result["baseline_evidence_id"] = single["evidence_id"]
+                    delta = parameter_result["plan_delta"]
+                    if delta["baseline"] is None and isinstance(baseline_plan, Mapping):
+                        delta["baseline"] = dict(baseline_plan)
+                        delta["plan_changed"] = (
+                            baseline_plan.get("plan_fingerprint")
+                            != delta["candidate"]["plan_fingerprint"]
+                            if delta["candidate"] is not None
+                            else None
+                        )
+                elif pooled is not None:
                     parameter_result["drift_check"] = drift_check
                     if baseline_source == "session_pool":
                         parameter_result["baseline_evidence_id"] = pooled["evidence_id"]
@@ -3871,6 +4089,7 @@ class PerformanceWorkflowService:
                 "cross_case_result": cross_case_result,
                 # Kept for later candidates of this session; not returned.
                 "baseline_samples": baseline_samples_by_case,
+                "baseline_plans": baseline_plans_by_case,
             },
             metadata={
                 "session_id": session_id,
@@ -4558,8 +4777,17 @@ class PerformanceWorkflowService:
         bucket = await self._bind_bucket(database_name, baseline_sql, parameter_case)
         return self._contracts_from_bucket(baseline_sql, candidate_sql, bucket)
 
-    def _session_baseline_pool(self, session_id: str) -> dict[str, dict[str, Any]]:
-        """The latest measured baseline samples of this session, by parameter case."""
+    def _session_baseline_pool(
+        self,
+        session_id: str,
+        *,
+        minimum_samples: int = 2,
+    ) -> dict[str, dict[str, Any]]:
+        """The latest measured baseline samples of this session, by parameter case.
+
+        ``minimum_samples=1`` also returns a baseline that ran once because it
+        is too slow to repeat, with the plan brief kept from that run.
+        """
 
         pool: dict[str, dict[str, Any]] = {}
         for evidence in self.store.list_evidence_for_session(session_id):
@@ -4568,9 +4796,14 @@ class PerformanceWorkflowService:
                 samples, Mapping
             ):
                 continue
+            plans = evidence.metrics.get("baseline_plans")
             for name, items in samples.items():
-                if isinstance(items, list) and len(items) >= 2:
-                    pool[str(name)] = {"samples": items, "evidence_id": evidence.evidence_id}
+                if isinstance(items, list) and len(items) >= minimum_samples:
+                    pool[str(name)] = {
+                        "samples": items,
+                        "evidence_id": evidence.evidence_id,
+                        "plan": plans.get(name) if isinstance(plans, Mapping) else None,
+                    }
         return pool
 
     @staticmethod

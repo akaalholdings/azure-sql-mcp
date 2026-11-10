@@ -310,7 +310,12 @@ class TuningSessionStateMachine:
             session_id,
             allowed={"created", "screening", "finalist_validation"},
         )
-        if session.status == "finalist_validation":
+        # A session takes new screening candidates after a finalist run until
+        # it is finalized or its budget is spent. Only a candidate that names a
+        # parent must prove that lineage.
+        if session.status == "finalist_validation" and (
+            rewrite_artifact_ref is not None or strategy == "rewrite_plus_index"
+        ):
             try:
                 lineage_validator = {
                     "combined": validate_combined_parent_request,
@@ -462,9 +467,13 @@ class TuningSessionStateMachine:
         *,
         idempotency_key: str | None = None,
     ) -> TuningSessionV1:
-        session = self._active_session(session_id, allowed={"created", "screening"})
+        session = self._active_session(
+            session_id,
+            allowed={"created", "screening", "finalist_validation"},
+        )
         self._check_deadline(session)
-        if session.status == "screening":
+        if session.status in {"screening", "finalist_validation"}:
+            # A finalist run does not end screening for the other candidates.
             return session
         if not session.candidate_ids:
             raise InvalidTransitionError("At least one candidate is required before screening.")
@@ -589,7 +598,10 @@ class TuningSessionStateMachine:
             raise InvalidTransitionError(
                 "Candidate results require screening or finalist validation."
             )
-        if state in {"proposed", "screening"} and session.status != "screening":
+        if state in {"proposed", "screening"} and session.status not in {
+            "screening",
+            "finalist_validation",
+        }:
             raise InvalidTransitionError("Screening results require screening status.")
         if state in {"finalist", "validating"} and session.status != "finalist_validation":
             raise InvalidTransitionError("Finalist results require finalist validation status.")

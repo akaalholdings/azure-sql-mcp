@@ -518,6 +518,11 @@ def _classify_scalar(
                     )
         elif tag == "Compare":
             _classify_compare(child, belongs, residual, nonsargable, implicit, under_or=under_or)
+        elif tag == "Intrinsic" and (child.get("FunctionName") or "").lower() == "probe":
+            # PROBE(bitmap, column) is the bitmap filter of a parallel hash join
+            # pushed into the scan. The optimizer added it; the query text has no
+            # function on the column, and no index could seek it.
+            continue
         elif tag == "Intrinsic" and (child.get("FunctionName") or "").lower() == "like":
             operands = child.findall(f"{_Q}ScalarOperator")
             leading_wildcard = not negated and len(operands) > 1 and _leading_wildcard(operands[1])
@@ -645,6 +650,8 @@ def _wrapped_columns(element: ET.Element, belongs, *, wrapper: str | None) -> li
             current = "convert_implicit"
         elif tag == "Intrinsic":
             current = f"function:{(element.get('FunctionName') or 'unknown').lower()}"
+        elif tag == "Arithmetic" and _is_identity_arithmetic(element):
+            current = "arithmetic_identity"
         else:
             current = _WRAPPER_ELEMENTS[tag]
     if tag == "ColumnReference":
@@ -655,6 +662,31 @@ def _wrapped_columns(element: ET.Element, belongs, *, wrapper: str | None) -> li
     for child in element:
         results.extend(_wrapped_columns(child, belongs, wrapper=current))
     return results
+
+
+def _is_identity_arithmetic(element: ET.Element) -> bool:
+    """``column + 0``, ``column - 0`` or ``column * 1``: the value is the column itself.
+
+    Written on purpose to stop the optimizer from seeking an index on the column.
+    """
+
+    operands = element.findall(f"{_Q}ScalarOperator")
+    if len(operands) != 2:
+        return False
+    operation = (element.get("Operation") or "").upper()
+    neutral = {"ADD": "0", "SUB": "0", "MULT": "1"}.get(operation)
+    if neutral is None:
+        return False
+
+    def constant(operand: ET.Element) -> str | None:
+        const = operand.find(f"{_Q}Const")
+        value = (const.get("ConstValue") or "") if const is not None else None
+        return value.strip("()") if value is not None else None
+
+    first, second = operands
+    if _direct_column(first) is not None and constant(second) == neutral:
+        return True
+    return operation != "SUB" and _direct_column(second) is not None and constant(first) == neutral
 
 
 def _parse_dml(relop: ET.Element, element: ET.Element) -> DmlTarget | None:

@@ -283,9 +283,11 @@ def test_summarize_showplan_xml_extracts_actual_plan_evidence():
     # statement-level QueryTimeStats, so totals stay explicitly unavailable.
     assert summary["actual_metrics"]["actual_cpu_ms"] is None
     assert summary["actual_metrics"]["actual_elapsed_ms"] is None
-    assert summary["actual_metrics"]["actual_logical_reads"] is None
+    # Logical reads are each operator's own reads, so their sum is the
+    # statement's reads (stream S12; time counters stay cumulative and unsummed).
+    assert summary["actual_metrics"]["actual_logical_reads"] == 120
     assert summary["actual_metrics"]["read_metric_source"] == (
-        "not_available_as_reliable_query_total"
+        "showplan_operator_runtime_counters"
     )
     assert summary["memory_grants"][0]["granted_memory_kb"] == 2048
     assert summary["missing_indexes"][0]["impact_pct"] == 87.5

@@ -211,7 +211,7 @@ async def test_without_a_catalog_reader_an_ordered_limit_stays_unproven() -> Non
 async def test_catalog_is_read_once_per_table_and_only_when_a_total_order_is_needed() -> None:
     catalog = FakeCatalog({"posts": _facts("Posts")})
 
-    await _analyze("SELECT p.Id FROM dbo.Posts AS p ORDER BY p.Score", catalog)
+    await _analyze("SELECT p.Id FROM dbo.Posts AS p WHERE p.Score > 5", catalog)
     assert catalog.reads == []
 
     await _analyze(

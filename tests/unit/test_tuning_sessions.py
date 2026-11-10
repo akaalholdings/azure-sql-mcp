@@ -174,19 +174,14 @@ def test_only_explicit_lineage_work_can_add_a_candidate_during_finalist_validati
             evidence_ids=(evidence.evidence_id,),
         )
 
-        with pytest.raises(InvalidTransitionError, match="lineage-backed combined"):
-            machine.add_candidate(
-                session.session_id,
-                strategy="combined",
-                rewrite_fingerprint="rewrite-hash",
-            )
-
-        with pytest.raises(InvalidTransitionError, match="lineage-backed combined"):
-            machine.add_candidate(
-                session.session_id,
-                strategy="predicate",
-                rewrite_fingerprint="rewrite-hash",
-            )
+        # Stream S12: a candidate that names no parent is ordinary screening
+        # work and is accepted after a finalist run (the session used to lock).
+        plain = machine.add_candidate(
+            session.session_id,
+            strategy="predicate",
+            rewrite_fingerprint="another-rewrite-hash",
+        )
+        assert plain.state == "proposed"
 
         with pytest.raises(InvalidTransitionError, match="lineage-backed combined"):
             machine.add_candidate(

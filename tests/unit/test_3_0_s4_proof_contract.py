@@ -60,12 +60,14 @@ def test_select_list_alias_and_ordinal_resolve_to_the_base_column() -> None:
     ("sql", "reason"),
     [
         (
-            "WITH recent AS (SELECT Id FROM dbo.Posts) "
+            # Stream S12 proves a CTE or derived table that is a plain SELECT of
+            # base columns; these two still have no key.
+            "WITH recent AS (SELECT Id FROM dbo.Posts UNION ALL SELECT Id FROM dbo.Archive) "
             "SELECT TOP (5) Id FROM recent ORDER BY Id",
             "common table expression",
         ),
         (
-            "SELECT TOP (5) d.Id FROM (SELECT Id FROM dbo.Posts) AS d ORDER BY d.Id",
+            "SELECT TOP (5) d.Id FROM (SELECT * FROM dbo.Posts) AS d ORDER BY d.Id",
             "derived table",
         ),
         (
