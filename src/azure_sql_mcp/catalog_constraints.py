@@ -15,6 +15,9 @@ from dataclasses import dataclass
 from typing import Any
 
 PRECONDITION_KINDS = ("not_null", "unique", "trusted_foreign_key", "trusted_check")
+# Spellings callers reached for. Each has one meaning, so it is accepted.
+_KIND_ALIASES = {"unique_key": "unique"}
+_COLUMN_FIELDS = ("columns", "column_names", "column_name", "column")
 
 _OBJECT_FILTER = "OBJECT_ID(QUOTENAME(?) + N'.' + QUOTENAME(?))"
 
@@ -349,7 +352,14 @@ def verify_precondition(
     """
 
     kind = str(item.get("kind") or "").strip().casefold()
-    columns = [str(column) for column in item.get("columns") or ()]
+    kind = _KIND_ALIASES.get(kind, kind)
+    given = [field for field in _COLUMN_FIELDS if item.get(field)]
+    raw_columns = item.get(given[0]) if given else ()
+    columns = (
+        [raw_columns]
+        if isinstance(raw_columns, str)
+        else [str(column) for column in raw_columns or ()]
+    )
     result: dict[str, Any] = {
         "kind": kind,
         "schema_name": facts.schema_name,
@@ -366,8 +376,15 @@ def verify_precondition(
         result.update({"verified": True, "reason": reason, **evidence})
         return result
 
+    if len(given) > 1:
+        return failed(f"Pass one of {', '.join(_COLUMN_FIELDS)}, not {' and '.join(given)}.")
     if kind not in PRECONDITION_KINDS:
-        return failed(f"kind must be one of {', '.join(PRECONDITION_KINDS)}.")
+        return failed(
+            f"kind must be one of {', '.join(PRECONDITION_KINDS)}. Fields: schema_name, "
+            "table_name, columns (a list); trusted_foreign_key adds referenced_schema, "
+            "referenced_table, referenced_columns; trusted_check takes constraint_name "
+            "and expected_predicate."
+        )
     if not facts.exists:
         return failed(
             f"{facts.qualified_name} could not be read from the catalog"

@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import statistics
+import time
 import xml.etree.ElementTree as ET
 from collections import Counter
 from dataclasses import replace
@@ -58,9 +59,11 @@ from .safe_sql import SafeSqlValidator
 from .tuning_sessions import DEFAULT_EXECUTIONS
 from .tuning_sessions import DEFAULT_MAX_CANDIDATES
 from .tuning_sessions import DEFAULT_TIME_LIMIT_SECONDS
+from .tuning_sessions import SLOW_STATEMENT_SECONDS
 from .tuning_sessions import WARMUP_RUNS_PER_SIDE
 from .tuning_sessions import InvalidTransitionError
 from .tuning_sessions import TuningSessionStateMachine
+from .tuning_sessions import adaptive_run_count
 from .tuning_sessions import lineage_execution_budget
 from .tuning_sessions import session_failure_diagnostic
 
@@ -105,6 +108,31 @@ COMPARISON_DECISION_BASIS = "per_bucket_median_shift_v2"
 # A baseline that ran once has no measured noise: only a 2x gain counts.
 SINGLE_BASELINE_MIN_GAIN = 0.5
 EXECUTION_PROTOCOL_VERSION = 2
+MAX_COMPARISON_CASES = 4
+# Preflight gaps under which compare_query_results still runs. In one snapshot
+# the rows of each statement are fixed, so a duplicate-aware comparison settles
+# today's data for the tested values. It is a test, never a proof: the gap
+# stays in the result. Every other gap (a clock, NEWID, TABLESAMPLE, a row
+# limit with no ORDER BY, an isolation hint) makes the result itself unstable.
+COMPARABLE_PREFLIGHT_GAPS = frozenset(
+    {
+        "result_order_ties",
+        "row_limit_total_order_unproven",
+        "window_order_total_order_unproven",
+        "order_contract_changed",
+    }
+)
+# Rows tied on the ORDER BY key at a row limit may differ between two correct runs.
+_TIE_AT_LIMIT_GAPS = frozenset(
+    {"row_limit_total_order_unproven", "window_order_total_order_unproven"}
+)
+_COMPARISON_STATUS_PRECEDENCE = (
+    "mismatch",
+    "timed_out",
+    "not_run",
+    "order_only_mismatch",
+    "inconclusive",
+)
 # Sections that describe the case's own query. The others describe the whole
 # database: they are context and do not decide the case's outcome.
 QUERY_SCOPED_SECTIONS = frozenset({"query_store", "query_store_history"})
@@ -486,6 +514,62 @@ def _bounded_result(
     return rows[:row_limit], len(rows) > row_limit
 
 
+_TYPE_SIGNATURE_ATTRIBUTES = ("type", "length", "length", "precision", "scale", "nullability")
+
+
+def result_type_differences(
+    columns: Sequence[str],
+    baseline_signatures: Sequence[str],
+    candidate_signatures: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Name each column attribute on which two result sets differ.
+
+    A signature is ``type|display_size|internal_size|precision|scale|null_ok``
+    (``AzureSqlExecutor._column_type_signature``). Each difference names the
+    ordinal, the column and the attribute: type, length, precision, scale or
+    nullability. A signature in another form is compared as a whole type.
+    """
+
+    differences: list[dict[str, Any]] = []
+    for ordinal, (name, before, after) in enumerate(
+        zip(columns, baseline_signatures, candidate_signatures), start=1
+    ):
+        if before == after:
+            continue
+        left, right = before.rsplit("|", 5), after.rsplit("|", 5)
+        if len(left) != 6 or len(right) != 6:
+            differences.append(
+                {
+                    "ordinal": ordinal,
+                    "column": name,
+                    "attribute": "type",
+                    "baseline": before,
+                    "candidate": after,
+                }
+            )
+            continue
+        seen: set[str] = set()
+        for attribute, old, new in zip(_TYPE_SIGNATURE_ATTRIBUTES, left, right):
+            if old == new or attribute in seen:
+                continue
+            seen.add(attribute)
+            if attribute == "nullability":
+                old, new = (
+                    {"True": "nullable", "False": "not_null"}.get(value, value)
+                    for value in (old, new)
+                )
+            differences.append(
+                {
+                    "ordinal": ordinal,
+                    "column": name,
+                    "attribute": attribute,
+                    "baseline": old,
+                    "candidate": new,
+                }
+            )
+    return differences
+
+
 def compare_result_sets(
     baseline: QueryResult | None,
     candidate: QueryResult | None,
@@ -543,14 +627,31 @@ def compare_result_sets(
         len(baseline.column_type_signatures) == len(baseline.columns)
         and len(candidate.column_type_signatures) == len(candidate.columns)
     )
+    type_differences = (
+        result_type_differences(
+            baseline.columns, baseline.column_type_signatures, candidate.column_type_signatures
+        )
+        if type_metadata_available and columns_match
+        else []
+    )
+    # The declared nullability of a column is metadata: it changes no returned
+    # value. It is reported as its own difference and does not fail the match.
+    nullability_only = bool(type_differences) and all(
+        item["attribute"] == "nullability" for item in type_differences
+    )
     types_match = (
-        baseline.column_type_signatures == candidate.column_type_signatures
+        (
+            baseline.column_type_signatures == candidate.column_type_signatures
+            or nullability_only
+        )
         if type_metadata_available
         else None
     )
     baseline_canonical = [_canonical_row(row) for row in baseline_rows]
     candidate_canonical = [_canonical_row(row) for row in candidate_rows]
-    multiset_match = Counter(baseline_canonical) == Counter(candidate_canonical)
+    baseline_counts = Counter(baseline_canonical)
+    candidate_counts = Counter(candidate_canonical)
+    multiset_match = baseline_counts == candidate_counts
     if compare_order:
         rows_match = baseline_canonical == candidate_canonical
     else:
@@ -569,6 +670,12 @@ def compare_result_sets(
     elif not columns_match or not row_widths_match or not rows_match or types_match is False:
         status = "mismatch"
         reason = "result shape, types, duplicates, values, or required order differ"
+        if type_differences and types_match is False:
+            reason += ": " + "; ".join(
+                f"column {item['ordinal']} [{item['column']}] {item['attribute']} "
+                f"{item['baseline']} -> {item['candidate']}"
+                for item in type_differences[:5]
+            )
         proven = False
     elif (
         not same_snapshot
@@ -592,7 +699,7 @@ def compare_result_sets(
             "complete duplicate-aware results and type metadata match for this parameter case"
         )
         proven = True
-    return {
+    result = {
         "status": status,
         "reason": reason,
         "proven_for_parameter_case": proven,
@@ -602,11 +709,18 @@ def compare_result_sets(
         "type_metadata_available": type_metadata_available,
         "positional_metadata_available": positional_metadata_available,
         "types_match": types_match,
+        "type_differences": type_differences,
         "rows_match": rows_match,
         "baseline_row_count": len(baseline_rows),
         "candidate_row_count": len(candidate_rows),
+        # Rows beyond the first copy of each distinct row.
+        "baseline_duplicate_rows": len(baseline_rows) - len(baseline_counts),
+        "candidate_duplicate_rows": len(candidate_rows) - len(candidate_counts),
         "truncated": truncated,
     }
+    if nullability_only:
+        result["metadata_difference"] = "nullability_only"
+    return result
 
 
 def compare_result_collections(
@@ -760,6 +874,73 @@ def profile_result_fingerprint(
         "order_compared": compare_order,
         "truncated": False,
     }
+
+
+def preflight_gap_codes(
+    preflight: Mapping[str, Mapping[str, Any]],
+) -> tuple[list[str], list[str]]:
+    """The risk codes of a two-sided preflight, and those no comparison can settle.
+
+    A candidate that drops the outer ORDER BY can return the baseline order
+    by accident, so that change blocks. An ORDER BY whose keys differ only as
+    text (another alias, a derived table) is compared.
+    """
+
+    sides = [side for side in preflight.values() if isinstance(side, Mapping)]
+    gaps = list(
+        dict.fromkeys(str(code) for side in sides for code in side.get("risk_codes") or ())
+    )
+    blocking = [code for code in gaps if code not in COMPARABLE_PREFLIGHT_GAPS]
+    order_removed = any(
+        isinstance(item, Mapping)
+        and item.get("risk") == "order_contract_changed"
+        and item.get("change") != "keys_differ"
+        for side in sides
+        for key in ("details", "risks")
+        for item in side.get(key) or ()
+    )
+    if order_removed and "order_contract_changed" not in blocking:
+        blocking.append("order_contract_changed")
+    return gaps, blocking
+
+
+def label_comparison(
+    result: dict[str, Any],
+    gaps: Sequence[str],
+    compare_order: bool,
+) -> None:
+    """Say how the rows were compared, and what a preflight gap leaves open."""
+
+    if compare_order:
+        result["ordered_rows_match"] = result.get("rows_match") is True
+    result["duplicate_rows"] = {
+        "baseline": result.get("baseline_duplicate_rows"),
+        "candidate": result.get("candidate_duplicate_rows"),
+    }
+    if not gaps:
+        result["comparison_basis"] = (
+            "ordered_rows" if compare_order else "multiset_with_duplicate_counts"
+        )
+        return
+    # No total order is proven for both statements, so the rows are judged
+    # as a multiset: each distinct row with its number of copies.
+    result["comparison_basis"] = "multiset_with_duplicate_counts"
+    result["proof_scope"] = "snapshot_test"
+    result["proven_for_parameter_case"] = False
+    if result.get("status") == "order_only_mismatch":
+        result["status"] = "match"
+        result["reason"] = (
+            "the same rows with the same duplicate counts were returned; their "
+            "order differs and is not judged, because no total order is proven "
+            "for both statements"
+        )
+    if result.get("status") == "mismatch" and set(gaps) & _TIE_AT_LIMIT_GAPS:
+        result["mismatch_may_be_a_tie"] = True
+        result["reason"] = (
+            f"{result.get('reason')}. Rows tied on the ORDER BY key at the row limit "
+            "may be returned by either statement: add a unique tiebreaker to both "
+            "to make the comparison decisive"
+        )
 
 
 def with_order_contract(
@@ -1113,12 +1294,14 @@ def _bucket_decision(
     *,
     paired: bool,
     single_baseline: bool = False,
+    single_candidate: bool = False,
 ) -> dict[str, Any]:
     """Judge one parameter case from its measured samples.
 
     ``single_baseline``: the baseline ran once because it is too slow to
     repeat. One sample has no measured noise, so a gain counts only when the
     candidate median is at most half of it. A regression needs no such margin.
+    ``single_candidate``: the same rule when the candidate ran once.
 
     Interleaved samples are judged as pairs: run i of the candidate against
     run i of the baseline, so drift that moves both sides cancels. A gain
@@ -1177,13 +1360,19 @@ def _bucket_decision(
         ) / (len(baseline_values) * len(candidate_values))
         relative_gain = shift / baseline_median
         improved = shift >= threshold and superiority > 0.5
-        if single_baseline:
+        if single_baseline or single_candidate:
             improved = improved and relative_gain >= SINGLE_BASELINE_MIN_GAIN
         regressed = -shift >= threshold
         decision.update(
             {
                 "comparison": (
-                    "single_baseline_sample" if single_baseline else "independent_samples"
+                    "single_samples"
+                    if single_baseline and single_candidate
+                    else "single_baseline_sample"
+                    if single_baseline
+                    else "single_candidate_sample"
+                    if single_candidate
+                    else "independent_samples"
                 ),
                 "noise_threshold": threshold,
                 "superiority_probability": superiority,
@@ -1196,6 +1385,46 @@ def _bucket_decision(
     return decision
 
 
+def _equivalence_gate(
+    equivalence: Sequence[Mapping[str, Any]],
+    require_snapshot_attestation: bool,
+) -> tuple[str, str] | None:
+    """The classification a result comparison forces, or None when every case matched."""
+
+    if require_snapshot_attestation and (
+        not equivalence
+        or any(
+            result.get("same_snapshot") is not True
+            or result.get("snapshot_isolation_verified") is not True
+            for result in equivalence
+        )
+    ):
+        return (
+            "inconclusive",
+            "snapshot isolation was not verified for every parameter case",
+        )
+    if any(result.get("status") == "mismatch" for result in equivalence):
+        return "equivalence_failed", "at least one parameter case returned different results"
+    if any(result.get("status") == "order_only_mismatch" for result in equivalence):
+        return (
+            "inconclusive",
+            "at least one parameter case returned the same rows in a "
+            "different order; order equivalence is not proven",
+        )
+    if not equivalence or any(result.get("status") != "match" for result in equivalence):
+        return (
+            "inconclusive",
+            "full snapshot equivalence was not proven for every parameter case",
+        )
+    if all(result.get("vacuous") is True for result in equivalence):
+        return (
+            "inconclusive",
+            "every tested parameter case returned zero rows on both sides, so the "
+            "match proves nothing; register parameter values that return rows",
+        )
+    return None
+
+
 def classify_benchmark(
     parameter_results: Sequence[Mapping[str, Any]],
     equivalence: Sequence[Mapping[str, Any]],
@@ -1204,40 +1433,26 @@ def classify_benchmark(
     require_equivalence: bool = True,
     require_snapshot_attestation: bool = False,
 ) -> tuple[str, str]:
+    """Classify a candidate from its per-case samples and its result comparison.
+
+    A case whose baseline median on the objective is zero (below the
+    resolution of the measurement: 1 ms, 1 page) has no relative gain. It is
+    judged on the absolute floor alone: ``unchanged_at_zero`` while the
+    candidate median stays under ``MIN_ABSOLUTE_IMPROVEMENT``, ``regressed``
+    at or above it. The other cases decide the candidate. When every case is
+    at zero the candidate is ``neutral`` on this objective.
+
+    Each case gets its ``comparison_margin`` even when the result comparison
+    fails the candidate, so the timings that were paid for are returned.
+    """
+
     if require_equivalence:
-        if require_snapshot_attestation and (
-            not equivalence
-            or any(
-                result.get("same_snapshot") is not True
-                or result.get("snapshot_isolation_verified") is not True
-                for result in equivalence
+        gate = _equivalence_gate(equivalence, require_snapshot_attestation)
+        if gate is not None:
+            classify_benchmark(
+                parameter_results, (), objective=objective, require_equivalence=False
             )
-        ):
-            return (
-                "inconclusive",
-                "snapshot isolation was not verified for every parameter case",
-            )
-        if any(result.get("status") == "mismatch" for result in equivalence):
-            return "equivalence_failed", "at least one parameter case returned different results"
-        if any(result.get("status") == "order_only_mismatch" for result in equivalence):
-            return (
-                "inconclusive",
-                "at least one parameter case returned the same rows in a "
-                "different order; order equivalence is not proven",
-            )
-        if not equivalence or any(
-            result.get("status") != "match" for result in equivalence
-        ):
-            return (
-                "inconclusive",
-                "full snapshot equivalence was not proven for every parameter case",
-            )
-        if all(result.get("vacuous") is True for result in equivalence):
-            return (
-                "inconclusive",
-                "every tested parameter case returned zero rows on both sides, so the "
-                "match proves nothing; register parameter values that return rows",
-            )
+            return gate
 
     objective = normalize_tuning_objective(objective)
     if objective == "physical_reads":
@@ -1253,6 +1468,7 @@ def classify_benchmark(
     regressed_cases: list[str] = []
     cpu_regressed_cases: list[str] = []
     improved_cases = 0
+    zero_baseline_cases = 0
 
     for result in parameter_results:
         baseline = result.get("baseline", {})
@@ -1310,21 +1526,48 @@ def classify_benchmark(
         baseline_values = _run_values(baseline, metric_name)
         candidate_values = _run_values(candidate, metric_name)
         single_baseline = result.get("baseline_single_sample") is True and len(baseline_values) == 1
-        if len(candidate_values) < 2 or (len(baseline_values) < 2 and not single_baseline):
+        # A side too slow to repeat ran once and says so; any other single
+        # sample is an incomplete measurement.
+        single_candidate = (
+            result.get("candidate_single_sample") is True and len(candidate_values) == 1
+        )
+        if (len(candidate_values) < 2 and not single_candidate) or (
+            len(baseline_values) < 2 and not single_baseline
+        ):
             return "inconclusive", "at least two measured samples per side are required"
         if before <= 0:
-            return (
-                "inconclusive",
-                f"baseline {objective} is zero at the resolution of the measurement, so a "
-                "relative gain is not defined; use the logical_reads objective",
-            )
-        paired = result.get("paired") is True
+            floor = MIN_ABSOLUTE_IMPROVEMENT[objective]
+            candidate_median = float(statistics.median(candidate_values))
+            at_zero_verdict = "regressed" if candidate_median >= floor else "unchanged_at_zero"
+            if isinstance(result, dict):
+                result["comparison_margin"] = {
+                    "objective": objective,
+                    "metric": metric_name,
+                    "metric_source": metric_source,
+                    "baseline_min": min(baseline_values),
+                    "baseline_max": max(baseline_values),
+                    "candidate_min": min(candidate_values),
+                    "candidate_max": max(candidate_values),
+                    "baseline_median": 0.0,
+                    "candidate_median": candidate_median,
+                    "median_shift": -candidate_median,
+                    "comparison": "absolute_floor_at_zero_baseline",
+                    "noise_threshold": floor,
+                    "bucket_verdict": at_zero_verdict,
+                }
+                result["decision_basis"] = COMPARISON_DECISION_BASIS
+            zero_baseline_cases += 1
+            if at_zero_verdict == "regressed":
+                regressed_cases.append(str(result.get("parameter_case")))
+            continue
+        paired = result.get("paired") is True and not single_candidate
         decision = _bucket_decision(
             objective,
             baseline_values,
             candidate_values,
             paired=paired,
             single_baseline=single_baseline,
+            single_candidate=single_candidate,
         )
         comparison_margin = {
             "objective": objective,
@@ -1365,13 +1608,20 @@ def classify_benchmark(
             regressed_cases.append(str(result.get("parameter_case")))
         elif decision["bucket_verdict"] == "improved":
             improved_cases += 1
-    if not relative_gains:
+    if not relative_gains and not zero_baseline_cases:
         return "inconclusive", "no parameter cases were measured"
     if regressed_cases:
         return (
             "regressed",
             f"candidate materially regressed {objective} for parameter case "
             + ", ".join(regressed_cases),
+        )
+    if not relative_gains:
+        return (
+            "neutral",
+            f"baseline {objective} is zero at the resolution of the measurement for every "
+            f"parameter case, so {objective} cannot rank this candidate; read "
+            "decision.by_metric for the verdict on elapsed time and logical reads",
         )
     if cpu_regressed_cases:
         return (
@@ -1666,12 +1916,69 @@ def _evidence_summary(evidence: EvidenceEnvelopeV1) -> dict[str, Any]:
 def _equivalence_status(result: Mapping[str, Any]) -> str:
     comparisons = [item for item in result.get("equivalence") or () if isinstance(item, Mapping)]
     statuses = {str(item.get("status")) for item in comparisons}
-    if not comparisons:
+    if not comparisons or statuses == {"not_compared"}:
         return "not_compared"
     for status in ("mismatch", "order_only_mismatch", "inconclusive"):
         if status in statuses:
             return status
     return "match" if statuses == {"match"} else "inconclusive"
+
+
+def _worst_case(cases: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """The parameter case the candidate serves least: a regression first, then the lowest speedup.
+
+    The classification is a weighted verdict over all cases. A design is
+    only as good as its worst case, so that case is named next to it.
+    """
+
+    def rank(case: Mapping[str, Any]) -> tuple[int, float]:
+        verdict = case.get("verdict")
+        order = 0 if verdict == "regressed" else 2 if verdict == "improved" else 1
+        speedup = case.get("speedup")
+        if not isinstance(speedup, (int, float)):
+            speedup = case.get("speedup_at_least")
+        return order, float(speedup) if isinstance(speedup, (int, float)) else 1.0
+
+    worst = min(cases, key=rank)
+    return {
+        key: worst.get(key)
+        for key in ("parameter_case", "verdict", "speedup")
+    }
+
+
+# One millisecond or one page: a median of 0 means "below this", not "free".
+METRIC_RESOLUTION = 1.0
+_BY_METRIC_OBJECTIVES = ("cpu", "elapsed_time", "logical_reads")
+
+
+def verdicts_by_metric(parameter_results: Sequence[Any]) -> dict[str, dict[str, Any]]:
+    """The performance verdict on CPU, elapsed time and logical reads from one measurement.
+
+    The case objective picks the headline classification. This block answers
+    "and on the other metrics?" without a new case or a new run. It judges
+    timings only: the result comparison is reported under ``equivalence``.
+    """
+
+    by_metric: dict[str, dict[str, Any]] = {}
+    for objective in _BY_METRIC_OBJECTIVES:
+        cases = [dict(item) for item in parameter_results if isinstance(item, Mapping)]
+        for case in cases:
+            case.pop("comparison_margin", None)
+        classification, reason = classify_benchmark(
+            cases, (), objective=objective, require_equivalence=False
+        )
+        verdict: dict[str, Any] = {
+            "classification": "improved" if classification == "promising" else classification,
+            "cases": {
+                str(case.get("parameter_case")): case["comparison_margin"].get("bucket_verdict")
+                for case in cases
+                if isinstance(case.get("comparison_margin"), Mapping)
+            },
+        }
+        if classification in {"inconclusive", "regressed"}:
+            verdict["reason"] = reason
+        by_metric[objective] = verdict
+    return by_metric
 
 
 def compact_benchmark_result(result: Mapping[str, Any]) -> dict[str, Any]:
@@ -1700,6 +2007,14 @@ def compact_benchmark_result(result: Mapping[str, Any]) -> dict[str, Any]:
                 else None
             ),
         }
+        if (
+            isinstance(before, (int, float))
+            and isinstance(after, (int, float))
+            and after <= 0 < before
+        ):
+            # A median of 0 is below 1 ms or 1 page: the gain is at least this.
+            case["candidate_below_resolution"] = True
+            case["speedup_at_least"] = round(float(before) / METRIC_RESOLUTION, 2)
         for side in ("baseline", "candidate"):
             aggregate = item.get(side)
             case[side] = {
@@ -1738,6 +2053,23 @@ def compact_benchmark_result(result: Mapping[str, Any]) -> dict[str, Any]:
         },
         "cases": cases,
     }
+    metadata_differences = [
+        {"parameter_case": comparison.get("parameter_case"), **difference}
+        for comparison in result.get("equivalence") or ()
+        if isinstance(comparison, Mapping)
+        for result_set in comparison.get("result_sets") or (comparison,)
+        if isinstance(result_set, Mapping)
+        for difference in result_set.get("type_differences") or ()
+        if isinstance(difference, Mapping)
+    ]
+    if metadata_differences:
+        # Named per column: a nullability-only difference does not fail the
+        # match, but a client that reads result metadata must hear of it.
+        decision["equivalence"]["metadata_differences"] = metadata_differences
+    if cases:
+        decision["by_metric"] = verdicts_by_metric(result.get("parameter_results") or ())
+    if len(cases) > 1:
+        decision["worst_case"] = _worst_case(cases)
     lead = ("session_id", "candidate_id", "evidence_id", "durable_state", "session_continues")
     return {
         "decision": decision,
@@ -2711,7 +3043,10 @@ class PerformanceWorkflowService:
                 "combined is a multi-family rewrite and does not accept lineage; "
                 "use rewrite_plus_index."
             )
-        if normalized_strategy == "rewrite_plus_index":
+        # With no parent, a rewrite_plus_index candidate is the rewrite with its
+        # indexes: benchmark_index_candidate measures it against the original
+        # statement and compares the results in that call (candidate_sql).
+        if normalized_strategy == "rewrite_plus_index" and artifact_ref is not None:
             parent_id = parse_combined_parent_reference(artifact_ref)
             parent = self.sessions.get_candidate(parent_id)
             parent_evidence = [
@@ -2762,9 +3097,36 @@ class PerformanceWorkflowService:
         *,
         compare_order: bool | None = None,
         parameter_case: ParameterCase | None = None,
+        parameter_cases: Sequence[ParameterCase] | None = None,
+        max_seconds: float | None = None,
+        estimated_seconds: float | None = None,
     ) -> dict[str, Any]:
+        """Compare the results of two read-only statements in one snapshot.
+
+        Clean preflight: the comparison is ``direct_snapshot``; statements
+        with an outer ORDER BY are compared as ordered rows, the others as
+        multisets with duplicate counts. A preflight gap that a comparison
+        can settle (``COMPARABLE_PREFLIGHT_GAPS``) no longer stops the run:
+        the rows are compared as multisets with duplicate counts and the
+        result is a ``snapshot_test``, never proven, with the gap listed in
+        ``not_settled``. Any other gap is refused with zero executions.
+
+        ``max_seconds`` caps the comparison; a capped run is cancelled and
+        returns ``timed_out`` with the arm that was running. With
+        ``estimated_seconds`` (the time one execution of the slower statement
+        takes) a comparison the cap cannot afford is not started. Up to
+        ``MAX_COMPARISON_CASES`` parameter cases run in one call.
+        """
+
         baseline = self.validator.validate_read_only_candidate(baseline_sql).execution_sql
         candidate = self.validator.validate_read_only_candidate(candidate_sql).execution_sql
+        if parameter_case is not None and parameter_cases:
+            raise ValueError("Pass parameter_case or parameter_cases, not both.")
+        if parameter_cases is not None and not 1 <= len(parameter_cases) <= MAX_COMPARISON_CASES:
+            raise ValueError(
+                f"parameter_cases takes at most {MAX_COMPARISON_CASES} parameter cases "
+                "per call (and at least one)."
+            )
         preflight = with_order_contract(
             {
                 "baseline": await self._analyze_equivalence(database_name, baseline),
@@ -2778,59 +3140,147 @@ class PerformanceWorkflowService:
             has_outer_literal_top_zero(baseline)
             and has_outer_literal_top_zero(candidate)
         )
-        if any(
-            not item["direct_snapshot_supported"] for item in preflight.values()
-        ) and not statically_zero_row:
+        gaps, blocking = preflight_gap_codes(preflight)
+        if blocking and not statically_zero_row:
             return {
                 "status": "proof_contract_required",
                 "reason": (
                     "This MCP contract has no deterministic proof input for this "
-                    "SQL shape; equivalence remains unproven."
+                    "SQL shape; equivalence remains unproven. A result comparison "
+                    "cannot settle " + ", ".join(blocking) + ": the rows or the order "
+                    "of a statement can change between two runs on the same data."
                 ),
+                "blocking_gaps": blocking,
                 "proven_for_parameter_case": False,
                 "executions": 0,
                 "equivalence_preflight": preflight,
             }
-        if parameter_case is not None:
-            cases = self._normalize_parameter_cases([parameter_case])
-            baseline_contract, candidate_contract = await self._bind_comparison_case(
-                database_name,
-                baseline,
-                candidate,
-                cases[0],
-            )
-            case_name = cases[0]["name"]
+        if (
+            max_seconds is not None
+            and estimated_seconds is not None
+            and 2 * estimated_seconds > max_seconds
+        ):
+            needed = math.ceil(2 * estimated_seconds)
+            return {
+                "status": "not_run",
+                "reason": (
+                    f"Both statements run once: about {needed} seconds at "
+                    f"{estimated_seconds:g} seconds each, and max_seconds is "
+                    f"{max_seconds:g}. Nothing was executed. Pass max_seconds >= {needed} "
+                    "to run it, or compare with parameter values that run faster."
+                ),
+                "needed_seconds": needed,
+                "max_seconds": max_seconds,
+                "proven_for_parameter_case": False,
+                "executions": 0,
+            }
+        contracts: list[tuple[str, ParameterExecutionContract, ParameterExecutionContract]] = []
+        supplied = (
+            [parameter_case] if parameter_case is not None else list(parameter_cases or ())
+        )
+        if supplied:
+            for normalized in self._normalize_parameter_cases(supplied):
+                contracts.append(
+                    (
+                        str(normalized["name"]),
+                        *await self._bind_comparison_case(
+                            database_name, baseline, candidate, normalized
+                        ),
+                    )
+                )
         else:
             if detect_parameters(baseline) or detect_parameters(candidate):
                 raise ValueError(
                     "Parameterized result comparison requires one exact typed "
-                    "parameter_case."
+                    "parameter_case, or parameter_cases: [{name, values, types}]."
                 )
-            baseline_contract, candidate_contract = self._contracts_from_bucket(
-                baseline,
-                candidate,
-                TypedParameterBucket(
-                    bucket_id="unparameterized",
-                    parameters=(),
-                    provenance="direct_comparison",
-                ),
+            contracts.append(
+                (
+                    "unparameterized",
+                    *self._contracts_from_bucket(
+                        baseline,
+                        candidate,
+                        TypedParameterBucket(
+                            bucket_id="unparameterized",
+                            parameters=(),
+                            provenance="direct_comparison",
+                        ),
+                    ),
+                )
             )
-            case_name = "unparameterized"
-        result = await self._compare_execution_contracts(
-            database_name,
-            baseline_contract,
-            candidate_contract,
-            compare_order=compare_order,
-        )
-        result["parameter_case"] = case_name
-        # A match holds for this parameter case on today's data. It is a test
-        # result; the requirements name what would make it a proof.
-        result["equivalence_scope"] = "snapshot_matched_for_parameter_case"
-        result["rewrite_requirements"] = rewrite_requirements(baseline, candidate)
+        tested_under_gap = bool(gaps) and not statically_zero_row
+        requirements = rewrite_requirements(baseline, candidate)
+        started = time.monotonic()
+        results: list[dict[str, Any]] = []
+        for case_name, baseline_contract, candidate_contract in contracts:
+            remaining = (
+                None if max_seconds is None else max_seconds - (time.monotonic() - started)
+            )
+            if remaining is not None and remaining <= 0:
+                results.append(
+                    {
+                        "parameter_case": case_name,
+                        "status": "not_run",
+                        "reason": "the max_seconds cap was spent by the earlier cases",
+                        "proven_for_parameter_case": False,
+                        "executions": 0,
+                    }
+                )
+                continue
+            result = await self._compare_execution_contracts(
+                database_name,
+                baseline_contract,
+                candidate_contract,
+                compare_order=compare_order,
+                max_seconds=remaining,
+            )
+            result["parameter_case"] = case_name
+            if result.get("status") == "timed_out":
+                # The caller's cap, not the share that was left for this case.
+                result["max_seconds"] = max_seconds
+            if "same_snapshot" in result and "rows_match" in result:
+                label_comparison(result, gaps if tested_under_gap else (), compare_order)
+            if tested_under_gap:
+                result["proven_for_parameter_case"] = False
+            results.append(result)
+        scope: dict[str, Any] = {
+            # A match holds for the tested parameter cases on today's data. It
+            # is a test result; the requirements name what would make it a proof.
+            "equivalence_scope": (
+                "snapshot_test_for_parameter_case"
+                if tested_under_gap
+                else "snapshot_matched_for_parameter_case"
+            ),
+            "proof_scope": "snapshot_test" if tested_under_gap else "direct_snapshot",
+            "rewrite_requirements": requirements,
+        }
+        if tested_under_gap:
+            scope["preflight_gaps"] = gaps
+            scope["not_settled"] = _preflight_blockers(preflight)
         if statically_zero_row:
-            result["comparison_scope"] = "statically_zero_row"
-            result["equivalence_preflight"] = preflight
-        return result
+            scope["comparison_scope"] = "statically_zero_row"
+            scope["equivalence_preflight"] = preflight
+        if len(results) == 1:
+            return {**results[0], **scope}
+        statuses = [str(item.get("status")) for item in results]
+        status = next(
+            (name for name in _COMPARISON_STATUS_PRECEDENCE if name in statuses),
+            "match" if set(statuses) == {"match"} else "inconclusive",
+        )
+        return {
+            "status": status,
+            "reason": (
+                "every parameter case matched"
+                if status == "match"
+                else "at least one parameter case is " + status.replace("_", " ")
+            ),
+            "proven_for_parameter_case": all(
+                item.get("proven_for_parameter_case") is True for item in results
+            ),
+            "executions": sum(int(item.get("executions") or 0) for item in results),
+            "cases": results,
+            **scope,
+        }
 
     async def _compare_execution_contracts(
         self,
@@ -2840,7 +3290,14 @@ class PerformanceWorkflowService:
         *,
         compare_order: bool,
         before_dispatch: Callable[[], Any] | None = None,
+        max_seconds: float | None = None,
     ) -> dict[str, Any]:
+        """Run both statements in one snapshot transaction and compare their results.
+
+        ``max_seconds`` cancels the comparison when it is spent. The result is
+        then ``timed_out`` with the arm that was running.
+        """
+
         self._require_benchmark_policy(database_name, 2)
         baseline_sql = (
             baseline.sp_executesql_sql
@@ -2870,6 +3327,7 @@ class PerformanceWorkflowService:
         )
         dispatched_query_count = 0
         last_statement_index: int | None = None
+        arm_started: dict[int, float] = {}
 
         def before_statement_dispatch(statement_index: int) -> None:
             nonlocal dispatched_query_count, last_statement_index
@@ -2878,6 +3336,7 @@ class PerformanceWorkflowService:
                 return
             if before_dispatch is not None:
                 before_dispatch()
+            arm_started[statement_index] = time.monotonic()
             dispatched_query_count = statement_index - 1
 
         statements = [
@@ -2923,12 +3382,50 @@ class PerformanceWorkflowService:
                 None,
                 None,
             ]
+        cap = asyncio.timeout(max_seconds)
         try:
-            per_statement = await self.executor.execute_session_exactly_once(
-                database_name,
-                statements,
-                **session_kwargs,
-            )
+            async with cap:
+                per_statement = await self.executor.execute_session_exactly_once(
+                    database_name,
+                    statements,
+                    **session_kwargs,
+                )
+        except TimeoutError as exc:
+            if not cap.expired() or 2 not in arm_started:
+                # Not the cap: a driver or server timeout is reported as before.
+                note_exception(exc, "performance_workflows.snapshot_comparison")
+                return {
+                    "status": "inconclusive",
+                    "reason": "snapshot comparison could not complete",
+                    "error_type": type(exc).__name__,
+                    "same_snapshot": False,
+                    "snapshot_isolation_verified": False,
+                    "proven_for_parameter_case": False,
+                    "executions": 2 if last_statement_index is None else dispatched_query_count,
+                    "execution_count_is_conservative": last_statement_index is None,
+                }
+            note_exception(exc, "performance_workflows.snapshot_comparison_cap")
+            candidate_started = 3 in arm_started
+            arm = "candidate" if candidate_started else "baseline"
+            partial: dict[str, Any] = {
+                "status": "timed_out",
+                "reason": (
+                    f"The comparison was cancelled at max_seconds = {max_seconds:g} while "
+                    f"the {arm} statement was running. No result was compared. Pass a "
+                    "larger max_seconds, or parameter values that run faster."
+                ),
+                "timed_out_arm": arm,
+                "completed_arms": ["baseline"] if candidate_started else [],
+                "max_seconds": max_seconds,
+                "same_snapshot": False,
+                "snapshot_isolation_verified": False,
+                "proven_for_parameter_case": False,
+                "executions": dispatched_query_count,
+                "execution_count_is_conservative": False,
+            }
+            if candidate_started:
+                partial["baseline_seconds"] = round(arm_started[3] - arm_started[2], 3)
+            return partial
         except StatementDispatchPrevented as exc:
             if exc.statement_index not in {2, 3}:
                 raise
@@ -3637,6 +4134,25 @@ class PerformanceWorkflowService:
         single_pool = (
             self._session_baseline_pool(session_id, minimum_samples=1) if slow_cases else {}
         )
+        # A one-run baseline either benchmark tool kept is not run again, even
+        # when this call does not declare the case slow. It stays out of
+        # slow_cases: the request fingerprint must not depend on session state.
+        pooled_slow: dict[str, float] = {}
+        for name, kept in self.session_slow_baselines(session_id).items():
+            if cross_names is not None and name in cross_names:
+                continue
+            single_pool.setdefault(
+                name,
+                {
+                    "samples": [dict(kept["sample"])],
+                    "evidence_id": kept["evidence_id"],
+                    "plan": kept.get("plan"),
+                },
+            )
+            pooled_slow[name] = (
+                float(kept["sample"].get("client_elapsed_ms") or 0.0) / 1000
+                or SLOW_STATEMENT_SECONDS
+            )
         comparison_executions = len(cases) * 2 if compare_equivalence else 0
         # The worst case is reserved: a reused session baseline needs fewer.
         # A slow baseline is exact: one run, or none when the session has it.
@@ -3769,6 +4285,7 @@ class PerformanceWorkflowService:
         equivalence: list[dict[str, Any]] = []
         baseline_samples_by_case: dict[str, list[dict[str, Any]]] = {}
         baseline_plans_by_case: dict[str, Any] = {}
+        slow_baselines_kept: dict[str, Any] = {}
         cross_case_result: dict[str, Any] | None = None
         objective = normalize_tuning_objective(case.metadata.get("objective"))
         objective_metric = OBJECTIVE_METRICS[objective]
@@ -3825,10 +4342,58 @@ class PerformanceWorkflowService:
                         extract_profile_metrics(profiled)
                     )
 
-                slow_seconds = slow_cases.get(case_name)
-                single = single_pool.get(case_name)
+                slow_seconds = slow_cases.get(case_name, pooled_slow.get(case_name))
+                slow_auto = False
+                case_runs = runs
+                candidate_single = False
+                single = single_pool.get(case_name) if slow_seconds is not None else None
                 baseline_plan: Any = None
-                if slow_seconds is not None:
+                if slow_seconds is None and pooled is None and cross_names is None:
+                    # The discarded first execution compiles the plan and warms
+                    # the pages. Which side goes first alternates by case. Its
+                    # time also sets the run count (adaptive_run_count).
+                    warmups: dict[str, ProfiledPlanResult] = {}
+                    for side in (
+                        ("baseline", "candidate")
+                        if case_ordinal % 2 == 0
+                        else ("candidate", "baseline")
+                    ):
+                        warmups[side] = await run_once(
+                            case_baseline if side == "baseline" else case_rewrite
+                        )
+                    seconds = {
+                        side: float(profiled.elapsed_wall_ms) / 1000
+                        for side, profiled in warmups.items()
+                    }
+                    if seconds["baseline"] >= SLOW_STATEMENT_SECONDS:
+                        # Found slow: that one run is the sample, as for a
+                        # declared slow case, and it is kept for the session.
+                        slow_seconds = round(seconds["baseline"], 1)
+                        slow_auto = True
+                        last_profiles["baseline"] = warmups["baseline"]
+                        baseline_samples.append(extract_profile_metrics(warmups["baseline"]))
+                        baseline_source = "single_run"
+                        baseline_plan = _plan_brief(warmups["baseline"])
+                        baseline_plans_by_case[case_name] = baseline_plan
+                        if seconds["candidate"] >= SLOW_STATEMENT_SECONDS:
+                            last_profiles["candidate"] = warmups["candidate"]
+                            rewrite_samples.append(extract_profile_metrics(warmups["candidate"]))
+                            candidate_single = True
+                        else:
+                            for _run_number in range(
+                                adaptive_run_count(seconds["candidate"], runs)
+                            ):
+                                await measure("candidate")
+                    else:
+                        case_runs = adaptive_run_count(max(seconds.values()), runs)
+                        for run_number in range(case_runs):
+                            for side in (
+                                ("baseline", "candidate")
+                                if run_number % 2 == 0
+                                else ("candidate", "baseline")
+                            ):
+                                await measure(side)
+                elif slow_seconds is not None:
                     if single is None:
                         # The one baseline run is also its own cold run: it is
                         # kept as the sample, and the label says so.
@@ -3881,11 +4446,33 @@ class PerformanceWorkflowService:
                         baseline_samples = [dict(item) for item in pooled["samples"]]
                 if baseline_source not in {"session_pool", "session_single_run"}:
                     baseline_samples_by_case[case_name] = baseline_samples
+                if baseline_source == "single_run" and "baseline" in last_profiles:
+                    digest = profile_result_fingerprint(
+                        last_profiles["baseline"], compare_order=compare_order
+                    )
+                    if digest.get("complete") is True:
+                        # Kept for both benchmark tools: the session does not
+                        # run this slow statement again.
+                        slow_baselines_kept[case_name] = {
+                            "sample": baseline_samples[0],
+                            "result": digest,
+                            "plan": baseline_plan,
+                            "order_compared": compare_order,
+                        }
                 parameter_result: dict[str, Any] = {
                     "parameter_case": case_name,
                     "weight": parameter_case["weight"],
                     "paired": baseline_source == "measured",
                     "baseline_source": baseline_source,
+                    "runs": {
+                        "baseline": (
+                            len(baseline_samples)
+                            if baseline_source
+                            in {"measured", "single_run", "remeasured_after_drift"}
+                            else 0
+                        ),
+                        "candidate": len(rewrite_samples),
+                    },
                     "baseline": aggregate_samples(baseline_samples),
                     "candidate": aggregate_samples(rewrite_samples),
                     "compile_state": {
@@ -3902,10 +4489,21 @@ class PerformanceWorkflowService:
                         last_profiles.get("candidate"),
                     ),
                 }
+                if len(rewrite_samples) == 1 and (candidate_single or case_runs == 1):
+                    # Ran once by rule (slow, or runs=1): the 2x rule applies.
+                    parameter_result["candidate_single_sample"] = True
+                if slow_seconds is None and case_runs == 1 and len(baseline_samples) == 1:
+                    parameter_result["baseline_single_sample"] = True
                 if slow_seconds is not None:
                     parameter_result["baseline_single_sample"] = len(baseline_samples) == 1
                     parameter_result["baseline_note"] = (
-                        f"baseline too slow to repeat: {slow_seconds:g} seconds. It ran once; "
+                        (
+                            f"baseline took {slow_seconds:g} seconds on its first run, so it "
+                            "was not repeated (10 seconds or more runs once). The candidate "
+                            "was measured alone and compared with that one sample."
+                        )
+                        if slow_auto
+                        else f"baseline too slow to repeat: {slow_seconds:g} seconds. It ran once; "
                         "the candidate was measured alone and compared with that one sample."
                     )
                     if single is not None:
@@ -4046,6 +4644,12 @@ class PerformanceWorkflowService:
                 should_prove_equivalence=compare_equivalence,
             )
 
+        if measured_executions != requested_executions:
+            # Adaptive run counts needed fewer executions than were reserved.
+            execution_protocol = {
+                **execution_protocol,
+                "adaptive_expected_executions": measured_executions,
+            }
         performance_classification = state
         performance_reason = reason
         candidate_state = state
@@ -4090,6 +4694,7 @@ class PerformanceWorkflowService:
                 # Kept for later candidates of this session; not returned.
                 "baseline_samples": baseline_samples_by_case,
                 "baseline_plans": baseline_plans_by_case,
+                **({"slow_baselines": slow_baselines_kept} if slow_baselines_kept else {}),
             },
             metadata={
                 "session_id": session_id,
@@ -4235,6 +4840,14 @@ class PerformanceWorkflowService:
                     * candidate.parameter_cases
                     * multiplier
                 )
+                # A completed run whose arms needed fewer runs than were reserved
+                # (adaptive_run_count) records the count it completed with.
+                completed_executions = (
+                    int(protocol["adaptive_expected_executions"])
+                    if isinstance(protocol, Mapping)
+                    and isinstance(protocol.get("adaptive_expected_executions"), int)
+                    else expected_executions
+                )
                 reservation_id = metadata.get("execution_reservation_id")
                 try:
                     reservation = (
@@ -4251,7 +4864,7 @@ class PerformanceWorkflowService:
                     and metadata.get("proof_scope") == "performance_only"
                     and metadata.get("equivalence_deferred") is True
                     and candidate.parameter_cases > 0
-                    and evidence.observed_execution_count == expected_executions
+                    and evidence.observed_execution_count == completed_executions
                     and isinstance(parameter_results, list)
                     and len(parameter_results) == candidate.parameter_cases
                     and all(
@@ -4513,6 +5126,34 @@ class PerformanceWorkflowService:
                     ),
                 }
                 for requirement in basis["requirements"]
+            )
+        nullability = {
+            (item.get("ordinal"), item.get("column")): item
+            for comparison in comparisons or ()
+            if isinstance(comparison, Mapping)
+            for result_set in comparison.get("result_sets") or (comparison,)
+            if isinstance(result_set, Mapping)
+            for item in result_set.get("type_differences") or ()
+            if isinstance(item, Mapping) and item.get("attribute") == "nullability"
+        }
+        if nullability:
+            # The rows matched; the declared contract of the column did not.
+            blockers.append(
+                {
+                    "code": "result_nullability_changed",
+                    "reason": (
+                        "The rewrite changes the declared nullability of result column "
+                        + ", ".join(
+                            f"{ordinal} [{column}] ({item.get('baseline')} -> "
+                            f"{item.get('candidate')})"
+                            for (ordinal, column), item in nullability.items()
+                        )
+                        + ". The values are equal, but a client that reads result "
+                        "metadata (SELECT INTO, a typed reader, an ORM mapping) sees a "
+                        "different column. Keep the original expression's nullability or "
+                        "confirm no consumer depends on it."
+                    ),
+                }
             )
         return {"scope": scope, "blockers": blockers, "added_hints": added_hints, "basis": basis}
 
@@ -4804,6 +5445,26 @@ class PerformanceWorkflowService:
                         "evidence_id": evidence.evidence_id,
                         "plan": plans.get(name) if isinstance(plans, Mapping) else None,
                     }
+        return pool
+
+    def session_slow_baselines(self, session_id: str) -> dict[str, dict[str, Any]]:
+        """The baselines of this session that ran once because they are slow, by case.
+
+        One pool for both benchmark tools: the statement of the performance
+        case is not run again for a later candidate, whichever tool measured
+        it first. Each entry holds the sample, the plan brief, the result
+        digest of that run with its ``order_compared`` flag, and the id of
+        the evidence that keeps it.
+        """
+
+        pool: dict[str, dict[str, Any]] = {}
+        for evidence in self.store.list_evidence_for_session(session_id):
+            kept = evidence.metrics.get("slow_baselines")
+            if not isinstance(kept, Mapping):
+                continue
+            for name, item in kept.items():
+                if isinstance(item, Mapping) and isinstance(item.get("sample"), Mapping):
+                    pool[str(name)] = {**item, "evidence_id": evidence.evidence_id}
         return pool
 
     @staticmethod

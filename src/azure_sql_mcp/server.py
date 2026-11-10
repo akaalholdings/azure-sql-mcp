@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import hashlib
 import json
 import logging
@@ -49,7 +50,10 @@ from .auth import AzureSqlAuthenticator
 from .capabilities import CapabilityService
 from .column_statistics import ColumnStatisticsService
 from .capacity_assessment import CapacityAssessmentService
+from .columnstore_health import OBJECT_FILTER
+from .columnstore_health import ROW_GROUP_SQL
 from .columnstore_health import ColumnstoreHealthService
+from .columnstore_health import summarize_columnstore_indexes
 from .candidate_lineage import combined_parent_id
 from .candidate_lineage import validate_combined_parent
 from .config import AccessMode
@@ -69,7 +73,10 @@ from .database_policy import extends_test_index_prefix
 from .database_policy import load_database_policy_or_deny
 from .diagnostics import DiagnosticQueryService
 from .elastic_pool import ElasticPoolService
+from .equivalence_contract import analyze_equivalence_preflight
 from .equivalence_contract import effective_compare_order
+from .equivalence_contract import rewrite_requirements
+from .equivalence_contract import statement_hint_profile
 from .equivalence_preflight import EquivalencePreflightService
 from .health import HealthService
 from .history_azure_monitor import ARM_SCOPE
@@ -93,7 +100,11 @@ from .incident_log import note_exception
 from .incident_log import record_startup_failure
 from .incident_log import summarize_backlog
 from .incident_log import tool_failure_code
+from .index_advisor import NON_ALIGNED_INDEX_WARNING
 from .index_advisor import build_index_change_plan
+from .index_optimizer import INDEX_KIND_NONCLUSTERED_COLUMNSTORE
+from .index_optimizer import INDEX_KIND_ROWSTORE
+from .index_optimizer import TEST_INDEX_KINDS
 from .index_optimizer import TEST_INDEX_LOW_PRIORITY_WAIT_MINUTES
 from .index_optimizer import IndexCandidate
 from .index_optimizer import IndexOptimizer
@@ -101,11 +112,13 @@ from .index_optimizer import ReplacementExperiment
 from .index_optimizer import bounded_table_lock_probe_sql
 from .index_optimizer import build_test_index_statement
 from .index_optimizer import classify_create_index_failure
+from .index_optimizer import columnstore_index_blockers
 from .index_optimizer import expected_index_definition_matches
 from .index_optimizer import hint_candidate_index
 from .index_optimizer import plan_replacement_experiment
 from .index_optimizer import verify_plan_uses_index
 from .index_metadata import collect_existing_indexes
+from .index_metadata import collect_table_column_facts
 from .index_metadata import existing_index_covers_candidate
 from .index_metadata import MAX_GENERATED_TEST_INDEX_NAME_LENGTH
 from .index_metadata import is_test_index_name
@@ -158,13 +171,39 @@ from .performance_workflows import extract_profile_metrics
 from .performance_workflows import fingerprint_json
 from .performance_workflows import fingerprint_text
 from .performance_workflows import fingerprint_text_matches
+from .performance_workflows import label_comparison
 from .performance_workflows import mark_benchmark_sql
 from .performance_workflows import parameter_case_fingerprint
 from .performance_workflows import parameter_case_mismatch
 from .performance_workflows import parameter_case_receipt
 from .performance_workflows import plan_delta_from_profiles
+from .performance_workflows import preflight_gap_codes
 from .performance_workflows import profile_result_fingerprint
 from .performance_workflows import scope_case_regressions
+from .performance_workflows import with_order_contract
+from .view_experiments import LEASE_OBJECT_KIND
+from .view_experiments import MAX_VIEW_EXTRA_INDEXES
+from .view_experiments import READ_MODE_AUTOMATIC
+from .view_experiments import READ_MODE_NOEXPAND
+from .view_experiments import SESSION_SET_OPTIONS_SQL
+from .view_experiments import ViewCatalogState
+from .view_experiments import ViewIndexSpec
+from .view_experiments import build_test_view_drop_batch
+from .view_experiments import build_view_experiment_create_batch
+from .view_experiments import name_in_use_blocker
+from .view_experiments import plan_view_experiment
+from .view_experiments import read_view_catalog_state
+from .view_experiments import reconcile_view_experiment
+from .view_experiments import require_view_experiment_policy
+from .view_experiments import session_set_option_blockers
+from .view_experiments import validate_test_view_definition
+from .view_experiments import verify_view_experiment
+from .view_experiments import view_build_failure
+from .view_experiments import view_candidate_findings
+from .view_experiments import view_experiment_batch_params
+from .view_experiments import view_experiment_policy_blockers
+from .view_experiments import view_index_size
+from .view_experiments import view_name_prefixes
 from .plan_action_service import PlanActionService
 from .plan_cache import PlanCacheService
 from .plan_enforcement import PlanEnforcementService
@@ -219,8 +258,11 @@ from .tool_contracts import SelectionScope
 from .tool_contracts import SessionToolOutput
 from .tool_contracts import TuningObjective
 from .tool_contracts import TuningStrategy
+from .tuning_sessions import INDEX_ABA_PHASES
+from .tuning_sessions import SLOW_STATEMENT_SECONDS
 from .tuning_sessions import InvalidTransitionError
 from .tuning_sessions import TuningSessionStateMachine
+from .tuning_sessions import adaptive_run_count
 from .tuning_sessions import session_failure_diagnostic
 from .transport_auth import StaticBearerTokenVerifier
 from .version_store import VersionStoreService
@@ -267,27 +309,47 @@ def _parameter_case_payloads(
 TEST_INDEX_PREFIX = WORKFLOW_TEST_INDEX_PREFIX
 MAX_TEST_INDEX_SET = 4
 # One row per index: B-tree depth, pages in use and rows, read after the build.
+# INDEXPROPERTY(..., 'IndexDepth') is NULL for a partitioned index (observed on
+# Azure SQL Database). The depth is then the deepest partition, read in LIMITED
+# mode (parent pages only). The function takes no correlated arguments, so the
+# object and index ids are variables.
 _BUILT_INDEX_SQL = """
+DECLARE @object_id int = OBJECT_ID(QUOTENAME(?) + N'.' + QUOTENAME(?));
+DECLARE @index_name sysname = ?;
+DECLARE @index_id int = (
+    SELECT i.index_id
+    FROM sys.indexes AS i
+    WHERE i.object_id = @object_id AND i.name = @index_name
+);
 SELECT
-    INDEXPROPERTY(i.object_id, i.name, 'IndexDepth') AS index_depth,
+    COALESCE(
+        INDEXPROPERTY(@object_id, @index_name, 'IndexDepth'),
+        (
+            SELECT MAX(ips.index_depth)
+            FROM sys.dm_db_index_physical_stats(
+                DB_ID(), @object_id, @index_id, NULL, 'LIMITED'
+            ) AS ips
+            WHERE @index_id IS NOT NULL
+              AND ips.alloc_unit_type_desc = N'IN_ROW_DATA'
+        )
+    ) AS index_depth,
     SUM(ps.used_page_count) AS used_pages,
     SUM(ps.row_count) AS row_count,
     MAX(p.data_compression_desc) AS data_compression
-FROM sys.indexes AS i
-JOIN sys.dm_db_partition_stats AS ps
-  ON ps.object_id = i.object_id AND ps.index_id = i.index_id
+FROM sys.dm_db_partition_stats AS ps
 JOIN sys.partitions AS p ON p.partition_id = ps.partition_id
-WHERE i.object_id = OBJECT_ID(QUOTENAME(?) + N'.' + QUOTENAME(?))
-  AND i.name = ?
-GROUP BY i.object_id, i.name;
+WHERE ps.object_id = @object_id
+  AND ps.index_id = @index_id
+HAVING COUNT(*) > 0;
 """
 
 
 _SLOW_BASELINE_DESCRIPTION = (
     "Parameter cases whose baseline is too slow to repeat: {case name: seconds one "
     "run takes}. Such a baseline runs once, without a warm-up, and later candidates "
-    "of the session reuse that one sample. With one sample only a gain of 50% or "
-    "more counts as improved."
+    "of the session reuse that one sample, in both benchmark tools. With one sample "
+    "only a gain of 50% or more counts as improved. A baseline whose first run takes "
+    "10 seconds or more is treated this way without being named here."
 )
 
 
@@ -298,13 +360,55 @@ class IndexDefinitionInput(BaseModel):
 
     table_name: str = Field(min_length=1)
     key_columns: list[str] = Field(
-        min_length=1, description="Ordered key columns, each optionally with ASC or DESC."
+        min_length=1,
+        description=(
+            "Ordered key columns, each optionally with ASC or DESC. For kind "
+            "nonclustered_columnstore: the columns of the index, no ASC or DESC."
+        ),
     )
     schema_name: str = Field(default="dbo", min_length=1)
     include_columns: list[str] | None = None
     filter_definition: str | None = None
     is_unique: bool = False
-    data_compression: Literal["NONE", "ROW", "PAGE"] | None = None
+    data_compression: (
+        Literal["NONE", "ROW", "PAGE", "COLUMNSTORE", "COLUMNSTORE_ARCHIVE"] | None
+    ) = Field(
+        default=None,
+        description=(
+            "rowstore: NONE, ROW or PAGE. nonclustered_columnstore: COLUMNSTORE "
+            "(default) or COLUMNSTORE_ARCHIVE."
+        ),
+    )
+    kind: Literal["rowstore", "nonclustered_columnstore"] = Field(
+        default="rowstore",
+        description=(
+            "rowstore: a B-tree index. nonclustered_columnstore: for an aggregate "
+            "scan of a rowstore table; no include_columns, not unique. Refused before "
+            "any run when the table already has a columnstore index or a column is "
+            "(max), computed, sparse or of a type a columnstore index cannot hold."
+        ),
+    )
+    partition_aligned: bool = Field(
+        default=True,
+        description=(
+            "On a partitioned table: true builds the index on the table's partition "
+            "scheme (one B-tree per partition). false builds it ON [PRIMARY]: one "
+            "ordered B-tree across all partitions, which blocks partition SWITCH "
+            "(non_aligned_index_warning in the result). Refused on a partitioned "
+            "table with a clustered columnstore index. Ignored with a note on a "
+            "table that is not partitioned."
+        ),
+    )
+
+
+class ViewIndexInput(BaseModel):
+    """One more index on the view that benchmark_indexed_view_candidate builds."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key_columns: list[str] = Field(min_length=1)
+    include_columns: list[str] | None = None
+    is_unique: bool = False
 
 
 _GENERATED_NAME_HASH_LENGTH = 8
@@ -385,26 +489,52 @@ def _replacement_summary(experiment: ReplacementExperiment) -> dict[str, Any]:
     }
 
 
+NON_ALIGNED_DATA_SPACE = "PRIMARY"
+
+
 @dataclass(frozen=True)
 class _TestIndexTable:
     """Catalog facts about the table a test index is built on."""
 
     schema: str
     table: str
-    # An enabled columnstore index: the engine then refuses an online index build.
-    has_columnstore_index: bool = False
+    # The clustered index is columnstore (sys.indexes type 5): the engine then
+    # refuses an online index build with error 35352. A nonclustered columnstore
+    # index (type 6) on a rowstore table does not: that build stays online.
+    has_clustered_columnstore_index: bool = False
     partition_scheme: str | None = None
     partition_function: str | None = None
     partition_column: str | None = None
+    # Set for a test index that is not partition-aligned: the filegroup it is
+    # built on. Azure SQL Database has one filegroup, PRIMARY.
+    data_space: str | None = None
+
+    @property
+    def partitioned(self) -> bool:
+        return self.partition_scheme is not None and self.partition_column is not None
+
+    def non_aligned(self) -> "_TestIndexTable":
+        """The same table for an index built on PRIMARY, not on the partition scheme."""
+
+        return replace(
+            self,
+            partition_scheme=None,
+            partition_function=None,
+            partition_column=None,
+            data_space=NON_ALIGNED_DATA_SPACE,
+        )
 
     def placement(self) -> dict[str, Any]:
-        """IndexCandidate fields that align a test index with a partitioned table.
+        """IndexCandidate fields that place a test index on a partitioned table.
 
         CREATE INDEX without an ON clause builds the index on the table's
         partition scheme. The request names that placement, so the built index
-        is compared with what the engine creates.
+        is compared with what the engine creates. A non-aligned index names
+        its filegroup and no partition column.
         """
 
+        if self.data_space is not None:
+            return {"data_space_name": self.data_space}
         if self.partition_scheme is None or self.partition_column is None:
             return {}
         return {
@@ -416,8 +546,8 @@ class _TestIndexTable:
 
 
 _COLUMNSTORE_OFFLINE_BUILD_NOTE = (
-    "The table has a columnstore index. Azure SQL Database cannot build an index online "
-    "on such a table, so the test index is built offline. An offline build blocks all "
+    "The table has a clustered columnstore index. Azure SQL Database cannot build an index "
+    "online on such a table, so the test index is built offline. An offline build blocks all "
     "writes to the table while it runs."
 )
 
@@ -427,17 +557,17 @@ def _test_index_build_online(
 ) -> bool:
     """Whether a test index is built online on this table.
 
-    A table with a columnstore index takes an offline build only. Raises when
-    the database policy does not allow that build.
+    A table with a clustered columnstore index takes an offline build only.
+    Raises when the database policy does not allow that build.
     """
 
-    if table is None or not table.has_columnstore_index:
+    if table is None or not table.has_clustered_columnstore_index:
         return online
     if not policy.allow_offline_test_index:
         raise PermissionError(
-            f"{table.schema}.{table.table} has a columnstore index. Azure SQL Database "
-            "cannot build an index online on a table that has a columnstore index, so a "
-            "test index on it must be built offline, and an offline build blocks all "
+            f"{table.schema}.{table.table} has a clustered columnstore index. Azure SQL "
+            "Database cannot build an index online on such a table (engine error 35352), so "
+            "a test index on it must be built offline, and an offline build blocks all "
             "writes to the table while it runs. The database policy does not allow that "
             "build. A DBA must set allow_offline_test_index to true for this database "
             "before a test index can be built on this table. No query and no DDL was run."
@@ -446,6 +576,62 @@ def _test_index_build_online(
 
 
 _INDEX_DDL_STEPS = frozenset({"create_index", "drop_index"})
+# compare_query_results stops after this many seconds unless the caller sets max_seconds.
+_DEFAULT_COMPARISON_SECONDS = 120.0
+
+
+def _view_recreate_sql(state: ViewCatalogState) -> str:
+    """The statements that put back a view and its indexes as the catalog holds them.
+
+    The inverse of a guarded DROP VIEW, for the admin action's rollback
+    record. The clustered index comes first: the others need it.
+    """
+
+    statements = [str(state.definition or "").strip().rstrip(";") + ";"]
+    for index in sorted(state.indexes, key=lambda item: item.index_id):
+        keys = ", ".join(
+            f"[{column.name}]" + (" DESC" if column.direction == "DESC" else "")
+            for column in index.key_columns
+        )
+        include = (
+            " INCLUDE (" + ", ".join(f"[{name}]" for name in index.include_columns) + ")"
+            if index.include_columns
+            else ""
+        )
+        kind = ("UNIQUE " if index.is_unique else "") + str(index.index_type).strip().upper()
+        statements.append(
+            f"CREATE {kind} INDEX [{index.name}] ON [{index.schema}].[{index.table}] "
+            f"({keys}){include};"
+        )
+    return "\n".join(statements)
+
+
+def _two_part_name(schema_name: str | None, object_name: str | None) -> tuple[str | None, str | None]:
+    """Split ``schema.object`` (brackets allowed) when the schema was not given apart."""
+
+    name = (object_name or "").strip()
+    schema = (schema_name or "").strip() or None
+    if not name:
+        return schema, None
+    parts = [part.strip().strip("[]") for part in name.split(".")]
+    if len(parts) == 2 and all(parts):
+        if schema is not None and schema.casefold() != parts[0].casefold():
+            raise ValueError(
+                f"schema_name is {schema} but the object name says {parts[0]}: pass one schema."
+            )
+        return parts[0], parts[1]
+    return schema, name.strip("[]")
+
+
+def _sample_seconds(sample: Mapping[str, Any]) -> float:
+    """Wall seconds one measured run took: what a caller waits for."""
+
+    values = [
+        float(value)
+        for value in (sample.get("client_elapsed_ms"), sample.get("elapsed_ms"))
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    ]
+    return max(values) / 1000 if values else 0.0
 
 
 def _index_experiment_failure(
@@ -498,7 +684,7 @@ def _index_experiment_failure(
 
 def _offline_build_report(tables: Sequence[_TestIndexTable]) -> dict[str, Any]:
     return {
-        "reason": "columnstore_table",
+        "reason": "clustered_columnstore_table",
         "tables": [f"{table.schema}.{table.table}" for table in tables],
         "note": _COLUMNSTORE_OFFLINE_BUILD_NOTE,
     }
@@ -521,7 +707,7 @@ class _IndexSetMember:
     create_key: str
     cleanup_key: str
     table_facts: _TestIndexTable
-    # False on a columnstore table: the engine builds that index offline only.
+    # False on a clustered columnstore table: the engine builds that index offline only.
     online: bool
     # What the lease holds for this index. The lease of a one-index set keeps
     # these fields at its top level, as every lease before sets did.
@@ -542,8 +728,8 @@ class _IndexSetMember:
     @property
     def fingerprint(self) -> str:
         return self.candidate.definition_fingerprint
-# One row per table: its catalog spelling, whether it has an enabled
-# columnstore index (type 5 or 6), and its partition scheme and column.
+# One row per table: its catalog spelling, whether its clustered index is
+# columnstore (type 5), and its partition scheme and column.
 _TEST_INDEX_TABLE_SQL = """
 SELECT TOP (2)
     s.name AS schema_name,
@@ -552,9 +738,8 @@ SELECT TOP (2)
         SELECT 1
         FROM sys.indexes AS cs
         WHERE cs.object_id = t.object_id
-          AND cs.type IN (5, 6)
-          AND cs.is_disabled = 0
-    ) THEN 1 ELSE 0 END AS has_columnstore_index,
+          AND cs.type = 5
+    ) THEN 1 ELSE 0 END AS has_clustered_columnstore_index,
     ps.name AS partition_scheme_name,
     pf.name AS partition_function_name,
     pc.name AS partitioning_column
@@ -615,6 +800,7 @@ _SESSION_WORKFLOW_TOOLS = frozenset(
     {
         "benchmark_tuning_candidate",
         "benchmark_index_candidate",
+        "benchmark_indexed_view_candidate",
         "benchmark_query_rewrite",
         "apply_prepared_view_change",
         "verify_view_change",
@@ -770,10 +956,27 @@ class _SanitizingToolManager(ToolManager):
                     include_input=False,
                 )
             ]
+            # When an argument name was the problem, name what the tool takes,
+            # so the corrected call needs no second look-up.
+            tool = self.get_tool(name)
+            accepted = sorted(tool.parameters.get("properties", {})) if tool is not None else []
+            details: dict[str, Any] = {"issues": issues}
+            # A tool with one argument needs no list: its envelope stays as it was.
+            if len(accepted) > 1 and any(
+                issue["code"] in {"extra_forbidden", "missing"} for issue in issues
+            ):
+                details["accepted_arguments"] = accepted
+                for issue in issues:
+                    if issue["code"] == "extra_forbidden" and "." not in issue["path"]:
+                        close = difflib.get_close_matches(
+                            issue["path"], accepted, n=1, cutoff=0.5
+                        )
+                        if close:
+                            issue["did_you_mean"] = close[0]
             payload = ErrorPayload(
                 code="invalid_arguments",
                 message="Tool arguments failed validation.",
-                details={"issues": issues},
+                details=details,
             ).as_dict()
             raise ToolError(
                 json.dumps(
@@ -991,10 +1194,16 @@ def _compact_benchmark_payload(payload: Any) -> Any:
             if not isinstance(item, Mapping):
                 slim_results.append(item)
                 continue
-            slim = {key: _compact_aggregate(value) for key, value in item.items()}
-            after = slim.get("baseline_after_plan_delta")
-            if isinstance(after, Mapping):
-                slim["baseline_after_plan_delta"] = {"plan_changed": after.get("plan_changed")}
+            slim = {
+                key: _compact_aggregate(value)
+                for key, value in item.items()
+                # The verdict and the margin are in decision.cases.
+                if key not in {"comparison_margin", "decision_basis"}
+            }
+            for name in ("plan_delta", "baseline_after_plan_delta"):
+                delta = slim.get(name)
+                if isinstance(delta, Mapping):
+                    slim[name] = _compact_plan_delta(delta, operators=name == "plan_delta")
             uses = slim.get("plan_use")
             if isinstance(uses, list):
                 slim["plan_use"] = {
@@ -1008,7 +1217,13 @@ def _compact_benchmark_payload(payload: Any) -> Any:
     equivalence = payload.get("equivalence")
     if isinstance(equivalence, list):
         compact["equivalence"] = [
-            {key: value for key, value in item.items() if key != "result_evidence"}
+            {
+                key: value
+                for key, value in item.items()
+                if key not in _EQUIVALENCE_DETAIL_KEYS
+                # A reason is kept where the case did not simply match.
+                and (key != "reason" or item.get("status") != "match")
+            }
             if isinstance(item, Mapping)
             else item
             for item in equivalence
@@ -1023,14 +1238,124 @@ def _compact_benchmark_payload(payload: Any) -> Any:
     lease = payload.get("lease")
     if isinstance(lease, Mapping):
         compact["lease"] = {key: lease[key] for key in _LEASE_DECISION_KEYS if key in lease}
+    for key in ("lineage", "cross_case_result"):
+        if compact.get(key) is None:
+            compact.pop(key, None)
+    compact["detail_note"] = (
+        'detail="full" adds per-run values, spread, the operators of each plan, '
+        "result digests and the whole preflight."
+    )
     return compact
+
+
+# Per-case comparison fields that only detail="full" returns.
+_EQUIVALENCE_DETAIL_KEYS = frozenset(
+    {
+        "result_evidence",
+        "result_sets",
+        "basis",
+        "columns_match",
+        "type_metadata_available",
+        "positional_metadata_available",
+        "rows_match",
+        "truncated",
+        "baseline_result_set_count",
+        "candidate_result_set_count",
+        "execution_count_is_conservative",
+        "baseline_duplicate_rows",
+        "candidate_duplicate_rows",
+    }
+)
+
+
+def _compact_plan_delta(delta: Mapping[str, Any], *, operators: bool) -> dict[str, Any]:
+    """Whether the plan changed and, for the candidate, its three costliest operators."""
+
+    compact: dict[str, Any] = {"plan_changed": delta.get("plan_changed")}
+    candidate = delta.get("candidate")
+    if operators and isinstance(candidate, Mapping):
+        compact["candidate_operators"] = [
+            " ".join(
+                str(operator[key]) for key in ("operator", "object") if operator.get(key)
+            )
+            for operator in candidate.get("top_operators") or ()
+            if isinstance(operator, Mapping)
+        ]
+    return compact
+
+
+def _capabilities_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """What a tuning session needs from check_capabilities, in under 2 KB.
+
+    The contract flags, the local policy and the view-experiment verdict are
+    kept whole. The platform is four facts, Query Store its state, and each
+    probe one word; a probe that failed keeps its whole entry.
+    """
+
+    # Every small top-level field is kept: the result status and its reason,
+    # the contract flags, the local policy.
+    summary: dict[str, Any] = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"checks", "azure_sql_database", "query_store_replicas"}
+    }
+    platform = payload.get("azure_sql_database")
+    data = platform.get("data") if isinstance(platform, Mapping) else None
+    if isinstance(platform, Mapping) and not isinstance(data, Mapping):
+        # The platform read failed: its error is the fact to report.
+        summary["azure_sql_database"] = platform
+    if isinstance(data, Mapping):
+        summary["platform"] = {
+            key: data[key]
+            for key in (
+                "platform_supported",
+                "engine_edition",
+                "service_objective",
+                "compatibility_level",
+            )
+            if key in data
+        }
+    probes = payload.get("checks")
+    if isinstance(probes, Mapping):
+        query_store = probes.get("query_store")
+        if isinstance(query_store, Mapping):
+            detail = query_store.get("detail")
+            summary["query_store"] = {
+                "available": query_store.get("available"),
+                **(
+                    {key: detail[key] for key in ("enabled", "state") if key in detail}
+                    if isinstance(detail, Mapping)
+                    else {}
+                ),
+            }
+        summary["checks"] = {
+            name: (
+                "available"
+                if isinstance(probe, Mapping) and probe.get("available") is True
+                else probe
+            )
+            for name, probe in probes.items()
+        }
+    summary["detail_note"] = (
+        'detail="full" adds the probe details, the platform report and the Query Store '
+        "replica dimension."
+    )
+    return summary
 
 
 def _lead_with_requested_queries(
     report: Mapping[str, Any],
     query_ids: Sequence[int],
+    *,
+    include_others: bool = False,
 ) -> dict[str, Any]:
-    """Put the recommendations that serve the requested queries first, and count them."""
+    """Lead the report with the queries the caller named.
+
+    The design for each named query alone and the count of recommendations
+    that serve them come first. The recommendations of other queries are
+    counted, and returned only with ``include_others``: they were most of a
+    16 to 34 KB report that the caller did not ask for.
+    """
 
     requested = {int(query_id) for query_id in query_ids}
     recommendations = report.get("recommendations")
@@ -1060,17 +1385,26 @@ def _lead_with_requested_queries(
     else:
         message = (
             f"No recommendation serves query id {ids}: the review found no index change "
-            f"that helps. The {len(others)} recommendation(s) below come from other "
-            "queries of the workload."
+            "that helps."
         )
+    requested_queries: dict[str, Any] = {
+        "query_ids": sorted(requested),
+        "recommendations_for_them": len(for_them),
+    }
+    if others and not include_others:
+        requested_queries["other_recommendations_omitted"] = len(others)
+        message += (
+            f" {len(others)} recommendation(s) from other queries of the workload are "
+            "left out; pass include_other_recommendations=true to see them."
+        )
+    elif others:
+        message += f" The {len(others)} recommendation(s) after them come from other queries."
+    requested_queries["message"] = message
     return {
-        **report,
-        "requested_queries": {
-            "query_ids": sorted(requested),
-            "recommendations_for_them": len(for_them),
-            "message": message,
-        },
-        "recommendations": [*for_them, *others],
+        "requested_queries": requested_queries,
+        "requested_query_design": report.get("requested_query_design", []),
+        **{key: value for key, value in report.items() if key != "requested_query_design"},
+        "recommendations": [*for_them, *(others if include_others else [])],
     }
 
 
@@ -1523,6 +1857,12 @@ class AzureSqlMcpApplication:
         async def get_column_statistics(
             schema_name: str = Field(description="Schema of the table."),
             table_name: str = Field(description="Table name."),
+            column_names: list[str] | None = Field(
+                default=None, description="Another name for columns. Pass one of the three."
+            ),
+            column_name: str | None = Field(
+                default=None, description="One column: another name for columns=[column]."
+            ),
             columns: list[str] | None = Field(
                 default=None,
                 description="Up to 20 columns. Default: the columns that lead a statistic.",
@@ -1532,6 +1872,14 @@ class AzureSqlMcpApplication:
             top_values: int = Field(default=5, ge=1, le=20),
             database_name: str | None = Field(default=None),
         ) -> ResponseType:
+            given = [
+                value
+                for value in (columns, column_names, [column_name] if column_name else None)
+                if value
+            ]
+            if len(given) > 1:
+                raise ValueError("Pass one of columns, column_names, column_name.")
+            requested_columns = given[0] if given else None
             return await self._run_tool(
                 "get_column_statistics",
                 database_name,
@@ -1539,7 +1887,7 @@ class AzureSqlMcpApplication:
                     db,
                     schema_name,
                     table_name,
-                    columns,
+                    requested_columns,
                     include_histogram=include_histogram,
                     max_steps=max_steps,
                     top_values=top_values,
@@ -1580,12 +1928,20 @@ class AzureSqlMcpApplication:
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
             ),
+            detail: Literal["summary", "full"] = Field(
+                default="summary",
+                description=(
+                    "summary: mcp_contract, local_tuning_policy, indexed_view_experiment, "
+                    "the platform line, the Query Store state and one word per probe. "
+                    "full: adds the probe details, the platform report and the replicas."
+                ),
+            ),
         ) -> ResponseType:
-            return await self._run_tool(
-                "check_capabilities",
-                database_name,
-                self._check_database_capabilities,
-            )
+            async def check(db: str) -> dict[str, Any]:
+                payload = await self._check_database_capabilities(db)
+                return payload if detail == "full" else _capabilities_summary(payload)
+
+            return await self._run_tool("check_capabilities", database_name, check)
 
         @self.mcp.tool(
             description="List schemas in the selected Azure SQL database.",
@@ -1684,8 +2040,17 @@ class AzureSqlMcpApplication:
             ),
         )
         async def get_object_details(
-            schema_name: str = Field(description="Schema name."),
-            object_name: str = Field(description="Object name."),
+            schema_name: str | None = Field(
+                default=None,
+                description="Schema name. May be left out when object_name is schema.object.",
+            ),
+            object_name: str | None = Field(
+                default=None,
+                description="Object name, or a two-part name such as dw.FactPost.",
+            ),
+            table_name: str | None = Field(
+                default=None, description="Another name for object_name. Pass one of the two."
+            ),
             object_type: str = Field(
                 default="table",
                 description="Object type: table, view, procedure, function, or index.",
@@ -1695,13 +2060,21 @@ class AzureSqlMcpApplication:
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
             ),
         ) -> ResponseType:
+            if object_name and table_name:
+                raise ValueError("Pass object_name or table_name, not both.")
+            schema, name = _two_part_name(schema_name, object_name or table_name)
+            if not schema or not name:
+                raise ValueError(
+                    "get_object_details needs schema_name and object_name, or object_name "
+                    "as schema.object (for example dw.FactPost)."
+                )
             return await self._run_tool(
                 "get_object_details",
                 database_name,
                 lambda resolved_database: self._get_object_details(
                     resolved_database,
-                    schema_name,
-                    object_name,
+                    schema,
+                    name,
                     object_type,
                 ),
             )
@@ -1749,19 +2122,31 @@ class AzureSqlMcpApplication:
                 default=None,
                 description="Optional schema filter. Omit for all schemas.",
             ),
+            table_name: str | None = Field(
+                default=None,
+                description=(
+                    "Optional table filter: a table name, or schema.table. Without a "
+                    "schema the table is returned from every schema that has it."
+                ),
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
             ),
         ) -> ResponseType:
-            return await self._run_tool(
-                "get_table_stats",
-                database_name,
-                lambda resolved_database: self.introspection.get_table_stats(
-                    resolved_database,
-                    schema_name,
-                ),
-            )
+            schema, table = _two_part_name(schema_name, table_name)
+
+            async def table_stats(resolved_database: str) -> list[dict[str, Any]]:
+                rows = await self.introspection.get_table_stats(resolved_database, schema)
+                if not table:
+                    return rows
+                return [
+                    row
+                    for row in rows
+                    if str(row.get("table_name") or "").casefold() == table.casefold()
+                ]
+
+            return await self._run_tool("get_table_stats", database_name, table_stats)
 
         @self.mcp.tool(
             description="Capture a point-in-time schema snapshot for a database.",
@@ -2585,8 +2970,11 @@ class AzureSqlMcpApplication:
             artifact_ref: str | None = Field(
                 default=None,
                 description=(
-                    "Durable artifact reference. rewrite_plus_index candidates "
-                    "require candidate:<parent-id>."
+                    "Parent of a rewrite_plus_index candidate: candidate:<parent-id>, "
+                    "a rewrite finalist of this session whose results matched (improved, "
+                    "neutral or regressed). Leave it out to measure the rewrite with its "
+                    "indexes against the original in one call (candidate_sql of "
+                    "benchmark_index_candidate)."
                 ),
             ),
             idempotency_key: str | None = Field(default=None),
@@ -2722,7 +3110,12 @@ class AzureSqlMcpApplication:
                 "key_columns, or several (also on different tables) with indexes. "
                 "Every index is created or none is left, and every one is dropped on "
                 "every path; cleanup failures are durable. The result lists per index "
-                "what was built, its size in MB and its B-tree depth."
+                "what was built, its size in MB and its B-tree depth. Every parameter "
+                "case of the call is measured under the one build: decision.cases is "
+                "the per-case table and decision.worst_case the case that gains least. "
+                "For a rewrite that needs its indexes, pass the rewrite as candidate_sql: "
+                "one call measures the original against the rewrite with its indexes "
+                "and compares their results."
             ),
             annotations=ToolAnnotations(
                 title="Benchmark Index Candidate",
@@ -2735,7 +3128,42 @@ class AzureSqlMcpApplication:
         async def benchmark_index_candidate(
             session_id: str = Field(description="Tuning session identifier."),
             candidate_id: str = Field(description="Index candidate identifier."),
-            sql: str = Field(description="Read-only query measured before and after the index."),
+            sql: str = Field(
+                description=(
+                    "Read-only query measured before and after the index. With "
+                    "candidate_sql: the original statement of the performance case."
+                )
+            ),
+            candidate_sql: str | None = Field(
+                default=None,
+                description=(
+                    "A rewrite measured WITH the index set, against sql (the original) "
+                    "without it: one call for a rewrite that needs its indexes. The "
+                    "candidate is registered with add_tuning_candidate(strategy="
+                    "'rewrite_plus_index') and no artifact_ref. A finalist compares the "
+                    "results of both statements in one snapshot per parameter case "
+                    "before the indexes are dropped."
+                ),
+            ),
+            runs: int | None = Field(
+                default=None,
+                ge=1,
+                description=(
+                    "Measured runs per arm and parameter case, from 1 to the session "
+                    "limit of the phase (default: that limit). The tool lowers it by "
+                    "itself for a slow statement: at most 3 runs when the first run "
+                    "takes 1 to 10 seconds, one run at 10 seconds or more."
+                ),
+            ),
+            plan_reuse: Literal["per_case", "first_case"] = Field(
+                default="per_case",
+                description=(
+                    "per_case: each parameter case compiles its own plan. first_case: "
+                    "all cases share one statement text, so the first case compiles "
+                    "and the later cases run on its plan, in the order given, as a "
+                    "plan cache does. plan_compiled_for names the case per result."
+                ),
+            ),
             schema_name: str | None = Field(
                 default=None, description="Target schema of a one-index candidate."
             ),
@@ -2751,11 +3179,31 @@ class AzureSqlMcpApplication:
                 description="Optional filtered-index predicate; no SQL statements or comments.",
             ),
             is_unique: bool = Field(default=False),
-            data_compression: Literal["NONE", "ROW", "PAGE"] | None = Field(
+            data_compression: (
+                Literal["NONE", "ROW", "PAGE", "COLUMNSTORE", "COLUMNSTORE_ARCHIVE"] | None
+            ) = Field(
                 default=None,
                 description=(
                     "Compression of a one-index candidate. ROW or PAGE can keep a wide "
-                    "index one B-tree level shallower; compare index_depth in the result."
+                    "index one B-tree level shallower; compare index_depth in the result. "
+                    "A nonclustered columnstore index takes COLUMNSTORE or COLUMNSTORE_ARCHIVE."
+                ),
+            ),
+            index_kind: Literal["rowstore", "nonclustered_columnstore"] | None = Field(
+                default=None,
+                description=(
+                    "Kind of a one-index candidate: rowstore (default) or "
+                    "nonclustered_columnstore, where key_columns lists the columns of "
+                    "the index. In indexes the same field is named kind."
+                ),
+            ),
+            partition_aligned: bool | None = Field(
+                default=None,
+                description=(
+                    "One-index candidate on a partitioned table: false builds the index "
+                    "ON [PRIMARY], one ordered B-tree across all partitions (default: "
+                    "aligned with the table's partition scheme). The result then carries "
+                    "non_aligned_index_warning. The same field exists in each indexes entry."
                 ),
             ),
             indexes: list[IndexDefinitionInput] | None = Field(
@@ -2764,7 +3212,8 @@ class AzureSqlMcpApplication:
                     "A set of 1 to 4 indexes tested together as one candidate, in place "
                     "of the single-index arguments. Each: {table_name, key_columns, "
                     "schema_name (default dbo), include_columns, filter_definition, "
-                    "is_unique, data_compression}. Use it when the design needs two "
+                    "is_unique, data_compression, kind (rowstore or "
+                    "nonclustered_columnstore)}. Use it when the design needs two "
                     "indexes, or one index on each of two tables."
                 ),
             ),
@@ -2803,8 +3252,9 @@ class AzureSqlMcpApplication:
             online: bool = Field(
                 default=True,
                 description=(
-                    "Build the test index online. A table with a columnstore index is "
-                    "built offline only (the engine refuses ONLINE there): the build "
+                    "Build the test index online. A table with a clustered columnstore "
+                    "index is built offline only (the engine refuses ONLINE there, error "
+                    "35352; a nonclustered columnstore index does not force this): the build "
                     "then needs allow_offline_test_index in the database policy, blocks "
                     "writes to the table while it runs, and the result says so in "
                     "offline_build."
@@ -2859,6 +3309,11 @@ class AzureSqlMcpApplication:
                     index_name_prefix=index_name_prefix,
                     replaces=replaces,
                     slow_baseline_cases=slow_baseline_cases,
+                    candidate_sql=candidate_sql,
+                    runs=runs,
+                    plan_reuse=plan_reuse,
+                    index_kind=index_kind,
+                    partition_aligned=partition_aligned,
                 )
                 return payload if detail == "full" else _compact_benchmark_payload(payload)
 
@@ -2871,6 +3326,160 @@ class AzureSqlMcpApplication:
                     deadline_provider=lambda: self.tuning_sessions.get_session(
                         session_id
                     ).deadline_at_utc,
+                    decision_id=decision_id,
+                ),
+            )
+
+        @self.mcp.tool(
+            description=(
+                "Benchmark a leased indexed view as one candidate, in a policy-allowlisted "
+                "sandbox: the original statement is measured before and after, and the "
+                "statement that reads the view while the view exists. One lease builds "
+                "the schema-bound view, its unique clustered index and up to 3 more "
+                "indexes in one transaction, and drops the view on every path. Needs "
+                "allow_test_indexes, allow_view_apply and allow_offline_test_index in the "
+                "database policy (the first index of a view is built offline). "
+                "preview=true returns the names, the findings and the setup statements "
+                "and runs nothing. The result carries the write overhead warning: every "
+                "write to a base table also maintains the view."
+            ),
+            annotations=ToolAnnotations(
+                title="Benchmark Indexed View Candidate",
+                readOnlyHint=False,
+                destructiveHint=True,
+                idempotentHint=False,
+                openWorldHint=False,
+            ),
+        )
+        async def benchmark_indexed_view_candidate(
+            view_definition: str = Field(
+                description=(
+                    "The view: its SELECT body, or a whole CREATE VIEW ... WITH "
+                    "SCHEMABINDING AS SELECT ... statement. Two-part table names, "
+                    "COUNT_BIG(*) with GROUP BY, no outer joins, no subqueries."
+                )
+            ),
+            session_id: str | None = Field(
+                default=None, description="Tuning session identifier. Not needed for preview."
+            ),
+            candidate_id: str | None = Field(
+                default=None,
+                description=(
+                    "Candidate identifier. read_mode noexpand: a rewrite_plus_index "
+                    "candidate registered with candidate_sql and no artifact_ref. "
+                    "read_mode automatic: an index candidate with the unchanged statement."
+                ),
+            ),
+            sql: str | None = Field(
+                default=None,
+                description="The original statement of the performance case. Not needed for preview.",
+            ),
+            candidate_sql: str | None = Field(
+                default=None,
+                description=(
+                    "read_mode noexpand: the statement that reads the view, with a "
+                    "two-part name and WITH (NOEXPAND). Call with preview=true first "
+                    "when you let the tool choose the view name."
+                ),
+            ),
+            read_mode: Literal["noexpand", "automatic"] = Field(
+                default="noexpand",
+                description=(
+                    "noexpand: candidate_sql reads the view WITH (NOEXPAND). automatic: "
+                    "the original statement runs again and the result says whether the "
+                    "optimizer matched the view."
+                ),
+            ),
+            clustered_index_key: list[str] | None = Field(
+                default=None,
+                description=(
+                    "Ordered key of the unique clustered index. May be left out for a "
+                    "view with GROUP BY that returns every GROUP BY expression."
+                ),
+            ),
+            extra_indexes: list[ViewIndexInput] | None = Field(
+                default=None,
+                description="0 to 3 more indexes on the view: {key_columns, include_columns, is_unique}.",
+            ),
+            view_name: str | None = Field(
+                default=None,
+                description=(
+                    "Name under a test view prefix (v_Testing_, or the v_ twin of a "
+                    "policy prefix: IX_bench_ gives v_bench_). Any other name, or none, "
+                    "gives a generated name; the plan and the refusal name it."
+                ),
+            ),
+            schema_name: str | None = Field(default=None, description="Schema of the view; default dbo."),
+            index_name_prefix: str | None = Field(
+                default=None, description="As for benchmark_index_candidate."
+            ),
+            parameter_cases: list[ParameterCaseInput] | None = Field(
+                default=None,
+                description="The same named parameter cases recorded on the performance case.",
+            ),
+            phase: BenchmarkPhase = Field(
+                default="screening", description="Benchmark phase: screening or finalist."
+            ),
+            runs: int | None = Field(
+                default=None,
+                ge=1,
+                description="Runs per arm and case, 1 to the session limit; lowered for a slow statement.",
+            ),
+            compare_order: bool | None = Field(default=None),
+            lease_minutes: int = Field(default=30, ge=5, le=120),
+            idempotency_key: str | None = Field(
+                default=None,
+                description="Caller-generated key that fences retries and cleanup. Not needed for preview.",
+            ),
+            preview: bool = Field(
+                default=False,
+                description="Plan only: names, findings and setup statements. No statement runs.",
+            ),
+            detail: Literal["summary", "full"] = Field(default="summary"),
+            decision_id: str | None = Field(default=None),
+            database_name: str | None = Field(default=None),
+        ) -> BenchmarkToolOutput:
+            async def benchmark(db: str) -> Any:
+                payload = await self._benchmark_indexed_view_candidate(
+                    db,
+                    session_id,
+                    candidate_id,
+                    view_definition,
+                    sql=sql,
+                    candidate_sql=candidate_sql,
+                    read_mode=read_mode,
+                    clustered_index_key=clustered_index_key,
+                    extra_indexes=(
+                        [item.model_dump(mode="python") for item in extra_indexes]
+                        if extra_indexes is not None
+                        else None
+                    ),
+                    view_name=view_name,
+                    schema_name=schema_name,
+                    index_name_prefix=index_name_prefix,
+                    parameter_cases=_parameter_case_payloads(parameter_cases),
+                    phase=phase,
+                    runs=runs,
+                    compare_order=compare_order,
+                    lease_minutes=lease_minutes,
+                    idempotency_key=idempotency_key,
+                    preview=preview,
+                )
+                if preview or detail == "full":
+                    return payload
+                return _compact_benchmark_payload(payload)
+
+            return cast(
+                BenchmarkToolOutput,
+                await self._run_tool(
+                    "benchmark_indexed_view_candidate",
+                    database_name,
+                    benchmark,
+                    deadline_provider=(
+                        (lambda: self.tuning_sessions.get_session(session_id).deadline_at_utc)
+                        if session_id
+                        else None
+                    ),
                     decision_id=decision_id,
                 ),
             )
@@ -2907,11 +3516,17 @@ class AzureSqlMcpApplication:
                 default=None,
                 description=(
                     "Data properties the selected rewrite depends on, each verified in "
-                    "the catalog before the session completes: {kind: not_null | "
-                    "unique_key | trusted_foreign_key | trusted_check, schema_name, "
-                    "table_name, ...}. A rewrite is deployment_ready only when its "
-                    "preconditions are catalog-verified. One the catalog refutes "
-                    "raises and leaves the session open."
+                    "the catalog before the session completes. Every entry has kind: "
+                    "not_null | unique | trusted_foreign_key | trusted_check, with "
+                    "schema_name and table_name. not_null: {kind, schema_name, "
+                    "table_name, columns: [..]}. unique: the same fields; an enabled, "
+                    "unfiltered unique key must lie within columns. trusted_foreign_key: "
+                    "{kind, schema_name, table_name, columns, referenced_schema, "
+                    "referenced_table, referenced_columns}. trusted_check: {kind, "
+                    "schema_name, table_name, constraint_name, expected_predicate}. "
+                    "A rewrite is deployment_ready only when its preconditions are "
+                    "catalog-verified. One the catalog refutes raises and leaves the "
+                    "session open."
                 ),
             ),
             idempotency_key: str | None = Field(default=None),
@@ -2939,7 +3554,14 @@ class AzureSqlMcpApplication:
         @self.mcp.tool(
             description=(
                 "Compare two read-only query results in one snapshot. The result is proven "
-                "only when the complete bounded results, duplicates, shape, and required order match."
+                "only when the complete bounded results, duplicates, shape, and required order "
+                "match. Statements with a proven total order are compared as ordered rows, the "
+                "others as multisets with duplicate counts; comparison_basis says which. A "
+                "preflight gap that a comparison can settle (possible ORDER BY ties, a row "
+                "limit with ties, a UNION ALL rewrite, a changed ORDER BY) no longer stops "
+                "the run: the result is then proof_scope snapshot_test, a test on today's "
+                "data that lists what is not settled. A volatile statement (clock, NEWID, "
+                "TABLESAMPLE, unordered row limit) is refused. max_seconds caps the run."
             ),
             annotations=ToolAnnotations(
                 title="Compare Query Results",
@@ -2969,10 +3591,42 @@ class AzureSqlMcpApplication:
                 default=None,
                 description="Short form of parameter_case.types.",
             ),
+            parameter_cases: list[ParameterCaseInput] | None = Field(
+                default=None,
+                description=(
+                    "Up to 4 named cases compared in one call, in place of "
+                    "parameter_case: [{name, values, types}]. The result has one entry "
+                    "per case under cases."
+                ),
+            ),
+            max_seconds: float | None = Field(
+                default=None,
+                gt=0,
+                description=(
+                    "Time cap for the whole comparison; default 120, or the server tool "
+                    "timeout less 5 seconds when that is lower. When it is spent the running "
+                    "statement is cancelled and the result is timed_out with the arm "
+                    "that was running (and baseline_seconds when the baseline finished). "
+                    "It cannot exceed the server tool timeout; a lower effective cap is "
+                    "reported in max_seconds_note."
+                ),
+            ),
+            estimated_seconds: float | None = Field(
+                default=None,
+                gt=0,
+                description=(
+                    "Seconds one execution of the slower statement takes, when known "
+                    "(explain_query with analyze, or a benchmark). Both statements run "
+                    "once: when twice this exceeds max_seconds nothing is started and "
+                    "the result (not_run) says which max_seconds to pass."
+                ),
+            ),
             database_name: str | None = Field(default=None),
         ) -> ResponseType:
             async def compare(db: str) -> dict[str, Any]:
-                return await self.performance_workflows.compare_query_results(
+                # The tool timeout ends the call without a result; the cap must end first.
+                ceiling = max(1.0, float(self.config.tool_timeout_seconds) - 5.0)
+                result = await self.performance_workflows.compare_query_results(
                     db,
                     baseline_sql,
                     candidate_sql,
@@ -2980,7 +3634,20 @@ class AzureSqlMcpApplication:
                     parameter_case=_one_parameter_shape(
                         parameter_case, parameter_values, parameter_types
                     ),
+                    parameter_cases=_parameter_case_payloads(parameter_cases),
+                    max_seconds=min(
+                        _DEFAULT_COMPARISON_SECONDS if max_seconds is None else max_seconds,
+                        ceiling,
+                    ),
+                    estimated_seconds=estimated_seconds,
                 )
+                if max_seconds is not None and max_seconds > ceiling and isinstance(result, dict):
+                    result["max_seconds_note"] = (
+                        f"max_seconds was lowered to {ceiling:g}: the server tool timeout "
+                        f"is {self.config.tool_timeout_seconds} seconds "
+                        "(AZURE_SQL_TOOL_TIMEOUT_SECONDS)."
+                    )
+                return result
 
             return await self._run_tool("compare_query_results", database_name, compare)
 
@@ -3659,9 +4326,18 @@ class AzureSqlMcpApplication:
                 description=(
                     "Query Store query ids that must be analysed whatever their rank "
                     "or table scope. Pass the query being tuned so its access paths "
-                    "shape the advice. The recommendations that serve these queries "
-                    "come first (serves_requested_query), and requested_queries says "
-                    "plainly when there is none for them."
+                    "shape the advice. The report then leads with requested_queries "
+                    "and requested_query_design (the index each of these queries would "
+                    "get alone: equality columns, then ORDER BY, then one range column), "
+                    "and returns only the recommendations that serve them."
+                ),
+            ),
+            include_other_recommendations: bool = Field(
+                default=False,
+                description=(
+                    "With query_ids: also return the recommendations that come from "
+                    "other queries of the workload. By default they are counted in "
+                    "requested_queries.other_recommendations_omitted and left out."
                 ),
             ),
             include_change_plan: bool = Field(
@@ -3710,7 +4386,9 @@ class AzureSqlMcpApplication:
                     **policy_prefixes,
                 )
                 if query_ids:
-                    report = _lead_with_requested_queries(report, query_ids)
+                    report = _lead_with_requested_queries(
+                        report, query_ids, include_others=include_other_recommendations
+                    )
                 if include_change_plan:
                     report = {
                         **report,
@@ -5612,13 +6290,20 @@ class AzureSqlMcpApplication:
                     default=True,
                     description=(
                         "Use ONLINE=ON (avoids blocking during the build). A table with a "
-                        "columnstore index is built offline only: see offline_build."
+                        "clustered columnstore index is built offline only: see offline_build."
                     ),
                 ),
                 dry_run: bool = Field(
                     default=True,
                     description=(
                         "Must remain true. Direct test-index creation is preview-only."
+                    ),
+                ),
+                index_kind: Literal["rowstore", "nonclustered_columnstore"] = Field(
+                    default="rowstore",
+                    description=(
+                        "rowstore (default) or nonclustered_columnstore, where "
+                        "key_columns lists the columns of the index."
                     ),
                 ),
                 database_name: str | None = Field(
@@ -5636,6 +6321,7 @@ class AzureSqlMcpApplication:
                         db, schema_name, table_name, index_name,
                         key_columns, include_columns, online, dry_run,
                         table_facts=table_facts,
+                        index_kind=index_kind,
                     )
 
                 return await self._run_tool("create_test_index", database_name, preview)
@@ -7064,6 +7750,9 @@ class AzureSqlMcpApplication:
                 "result_status": 1,
                 "plan_digest": 1,
             },
+            # Whether benchmark_indexed_view_candidate may run here, and the
+            # prefixes a test view name may start with.
+            "indexed_view_experiment": self._local_view_experiment_capability(policy),
             "local_tuning_policy": {
                 "configured": policy.configured,
                 "environment": policy.environment,
@@ -8507,6 +9196,8 @@ class AzureSqlMcpApplication:
         is_unique: bool,
         data_compression: str | None,
         indexes: list[dict[str, Any]] | None,
+        index_kind: str | None = None,
+        partition_aligned: bool | None = None,
     ) -> list[dict[str, Any]]:
         """The 1 to 4 index definitions of one candidate, from either argument form."""
 
@@ -8521,9 +9212,11 @@ class AzureSqlMcpApplication:
                         include_columns,
                         filter_definition,
                         data_compression,
+                        index_kind,
                     )
                 )
                 or is_unique
+                or partition_aligned is not None
             ):
                 raise ValueError(
                     "Pass indexes, or the single-index arguments (schema_name, "
@@ -8546,14 +9239,27 @@ class AzureSqlMcpApplication:
                     "filter_definition": filter_definition,
                     "is_unique": is_unique,
                     "data_compression": data_compression,
+                    "kind": index_kind,
+                    "partition_aligned": partition_aligned,
                 }
             ]
         specs: list[dict[str, Any]] = []
         for item in raw:
             if not item.get("key_columns"):
                 raise ValueError("key_columns must contain at least one column.")
-            compression = str(item.get("data_compression") or "NONE").strip().upper()
-            if compression not in {"NONE", "ROW", "PAGE"}:
+            kind = str(item.get("kind") or INDEX_KIND_ROWSTORE).strip().casefold()
+            if kind not in TEST_INDEX_KINDS:
+                raise ValueError("kind must be " + " or ".join(TEST_INDEX_KINDS) + ".")
+            columnstore = kind == INDEX_KIND_NONCLUSTERED_COLUMNSTORE
+            # The default of the engine for the kind: the same index, the same name.
+            engine_default = "COLUMNSTORE" if columnstore else "NONE"
+            compression = str(item.get("data_compression") or engine_default).strip().upper()
+            if columnstore and compression not in {"COLUMNSTORE", "COLUMNSTORE_ARCHIVE"}:
+                raise ValueError(
+                    "data_compression must be COLUMNSTORE or COLUMNSTORE_ARCHIVE for a "
+                    "nonclustered_columnstore index."
+                )
+            if not columnstore and compression not in {"NONE", "ROW", "PAGE"}:
                 raise ValueError("data_compression must be NONE, ROW or PAGE.")
             specs.append(
                 {
@@ -8563,8 +9269,9 @@ class AzureSqlMcpApplication:
                     "include_columns": item.get("include_columns"),
                     "filter_definition": item.get("filter_definition"),
                     "is_unique": bool(item.get("is_unique", False)),
-                    # NONE is the default of the engine: the same index, the same name.
-                    "data_compression": None if compression == "NONE" else compression,
+                    "data_compression": None if compression == engine_default else compression,
+                    "kind": kind,
+                    "partition_aligned": item.get("partition_aligned") is not False,
                 }
             )
         return specs
@@ -8595,26 +9302,20 @@ class AzureSqlMcpApplication:
         session_id: str,
         compare_order: bool,
     ) -> dict[str, dict[str, Any]]:
-        """The one-run baselines that earlier index benchmarks of the session kept.
+        """The one-run baselines the session holds, from either benchmark tool.
 
         Each holds the sample, the plan brief and the result digest of that
         run, so a later index is still compared with the baseline's rows.
         """
 
-        pool: dict[str, dict[str, Any]] = {}
-        for evidence in self.performance_store.list_evidence_for_session(session_id):
-            kept = evidence.metrics.get("slow_baselines")
-            if not evidence.kind.startswith("index_") or not isinstance(kept, Mapping):
-                continue
-            for name, item in kept.items():
-                if (
-                    isinstance(item, Mapping)
-                    and isinstance(item.get("sample"), Mapping)
-                    and isinstance(item.get("result"), Mapping)
-                    and item.get("order_compared") is compare_order
-                ):
-                    pool[str(name)] = {**item, "evidence_id": evidence.evidence_id}
-        return pool
+        return {
+            name: item
+            for name, item in self.performance_workflows.session_slow_baselines(
+                session_id
+            ).items()
+            if isinstance(item.get("result"), Mapping)
+            and item.get("order_compared") is compare_order
+        }
 
     async def _built_index_facts(
         self,
@@ -8654,9 +9355,56 @@ class AzureSqlMcpApplication:
             "index_depth": int(depth) if depth is not None else None,
             "row_count": int(row_count) if row_count is not None else None,
         }
-        if pages is None or depth is None:
+        if member.candidate.index_kind == INDEX_KIND_NONCLUSTERED_COLUMNSTORE:
+            # No B-tree, so no depth (the catalog read gives 0). What matters is
+            # how the rows compressed.
+            facts["index_depth"] = None
+            facts.update(await self._columnstore_index_facts(database_name, member))
+            if pages is None:
+                facts["facts_note"] = "The size of the built index could not be read."
+            return facts
+        if pages is None and depth is None:
             facts["facts_note"] = "The size or depth of the built index could not be read."
+        elif depth is None:
+            facts["facts_note"] = "The B-tree depth of the built index could not be read."
+        elif pages is None:
+            facts["facts_note"] = "The size of the built index could not be read."
         return facts
+
+    async def _columnstore_index_facts(
+        self,
+        database_name: str,
+        member: _IndexSetMember,
+    ) -> dict[str, Any]:
+        """Row groups of a built columnstore test index; empty when they cannot be read."""
+
+        try:
+            rows = await self.executor.fetch_all(
+                database_name,
+                ROW_GROUP_SQL.format(object_filter=OBJECT_FILTER),
+                params=[member.schema, member.table],
+                sql_origin="server_built",
+            )
+        except Exception as exc:
+            note_exception(exc, "server.columnstore_index_facts")
+            return {}
+        summary = next(
+            (
+                item
+                for item in summarize_columnstore_indexes(rows)
+                if item.get("index_name") == member.index_name
+            ),
+            None,
+        )
+        if summary is None:
+            return {}
+        return {
+            "row_groups": {
+                key: summary.get(key)
+                for key in ("compressed_row_groups", "compressed_rows", "size_bytes", "trim_reasons")
+                if summary.get(key) is not None
+            }
+        }
 
     @staticmethod
     def _index_lease_members(lease: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -8887,11 +9635,35 @@ class AzureSqlMcpApplication:
         index_name_prefix: str | None = None,
         replaces: str | None = None,
         slow_baseline_cases: Mapping[str, float] | None = None,
+        candidate_sql: str | None = None,
+        runs: int | None = None,
+        plan_reuse: str = "per_case",
+        index_kind: str | None = None,
+        partition_aligned: bool | None = None,
     ) -> dict[str, Any]:
         """Measure a query before, with and after a leased set of 1 to 4 test indexes.
 
         One lease covers the whole set: every index is created or none is
         left, and every created index is dropped on every path.
+
+        ``candidate_sql`` is the one-call path for a rewrite that needs its
+        indexes: ``sql`` is the statement of the performance case and runs in
+        the two baseline arms (no test index), ``candidate_sql`` is the
+        rewrite and runs while the index set exists. A finalist compares the
+        two statements in one snapshot per parameter case before the indexes
+        are dropped, so the verdict is one measurement of the original
+        against the rewrite with its indexes. The candidate is a
+        rewrite_plus_index candidate; it needs no parent.
+
+        Every parameter case of the call is measured under the one build.
+        ``runs`` lowers the runs per arm and case (1 to the session limit of
+        the phase). The first run of each arm then sets its count
+        (``adaptive_run_count``): a statement that takes seconds gets at most
+        3 runs, and one that takes 10 seconds or more runs once; such a
+        baseline is kept for the session and not run again. ``plan_reuse``:
+        ``per_case`` compiles a plan for each case; ``first_case`` gives all
+        cases one statement text, so the later cases run on the plan the
+        first case compiled, as a plan cache does.
         """
 
         if self.config.profile != McpProfile.SANDBOX:
@@ -8907,6 +9679,8 @@ class AzureSqlMcpApplication:
             raise PermissionError("Database policy does not permit temporary indexes.")
         if phase not in {"screening", "finalist"}:
             raise ValueError("phase must be screening or finalist.")
+        if plan_reuse not in {"per_case", "first_case"}:
+            raise ValueError("plan_reuse must be per_case or first_case.")
         name_prefix, name_tag = self._resolve_test_index_prefix(policy, index_name_prefix)
         allowed_session_statuses = {
             "created",
@@ -8926,6 +9700,11 @@ class AzureSqlMcpApplication:
         # A read-only branching batch is one candidate here too: a rewrite into
         # branches often needs its indexes measured with it.
         normalized_sql = self.validator.validate_read_only_candidate(sql).execution_sql
+        normalized_rewrite = (
+            self.validator.validate_read_only_candidate(candidate_sql).execution_sql
+            if candidate_sql is not None
+            else None
+        )
         compare_order = effective_compare_order(normalized_sql, compare_order)
         candidate = self.tuning_sessions.get_candidate(candidate_id)
         case = self.performance_store.get_performance_case(session.performance_case_id)
@@ -8963,22 +9742,65 @@ class AzureSqlMcpApplication:
                 "Index benchmarking requires index or rewrite_plus_index; "
                 "lineage-backed combined is accepted only for legacy records."
             )
-        if not fingerprint_text_matches(
-            candidate.rewrite_fingerprint,
-            normalized_sql,
-            allow_legacy=bool(self.config.legacy_state_server_binding),
-        ):
-            raise ValueError("Index candidate SQL fingerprint does not match.")
-        lineage: dict[str, Any] | None = None
-        if candidate.strategy == "index":
+        allow_legacy_fingerprint = bool(self.config.legacy_state_server_binding)
+        one_call_route = (
+            "To measure a rewrite with its indexes against the original statement in "
+            "one call, register the rewrite with add_tuning_candidate(strategy="
+            "'rewrite_plus_index') and no artifact_ref, then pass sql = the statement "
+            "of the performance case and candidate_sql = the rewrite."
+        )
+        if normalized_rewrite is not None:
+            if candidate.strategy != "rewrite_plus_index":
+                raise ValueError(
+                    f"candidate_sql needs a rewrite_plus_index candidate; this candidate "
+                    f"has strategy {candidate.strategy}. {one_call_route}"
+                )
+            if replaces is not None:
+                raise ValueError("replaces tests an index on unchanged SQL; do not pass candidate_sql.")
+            if not fingerprint_text_matches(
+                candidate.rewrite_fingerprint,
+                normalized_rewrite,
+                allow_legacy=allow_legacy_fingerprint,
+            ):
+                raise ValueError(
+                    "candidate_sql does not match the SQL this candidate was registered "
+                    "with. Pass the registered rewrite unchanged, or add a new candidate."
+                )
             if not fingerprint_text_matches(
                 case.query_fingerprint,
                 normalized_sql,
-                allow_legacy=bool(self.config.legacy_state_server_binding),
+                allow_legacy=allow_legacy_fingerprint,
             ):
                 raise ValueError(
-                    "Index benchmark SQL does not match the performance case."
+                    "With candidate_sql, sql is the original statement: it must match the "
+                    "performance case. The rewrite goes in candidate_sql."
                 )
+        elif not fingerprint_text_matches(
+            candidate.rewrite_fingerprint,
+            normalized_sql,
+            allow_legacy=allow_legacy_fingerprint,
+        ):
+            raise ValueError("Index candidate SQL fingerprint does not match.")
+        lineage: dict[str, Any] | None = None
+        if normalized_rewrite is not None:
+            # Measured against the original itself: no parent result is needed.
+            pass
+        elif candidate.strategy == "index":
+            if not fingerprint_text_matches(
+                case.query_fingerprint,
+                normalized_sql,
+                allow_legacy=allow_legacy_fingerprint,
+            ):
+                raise ValueError(
+                    "Index benchmark SQL does not match the performance case: an index "
+                    f"candidate measures the unchanged statement. {one_call_route}"
+                )
+        elif candidate.strategy == "rewrite_plus_index" and not candidate.rewrite_artifact_ref:
+            raise ValueError(
+                "This rewrite_plus_index candidate names no parent, so it is measured "
+                "against the original statement: pass sql = the statement of the "
+                "performance case and candidate_sql = the rewrite."
+            )
         else:
             if phase != "finalist":
                 raise ValueError(
@@ -9015,9 +9837,16 @@ class AzureSqlMcpApplication:
             is_unique,
             data_compression,
             indexes,
+            index_kind,
+            partition_aligned,
         )
         if replaces is not None and len(index_specs) != 1:
             raise ValueError("replaces applies to a candidate of exactly one index.")
+        if replaces is not None and index_specs[0]["kind"] != INDEX_KIND_ROWSTORE:
+            raise ValueError(
+                "replaces tests a rowstore index against the one it would replace; a "
+                "nonclustered columnstore index replaces no B-tree index."
+            )
         self._require_tuning_session_time(session_id)
         equivalence_preflight = await self._check_equivalence_preflight(
             database_name,
@@ -9026,6 +9855,36 @@ class AzureSqlMcpApplication:
         direct_snapshot_supported = bool(
             equivalence_preflight["direct_snapshot_supported"]
         )
+        if normalized_rewrite is not None:
+            # Two statements are compared, so the preflight has one entry per side.
+            equivalence_preflight = with_order_contract(
+                {
+                    "baseline": equivalence_preflight,
+                    "candidate": await self._check_equivalence_preflight(
+                        database_name, normalized_rewrite
+                    ),
+                },
+                normalized_sql,
+                normalized_rewrite,
+            )
+            direct_snapshot_supported = all(
+                bool(side["direct_snapshot_supported"])
+                for side in equivalence_preflight.values()
+            )
+        # A finalist of the one-call path compares the original with the rewrite
+        # in one snapshot per case, while the index set exists.
+        compare_in_call = (
+            normalized_rewrite is not None
+            and direct_snapshot_supported
+            and phase == "finalist"
+        )
+        # A gap that a comparison can settle (a UNION ALL rewrite, possible
+        # ties) is tested in the call too. That result is a test on today's
+        # data: the candidate stays performance_only.
+        tested_gaps: list[str] = []
+        if normalized_rewrite is not None and not direct_snapshot_supported and phase == "finalist":
+            gap_codes, blocking_gaps = preflight_gap_codes(equivalence_preflight)
+            tested_gaps = [] if blocking_gaps else gap_codes
         parent_equivalence_unproven = bool(
             lineage and lineage.get("parent_equivalence") == "unproven"
         )
@@ -9075,7 +9934,10 @@ class AzureSqlMcpApplication:
             registered_case_fingerprints
         ):
             raise ValueError(
-                "Finalist index validation must cover every registered parameter case."
+                "Finalist index validation must cover all "
+                f"{len(registered_case_fingerprints)} registered parameter cases; this call "
+                f"names {len(supplied_case_fingerprints)}. Leave parameter_cases out to run "
+                'them all, or use phase="screening" for a subset.'
             )
 
         def begin_candidate_phase() -> None:
@@ -9089,28 +9951,41 @@ class AzureSqlMcpApplication:
                 candidate_id,
             )
 
-        runs = (
+        default_runs = (
             session.screen_runs_per_candidate
             if phase == "screening"
             else session.finalist_runs_per_candidate
         )
+        if runs is None:
+            runs = default_runs
+        elif not 1 <= runs <= default_runs:
+            raise ValueError(
+                f"runs must be between 1 and the {phase} limit of {default_runs}."
+            )
         slow_cases = self._slow_baseline_seconds(slow_baseline_cases, cases)
-        if slow_cases and candidate.strategy != "index":
+        if slow_cases and candidate.strategy != "index" and normalized_rewrite is None:
             raise ValueError(
                 "slow_baseline_cases applies to an index candidate on the SQL of the "
                 "performance case; a lineage candidate measures a rewrite."
             )
-        # A baseline too slow to repeat runs once in the session; its result
-        # digest is kept with the sample, so a later index is still compared with it.
+        # A baseline too slow to repeat runs once in the session, whichever
+        # benchmark tool ran it; its result digest is kept with the sample, so a
+        # later index is still compared with it. Only the statement of the
+        # performance case on its own plan is pooled.
+        pool_allowed = (
+            candidate.strategy == "index" or normalized_rewrite is not None
+        ) and plan_reuse == "per_case"
         slow_pool = (
-            self._session_slow_index_baselines(session_id, compare_order) if slow_cases else {}
+            self._session_slow_index_baselines(session_id, compare_order)
+            if pool_allowed
+            else {}
         )
         requested_executions = sum(
             runs + (0 if str(parameter_case["name"]) in slow_pool else 1)
             if str(parameter_case["name"]) in slow_cases
             else runs * 3
             for parameter_case in cases
-        )
+        ) + (2 * len(cases) if compare_in_call or tested_gaps else 0)
         if not policy.can_benchmark(requested_executions):
             raise PermissionError("Database policy does not permit this benchmark count.")
         if not idempotency_key or not idempotency_key.strip():
@@ -9165,7 +10040,14 @@ class AzureSqlMcpApplication:
             "lineage": lineage,
         }
         # Added only when used, so a one-index request keeps its fingerprint.
-        if len(index_specs) > 1 or first_spec["data_compression"]:
+        any_columnstore = any(spec["kind"] != INDEX_KIND_ROWSTORE for spec in index_specs)
+        any_non_aligned = any(not spec["partition_aligned"] for spec in index_specs)
+        if (
+            len(index_specs) > 1
+            or first_spec["data_compression"]
+            or any_columnstore
+            or any_non_aligned
+        ):
             request_identity["index_set"] = [
                 {
                     "schema": spec["schema"],
@@ -9175,6 +10057,12 @@ class AzureSqlMcpApplication:
                     "filter_definition": spec["filter_definition"],
                     "is_unique": spec["is_unique"],
                     "data_compression": spec["data_compression"],
+                    **({"kind": spec["kind"]} if any_columnstore else {}),
+                    **(
+                        {"partition_aligned": spec["partition_aligned"]}
+                        if any_non_aligned
+                        else {}
+                    ),
                 }
                 for spec in index_specs
             ]
@@ -9186,7 +10074,16 @@ class AzureSqlMcpApplication:
             request_identity["replaces"] = replaces
         if slow_cases:
             request_identity["slow_baseline_cases"] = dict(slow_cases)
+        if normalized_rewrite is not None:
+            request_identity["candidate_sql"] = normalized_rewrite
+        if plan_reuse != "per_case":
+            request_identity["plan_reuse"] = plan_reuse
         request_fingerprint = fingerprint_json(request_identity)
+
+        def plan_identity(parameter_case: Mapping[str, Any]) -> str:
+            # One text for all cases: the first case compiles, the others reuse.
+            return str(parameter_case["name"]) if plan_reuse == "per_case" else "shared-plan"
+
         # Request-validation reads and refusals run before the request binds
         # the candidate; else the corrected request is refused as a replay.
         # The budget reservation runs after the bind, so its refusal releases
@@ -9208,7 +10105,7 @@ class AzureSqlMcpApplication:
                         session_id,
                         "index",
                         candidate_id,
-                        str(parameter_case["name"]),
+                        plan_identity(parameter_case),
                     ),
                     parameter_case,
                 ),
@@ -9217,6 +10114,7 @@ class AzureSqlMcpApplication:
         ]
         self._require_tuning_session_time(session_id)
         canonical_tables: dict[tuple[str, str], _TestIndexTable] = {}
+        not_partitioned: list[str] = []
         members: list[_IndexSetMember] = []
         for ordinal, spec in enumerate(index_specs):
             spelled = (spec["schema"], spec["table"])
@@ -9226,6 +10124,28 @@ class AzureSqlMcpApplication:
                 )
             table_facts = canonical_tables[spelled]
             member_schema, member_table = table_facts.schema, table_facts.table
+            if not spec["partition_aligned"]:
+                if not table_facts.partitioned:
+                    not_partitioned.append(f"{member_schema}.{member_table}")
+                elif spec["kind"] == INDEX_KIND_NONCLUSTERED_COLUMNSTORE:
+                    raise ValueError(
+                        f"{member_schema}.{member_table} is partitioned. A columnstore index "
+                        "on a partitioned table must be partition-aligned: the engine "
+                        "refuses ON [PRIMARY] with error 35316. Leave partition_aligned "
+                        "out. No query and no DDL was run."
+                    )
+                elif table_facts.has_clustered_columnstore_index:
+                    raise ValueError(
+                        f"{member_schema}.{member_table} is partitioned and has a clustered "
+                        "columnstore index. A nonclustered index on such a table must be "
+                        "partition-aligned: this is an expected engine refusal of "
+                        "CREATE INDEX ... ON [PRIMARY]. Leave partition_aligned out to "
+                        "test the aligned index. No query and no DDL was run."
+                    )
+                else:
+                    # One B-tree on the only filegroup; the built index is
+                    # verified against this placement, not the table's scheme.
+                    table_facts = table_facts.non_aligned()
             # Refused here, before the request binds and before any baseline
             # run, when the engine needs an offline build the policy forbids.
             member_online = _test_index_build_online(policy, online, table_facts)
@@ -9238,7 +10158,28 @@ class AzureSqlMcpApplication:
                 is_unique=spec["is_unique"],
                 compression=spec["data_compression"],
                 **table_facts.placement(),
+                index_kind=spec["kind"],
             )
+            if spec["kind"] == INDEX_KIND_NONCLUSTERED_COLUMNSTORE:
+                # Refused here, before the request binds and before any run: one
+                # columnstore index per table, and only columns it can hold.
+                blockers = columnstore_index_blockers(
+                    provisional_index,
+                    existing_indexes=await collect_existing_indexes(
+                        self.executor,
+                        database_name,
+                        schema_name=member_schema,
+                        table_name=member_table,
+                    ),
+                    table_columns=await collect_table_column_facts(
+                        self.executor,
+                        database_name,
+                        schema_name=member_schema,
+                        table_name=member_table,
+                    ),
+                )
+                if blockers:
+                    raise ValueError(" ".join(blockers) + " No query and no DDL was run.")
             # The caller chooses the prefix at most; the rest of the name is the
             # definition, so two requests can never fight over one name.
             member_candidate = replace(
@@ -9275,6 +10216,12 @@ class AzureSqlMcpApplication:
             raise ValueError("indexes holds the same index definition twice.")
         # Said in every result from here on: the name is not the one asked for.
         name_note: dict[str, str] = {}
+        if not_partitioned:
+            name_note["partition_aligned_note"] = (
+                ", ".join(dict.fromkeys(not_partitioned))
+                + " is not partitioned, so partition_aligned was ignored: the index is "
+                "built as on any table."
+            )
         if index_name_prefix is not None and not extends_test_index_prefix(
             index_name_prefix, self._allowed_test_index_prefixes(policy)
         ):
@@ -9332,7 +10279,20 @@ class AzureSqlMcpApplication:
                         session_id,
                         "index-hinted",
                         candidate_id,
-                        str(parameter_case["name"]),
+                        plan_identity(parameter_case),
+                    ),
+                    parameter_case,
+                )
+        if normalized_rewrite is not None:
+            for bound_case, parameter_case in zip(bound_cases, cases):
+                bound_case["candidate_contract"] = await self.performance_workflows._bind_case(
+                    database_name,
+                    mark_benchmark_sql(
+                        normalized_rewrite,
+                        session_id,
+                        "index-rewrite",
+                        candidate_id,
+                        plan_identity(parameter_case),
                     ),
                     parameter_case,
                 )
@@ -9345,6 +10305,8 @@ class AzureSqlMcpApplication:
             if hinted
             else "performance_only"
             if performance_only_scope
+            else "direct_snapshot"
+            if normalized_rewrite is not None
             else "aba_result_stability"
         )
         self._require_tuning_session_time(session_id)
@@ -9428,6 +10390,9 @@ class AzureSqlMcpApplication:
 
         def covers_member(existing: Any, member: _IndexSetMember) -> bool:
             if replaces is not None and existing.name.casefold() == replaces.casefold():
+                return False
+            if member.candidate.index_kind == INDEX_KIND_NONCLUSTERED_COLUMNSTORE:
+                # A B-tree on the same columns does not do what a columnstore index does.
                 return False
             if not existing_index_covers_candidate(
                 existing,
@@ -9688,7 +10653,15 @@ class AzureSqlMcpApplication:
                 }
                 if member.data_compression:
                     member.state["data_compression"] = member.data_compression
-                if member.table_facts.placement():
+                if member.candidate.index_kind != INDEX_KIND_ROWSTORE:
+                    # Ownership recovery rebuilds the definition from these fields.
+                    member.state["index_kind"] = member.candidate.index_kind
+                if member.table_facts.data_space is not None:
+                    # Not partition-aligned. Part of the definition fingerprint;
+                    # ownership recovery rebuilds the request from these fields.
+                    member.state["partition_aligned"] = False
+                    member.state["data_space"] = member.table_facts.data_space
+                elif member.table_facts.placement():
                     # Part of the definition fingerprint; ownership recovery
                     # rebuilds the request from these fields.
                     member.state["partition_scheme"] = member.table_facts.partition_scheme
@@ -9776,12 +10749,16 @@ class AzureSqlMcpApplication:
                 "candidate_contract": bound_case.get(
                     "candidate_contract", bound_case["execution_contract"]
                 ),
-                "slow_seconds": slow_cases.get(str(bound_case["name"])),
-                "pooled_baseline": (
-                    slow_pool.get(str(bound_case["name"]))
-                    if str(bound_case["name"]) in slow_cases
-                    else None
+                # Declared slow, or the session already holds its one run.
+                "slow_seconds": slow_cases.get(
+                    str(bound_case["name"]),
+                    _sample_seconds(slow_pool[str(bound_case["name"])]["sample"])
+                    if str(bound_case["name"]) in slow_pool
+                    else None,
                 ),
+                "slow_auto": False,
+                "pooled_baseline": slow_pool.get(str(bound_case["name"])),
+                "runs": {"baseline_before": 0, "candidate": 0, "baseline_after": 0},
                 "baseline_before_samples": [],
                 "baseline_after_samples": [],
                 "candidate_samples": [],
@@ -10106,17 +11083,50 @@ class AzureSqlMcpApplication:
             )
             measurement[f"{phase_name}_plan"] = profiled.plan.summary
             measurement[f"{phase_name}_profile"] = profiled
+            if phase_name == "candidate":
+                uses = [
+                    verify_plan_uses_index(profiled.plan.raw_xml, member.index_name).as_dict()
+                    for member in members
+                ]
+                measurement["plan_use"].append(_index_set_plan_use(uses) if is_set else uses[0])
             return profiled
+
+        arms_left = len(measurements) * INDEX_ABA_PHASES
+
+        async def measure_arm(measurement: dict[str, Any], phase_name: str) -> None:
+            """Measure one arm of one case; its first run sets how many runs it gets."""
+            nonlocal arms_left
+            await measure(measurement, phase_name)
+            remaining_seconds = self._require_tuning_session_time(session_id)
+            count = adaptive_run_count(
+                _sample_seconds(measurement[f"{phase_name}_samples"][0]),
+                runs,
+                seconds_available=(
+                    remaining_seconds / max(1, arms_left)
+                    if math.isfinite(remaining_seconds)
+                    else None
+                ),
+            )
+            for _ in range(count - 1):
+                await measure(measurement, phase_name)
+            measurement["runs"][phase_name] = count
+            arms_left -= 1
 
         try:
             for measurement in measurements:
-                if measurement["slow_seconds"] is None:
-                    before_runs = runs
-                else:
+                if measurement["slow_seconds"] is not None:
                     # Too slow to repeat: once in the session, never again.
-                    before_runs = 0 if measurement["pooled_baseline"] is not None else 1
-                for _ in range(before_runs):
-                    await measure(measurement, "baseline_before")
+                    if measurement["pooled_baseline"] is None:
+                        await measure(measurement, "baseline_before")
+                        measurement["runs"]["baseline_before"] = 1
+                    arms_left -= 1
+                    continue
+                await measure_arm(measurement, "baseline_before")
+                first_seconds = _sample_seconds(measurement["baseline_before_samples"][0])
+                if first_seconds >= SLOW_STATEMENT_SECONDS:
+                    # Found slow by its first run: treated as a declared slow case.
+                    measurement["slow_seconds"] = round(first_seconds, 1)
+                    measurement["slow_auto"] = True
             self._require_tuning_session_time(session_id)
             if lease is None:
                 raise RuntimeError("Temporary index lease was not created.")
@@ -10139,7 +11149,9 @@ class AzureSqlMcpApplication:
                 create_options: dict[str, Any] = {}
                 if member.data_compression:
                     create_options["data_compression"] = member.data_compression
-                if member.table_facts.has_columnstore_index or member.table_facts.placement():
+                if member.candidate.index_kind != INDEX_KIND_ROWSTORE:
+                    create_options["index_kind"] = member.candidate.index_kind
+                if member.table_facts.has_clustered_columnstore_index or member.table_facts.placement():
                     create_options["table_facts"] = member.table_facts
                 try:
                     await self._create_test_index(
@@ -10192,18 +11204,24 @@ class AzureSqlMcpApplication:
             for member in members:
                 member.built = await self._built_index_facts(database_name, member)
             for measurement in measurements:
-                for _ in range(runs):
-                    profiled = await measure(measurement, "candidate")
-                    uses = [
-                        verify_plan_uses_index(
-                            profiled.plan.raw_xml,
-                            member.index_name,
-                        ).as_dict()
-                        for member in members
-                    ]
-                    measurement["plan_use"].append(
-                        _index_set_plan_use(uses) if is_set else uses[0]
+                await measure_arm(measurement, "candidate")
+            if compare_in_call or tested_gaps:
+                step = "compare_results"
+                for measurement in measurements:
+                    self._require_tuning_session_time(session_id)
+                    # Charged before the await: a timeout can follow an execution.
+                    measured_executions += 2
+                    comparison = await self.performance_workflows._compare_execution_contracts(
+                        database_name,
+                        measurement["execution_contract"],
+                        measurement["candidate_contract"],
+                        compare_order=compare_order,
+                        before_dispatch=lambda: self._require_tuning_session_time(session_id),
                     )
+                    measured_executions -= 2 - int(comparison.get("executions", 0))
+                    if tested_gaps and "rows_match" in comparison:
+                        label_comparison(comparison, tested_gaps, compare_order)
+                    measurement["snapshot_comparison"] = comparison
         except asyncio.CancelledError:
             benchmark_error = "timeout"
             benchmark_failure_diagnostic = {
@@ -10318,8 +11336,10 @@ class AzureSqlMcpApplication:
                 for measurement in measurements:
                     if measurement["slow_seconds"] is not None:
                         continue
-                    for _ in range(runs):
+                    # As many runs as before the build: both halves of the baseline.
+                    for _ in range(measurement["runs"]["baseline_before"]):
                         await measure(measurement, "baseline_after")
+                    measurement["runs"]["baseline_after"] = measurement["runs"]["baseline_before"]
             except asyncio.CancelledError:
                 benchmark_error = "timeout"
                 benchmark_failure_diagnostic = {
@@ -10370,18 +11390,46 @@ class AzureSqlMcpApplication:
                 (len(baseline_results) == 1, len(measurement["baseline_after_results"]) == 0)
                 if slow
                 else (
-                    len(baseline_results) == runs,
-                    len(measurement["baseline_after_results"]) == runs,
+                    0 < len(baseline_results) == measurement["runs"]["baseline_before"],
+                    len(measurement["baseline_after_results"])
+                    == measurement["runs"]["baseline_after"]
+                    == measurement["runs"]["baseline_before"],
                 )
             )
             complete_results = (
                 all(expected_counts)
-                and len(measurement["candidate_results"]) == runs
+                and 0 < len(measurement["candidate_results"]) == measurement["runs"]["candidate"]
                 and all(item.get("complete") is True for item in result_evidence)
             )
             plan_used = bool(measurement["plan_use"]) and all(
                 item.get("used") is True for item in measurement["plan_use"]
             )
+            if normalized_rewrite is not None:
+                # Two statements: only the snapshot comparison says they agree.
+                snapshot_comparison = measurement.get("snapshot_comparison") or {
+                    "status": "not_compared",
+                    "proven_for_parameter_case": False,
+                    "same_snapshot": False,
+                    "reason": (
+                        "this SQL shape has no deterministic comparison"
+                        if not direct_snapshot_supported
+                        else "a screening run does not compare results; the finalist does"
+                    ),
+                }
+                equivalence.append(
+                    {
+                        **snapshot_comparison,
+                        "parameter_case": measurement["parameter_case"],
+                        "order_compared": compare_order,
+                        "same_sql": False,
+                        "basis": (
+                            "the original and the rewrite compared in one snapshot "
+                            "while the test indexes existed"
+                        ),
+                        "plan_used_expected_index": plan_used,
+                    }
+                )
+                continue
             # An index often changes row access order; an order-only difference
             # is unproven, never a result mismatch.
             status = aba_result_status(result_evidence, complete=complete_results)
@@ -10433,14 +11481,29 @@ class AzureSqlMcpApplication:
                     measurement["baseline_after_profile"],
                 ),
                 "plan_use": measurement["plan_use"],
+                "runs": dict(measurement["runs"]),
+                "plan_compiled_for": str(
+                    measurement["parameter_case"]
+                    if plan_reuse == "per_case"
+                    else measurements[0]["parameter_case"]
+                ),
             }
+            if measurement["runs"]["candidate"] == 1:
+                # Ran once by rule (slow, runs=1 or the time left): the 2x rule applies.
+                parameter_result["candidate_single_sample"] = True
             if measurement["slow_seconds"] is not None:
                 parameter_result["baseline_single_sample"] = len(baseline_samples) == 1
                 parameter_result["baseline_source"] = (
                     "session_single_run" if pooled is not None else "single_run"
                 )
                 parameter_result["baseline_note"] = (
-                    f"baseline too slow to repeat: {measurement['slow_seconds']:g} seconds. "
+                    (
+                        f"baseline took {measurement['slow_seconds']:g} seconds on its first "
+                        "run, so it was not repeated (10 seconds or more runs once). "
+                    )
+                    if measurement["slow_auto"]
+                    else f"baseline too slow to repeat: {measurement['slow_seconds']:g} seconds. "
+                ) + (
                     "It ran once in the session; the index was measured against that one "
                     "sample, and the baseline was not run again after the index was dropped."
                 )
@@ -10456,7 +11519,8 @@ class AzureSqlMcpApplication:
                             else None
                         )
                 elif (
-                    measurement["baseline_before_samples"]
+                    pool_allowed
+                    and measurement["baseline_before_samples"]
                     and measurement["baseline_before_results"][0].get("complete") is True
                 ):
                     # Kept with the evidence, so the next index candidate of the
@@ -10494,9 +11558,31 @@ class AzureSqlMcpApplication:
                 parameter_results,
                 equivalence,
                 objective=objective,
-                require_equivalence=direct_snapshot_supported,
+                require_equivalence=(
+                    compare_in_call
+                    if normalized_rewrite is not None
+                    else direct_snapshot_supported
+                ),
+                require_snapshot_attestation=compare_in_call,
             )
 
+        tested_statuses = (
+            {str(comparison.get("status")) for comparison in equivalence} if tested_gaps else set()
+        )
+        if (
+            tested_statuses
+            and state in {"promising", "improved", "neutral", "regressed"}
+            and any(
+                comparison.get("status") == "mismatch"
+                and not comparison.get("mismatch_may_be_a_tie")
+                for comparison in equivalence
+            )
+        ):
+            # Different rows on today's data: no proof gap excuses that.
+            state, reason = (
+                "equivalence_failed",
+                "at least one parameter case returned different results",
+            )
         performance_classification = state
         performance_reason = reason
         candidate_state = state
@@ -10516,6 +11602,18 @@ class AzureSqlMcpApplication:
                 )
                 if hinted
                 else (
+                    "Candidate improved the measured objective. Its results were tested "
+                    "against the original in one snapshot per parameter case and "
+                    + (
+                        "matched as multisets with duplicate counts"
+                        if tested_statuses == {"match"}
+                        else "did not match for every case (" + ", ".join(sorted(tested_statuses)) + ")"
+                    )
+                    + "; that is a test on today's data, and the static proof still has a "
+                    "gap (" + ", ".join(tested_gaps) + "), so the result is performance-only."
+                )
+                if tested_gaps
+                else (
                     "Candidate improved the measured objective, but semantic "
                     "equivalence remains unproven; the result is performance-only."
                 )
@@ -10532,7 +11630,19 @@ class AzureSqlMcpApplication:
                     "include_columns": list(member.include_columns or ()),
                     "filter_definition": member.filter_definition,
                     "is_unique": member.is_unique,
-                    "data_compression": member.data_compression or "NONE",
+                    "index_kind": member.candidate.index_kind,
+                    **(
+                        {"partition_aligned": member.table_facts.data_space is None}
+                        if member.table_facts.data_space is not None
+                        or member.table_facts.partitioned
+                        else {}
+                    ),
+                    "data_compression": member.data_compression
+                    or (
+                        "COLUMNSTORE"
+                        if member.candidate.index_kind == INDEX_KIND_NONCLUSTERED_COLUMNSTORE
+                        else "NONE"
+                    ),
                     "online": member.online,
                     "built": member.ownership_recorded,
                     **(member.built or {}),
@@ -10565,6 +11675,21 @@ class AzureSqlMcpApplication:
             for measurement in measurements
             if measurement["candidate_plan"]
         ]
+        # What finalize_tuning_session needs to state how far the rewrite is proven.
+        rewrite_evidence: dict[str, Any] = {}
+        if normalized_rewrite is not None:
+            hint_profile = statement_hint_profile(normalized_rewrite)
+            original_hints = statement_hint_profile(normalized_sql)["plan_forcing_hints"]
+            hint_profile["added_plan_forcing_hints"] = [
+                hint
+                for hint in hint_profile["plan_forcing_hints"]
+                if hint not in original_hints
+            ]
+            rewrite_evidence = {
+                "experiment": "original_against_rewrite_with_indexes",
+                "rewrite_requirements": rewrite_requirements(normalized_sql, normalized_rewrite),
+                "hint_profile": hint_profile,
+            }
 
         evidence = self.performance_store.create_evidence(
             EvidenceEnvelopeV1(
@@ -10623,6 +11748,18 @@ class AzureSqlMcpApplication:
                     "reason": reason,
                     "performance_reason": performance_reason,
                     "failure_diagnostic": benchmark_failure_diagnostic,
+                    "execution_protocol": {
+                        "measured_runs": runs,
+                        "plan_reuse": plan_reuse,
+                        "expected_executions": requested_executions,
+                        # Adaptive run counts need fewer than were reserved.
+                        **(
+                            {"adaptive_expected_executions": measured_executions}
+                            if not benchmark_error and not cleanup_error
+                            else {}
+                        ),
+                    },
+                    **rewrite_evidence,
                 },
             ),
             idempotency_key=index_evidence_key,
@@ -10700,8 +11837,17 @@ class AzureSqlMcpApplication:
             "indexes": index_report,
             "index_ddl": index_ddl,
             "rollback_ddl": rollback_ddl,
+            "plan_reuse": plan_reuse,
             "session_continues": True,
         }
+        if any(member.table_facts.data_space is not None for member in members):
+            result["non_aligned_index_warning"] = NON_ALIGNED_INDEX_WARNING
+        if normalized_rewrite is not None:
+            result.update(rewrite_evidence)
+            result["measured_arms"] = {
+                "baseline": "the original statement, before and after, with no test index",
+                "candidate": "the rewrite while the test indexes existed",
+            }
         if replacement is not None:
             result["replacement_experiment"] = _replacement_summary(replacement)
             result["deployment_ready"] = False
@@ -10717,7 +11863,7 @@ class AzureSqlMcpApplication:
             dict.fromkeys(
                 member.table_facts
                 for member in members
-                if member.table_facts.has_columnstore_index
+                if member.table_facts.has_clustered_columnstore_index
             )
         )
         if offline_tables:
@@ -10725,6 +11871,870 @@ class AzureSqlMcpApplication:
         # A forced plan or Query Store hint on the application's query does
         # not apply to the marked benchmark text.
         result["plan_controls_not_applied"] = True
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
+
+    def _local_view_experiment_capability(self, policy: DatabasePolicy) -> dict[str, Any]:
+        """What check_capabilities says about indexed-view experiments on one database."""
+
+        blockers = view_experiment_policy_blockers(policy)
+        return {
+            "allowed": not blockers,
+            "blockers": list(blockers),
+            "test_view_name_prefixes": list(
+                view_name_prefixes(self._allowed_test_index_prefixes(policy))
+            ),
+        }
+
+    async def _benchmark_indexed_view_candidate(
+        self,
+        database_name: str,
+        session_id: str | None,
+        candidate_id: str | None,
+        view_definition: str,
+        *,
+        sql: str | None = None,
+        candidate_sql: str | None = None,
+        read_mode: str = READ_MODE_NOEXPAND,
+        clustered_index_key: Sequence[str] | None = None,
+        extra_indexes: Sequence[Mapping[str, Any]] | None = None,
+        view_name: str | None = None,
+        schema_name: str | None = None,
+        index_name_prefix: str | None = None,
+        parameter_cases: list[dict[str, Any]] | None = None,
+        phase: str = "screening",
+        runs: int | None = None,
+        compare_order: bool | None = None,
+        lease_minutes: int = 30,
+        idempotency_key: str | None = None,
+        preview: bool = False,
+    ) -> dict[str, Any]:
+        """Measure a statement against a leased indexed view built for it.
+
+        The original statement (``sql``, the statement of the performance
+        case) runs before the build and after the drop. One lease then builds
+        the schema-bound view, its unique clustered index and up to three more
+        indexes in one transaction with the owner markers. ``read_mode``
+        ``noexpand`` runs ``candidate_sql``, which reads the view ``WITH
+        (NOEXPAND)`` (a rewrite_plus_index candidate, no parent); a finalist
+        compares it with the original in one snapshot per parameter case
+        while the view exists. ``automatic`` runs the original again (an
+        index candidate) and reports whether the optimizer matched the view.
+        The view is dropped on every path by a drop that checks the markers.
+        ``preview`` returns the plan (names, findings, setup statements) and
+        runs nothing.
+        """
+
+        self._require_test_index_database(database_name)
+        policy = self.database_policy.require(database_name)
+        require_view_experiment_policy(policy)
+        if phase not in {"screening", "finalist"}:
+            raise ValueError("phase must be screening or finalist.")
+        if read_mode not in {READ_MODE_NOEXPAND, READ_MODE_AUTOMATIC}:
+            raise ValueError("read_mode must be noexpand or automatic.")
+        name_prefix, name_tag = self._resolve_test_index_prefix(policy, index_name_prefix)
+        allowed_prefixes = self._allowed_test_index_prefixes(policy)
+        if len(extra_indexes or ()) > MAX_VIEW_EXTRA_INDEXES:
+            raise ValueError(f"extra_indexes holds at most {MAX_VIEW_EXTRA_INDEXES} indexes.")
+        first_check = validate_test_view_definition(view_definition)
+        table_columns: dict[str, list[Any]] = {}
+        for base_table in first_check.base_tables:
+            base_schema, _, base_name = base_table.rpartition(".")
+            table_columns[base_table] = await collect_table_column_facts(
+                self.executor,
+                database_name,
+                schema_name=base_schema.strip("[]") or "dbo",
+                table_name=base_name.strip("[]"),
+            )
+            if not table_columns[base_table]:
+                raise ValueError(
+                    f"Base table {base_table} does not exist or is not visible. "
+                    "No query and no DDL was run."
+                )
+        plan = plan_view_experiment(
+            view_definition,
+            clustered_index_key=clustered_index_key,
+            extra_indexes=[
+                ViewIndexSpec(
+                    key_columns=tuple(item.get("key_columns") or ()),
+                    include_columns=tuple(item.get("include_columns") or ()),
+                    is_unique=bool(item.get("is_unique", False)),
+                )
+                for item in extra_indexes or ()
+            ],
+            schema_name=schema_name,
+            view_name=view_name,
+            index_name_prefix=name_prefix,
+            name_tag=name_tag,
+            test_index_name_prefixes=allowed_prefixes,
+            table_columns=table_columns,
+            maxdop=policy.test_index_maxdop or None,
+        )
+        if preview:
+            return {"preview": True, "executions": 0, **plan.as_dict()}
+
+        def refuse(findings: Sequence[Any]) -> ValueError:
+            return ValueError(
+                "The indexed-view experiment was refused before any statement ran. "
+                + " ".join(f"[{finding.code}] {finding.message}" for finding in findings)
+                + f" The view name is {plan.schema}.{plan.view_name}; call with "
+                "preview=true to see the plan."
+            )
+
+        if not plan.valid or plan.clustered_index is None:
+            raise refuse([item for item in plan.findings if item.severity == "error"] or plan.findings)
+        if not session_id or not candidate_id or not sql:
+            raise ValueError("session_id, candidate_id and sql are required unless preview is true.")
+        if not idempotency_key or not idempotency_key.strip():
+            raise ValueError("An indexed-view experiment requires an idempotency key.")
+        try:
+            session = self.tuning_sessions.require_session_status(
+                session_id, allowed={"created", "screening", "finalist_validation"}
+            )
+        except InvalidTransitionError as exc:
+            raise InvalidTransitionError(
+                f"{exc} Retrieve committed results with get_tuning_session; "
+                "terminal sessions cannot benchmark or replay."
+            ) from None
+        candidate = self.tuning_sessions.get_candidate(candidate_id)
+        if candidate.session_id != session_id:
+            raise ValueError("Candidate does not belong to the tuning session.")
+        case = self.performance_store.get_performance_case(session.performance_case_id)
+        allow_legacy = bool(self.config.legacy_state_server_binding)
+        if not database_fingerprint_matches(
+            case.database_fingerprint or "", database_name, self.config.server, allow_legacy=allow_legacy
+        ):
+            raise PermissionError("Tuning session belongs to another database.")
+        original = self.validator.validate_read_only_candidate(sql).execution_sql
+        if not fingerprint_text_matches(case.query_fingerprint, original, allow_legacy=allow_legacy):
+            raise ValueError("sql is the original statement: it must match the performance case.")
+        noexpand = read_mode == READ_MODE_NOEXPAND
+        if noexpand:
+            if not candidate_sql:
+                raise ValueError(
+                    "read_mode noexpand needs candidate_sql: the statement that reads "
+                    f"{plan.schema}.{plan.view_name} WITH (NOEXPAND)."
+                )
+            measured = self.validator.validate_read_only_candidate(candidate_sql).execution_sql
+            if candidate.strategy != "rewrite_plus_index" or not fingerprint_text_matches(
+                candidate.rewrite_fingerprint, measured, allow_legacy=allow_legacy
+            ):
+                raise ValueError(
+                    "Register candidate_sql with add_tuning_candidate(strategy="
+                    "'rewrite_plus_index') and no artifact_ref, and pass it unchanged."
+                )
+        else:
+            if candidate_sql:
+                raise ValueError("read_mode automatic runs the original statement; leave candidate_sql out.")
+            measured = original
+            if candidate.strategy != "index" or not fingerprint_text_matches(
+                candidate.rewrite_fingerprint, original, allow_legacy=allow_legacy
+            ):
+                raise ValueError(
+                    "read_mode automatic needs an index candidate registered with the "
+                    "unchanged statement of the performance case."
+                )
+        findings = view_candidate_findings(measured, plan, read_mode=read_mode)
+        if any(finding.severity == "error" for finding in findings) or (not noexpand and findings):
+            raise refuse(findings)
+        blocker = name_in_use_blocker(
+            plan,
+            await read_view_catalog_state(
+                self.executor, database_name, schema_name=plan.schema, view_name=plan.view_name
+            ),
+        )
+        if blocker is not None:
+            raise ValueError(blocker)
+        option_rows = await self.executor.fetch_all(
+            database_name, SESSION_SET_OPTIONS_SQL, sql_origin="server_built"
+        )
+        option_blockers = session_set_option_blockers(option_rows[0] if option_rows else {})
+        if option_blockers:
+            raise ValueError(
+                "The measurement connection cannot read an indexed view through its index: "
+                + "; ".join(option_blockers)
+                + ". No query and no DDL was run."
+            )
+        compare_order = effective_compare_order(original, compare_order)
+        equivalence_preflight: dict[str, Any] = await self._check_equivalence_preflight(
+            database_name, original
+        )
+        direct_snapshot_supported = bool(equivalence_preflight["direct_snapshot_supported"])
+        if noexpand:
+            equivalence_preflight = with_order_contract(
+                {
+                    "baseline": equivalence_preflight,
+                    # The view does not exist yet, so the catalog cannot resolve
+                    # it. Its body passed the indexed-view rules (deterministic,
+                    # schema-bound), so the statement text is what is analysed.
+                    "candidate": analyze_equivalence_preflight(measured).as_dict(),
+                },
+                original,
+                measured,
+            )
+            direct_snapshot_supported = all(
+                bool(side["direct_snapshot_supported"]) for side in equivalence_preflight.values()
+            )
+        compare_in_call = noexpand and direct_snapshot_supported and phase == "finalist"
+        cases = self.performance_workflows._resolve_parameter_cases(case.case_id, parameter_cases)
+        supplied = tuple(parameter_case_fingerprint(item) for item in cases)
+        registered = set(case.parameter_case_fingerprints)
+        if (
+            len(cases) > session.parameter_case_limit
+            or len(set(supplied)) != len(supplied)
+            or any(fingerprint not in registered for fingerprint in supplied)
+        ):
+            raise ValueError(
+                "parameter_cases must be an unchanged subset of the cases registered on "
+                f"the performance case, at most {session.parameter_case_limit}."
+            )
+        if phase == "finalist" and set(supplied) != registered:
+            raise ValueError(
+                f"A finalist must cover all {len(registered)} registered parameter cases; "
+                f'this call names {len(supplied)}. Use phase="screening" for a subset.'
+            )
+        default_runs = (
+            session.screen_runs_per_candidate
+            if phase == "screening"
+            else session.finalist_runs_per_candidate
+        )
+        if runs is None:
+            runs = default_runs
+        elif not 1 <= runs <= default_runs:
+            raise ValueError(f"runs must be between 1 and the {phase} limit of {default_runs}.")
+        requested_executions = len(cases) * runs * INDEX_ABA_PHASES + (
+            2 * len(cases) if compare_in_call else 0
+        )
+        if not policy.can_benchmark(requested_executions):
+            raise PermissionError("Database policy does not permit this benchmark count.")
+        cleanup = await self._cleanup_expired_index_leases(
+            database_fingerprint=case.database_fingerprint
+        )
+        if cleanup["cleanup_required"]:
+            return {
+                "session_id": session_id,
+                "candidate_id": candidate_id,
+                "classification": "cleanup_required",
+                "reason": (
+                    "Expired test object cleanup is unresolved in this database; "
+                    "no DDL or benchmark query was dispatched."
+                ),
+                "failure_code": "expired_index_cleanup_required",
+                "executions": 0,
+                "cleanup": cleanup,
+                "session_continues": False,
+            }
+        owner_fingerprint = fingerprint_json(
+            {
+                "session_id": session_id,
+                "candidate_id": candidate_id,
+                "phase": phase,
+                "idempotency_key": idempotency_key,
+            }
+        )
+        execution_owner = f"view-execution-{owner_fingerprint[:32]}"
+        lease_owner = f"index-lease-{owner_fingerprint[:32]}"
+        lease_id = f"lease-{fingerprint_json({'view': owner_fingerprint})[:32]}"
+        request_fingerprint = fingerprint_json(
+            {
+                "operation": "indexed-view-benchmark-v1",
+                "session_id": session_id,
+                "candidate_id": candidate_id,
+                "database_name": database_name,
+                "sql": original,
+                "candidate_sql": measured,
+                "read_mode": read_mode,
+                "view": plan.definition_fingerprint,
+                "phase": phase,
+                "parameter_cases": supplied,
+                "runs": runs,
+                "compare_order": compare_order,
+            }
+        )
+        operation_key = fingerprint_json({"operation": "indexed-view-result", "key": idempotency_key})
+        replay = {
+            "session_id": session_id,
+            "candidate_id": candidate_id,
+            "classification": candidate.state,
+            "durable_state": candidate.state,
+            "reason": (
+                "This idempotency key already ran for this candidate. No DDL and no "
+                "query was dispatched again; read the result with get_tuning_session."
+            ),
+            "executions": 0,
+            "replayed": True,
+            "session_continues": True,
+        }
+        if (
+            self.performance_store.get_idempotent_execution_reservation(
+                session_id,
+                candidate_id,
+                request_fingerprint,
+                idempotency_key=idempotency_key,
+                owner_reference=execution_owner,
+            )
+            is not None
+        ):
+            return replay
+        if candidate.is_terminal or (candidate.screen_runs if phase == "screening" else candidate.finalist_runs):
+            raise ValueError(f"This candidate already has a {phase} result; add a new candidate.")
+        bound_cases = [
+            {
+                "parameter_case": item["name"],
+                "weight": item["weight"],
+                "fingerprint": parameter_case_fingerprint(item),
+                "execution_contract": await self.performance_workflows._bind_case(
+                    database_name,
+                    mark_benchmark_sql(original, session_id, "view", candidate_id, str(item["name"])),
+                    item,
+                ),
+                "candidate_contract": await self.performance_workflows._bind_case(
+                    database_name,
+                    mark_benchmark_sql(
+                        measured, session_id, "view-candidate", candidate_id, str(item["name"])
+                    ),
+                    item,
+                ),
+            }
+            for item in cases
+        ]
+        self._require_tuning_session_time(session_id)
+        reservation = self.performance_store.reserve_execution_attempts(
+            session_id,
+            candidate_id,
+            requested_executions,
+            request_fingerprint,
+            idempotency_key=idempotency_key,
+            owner_reference=execution_owner,
+        )
+        if reservation["status"] != "reserved" or reservation.get("replayed") is True:
+            return replay
+        create_sql = build_view_experiment_create_batch(plan)
+        drop_sql = build_test_view_drop_batch(
+            plan.schema, plan.view_name, test_index_name_prefixes=allowed_prefixes
+        )
+        create_params, _drop_params = view_experiment_batch_params(plan, lease_owner)
+        try:
+            remaining = self._require_tuning_session_time(session_id)
+            lease: dict[str, Any] = self.performance_store.create_index_lease(
+                lease_id=lease_id,
+                database_fingerprint=case.database_fingerprint or "",
+                session_id=session_id,
+                candidate_id=candidate_id,
+                index_name=str(plan.clustered_index.index_name),
+                object_fingerprint=plan.definition_fingerprint,
+                expires_at_utc=(
+                    datetime.now(timezone.utc)
+                    + timedelta(
+                        minutes=max(lease_minutes, int(remaining / 60) + 2)
+                        if math.isfinite(remaining)
+                        else lease_minutes
+                    )
+                ).isoformat(),
+                metadata={
+                    **plan.lease_metadata(),
+                    "phase": phase,
+                    "lease_owner_fence": lease_owner,
+                    "sql_persisted": False,
+                },
+                owner_reference=lease_owner,
+                request_fingerprint=fingerprint_json({"lease_id": lease_id, "key": idempotency_key}),
+            )
+            if phase == "finalist":
+                if self.tuning_sessions.get_session(session_id).status == "created":
+                    self.tuning_sessions.start_screening(session_id)
+                self.tuning_sessions.mark_candidate_finalist(session_id, candidate_id)
+            else:
+                self.tuning_sessions.start_screening(session_id)
+        except BaseException:
+            self.performance_store.release_execution_attempts(
+                reservation["reservation_id"],
+                owner_reference=execution_owner,
+                expected_version=reservation["version"],
+            )
+            raise
+
+        def update_lease(status: str, metadata: Mapping[str, Any] | None = None) -> None:
+            nonlocal lease
+            lease = self.performance_store.update_index_lease(
+                lease_id,
+                status=status,
+                metadata=dict(metadata) if metadata is not None else None,
+                owner_reference=lease_owner,
+                expected_version=lease["version"],
+            )
+
+        view_index_names = [str(index.index_name) for index in plan.indexes]
+        measurements: list[dict[str, Any]] = [
+            {
+                **bound,
+                "runs": {"baseline_before": 0, "candidate": 0, "baseline_after": 0},
+                "baseline_before_samples": [],
+                "candidate_samples": [],
+                "baseline_after_samples": [],
+                "baseline_before_results": [],
+                "candidate_results": [],
+                "baseline_after_results": [],
+                "baseline_before_profile": None,
+                "candidate_profile": None,
+                "plan_use": [],
+            }
+            for bound in bound_cases
+        ]
+        measured_executions = 0
+        arms_left = len(measurements) * INDEX_ABA_PHASES
+
+        async def measure_arm(measurement: dict[str, Any], arm: str, count: int | None = None) -> None:
+            """One arm of one case; its first run sets the run count unless ``count`` is given."""
+            nonlocal measured_executions, arms_left
+            target = count
+            run = 0
+            while target is None or run < target:
+                remaining_seconds = self._require_tuning_session_time(session_id)
+                measured_executions += 1
+                profiled = await self.performance_workflows._profile_execution_contract(
+                    database_name,
+                    measurement["candidate_contract" if arm == "candidate" else "execution_contract"],
+                    max_result_rows=self.config.comparison_row_limit,
+                )
+                sample = extract_profile_metrics(profiled)
+                measurement[f"{arm}_samples"].append(sample)
+                measurement[f"{arm}_results"].append(
+                    profile_result_fingerprint(profiled, compare_order=compare_order)
+                )
+                if arm != "baseline_after":
+                    measurement[f"{arm}_profile"] = profiled
+                if arm == "candidate":
+                    measurement["plan_use"].append(
+                        any(
+                            verify_plan_uses_index(profiled.plan.raw_xml, name).used
+                            for name in view_index_names
+                        )
+                    )
+                run += 1
+                if target is None:
+                    target = adaptive_run_count(
+                        _sample_seconds(sample),
+                        runs,
+                        seconds_available=(
+                            remaining_seconds / max(1, arms_left)
+                            if math.isfinite(remaining_seconds)
+                            else None
+                        ),
+                    )
+            measurement["runs"][arm] = run
+            arms_left -= 1
+
+        async def drop_view(state: ViewCatalogState) -> str:
+            """Drop the view of this lease and return the lease status the catalog proves."""
+            await self.admin_policy.execute(
+                AdminAction(
+                    tool_name="benchmark_indexed_view_candidate",
+                    database_name=database_name,
+                    action_type="test_view",
+                    sql=drop_sql,
+                    params=(lease_owner, plan.definition_fingerprint, state.object_id or None),
+                    # The exact inverse of the drop: the build batch of this lease.
+                    rollback_sql=create_sql,
+                    rollback_params=create_params,
+                    trusted_generated=True,
+                    reviewed_intent=True,
+                    idempotency_key=fingerprint_json({"view-drop": owner_fingerprint}),
+                    exactly_once=True,
+                    policy_verified=True,
+                    non_production=True,
+                    verification_required=True,
+                ),
+                self.executor,
+                dry_run=False,
+            )
+            after = await read_view_catalog_state(
+                self.executor, database_name, schema_name=plan.schema, view_name=plan.view_name
+            )
+            return reconcile_view_experiment(
+                step="drop",
+                state=after,
+                owner_token=lease_owner,
+                definition_fingerprint=plan.definition_fingerprint,
+            ).lease_status
+
+        step = "baseline_before"
+        failure: dict[str, Any] | None = None
+        built: dict[str, Any] | None = None
+        verification: dict[str, Any] | None = None
+        view_exists = False
+        cancelled = False
+        comparisons: dict[str, dict[str, Any]] = {}
+        try:
+            for measurement in measurements:
+                await measure_arm(measurement, "baseline_before")
+            self._require_tuning_session_time(session_id)
+            step = "build_view"
+            update_lease("pending_create", {"create_dispatch_state": "dispatched"})
+            await self.admin_policy.execute(
+                AdminAction(
+                    tool_name="benchmark_indexed_view_candidate",
+                    database_name=database_name,
+                    action_type="test_view",
+                    sql=create_sql,
+                    params=create_params,
+                    rollback_sql=drop_sql,
+                    rollback_params=(lease_owner, plan.definition_fingerprint, None),
+                    trusted_generated=True,
+                    reviewed_intent=True,
+                    idempotency_key=fingerprint_json({"view-build": owner_fingerprint}),
+                    exactly_once=True,
+                    policy_verified=True,
+                    non_production=True,
+                    verification_required=True,
+                ),
+                self.executor,
+                dry_run=False,
+            )
+            step = "verify_built_view"
+            state = await read_view_catalog_state(
+                self.executor, database_name, schema_name=plan.schema, view_name=plan.view_name
+            )
+            view_exists = state.owned_by(lease_owner, plan.definition_fingerprint)
+            check = verify_view_experiment(plan, state, owner_token=lease_owner)
+            verification = check.as_dict()
+            if not check.matches:
+                raise RuntimeError("The built view does not match the request.")
+            update_lease("active", {"view_object_id": state.object_id})
+            built = view_index_size(plan, state)
+            step = "candidate_measure"
+            for measurement in measurements:
+                await measure_arm(measurement, "candidate")
+            if compare_in_call:
+                step = "compare_results"
+                for measurement in measurements:
+                    self._require_tuning_session_time(session_id)
+                    measured_executions += 2
+                    comparison = await self.performance_workflows._compare_execution_contracts(
+                        database_name,
+                        measurement["execution_contract"],
+                        measurement["candidate_contract"],
+                        compare_order=compare_order,
+                        before_dispatch=lambda: self._require_tuning_session_time(session_id),
+                    )
+                    measured_executions -= 2 - int(comparison.get("executions", 0))
+                    comparisons[str(measurement["parameter_case"])] = comparison
+        except asyncio.CancelledError:
+            cancelled = True
+            failure = {"diagnostic_code": "benchmark_cancelled", "failed_step": step}
+        except Exception as exc:
+            note_exception(exc, "server.indexed_view_benchmark")
+            failure = extract_failure_diagnostic(exc, engine_text=step == "build_view")
+            failure["failed_step"] = step
+            if step == "build_view":
+                build_failure = view_build_failure(exc)
+                failure["build_outcome"] = build_failure["outcome"]
+                failure["build_outcome_reason"] = build_failure["reason"]
+                if build_failure["engine_error_number"] is not None:
+                    failure["native_error_code"] = build_failure["engine_error_number"]
+            elif step == "verify_built_view" and verification is not None:
+                failure["cause_class"] = "definition_mismatch"
+                failure["mismatches"] = verification["mismatches"]
+        finally:
+            # The view is dropped on every path; the lease closes only when
+            # the catalog shows that nothing of it is left.
+            try:
+                if step == "baseline_before":
+                    update_lease("create_failed", {"failure_type": "not_built"})
+                else:
+                    try:
+                        state = await read_view_catalog_state(
+                            self.executor,
+                            database_name,
+                            schema_name=plan.schema,
+                            view_name=plan.view_name,
+                        )
+                    except Exception as read_error:
+                        note_exception(read_error, "server.indexed_view_catalog_read")
+                        state = None
+                    outcome = reconcile_view_experiment(
+                        step="build" if step == "build_view" and not view_exists else "drop",
+                        state=state,
+                        owner_token=lease_owner,
+                        definition_fingerprint=plan.definition_fingerprint,
+                        # Only a lost connection, a timeout or a cancel can
+                        # leave the build running after the catalog was read.
+                        transport_failure=cancelled
+                        or bool(
+                            failure
+                            and failure.get("build_outcome_reason") == "connection_or_timeout"
+                        ),
+                    )
+                    status = outcome.lease_status
+                    if outcome.drop_view and state is not None:
+                        update_lease("cleanup_pending")
+                        status = await drop_view(state)
+                    update_lease(
+                        status,
+                        {"cleaned_at_utc": datetime.now(timezone.utc).isoformat()}
+                        if status == "cleaned"
+                        else {"cleanup_reason": outcome.reason},
+                    )
+            except asyncio.CancelledError:
+                cancelled = True
+                update_lease("cleanup_required", {"cleanup_error_type": "cancelled"})
+            except Exception as cleanup_error:
+                note_exception(cleanup_error, "server.indexed_view_cleanup")
+                update_lease("cleanup_required", {"cleanup_error_type": type(cleanup_error).__name__})
+
+        if failure is None and lease["status"] == "cleaned":
+            try:
+                step = "baseline_after"
+                for measurement in measurements:
+                    await measure_arm(
+                        measurement, "baseline_after", measurement["runs"]["baseline_before"]
+                    )
+            except asyncio.CancelledError:
+                cancelled = True
+                failure = {"diagnostic_code": "benchmark_cancelled", "failed_step": step}
+            except Exception as exc:
+                note_exception(exc, "server.indexed_view_benchmark_after")
+                failure = {**extract_failure_diagnostic(exc), "failed_step": step}
+
+        equivalence: list[dict[str, Any]] = []
+        parameter_results: list[dict[str, Any]] = []
+        for measurement in measurements:
+            name = str(measurement["parameter_case"])
+            used = bool(measurement["plan_use"]) and all(measurement["plan_use"])
+            if noexpand:
+                comparison = comparisons.get(name) or {
+                    "status": "not_compared",
+                    "proven_for_parameter_case": False,
+                    "same_snapshot": False,
+                    "reason": (
+                        "this SQL shape has no deterministic comparison"
+                        if not direct_snapshot_supported
+                        else "a screening run does not compare results; the finalist does"
+                    ),
+                }
+                equivalence.append(
+                    {
+                        **comparison,
+                        "parameter_case": name,
+                        "order_compared": compare_order,
+                        "same_sql": False,
+                        "basis": "the original and the view statement compared in one "
+                        "snapshot while the view existed",
+                        "plan_used_expected_index": used,
+                    }
+                )
+            else:
+                evidence = [
+                    *measurement["baseline_before_results"],
+                    *measurement["candidate_results"],
+                    *measurement["baseline_after_results"],
+                ]
+                complete = (
+                    failure is None
+                    and len(measurement["baseline_after_results"]) > 0
+                    and all(item.get("complete") is True for item in evidence)
+                )
+                status = aba_result_status(evidence, complete=complete)
+                equivalence.append(
+                    {
+                        "parameter_case": name,
+                        "status": status,
+                        "order_compared": compare_order,
+                        "proven_for_parameter_case": status == "match",
+                        "same_sql": True,
+                        "same_snapshot": False,
+                        "basis": "unchanged SQL plus complete A-B-A result stability",
+                        "plan_used_expected_index": used,
+                    }
+                )
+            baseline_samples = [
+                *measurement["baseline_before_samples"],
+                *measurement["baseline_after_samples"],
+            ]
+            result_row: dict[str, Any] = {
+                "parameter_case": name,
+                "weight": measurement["weight"],
+                "baseline": aggregate_samples(baseline_samples),
+                "candidate": aggregate_samples(measurement["candidate_samples"]),
+                "plan_delta": plan_delta_from_profiles(
+                    measurement["baseline_before_profile"], measurement["candidate_profile"]
+                ),
+                "runs": dict(measurement["runs"]),
+                "view_index_used": used,
+            }
+            if measurement["runs"]["candidate"] == 1:
+                result_row["candidate_single_sample"] = True
+            if len(baseline_samples) == 1:
+                result_row["baseline_single_sample"] = True
+            parameter_results.append(result_row)
+
+        objective = str(case.metadata.get("objective") or "elapsed_time")
+        performance_only_scope = not direct_snapshot_supported
+        if lease["status"] == "cleanup_required":
+            state_name, reason = (
+                "cleanup_required",
+                "the test view could not be removed or its removal could not be verified",
+            )
+        elif failure is not None:
+            state_name, reason = (
+                "inconclusive",
+                f"the indexed-view experiment failed at step {failure.get('failed_step')}; "
+                "reject this candidate and continue",
+            )
+        elif not all(item["plan_used_expected_index"] for item in equivalence):
+            state_name, reason = (
+                "inconclusive",
+                (
+                    "the optimizer did not match the view for every measured case; "
+                    "read it WITH (NOEXPAND) (read_mode noexpand)"
+                    if not noexpand
+                    else "the plan did not read an index of the view in every measured case"
+                ),
+            )
+        else:
+            state_name, reason = classify_benchmark(
+                parameter_results,
+                equivalence,
+                objective=objective,
+                require_equivalence=compare_in_call if noexpand else direct_snapshot_supported,
+                require_snapshot_attestation=compare_in_call,
+            )
+        performance_classification = state_name
+        if phase == "finalist" and performance_only_scope and state_name in {"promising", "improved"}:
+            state_name, performance_classification = "performance_only", "improved"
+            reason = (
+                "The view statement improved the measured objective, but this SQL shape "
+                "has no deterministic comparison; the result is performance-only."
+            )
+        proof_scope = (
+            "performance_only"
+            if performance_only_scope
+            else "direct_snapshot"
+            if noexpand
+            else "aba_result_stability"
+        )
+        hint_profile = statement_hint_profile(measured)
+        hint_profile["added_plan_forcing_hints"] = [
+            hint
+            for hint in hint_profile["plan_forcing_hints"]
+            # NOEXPAND names the view: it is the design, not a forced plan shape.
+            if hint not in statement_hint_profile(original)["plan_forcing_hints"]
+            and hint.upper() != "NOEXPAND"
+        ]
+        view_report = {
+            key: value for key, value in plan.as_dict().items() if key != "findings" or value
+        }
+        evidence_envelope = self.performance_store.create_evidence(
+            EvidenceEnvelopeV1(
+                source="azure-sql-mcp",
+                kind=f"index_{phase}",
+                query_fingerprint=case.query_fingerprint,
+                database_fingerprint=case.database_fingerprint,
+                parameters_fingerprint=fingerprint_json(
+                    [
+                        {"name": bound["parameter_case"], "parameter_case_fingerprint": bound["fingerprint"]}
+                        for bound in bound_cases
+                    ]
+                ),
+                observed_execution_count=measured_executions,
+                metrics={
+                    "classification": state_name,
+                    "performance_classification": performance_classification,
+                    "objective": objective,
+                    "decision_basis": COMPARISON_DECISION_BASIS,
+                    "parameter_results": parameter_results,
+                },
+                metadata={
+                    "session_id": session_id,
+                    "candidate_id": candidate_id,
+                    "experiment": "indexed_view",
+                    "read_mode": read_mode,
+                    "lease_id": lease_id,
+                    "lease_status": lease["status"],
+                    "index_definition_fingerprint": plan.definition_fingerprint,
+                    "view": {"view": view_report["view"], "built": built},
+                    "execution_reservation_id": reservation["reservation_id"],
+                    "execution_protocol": {
+                        "measured_runs": runs,
+                        "expected_executions": requested_executions,
+                        **(
+                            {"adaptive_expected_executions": measured_executions}
+                            if failure is None
+                            else {}
+                        ),
+                    },
+                    "equivalence": equivalence,
+                    "equivalence_preflight": equivalence_preflight,
+                    "proof_scope": proof_scope,
+                    "equivalence_deferred": performance_only_scope,
+                    "rewrite_requirements": rewrite_requirements(original, measured) if noexpand else [],
+                    "hint_profile": hint_profile,
+                    "phase": phase,
+                    "reason": reason,
+                    "failure_diagnostic": failure,
+                },
+            ),
+            idempotency_key=fingerprint_json({"operation": "indexed-view-evidence", "key": idempotency_key}),
+            request_fingerprint=request_fingerprint,
+        )
+        screening_passed = phase == "screening" and state_name in {"promising", "improved"}
+        _session, updated = self.tuning_sessions.record_candidate_result(
+            session_id,
+            candidate_id,
+            state="screening" if screening_passed else state_name,
+            screen_runs=runs if phase == "screening" else 0,
+            finalist_runs=0 if phase == "screening" else runs,
+            parameter_cases=len(cases),
+            executions=measured_executions,
+            evidence_ids=(evidence_envelope.evidence_id,),
+            failure_code=(
+                state_name
+                if state_name in {"inconclusive", "cleanup_required", "equivalence_failed"}
+                else None
+            ),
+            idempotency_key=operation_key,
+        )
+        (
+            self.performance_store.complete_execution_attempts
+            if measured_executions
+            else self.performance_store.release_execution_attempts
+        )(
+            reservation["reservation_id"],
+            dispatched_attempt_count=measured_executions,
+            owner_reference=execution_owner,
+            expected_version=reservation["version"],
+        )
+        result: dict[str, Any] = {
+            "session_id": session_id,
+            "candidate_id": candidate_id,
+            "experiment": "indexed_view",
+            "read_mode": read_mode,
+            "classification": state_name,
+            "performance_classification": performance_classification,
+            "objective": objective,
+            "decision_basis": COMPARISON_DECISION_BASIS,
+            "durable_state": updated.state,
+            "reason": reason,
+            "phase": phase,
+            "executions": measured_executions,
+            "parameter_results": parameter_results,
+            "equivalence": equivalence,
+            "equivalence_preflight": equivalence_preflight,
+            "equivalence_deferred": performance_only_scope,
+            "proof_scope": proof_scope,
+            "evidence_id": evidence_envelope.evidence_id,
+            "lease": self._public_index_lease(lease),
+            "view": view_report,
+            "built": built,
+            "verification": verification,
+            "session_continues": lease["status"] != "cleanup_required",
+            "plan_controls_not_applied": True,
+        }
+        if failure is not None:
+            result["failure_diagnostic"] = failure
+        if lease["status"] == "cleanup_required":
+            result["remediation"] = "\n".join(plan.teardown_statements())
         if cancelled:
             raise asyncio.CancelledError
         return result
@@ -11102,7 +13112,7 @@ class AzureSqlMcpApplication:
         """Resolve catalog spelling and the facts a test index build depends on.
 
         One read, before any table DDL is generated: the canonical names,
-        whether the table has an enabled columnstore index, and the partition
+        whether the table has a clustered columnstore index, and the partition
         scheme and partitioning column of a partitioned table.
         """
 
@@ -11137,7 +13147,7 @@ class AzureSqlMcpApplication:
         return _TestIndexTable(
             schema=resolved_schema,
             table=resolved_table,
-            has_columnstore_index=bool(rows[0].get("has_columnstore_index")),
+            has_clustered_columnstore_index=bool(rows[0].get("has_clustered_columnstore_index")),
             partition_scheme=str(partition_scheme) if partition_scheme is not None else None,
             partition_function=(
                 str(partition_function) if partition_function is not None else None
@@ -11482,11 +13492,12 @@ class AzureSqlMcpApplication:
         ownership_proof: str | None = None,
         data_compression: str | None = None,
         table_facts: _TestIndexTable | None = None,
+        index_kind: str = INDEX_KIND_ROWSTORE,
     ) -> dict[str, Any]:
         """Preview or, for the leased workflow, build one test index.
 
         ``table_facts`` (``_resolve_canonical_table_identity``) makes the DDL
-        fit the table: no ONLINE option on a table with a columnstore index,
+        fit the table: no ONLINE option on a table with a clustered columnstore index,
         and the partition scheme of a partitioned table.
         """
 
@@ -11523,6 +13534,7 @@ class AzureSqlMcpApplication:
             index_name=index,
             compression=data_compression,
             **(table_facts.placement() if table_facts is not None else {}),
+            index_kind=index_kind,
         )
         if renamed:
             prefix = policy.test_index_name_prefixes[0]
@@ -11614,7 +13626,7 @@ class AzureSqlMcpApplication:
             "action": "test_index_created",
             "note": "Disposable test index — drop it with drop_test_index after measuring.",
         })
-        if table_facts is not None and table_facts.has_columnstore_index:
+        if table_facts is not None and table_facts.has_clustered_columnstore_index:
             payload["offline_build"] = _offline_build_report([table_facts])
         if renamed:
             payload["index_name_note"] = (
@@ -12945,6 +14957,12 @@ class AzureSqlMcpApplication:
             )
             if any(value is not None and not isinstance(value, str) for value in partition):
                 raise ValueError("pending CREATE lease partition placement is invalid")
+            data_space = metadata.get("data_space")
+            if data_space is not None and data_space != NON_ALIGNED_DATA_SPACE:
+                raise ValueError("pending CREATE lease data space is invalid")
+            index_kind = metadata.get("index_kind", INDEX_KIND_ROWSTORE)
+            if index_kind not in TEST_INDEX_KINDS:
+                raise ValueError("pending CREATE lease index kind is invalid")
             candidate = IndexCandidate(
                 schema=schema_name,
                 table=table_name,
@@ -12954,12 +14972,14 @@ class AzureSqlMcpApplication:
                 is_unique=is_unique,
                 index_name=index_name,
                 compression=data_compression,
+                index_kind=index_kind,
                 **_TestIndexTable(
                     schema_name,
                     table_name,
                     partition_scheme=partition[0],
                     partition_function=partition[1],
                     partition_column=partition[2],
+                    data_space=data_space,
                 ).placement(),
             )
         else:
@@ -13082,6 +15102,13 @@ class AzureSqlMcpApplication:
             metadata = lease.get("metadata") or {}
             ownership_proof = metadata.get("lease_owner_fence")
             try:
+                if metadata.get("object_kind") == LEASE_OBJECT_KIND:
+                    # A leased test view: it has no target_table on purpose.
+                    await self._recover_expired_view_lease(
+                        database_name, lease, ownership_proof, now
+                    )
+                    summary["cleaned"] += 1
+                    continue
                 # A set is one lease: every index of it is proven and dropped
                 # here, and the lease closes only when none is left.
                 views = self._index_lease_members(lease)
@@ -13152,6 +15179,88 @@ class AzureSqlMcpApplication:
                     )
                 summary["cleanup_required"] += 1
         return summary
+
+    async def _recover_expired_view_lease(
+        self,
+        database_name: str | None,
+        lease: Mapping[str, Any],
+        ownership_proof: Any,
+        now: datetime,
+    ) -> None:
+        """Drop the view of an expired indexed-view lease and close the lease.
+
+        Only a view that carries both markers of this lease is dropped. Any
+        other outcome than a proven clean catalog raises, and the caller
+        records the lease as cleanup_required.
+        """
+
+        metadata = lease.get("metadata") or {}
+        schema, view = metadata.get("target_schema"), metadata.get("target_view")
+        if not database_name or not isinstance(schema, str) or not isinstance(view, str):
+            raise ValueError("expired view lease has no resolvable cleanup target")
+        if not isinstance(ownership_proof, str) or not _INDEX_OWNER_PROOF.fullmatch(
+            ownership_proof
+        ):
+            raise ValueError("expired view lease has no private ownership marker token")
+        self._require_test_index_database(database_name)
+        policy = self.database_policy.require(database_name)
+        require_view_experiment_policy(policy)
+        fingerprint = str(lease["object_fingerprint"])
+        updated = self.performance_store.recover_index_lease(
+            lease["lease_id"],
+            status="cleanup_pending",
+            metadata={"recovery_attempted_at_utc": now.isoformat()},
+            expected_version=lease["version"],
+        )
+        state = await read_view_catalog_state(
+            self.executor, database_name, schema_name=schema, view_name=view
+        )
+        if state.owned_by(ownership_proof, fingerprint):
+            await self.admin_policy.execute(
+                AdminAction(
+                    tool_name="benchmark_indexed_view_candidate",
+                    database_name=database_name,
+                    action_type="test_view",
+                    sql=build_test_view_drop_batch(
+                        schema,
+                        view,
+                        test_index_name_prefixes=self._allowed_test_index_prefixes(policy),
+                    ),
+                    params=(ownership_proof, fingerprint, state.object_id),
+                    # The lease keeps no SQL text. The inverse of this drop is
+                    # what the catalog holds now: the module text and its indexes.
+                    rollback_sql=_view_recreate_sql(state),
+                    trusted_generated=True,
+                    reviewed_intent=True,
+                    idempotency_key=f"lease-recovery:{lease['lease_id']}:{updated['version']}",
+                    exactly_once=True,
+                    policy_verified=True,
+                    non_production=True,
+                    verification_required=True,
+                ),
+                self.executor,
+                dry_run=False,
+            )
+            state = await read_view_catalog_state(
+                self.executor, database_name, schema_name=schema, view_name=view
+            )
+        outcome = reconcile_view_experiment(
+            step="drop",
+            state=state,
+            owner_token=ownership_proof,
+            definition_fingerprint=fingerprint,
+        )
+        if outcome.lease_status != "cleaned":
+            raise RuntimeError(f"expired view lease was not cleaned: {outcome.reason}")
+        self.performance_store.recover_index_lease(
+            lease["lease_id"],
+            status="cleaned",
+            metadata={
+                "recovered_at_startup": True,
+                "cleaned_at_utc": datetime.now(timezone.utc).isoformat(),
+            },
+            expected_version=updated["version"],
+        )
 
     async def _recover_expired_lease_index(
         self,

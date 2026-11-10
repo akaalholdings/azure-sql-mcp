@@ -1352,6 +1352,10 @@ def order_contract_risk(
             "risk": "order_contract_changed",
             "source": "baseline_vs_candidate",
             "result_set_ordinal": ordinal,
+            # removed: no comparison can show an order that is not asked for.
+            # keys_differ: the candidate still orders its rows; the keys could
+            # not be matched as text (another alias, a derived table).
+            "change": "removed" if candidate_keys is None else "keys_differ",
             "reason": reason,
             "proof_requirement": (
                 "keep the baseline outer ORDER BY keys and directions as a "

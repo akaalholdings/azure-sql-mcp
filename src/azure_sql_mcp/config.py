@@ -90,6 +90,8 @@ TOOL_GROUPS: dict[str, ToolGroup] = {
     "add_tuning_candidate": ToolGroup.CORE,
     "benchmark_tuning_candidate": ToolGroup.CORE,
     "benchmark_index_candidate": ToolGroup.CORE,
+    # Builds and drops a leased test view: sandbox profile, unrestricted access.
+    "benchmark_indexed_view_candidate": ToolGroup.ADMIN,
     "finalize_tuning_session": ToolGroup.CORE,
     "compare_query_results": ToolGroup.CORE,
     "compare_plan_summaries": ToolGroup.CORE,
@@ -314,6 +316,7 @@ PROFILE_TOOL_ALLOWLISTS: dict[McpProfile, frozenset[str]] = {
             "add_tuning_candidate",
             "benchmark_tuning_candidate",
             "benchmark_index_candidate",
+            "benchmark_indexed_view_candidate",
             "finalize_tuning_session",
             "compare_query_results",
             "compare_plan_summaries",

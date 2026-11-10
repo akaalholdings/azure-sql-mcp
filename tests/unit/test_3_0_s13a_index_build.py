@@ -72,8 +72,8 @@ def _table_facts(app: AzureSqlMcpApplication, **facts: Any) -> None:
 
     async def fetch(database_name: str, sql: str, **kwargs: Any) -> list[dict[str, Any]]:
         rows = await inner(database_name, sql, **kwargs)
-        if "has_columnstore_index" in sql:
-            return [{**rows[0], "has_columnstore_index": 0, **facts}]
+        if "has_clustered_columnstore_index" in sql:
+            return [{**rows[0], "has_clustered_columnstore_index": 0, **facts}]
         return rows
 
     app.executor.fetch_all = AsyncMock(side_effect=fetch)  # type: ignore[method-assign]
@@ -123,7 +123,7 @@ async def test_columnstore_table_is_refused_before_any_execution_when_offline_is
     # The engine refuses the online build and the policy refuses the offline
     # one: the agent must learn both rules before a baseline run is spent.
     app = _sandbox_app(server_config_factory)
-    _table_facts(app, has_columnstore_index=1)
+    _table_facts(app, has_clustered_columnstore_index=1)
     session_id, candidate_id = _candidate(app, SQL)
     _, catalog = _install_catalog(monkeypatch, key_columns=["id"])
     app._create_test_index = AsyncMock()  # type: ignore[method-assign]
@@ -148,7 +148,7 @@ async def test_columnstore_table_builds_offline_and_says_so_when_policy_allows(
     server_config_factory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app = _sandbox_app(server_config_factory, allow_offline_test_index=True)
-    _table_facts(app, has_columnstore_index=1)
+    _table_facts(app, has_clustered_columnstore_index=1)
     session_id, candidate_id = _candidate(app, SQL)
     app._create_test_index = AsyncMock(return_value={"status": "completed"})  # type: ignore[method-assign]
     app._drop_test_index = AsyncMock(return_value={"status": "completed"})  # type: ignore[method-assign]
@@ -160,7 +160,7 @@ async def test_columnstore_table_builds_offline_and_says_so_when_policy_allows(
     create = app._create_test_index.await_args
     assert create.args[6] is False  # online
     assert "ONLINE" not in result["index_ddl"]
-    assert result["offline_build"]["reason"] == "columnstore_table"
+    assert result["offline_build"]["reason"] == "clustered_columnstore_table"
     assert result["offline_build"]["tables"] == ["dbo.Items"]
     assert "blocks all writes" in result["offline_build"]["note"]
     assert result["indexes"][0]["online"] is False
@@ -194,7 +194,7 @@ async def test_preview_of_a_test_index_on_a_columnstore_table_never_shows_online
     allowed = _sandbox_app(server_config_factory, allow_offline_test_index=True)
     refused = _sandbox_app(server_config_factory)
     columnstore = await allowed._resolve_canonical_table_identity("appdb", "dbo", "Items")
-    columnstore = type(columnstore)(schema="dbo", table="Items", has_columnstore_index=True)
+    columnstore = type(columnstore)(schema="dbo", table="Items", has_clustered_columnstore_index=True)
 
     preview = await allowed._create_test_index(
         "appdb", "dbo", "Items", "IX_Testing_s13a", ["id"], None, True,
@@ -203,7 +203,7 @@ async def test_preview_of_a_test_index_on_a_columnstore_table_never_shows_online
 
     assert "ONLINE" not in preview["sql_preview"]
     assert preview["online"] is False
-    assert preview["offline_build"]["reason"] == "columnstore_table"
+    assert preview["offline_build"]["reason"] == "clustered_columnstore_table"
     with pytest.raises(PermissionError, match="allow_offline_test_index"):
         await refused._create_test_index(
             "appdb", "dbo", "Items", "IX_Testing_s13a", ["id"], None, True,
@@ -214,17 +214,18 @@ async def test_preview_of_a_test_index_on_a_columnstore_table_never_shows_online
 @pytest.mark.asyncio
 async def test_table_read_returns_columnstore_and_partition_facts(server_config_factory) -> None:
     app = _sandbox_app(server_config_factory)
-    _table_facts(app, has_columnstore_index=1, **PARTITIONED)
+    _table_facts(app, has_clustered_columnstore_index=1, **PARTITIONED)
 
     table = await app._resolve_canonical_table_identity("appdb", "DBO", "items")
 
     assert (table.schema, table.table) == ("dbo", "Items")
-    assert table.has_columnstore_index is True
+    assert table.has_clustered_columnstore_index is True
     assert table.partition_scheme == "ps_Items"
     assert table.partition_function == "pf_Items"
     assert table.partition_column == "CreatedDateKey"
     sql = app.executor.fetch_all.await_args.args[1]
-    assert "type IN (5, 6)" in sql
+    # Live check: only a clustered columnstore index (type 5) refuses an online build.
+    assert "cs.type = 5" in sql
 
 
 # --- F7: partitioned table and explicit failure cause ----------------------------
@@ -576,7 +577,7 @@ async def test_create_test_index_tool_reads_the_table_and_previews_an_offline_bu
     ).database_policy
     app.executor.fetch_all = AsyncMock(  # type: ignore[method-assign]
         return_value=[
-            {"schema_name": "dbo", "table_name": "Items", "has_columnstore_index": 1, **PARTITIONED}
+            {"schema_name": "dbo", "table_name": "Items", "has_clustered_columnstore_index": 1, **PARTITIONED}
         ]
     )
 
@@ -594,5 +595,5 @@ async def test_create_test_index_tool_reads_the_table_and_previews_an_offline_bu
 
     assert "ONLINE" not in preview["sql_preview"]
     assert preview["sql_preview"].rstrip().endswith("ON [ps_Items]([CreatedDateKey]);")
-    assert preview["offline_build"]["reason"] == "columnstore_table"
+    assert preview["offline_build"]["reason"] == "clustered_columnstore_table"
     assert preview["index_name"] == "IX_Testing_s13a"

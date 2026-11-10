@@ -52,6 +52,8 @@ def test_the_registry_covers_the_major_tools_and_the_cross_tool_topics() -> None
         "blocking_triage",
         "columnstore",
         "client_report",
+        # Stream S13b-2: the run-count and baseline-reuse rules of both benchmark tools.
+        "measurement_time_rules",
     }
     # A tool guide for a tool that does not exist would never be fetched.
     assert tools <= KNOWN_TOOLS

@@ -497,6 +497,11 @@ def _norm(value: str) -> str:
     return value.casefold()
 
 
+# performance_workflows.BENCHMARK_MARKER_PREFIX: the comment that opens every
+# statement a benchmark tool of this server runs.
+_BENCHMARK_MARKER = "/* azure-sql-mcp:bench:"
+
+
 class WorkloadIndexAdvisor:
     def __init__(
         self,
@@ -647,6 +652,7 @@ class WorkloadIndexAdvisor:
             focus_tables=focus_tables,
             focus_schema=schema_name if not table_names else None,
             test_index_name_prefixes=tuple(test_index_name_prefixes),
+            requested_query_ids=frozenset(pinned_ids),
         )
 
         detail_keys = [
@@ -878,6 +884,14 @@ class WorkloadIndexAdvisor:
                     "total_logical_reads": _float(row.get("workload_logical_reads")),
                     "executions": _float(row.get("workload_executions")),
                 }
+            query_id = int(row.get("query_id") or 0)
+            if (
+                str(row.get("query_text_preview") or "").lstrip().startswith(_BENCHMARK_MARKER)
+                and query_id not in pinned
+            ):
+                # A statement this server ran in a benchmark is not application
+                # workload: it must not shape or dilute an index design.
+                continue
             object_name = row.get("object_name")
             object_schema = row.get("object_schema")
             queries.append(

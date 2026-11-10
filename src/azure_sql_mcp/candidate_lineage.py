@@ -9,6 +9,16 @@ from .performance_contracts import TuningCandidateV1
 
 COMBINED_PARENT_REFERENCE_PREFIX = "candidate:"
 LINEAGE_BACKED_STRATEGIES = frozenset({"combined", "rewrite_plus_index"})
+# A rewrite that needs its index is often neutral or slower alone. It is a
+# valid parent of an index experiment when its results matched the original.
+NOT_FASTER_ALONE_PARENT_STATES = frozenset({"neutral", "regressed"})
+ONE_CALL_ROUTE = (
+    "Route: register the rewrite with add_tuning_candidate(strategy="
+    "'rewrite_plus_index') and no artifact_ref, then call benchmark_index_candidate "
+    "with sql = the statement of the performance case and candidate_sql = the "
+    "rewrite. That call measures the original against the rewrite with its "
+    "indexes and compares the results itself."
+)
 
 
 def parse_combined_parent_reference(reference: str | None) -> str:
@@ -77,6 +87,11 @@ def validate_rewrite_plus_index_parent_request(
     A performance-only parent is a valid starting point for an index
     experiment, but the child inherits that uncertainty and can never turn it
     into proven equivalence through index timings.
+
+    A parent whose finalist was neutral or regressed is valid too, when its
+    results matched the original for every parameter case: a rewrite that
+    needs its index is not faster alone. A refusal names the parent state,
+    the reason and the route that needs no parent.
     """
 
     return _validate_parent_request(
@@ -111,46 +126,71 @@ def _validate_parent_request(
         raise ValueError(
             "Lineage child SQL must exactly match its rewrite parent."
         )
+    # ``allow_performance_only`` marks the rewrite_plus_index lineage; the
+    # legacy combined lineage keeps its improved-only rule.
+    route = f" {ONE_CALL_ROUTE}" if allow_performance_only else ""
+    not_faster_alone = allow_performance_only and parent.state in NOT_FASTER_ALONE_PARENT_STATES
     allowed_parent_states = (
-        {"improved", "performance_only"}
+        {"improved", "performance_only"} | NOT_FASTER_ALONE_PARENT_STATES
         if allow_performance_only
         else {"improved"}
     )
     if parent.state not in allowed_parent_states or parent.finalist_runs <= 0:
         raise ValueError(
-            "Lineage child parent must be a completed finalist with measured runs."
+            "Lineage child parent must be a completed finalist with measured runs; "
+            f"the parent is in state '{parent.state}' with {parent.finalist_runs} "
+            f"finalist run(s).{route}"
         )
 
+    candidates = [
+        item
+        for item in reversed(tuple(evidence))
+        if pinned_evidence_id is None or item.evidence_id == pinned_evidence_id
+    ]
     proof = next(
         (
             item
-            for item in reversed(tuple(evidence))
+            for item in candidates
             if (
-                pinned_evidence_id is None
-                or item.evidence_id == pinned_evidence_id
+                _is_matched_finalist_evidence(item, parent)
+                and (not_faster_alone or item.metrics.get("classification") == "improved")
             )
-            and (
-                _is_proven_finalist_evidence(item, parent)
-                or (
-                    allow_performance_only
-                    and _is_performance_only_finalist_evidence(item, parent)
-                )
+            or (
+                allow_performance_only
+                and not not_faster_alone
+                and _is_performance_only_finalist_evidence(item, parent)
             )
         ),
         None,
     )
     if proof is None:
+        if not not_faster_alone:
+            raise ValueError(
+                "Lineage child parent has no complete improved finalist evidence; "
+                f"the parent is in state '{parent.state}'.{route}"
+            )
+        compared = any(
+            isinstance(item.metadata.get("equivalence"), (list, tuple))
+            and item.metadata.get("equivalence")
+            for item in candidates
+        )
         raise ValueError(
-            "Lineage child parent has no complete improved finalist evidence."
+            f"The parent finalist is '{parent.state}' and its results "
+            + (
+                "did not match the original for every parameter case"
+                if compared
+                else "were not compared with the original"
+            )
+            + f", so an index measured on it would prove nothing about the rewrite.{route}"
         )
 
     parent_equivalence = (
         "proven"
-        if _is_proven_finalist_evidence(proof, parent)
+        if _is_matched_finalist_evidence(proof, parent)
         else "unproven"
     )
 
-    return {
+    lineage = {
         "lineage_contract_version": 1,
         "parent_candidate_id": parent.candidate_id,
         "parent_evidence_id": proof.evidence_id,
@@ -158,6 +198,11 @@ def _validate_parent_request(
         "parent_equivalence": parent_equivalence,
         "marginal_experiment": "rewrite_without_index_with_index_after_cleanup",
     }
+    if not_faster_alone:
+        # Added only for these parents, so stored lineage of an improved or
+        # performance-only parent stays equal to what is recomputed here.
+        lineage["parent_state"] = parent.state
+    return lineage
 
 
 def validate_combined_parent(
@@ -210,12 +255,16 @@ def validate_rewrite_plus_index_parent(
     return validate_combined_parent(child, parent, evidence)
 
 
-def _is_proven_finalist_evidence(
+def _is_matched_finalist_evidence(
     evidence: EvidenceEnvelopeV1,
     parent: TuningCandidateV1,
 ) -> bool:
+    """Finalist evidence whose results matched the original for every case.
+
+    Equivalence only: how the timings were classified is a separate question.
+    """
+
     metadata = evidence.metadata
-    metrics = evidence.metrics
     comparisons = metadata.get("equivalence")
     if not isinstance(comparisons, (list, tuple)) or not comparisons:
         return False
@@ -226,7 +275,6 @@ def _is_proven_finalist_evidence(
         and metadata.get("candidate_id") == parent.candidate_id
         and metadata.get("phase") == "finalist"
         and metadata.get("proof_scope") == "direct_snapshot"
-        and metrics.get("classification") == "improved"
         and all(
             isinstance(comparison, dict)
             and comparison.get("status") == "match"

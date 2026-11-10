@@ -204,7 +204,8 @@ async def test_capabilities_do_not_return_the_probe_plan(app: AzureSqlMcpApplica
     # The probe proves the permission; its operators say nothing about the user's query.
     _stub_capabilities(app, {"platform_supported": True, "platform": "azure_sql_database"})
 
-    result = await _call(app, "check_capabilities", {})
+    # Stream S13b-2: the default is now the summary; the probe details are in full.
+    result = await _call(app, "check_capabilities", {"detail": "full"})
 
     for name in ("estimated_plan", "actual_plan"):
         check = result["checks"][name]

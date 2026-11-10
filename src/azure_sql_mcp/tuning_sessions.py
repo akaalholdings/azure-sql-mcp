@@ -39,6 +39,10 @@ DEFAULT_TIME_LIMIT_SECONDS = 20 * 60
 # warms the pages before the measured runs.
 WARMUP_RUNS_PER_SIDE = 1
 INDEX_ABA_PHASES = 3
+# Run counts follow the speed of the statement (adaptive_run_count).
+FAST_STATEMENT_SECONDS = 1.0
+SLOW_STATEMENT_SECONDS = 10.0
+MAX_RUNS_FOR_SECONDS_STATEMENT = 3
 
 
 class TuningSessionError(RuntimeError):
@@ -132,6 +136,40 @@ def lineage_execution_budget(
     }
     plan["total"] = sum(plan.values())
     return plan
+
+
+def adaptive_run_count(
+    first_run_seconds: float,
+    requested_runs: int,
+    *,
+    seconds_available: float | None = None,
+) -> int:
+    """How many measured runs one arm of one parameter case gets.
+
+    The first run of the arm is timed, then:
+
+    - under 1 second: every requested run;
+    - 1 to 10 seconds: at most 3 runs;
+    - 10 seconds or more: that one run. A single sample has no measured
+      noise, so the verdict counts a gain only when the other side is at
+      most half of it.
+
+    ``seconds_available`` is the session time left for this arm. The count
+    is cut to what fits, never below one run and never above the request;
+    the session and policy execution budgets are reserved before the first
+    run for the full request.
+    """
+
+    requested = max(1, int(requested_runs))
+    if first_run_seconds >= SLOW_STATEMENT_SECONDS:
+        runs = 1
+    elif first_run_seconds >= FAST_STATEMENT_SECONDS:
+        runs = min(requested, MAX_RUNS_FOR_SECONDS_STATEMENT)
+    else:
+        runs = requested
+    if seconds_available is not None and first_run_seconds > 0:
+        runs = min(runs, max(1, int(seconds_available // first_run_seconds)))
+    return runs
 
 
 Clock = Callable[[], datetime]
@@ -312,10 +350,9 @@ class TuningSessionStateMachine:
         )
         # A session takes new screening candidates after a finalist run until
         # it is finalized or its budget is spent. Only a candidate that names a
-        # parent must prove that lineage.
-        if session.status == "finalist_validation" and (
-            rewrite_artifact_ref is not None or strategy == "rewrite_plus_index"
-        ):
+        # parent must prove that lineage. A rewrite_plus_index candidate with no
+        # parent is measured against the original statement, with its indexes.
+        if session.status == "finalist_validation" and rewrite_artifact_ref is not None:
             try:
                 lineage_validator = {
                     "combined": validate_combined_parent_request,

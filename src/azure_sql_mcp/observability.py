@@ -48,6 +48,18 @@ _DUPLICATE_KEY_VALUE_PATTERN = re.compile(
 )
 # 3621 "The statement has been terminated" only accompanies another error.
 _COMPANION_NATIVE_CODES = frozenset({3621})
+# mssql-python reports no engine error number. For DDL this server builds, the
+# engine text names these errors (text observed on Azure SQL Database).
+_ENGINE_TEXT_ERROR_NUMBERS: tuple[tuple[re.Pattern[str], int], ...] = (
+    (
+        re.compile(
+            r"statement failed because the operation cannot be performed online on a "
+            r"table with a columnstore index",
+            re.IGNORECASE,
+        ),
+        35352,
+    ),
+)
 
 # The state stores raise "Unknown <kind>: <id>." from a KeyError subclass named
 # ...NotFoundError. str() of a KeyError is the quoted repr of that text.
@@ -341,6 +353,15 @@ def extract_failure_diagnostic(exc: Exception, *, engine_text: bool = False) -> 
                 ),
                 None,
             )
+            if code is None:
+                code = next(
+                    (
+                        number
+                        for pattern, number in _ENGINE_TEXT_ERROR_NUMBERS
+                        if pattern.search(message)
+                    ),
+                    None,
+                )
             if code is not None:
                 diagnostic.setdefault("native_error_code", code)
     return diagnostic

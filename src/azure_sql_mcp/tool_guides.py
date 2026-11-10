@@ -155,8 +155,8 @@ Avoid:
 - analyze=true executes the statement. Use it only for a read-only SELECT or
   batch and within the database policy.
 - An estimated plan cannot show what was slow.
-- A missing-index hint is a lead. Design the index with
-  review_workload_indexes.
+- A missing-index hint is a lead. Design the index from the plan (guide
+  index_design).
 - include_operator_summary=true returns the long operator list. Ask for it
   only when the digest is not enough.
 Next: check_equivalence_preflight before any comparison of a rewrite;
@@ -264,9 +264,12 @@ get_query_parameter_buckets for the values production compiled with.
         "tool",
         "Design and review indexes from the stored workload",
         """
-Use when: you need index advice for a database, a set of tables, or the query
-being tuned. It reads Query Store plans and the index catalog and returns
-create, extend, widen, consolidate, drop and heap recommendations.
+Use when: the question is about a table's whole index set (overlap, unused,
+consolidation, what to extend), or you already hold the Query Store query id
+at no extra cost. For a single statement, design the index from the plan
+(guide index_design); this review is not a step before every index candidate.
+It reads Query Store plans and the index catalog and returns create, extend,
+widen, consolidate, drop and heap recommendations.
 Read:
 - result_status, then gaps. gaps state coverage: the share of the workload
   analysed, the Query Store capture mode, unparsed plans, counter resets.
@@ -275,8 +278,11 @@ Read:
   the existing indexes with their usage.
 - Per recommendation: action, keys, includes, supporting query ids,
   confidence, reason_codes, blockers, write_impact, ddl and rollback_ddl.
-- offline_build: the table has a columnstore index, so the CREATE INDEX has
-  no ONLINE option and its build blocks writes. Say so with the DDL.
+- offline_build: the table has a clustered columnstore index, so CREATE
+  INDEX and ADD CONSTRAINT have no ONLINE option and block writes while
+  they run. Say so with the DDL.
+- With query_ids: requested_query_design is the index for that query alone
+  (equality, then ORDER BY, then one range column). It comes first.
 - estimated_max_benefit_pct: an upper bound from optimizer cost shares. It
   ranks options; it is not a measured saving.
 - rewrite_opportunities: non-sargable predicates and implicit conversions.
@@ -388,9 +394,10 @@ Read:
   timeout_seconds, lock_wait_abort, engine_error, definition_mismatch,
   connection_lost), native_error_code and engine_message. Fix that cause;
   do not repeat the same call.
-- A table with a columnstore index is built offline only. The policy must
-  set allow_offline_test_index, else the call is refused before any run.
-  offline_build in the result says the build blocked writes.
+- A table with a clustered columnstore index is built offline only (engine
+  error 35352). The policy must set allow_offline_test_index, else the call
+  is refused before any run. offline_build says the build blocked writes.
+- kind nonclustered_columnstore tests a columnstore index (guide columnstore).
 - proof_scope hinted_evidence (with replaces): what the index costs when
   used. It does not show that the optimizer will choose it.
 Avoid:
@@ -400,7 +407,7 @@ Avoid:
   that permits it, and that result is labelled measured outside the tool.
 - One query cannot justify a production index: state the write cost and the
   size, and check the other queries on the table.
-- Take keys and includes from review_workload_indexes, not from a
+- Design keys and includes from the plan (guide index_design), not from a
   missing-index hint.
 Next: get_tuning_session, then finalize_tuning_session. Hand the measured
 result, the DDL and the rollback to the DBA's change control.
@@ -620,11 +627,18 @@ it, measured per parameter case with benchmark_tuning_candidate.
 Use when: a predicate, join or order has no supporting index, a key lookup is
 large, or indexes overlap.
 Read:
-- Design from the access pattern: equality columns first, then one range or
-  ordering column, in the direction the query needs. An INCLUDE column cannot
-  seek or give order; it only removes a lookup.
+- For a single statement, design from the plan: equality columns first, then
+  the ORDER BY columns in the direction the query needs, then one range
+  column; INCLUDE the other columns the statement reads. A range column
+  placed before the ORDER BY columns loses the order. An INCLUDE column
+  cannot seek or give order; it only removes a lookup.
 - Compare with the existing indexes first. Extend or widen one before you add
   one.
+- On a partitioned rowstore table a new index is partition-aligned. A seek or
+  an ordered read that does not filter on the partitioning column then visits
+  every partition. Test the other form with partition_aligned=false in the
+  index spec of benchmark_index_candidate, and quote non_aligned_index_warning
+  (it blocks partition SWITCH). Never on a clustered columnstore table.
 - Count the cost: write activity on the table, size, log generation and the
   other queries that use the table.
 - A filtered index serves only queries whose predicate matches the filter
@@ -639,12 +653,12 @@ Avoid:
   not observed.
 - Indexes that enforce a constraint, a foreign key or uniqueness are not
   removal candidates.
-Next: review_workload_indexes with query_ids and the objective of the case;
-benchmark_index_candidate on a non-production copy; then the DDL and the
-rollback go to change control.
+Next: benchmark_index_candidate on a non-production copy; then the DDL and
+the rollback go to change control. Use review_workload_indexes when the
+question is the table's whole index set, or a query id is at hand.
 """,
-        "review_workload_indexes",
         "benchmark_index_candidate",
+        "review_workload_indexes",
         "get_object_index_diagnostics",
     ),
     _guide(
@@ -699,6 +713,16 @@ Read:
   value in a real column at load time.
 - Row group health (get_object_index_diagnostics): many small or open row
   groups and a high share of deleted rows make every scan read more.
+- To measure a nonclustered columnstore index for an aggregate scan of a
+  rowstore table: benchmark_index_candidate with indexes=[{table_name,
+  kind: "nonclustered_columnstore", key_columns: [the columns it holds]}]
+  (one index: index_kind). No include_columns, not unique; data_compression
+  COLUMNSTORE or COLUMNSTORE_ARCHIVE. It is built online and B-tree test
+  indexes on that table stay online. It is refused before any run when the
+  table already has a columnstore index or a column is (max), computed,
+  sparse or of an unsupported type. The result has row_groups, no depth.
+- Keep SUM and COUNT on the bare column inside the scan: an expression
+  inside the aggregate stops aggregate pushdown.
 Avoid:
 - Do not recommend a seek index for an aggregate over most of the table. A
   rowstore index helps a selective lookup; the columnstore serves the scan.
@@ -815,7 +839,8 @@ Read:
 - replaces: the existing index a one-index candidate would replace. The
   candidate arm is hinted and the result is hinted_evidence.
 - slow_baseline_cases={"case": seconds}: a baseline too slow to repeat runs
-  once and later index candidates of the session reuse it.
+  once and later candidates of the session reuse it (guide
+  measurement_time_rules).
 - Result: indexes (size_mb, index_depth, used_in_cases) and unused_indexes,
   the indexes of the set that no measured case used.
 Avoid:
@@ -826,14 +851,151 @@ Avoid:
 - A set with an unused index is larger than the design needs. Test it again
   without that index.
 Next: get_tuning_session, then finalize_tuning_session. For a rewrite that
-also needs the indexes, add a rewrite_plus_index candidate whose parent is
-the measured rewrite.
+also needs the indexes, pass the rewrite as candidate_sql (guide
+rewrite_with_indexes): one call, no parent.
 """,
         "check_capabilities",
         "start_performance_case",
         "add_tuning_candidate",
         "benchmark_index_candidate",
         "finalize_tuning_session",
+    ),
+    _guide(
+        "rewrite_with_indexes",
+        "workflow",
+        "A rewrite that is faster only with its indexes: one call",
+        """
+Use when: the rewrite needs an index (or a set) to win. Alone it is neutral
+or slower, so measuring it first and the index second gives two results for
+one answer. This path measures it in one call.
+Steps:
+- add_tuning_candidate with strategy=rewrite_plus_index, candidate_sql = the
+  rewrite, and no artifact_ref.
+- benchmark_index_candidate with sql = the statement of the performance case
+  (the original), candidate_sql = the rewrite, and the index or indexes.
+  phase=finalist covers every registered parameter case.
+- One lease builds the set. The original runs before the build and after the
+  drop; the rewrite runs while the indexes exist. A finalist then compares
+  the two statements in one snapshot per case, before the drop.
+Read:
+- experiment: original_against_rewrite_with_indexes. decision.cases is the
+  per-case table; decision.worst_case is the case that gains least.
+- equivalence per case: match, mismatch, or not_compared with the reason.
+  proof_scope direct_snapshot is a match on the tested cases and today's
+  data. finalize_tuning_session reports it as snapshot_matched; only a
+  catalog-verified precondition makes it constraint_backed.
+- performance_only: the SQL shape has no deterministic comparison. The
+  timing stands; the equality is not shown.
+- used_in_cases and unused_indexes: an index no case used is not part of
+  the design.
+The parent route still exists: a rewrite finalist of the session is a valid
+parent (artifact_ref=candidate:<id>) when its results matched for every
+case, whether it was improved, neutral or regressed. That run measures only
+what the index adds to the rewrite. A parent whose results did not match, or
+were not compared, is refused: the message names the state and this route.
+Avoid:
+- Do not open a second performance case with the rewrite as its baseline.
+- Do not pass the rewrite as sql: sql is always the original here.
+Next: finalize_tuning_session with the logical_preconditions the rewrite
+depends on.
+""",
+        "add_tuning_candidate",
+        "benchmark_index_candidate",
+        "finalize_tuning_session",
+    ),
+    _guide(
+        "indexed_view_experiment",
+        "workflow",
+        "Measure an indexed view as a leased test object",
+        """
+Use when: a fixed aggregate over a large table returns few rows and is called
+often. An indexed view stores the aggregate; the statement reads a few pages.
+Steps:
+- check_capabilities: indexed_view_experiment.allowed, its blockers and
+  test_view_name_prefixes. It needs allow_test_indexes, allow_view_apply
+  and allow_offline_test_index (the first index of a view is built offline:
+  writes to the base tables wait during the build).
+- benchmark_indexed_view_candidate with preview set to true and
+  view_definition (the SELECT body: two-part names, COUNT_BIG(*), SUM over a
+  NOT NULL column or with ISNULL). It returns the view name, the findings
+  and setup_statements, and runs nothing.
+- add_tuning_candidate with strategy=rewrite_plus_index, no artifact_ref,
+  and candidate_sql = the statement that reads dbo.<view> WITH (NOEXPAND).
+- benchmark_indexed_view_candidate with sql (the original), candidate_sql,
+  view_definition, view_name and phase=finalist.
+- read_mode automatic: an index candidate with the unchanged statement; the
+  result says whether the optimizer matched the view by itself.
+Read:
+- decision and equivalence as for a rewrite. proof_scope direct_snapshot is
+  a match on the tested cases; finalize reports snapshot_matched.
+- view.setup_statements and view.teardown_statements: the exact DDL for the
+  report. built.rows and built.size_mb: what the view stores.
+- view.write_overhead_warning, view.write_cost and
+  view.base_table_restrictions: every write to a base table also maintains
+  the view, and TRUNCATE, ALTER COLUMN and partition SWITCH on a base table
+  fail while it exists. Quote them with the recommendation.
+- lease.status cleaned: the view is gone. cleanup_required: give the user
+  remediation (DROP VIEW) and stop sandbox work in that database.
+- failure_diagnostic: failed_step, native_error_code and engine_message of
+  a refused build; the lease is then create_failed and nothing is left.
+Avoid:
+- Do not recommend an indexed view on a table with heavy writes without the
+  write warning and the covering index as the alternative.
+- Do not present read_mode automatic as proof that production will match
+  the view: matching depends on the edition and on the estimated cost.
+- A view over a data property with no constraint (no gaps, no overlaps) is
+  not equivalent by proof: name the property as a precondition.
+Next: finalize_tuning_session; hand the DDL, the SET options and the write
+warning to change control.
+""",
+        "check_capabilities",
+        "add_tuning_candidate",
+        "benchmark_indexed_view_candidate",
+        "finalize_tuning_session",
+    ),
+    _guide(
+        "measurement_time_rules",
+        "topic",
+        "How many times a benchmark runs a statement, and what is reused",
+        """
+Use when: you plan a benchmark of a statement that takes seconds or minutes,
+or you read runs, single-sample flags or baseline_source in a result.
+Read:
+- Both benchmark_tuning_candidate and benchmark_index_candidate time the
+  first run of each arm of each parameter case.
+  under 1 second: every requested run (default 3 screening, 5 finalist;
+  runs lowers it).
+  1 to 10 seconds: at most 3 runs.
+  10 seconds or more: that one run only.
+- The count never exceeds runs, the session execution budget or the policy
+  limit: those are reserved before the first run. In the index benchmark it
+  is also cut to the session time left.
+- A baseline that ran once is kept once in the session, with its plan and
+  result digest, and both benchmark tools reuse it for every later candidate:
+  baseline_source is single_run where it was measured and
+  session_single_run where it was reused. slow_baseline_cases declares such
+  a case before the first run; it is not needed for the rule to apply.
+- A fast baseline is measured again by each index benchmark, before the
+  build and after the drop: those runs are the noise check of that result.
+- One sample has no measured noise. With baseline_single_sample or
+  candidate_single_sample a gain counts only when the other side is at most
+  half of it; a regression needs no such margin.
+- A case whose baseline is 0 on the objective (under 1 ms or 1 page) is
+  unchanged_at_zero or regressed on the absolute floor; the other cases
+  decide. decision.by_metric gives the verdict on CPU, elapsed time and
+  logical reads from the same runs.
+- compare_query_results: max_seconds caps the comparison (default 120). A
+  capped run returns timed_out with the arm that was running. Pass
+  estimated_seconds when you know the statement time: a comparison that
+  cannot fit is not started, and the result says what to pass.
+Avoid:
+- Do not open a new case to change the objective or to rerun a baseline.
+- Do not read a single-sample verdict as a measured noise margin.
+Next: read parameter_results[].runs and baseline_note for what ran.
+""",
+        "benchmark_index_candidate",
+        "benchmark_tuning_candidate",
+        "compare_query_results",
     ),
 )
 _GUIDES = (*_GUIDES, *_WORKFLOW_GUIDES)

@@ -167,14 +167,24 @@ async def test_recommendations_that_serve_the_requested_queries_come_first(
         }
     )
 
+    # Stream S13b-2: the recommendations of other queries are counted and left
+    # out by default (they were most of a 16 to 34 KB report); they come back,
+    # after the ones that serve the query, with include_other_recommendations.
     result = await _call(app, "review_workload_indexes", {"query_ids": [42]})
+    everything = await _call(
+        app,
+        "review_workload_indexes",
+        {"query_ids": [42], "include_other_recommendations": True},
+    )
 
-    assert [item["table"] for item in result["recommendations"]] == [
+    assert [item["table"] for item in result["recommendations"]] == ["dbo.Posts"]
+    assert result["requested_queries"]["other_recommendations_omitted"] == 2
+    assert [item["table"] for item in everything["recommendations"]] == [
         "dbo.Posts",
         "dbo.Votes",
         "dbo.Badges",
     ]
-    assert [item["serves_requested_query"] for item in result["recommendations"]] == [
+    assert [item["serves_requested_query"] for item in everything["recommendations"]] == [
         True,
         False,
         False,

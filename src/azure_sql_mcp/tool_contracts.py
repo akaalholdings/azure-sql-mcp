@@ -157,6 +157,7 @@ _BENCHMARK_TOOLS = {
     "benchmark_query_rewrite",
     "benchmark_tuning_candidate",
     "benchmark_index_candidate",
+    "benchmark_indexed_view_candidate",
 }
 
 

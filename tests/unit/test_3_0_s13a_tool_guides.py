@@ -19,7 +19,7 @@ def _text(name: str) -> str:
 def test_benchmark_guide_states_the_columnstore_rule_and_the_failure_fields() -> None:
     text = _text("benchmark_index_candidate")
 
-    assert "columnstore index is built offline" in text
+    assert "clustered columnstore index is built offline" in text
     assert "allow_offline_test_index" in text and "offline_build" in text
     for field in ("failed_step", "cause_class", "engine_message", "timeout_seconds"):
         assert field in text, field
