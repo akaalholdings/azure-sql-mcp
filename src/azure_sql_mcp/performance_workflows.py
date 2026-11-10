@@ -12,13 +12,17 @@ import hashlib
 import json
 import math
 import statistics
+import xml.etree.ElementTree as ET
 from collections import Counter
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
+from .candidate_lineage import LINEAGE_BACKED_STRATEGIES
 from .candidate_lineage import parse_combined_parent_reference
 from .candidate_lineage import validate_rewrite_plus_index_parent_request
+from .catalog_constraints import CatalogConstraintService
+from .catalog_constraints import verify_precondition
 from .connection import AzureSqlExecutor
 from .connection import QueryResult
 from .connection import StatementDispatchPrevented
@@ -27,6 +31,8 @@ from .equivalence_contract import analyze_equivalence_preflight
 from .equivalence_contract import effective_compare_order
 from .equivalence_contract import has_outer_literal_top_zero
 from .equivalence_contract import order_contract_risk
+from .equivalence_contract import rewrite_requirements
+from .equivalence_contract import statement_hint_profile
 from .incident_log import note_exception
 from .observability import extract_failure_diagnostic
 from .performance_contracts import (
@@ -39,6 +45,9 @@ from .performance_contracts import (
 from .performance_store import PerformanceStore
 from .param_binding import ParameterExecutionContract, TypedParameterBucket
 from .param_binding import detect_parameters
+from .plan_digest import build_plan_digest
+from .plan_rules import analyze_plan
+from .plans import SHOWPLAN_NAMESPACE_URI
 from .plans import PlansService, ProfiledPlanResult
 from .query_identity import query_identity
 from .query_identity import query_identity_matches
@@ -49,8 +58,11 @@ from .safe_sql import SafeSqlValidator
 from .tuning_sessions import DEFAULT_EXECUTIONS
 from .tuning_sessions import DEFAULT_MAX_CANDIDATES
 from .tuning_sessions import DEFAULT_TIME_LIMIT_SECONDS
+from .tuning_sessions import WARMUP_RUNS_PER_SIDE
 from .tuning_sessions import InvalidTransitionError
 from .tuning_sessions import TuningSessionStateMachine
+from .tuning_sessions import lineage_execution_budget
+from .tuning_sessions import session_failure_diagnostic
 
 
 ParameterCase = dict[str, Any]
@@ -71,12 +83,15 @@ OBJECTIVE_METRICS = {
     "logical_reads": "logical_reads",
     "physical_reads": "physical_reads",
 }
+# Elapsed time is the statement's server time from the actual plan. The client
+# clock is the fallback, and only when both sides use it.
 OBJECTIVE_SOURCE_REQUIREMENTS = {
-    "elapsed_time": ("elapsed_ms", "client_wall_clock"),
+    "elapsed_time": ("elapsed_ms", "showplan_query_time_stats"),
     "cpu": ("cpu_ms", "showplan_query_time_stats"),
     "logical_reads": ("reads", "statistics_io_table_messages"),
     "physical_reads": ("reads", "statistics_io_table_messages"),
 }
+CLIENT_CLOCK_SOURCE = "client_wall_clock"
 MIN_RELATIVE_IMPROVEMENT = 0.10
 MIN_ABSOLUTE_IMPROVEMENT = {
     "elapsed_time": 5.0,
@@ -84,7 +99,35 @@ MIN_ABSOLUTE_IMPROVEMENT = {
     "logical_reads": 100.0,
     "physical_reads": 10.0,
 }
-COMPARISON_DECISION_BASIS = "observed_range_separation_v1"
+MAD_TO_SIGMA = 1.4826
+NOISE_SIGMA_MULTIPLIER = 2.0
+COMPARISON_DECISION_BASIS = "per_bucket_median_shift_v2"
+EXECUTION_PROTOCOL_VERSION = 2
+# Sections that describe the case's own query. The others describe the whole
+# database: they are context and do not decide the case's outcome.
+QUERY_SCOPED_SECTIONS = frozenset({"query_store", "query_store_history"})
+MAX_REMEMBERED_CASES = 64
+BENCHMARK_MARKER_PREFIX = "/* azure-sql-mcp:bench:"
+_RUN_VALUE_METRICS = (
+    "elapsed_ms",
+    "client_elapsed_ms",
+    "cpu_ms",
+    "logical_reads",
+    "physical_reads",
+)
+
+
+def mark_benchmark_sql(sql: str, *identity: str) -> str:
+    """Give a benchmark statement its own plan cache and Query Store entry.
+
+    The comment changes the statement text, so the first execution compiles a
+    plan for the parameter values of that execution and never reuses, or
+    replaces, the application's cached plan. A forced plan or Query Store hint
+    on the application's query does not apply to the marked text.
+    """
+
+    digest = hashlib.sha256("\x1f".join(identity).encode("utf-8")).hexdigest()[:16]
+    return f"{BENCHMARK_MARKER_PREFIX}{digest} */ {sql}"
 
 
 def fingerprint_text(value: str) -> str:
@@ -631,6 +674,11 @@ def compare_result_collections(
         "reason": reason,
         "proven_for_parameter_case": status == "match",
         "same_snapshot": same_snapshot,
+        # No row on either side: any two statements match. That is not evidence.
+        "vacuous": all(
+            result.get("baseline_row_count") == 0 and result.get("candidate_row_count") == 0
+            for result in comparisons
+        ),
         "baseline_result_set_count": len(baseline_sets),
         "candidate_result_set_count": len(candidate_sets),
         "result_sets": comparisons,
@@ -760,10 +808,20 @@ def profile_payload(
     include_result_sample: bool = False,
 ) -> dict[str, Any]:
     plan = profile.plan.as_dict(include_raw_xml=include_plan_xml)
+    raw_xml = profile.plan.raw_xml or ""
+    findings = analyze_plan(raw_xml)
     result = _first_tabular_result(profile.result_sets)
     rows = result.rows if result is not None else []
     payload = {
         "plan": plan,
+        "plan_digest": build_plan_digest(raw_xml, top_n=5, tree_budget=40),
+        "plan_findings": {
+            "plan_kind": findings.get("plan_kind"),
+            "finding_counts": findings.get("finding_counts", {}),
+            "findings": (findings.get("findings") or [])[:15],
+            "truncated": bool(findings.get("truncated"))
+            or len(findings.get("findings") or []) > 15,
+        },
         "result_shape": list(result.columns) if result is not None else [],
         "result_type_signatures": (
             list(result.column_type_signatures) if result is not None else []
@@ -779,6 +837,44 @@ def profile_payload(
     return payload
 
 
+def _client_fetch_wait_ms(raw_xml: str | None) -> float | None:
+    """ASYNC_NETWORK_IO from the actual plan: time the server waited for the client to fetch rows."""
+
+    if not raw_xml:
+        return None
+    try:
+        root = ET.fromstring(raw_xml)
+    except ET.ParseError:
+        return None
+    total = 0.0
+    for wait in root.iter(f"{{{SHOWPLAN_NAMESPACE_URI}}}Wait"):
+        if (wait.get("WaitType") or "").upper() != "ASYNC_NETWORK_IO":
+            continue
+        try:
+            total += float(wait.get("WaitTimeMs") or 0)
+        except ValueError:
+            return None
+    return total
+
+
+def _compile_state(summary: Mapping[str, Any]) -> str:
+    """Whether the plan that ran was compiled for the values it ran with.
+
+    Read from the plan's parameter list; the values themselves are not copied.
+    """
+
+    parameters = [
+        item for item in summary.get("parameters") or () if isinstance(item, Mapping)
+    ]
+    if not parameters:
+        return "no_parameters"
+    if any(item.get("compiled_value") is None for item in parameters):
+        return "unknown"
+    if all(item.get("compiled_value") == item.get("runtime_value") for item in parameters):
+        return "compiled_for_these_values"
+    return "compiled_for_other_values"
+
+
 def extract_profile_metrics(profile: ProfiledPlanResult) -> dict[str, Any]:
     metrics = profile.plan.summary.get("actual_metrics", {})
     statistics_io = profile.plan.summary.get("statistics_io", {})
@@ -792,15 +888,37 @@ def extract_profile_metrics(profile: ProfiledPlanResult) -> dict[str, Any]:
         if isinstance(statistics_io, Mapping) and read_totals
         else metrics.get("read_metric_source")
     )
+    server_elapsed = _numeric([metrics.get("actual_elapsed_ms")])
+    fetch_wait = _client_fetch_wait_ms(profile.plan.raw_xml)
+    if server_elapsed and metrics.get("query_metric_source") == "showplan_query_time_stats":
+        # Server time minus the wait for the client to fetch rows: what the
+        # plan cost, not what the network cost.
+        elapsed = max(0.0, server_elapsed[0] - (fetch_wait or 0.0))
+        elapsed_source = "showplan_query_time_stats"
+    else:
+        elapsed = float(profile.elapsed_wall_ms)
+        elapsed_source = CLIENT_CLOCK_SOURCE
+    in_row_reads = _numeric([read_totals.get("logical_reads")])
+    lob_reads = _numeric([read_totals.get("lob_logical_reads")])
     return {
-        "elapsed_ms": float(profile.elapsed_wall_ms),
+        "elapsed_ms": elapsed,
+        "server_elapsed_ms": server_elapsed[0] if server_elapsed else None,
+        "client_fetch_wait_ms": fetch_wait,
+        "client_elapsed_ms": float(profile.elapsed_wall_ms),
         "cpu_ms": metrics.get("actual_cpu_ms"),
         "actual_rows": metrics.get("actual_rows"),
-        "logical_reads": read_totals.get("logical_reads"),
+        "logical_reads": (
+            in_row_reads[0] + (lob_reads[0] if lob_reads else 0.0)
+            if in_row_reads
+            else None
+        ),
+        "lob_logical_reads": lob_reads[0] if lob_reads else None,
+        "logical_reads_definition": "in_row_plus_lob",
         "physical_reads": read_totals.get("physical_reads"),
         "warning_count": len(profile.plan.summary.get("warnings", [])),
         "plan_fingerprint": structural_plan_fingerprint(profile.plan.summary),
-        "elapsed_source": "client_wall_clock",
+        "compile_state": _compile_state(profile.plan.summary),
+        "elapsed_source": elapsed_source,
         "cpu_source": metrics.get("query_metric_source"),
         "read_source": read_source,
     }
@@ -898,7 +1016,17 @@ def aggregate_samples(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     aggregate: dict[str, Any] = {"sample_count": len(samples)}
     spread: dict[str, dict[str, float]] = {}
     coverage: dict[str, dict[str, Any]] = {}
-    for name in ("elapsed_ms", "cpu_ms", "actual_rows", "logical_reads", "physical_reads"):
+    run_values: dict[str, list[float]] = {}
+    for name in (
+        "elapsed_ms",
+        "client_elapsed_ms",
+        "client_fetch_wait_ms",
+        "cpu_ms",
+        "actual_rows",
+        "logical_reads",
+        "lob_logical_reads",
+        "physical_reads",
+    ):
         values = _numeric([sample.get(name) for sample in samples])
         coverage[name] = {
             "available_samples": len(values),
@@ -908,6 +1036,9 @@ def aggregate_samples(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         if not values:
             aggregate[name] = None
             continue
+        if name in _RUN_VALUE_METRICS and len(values) == len(samples):
+            # Execution order: the decision pairs run i of one side with run i of the other.
+            run_values[name] = values
         median = float(statistics.median(values))
         absolute_deviations = [abs(value - median) for value in values]
         mad = float(statistics.median(absolute_deviations))
@@ -929,6 +1060,7 @@ def aggregate_samples(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         else None
     )
     aggregate["spread"] = spread
+    aggregate["run_values"] = run_values
     aggregate["metric_coverage"] = coverage
     aggregate["plan_fingerprints"] = sorted(
         {
@@ -938,6 +1070,9 @@ def aggregate_samples(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         }
     )
     aggregate["plan_stable"] = len(aggregate["plan_fingerprints"]) <= 1
+    aggregate["compile_states"] = sorted(
+        {str(sample["compile_state"]) for sample in samples if sample.get("compile_state")}
+    )
     aggregate["metric_sources"] = {
         "elapsed_ms": sorted(
             {
@@ -962,6 +1097,92 @@ def aggregate_samples(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         ),
     }
     return aggregate
+
+
+def _run_values(aggregate: Mapping[str, Any], metric_name: str) -> list[float]:
+    values = aggregate.get("run_values")
+    return _numeric(values.get(metric_name) or ()) if isinstance(values, Mapping) else []
+
+
+def _bucket_decision(
+    objective: str,
+    baseline_values: Sequence[float],
+    candidate_values: Sequence[float],
+    *,
+    paired: bool,
+) -> dict[str, Any]:
+    """Judge one parameter case from its measured samples.
+
+    Interleaved samples are judged as pairs: run i of the candidate against
+    run i of the baseline, so drift that moves both sides cancels. A gain
+    needs the median pair ratio past the threshold and all pairs but one to
+    agree; one outlier sample cannot hide a real win or fake one. Samples
+    that were not interleaved (a reused baseline, an index A-B-A) are judged
+    by the shift of the medians against the larger median absolute deviation.
+    A regression needs no majority in either mode: that is the safe side.
+    """
+
+    baseline_median = float(statistics.median(baseline_values))
+    candidate_median = float(statistics.median(candidate_values))
+    shift = baseline_median - candidate_median
+    minimum = MIN_ABSOLUTE_IMPROVEMENT[objective]
+    decision: dict[str, Any] = {
+        "baseline_median": baseline_median,
+        "candidate_median": candidate_median,
+        "median_shift": shift,
+    }
+    if (
+        paired
+        and len(baseline_values) == len(candidate_values)
+        and all(value > 0 for value in baseline_values)
+    ):
+        ratios = [after / before for before, after in zip(baseline_values, candidate_values)]
+        ratio = float(statistics.median(ratios))
+        agreeing = sum(1 for item in ratios if item <= 1 - MIN_RELATIVE_IMPROVEMENT)
+        required = len(ratios) if len(ratios) <= 2 else len(ratios) - 1
+        relative_gain = 1 - ratio
+        improved = (
+            relative_gain > MIN_RELATIVE_IMPROVEMENT
+            and shift >= minimum
+            and agreeing >= required
+        )
+        regressed = ratio - 1 > MIN_RELATIVE_IMPROVEMENT and -shift >= minimum
+        decision.update(
+            {
+                "comparison": "paired_runs",
+                "paired_ratio_median": ratio,
+                "pairs": len(ratios),
+                "pairs_showing_gain": agreeing,
+            }
+        )
+    else:
+        def mad(values: Sequence[float], median: float) -> float:
+            return float(statistics.median([abs(value - median) for value in values]))
+
+        noise = max(mad(baseline_values, baseline_median), mad(candidate_values, candidate_median))
+        threshold = max(
+            minimum,
+            MIN_RELATIVE_IMPROVEMENT * baseline_median,
+            NOISE_SIGMA_MULTIPLIER * MAD_TO_SIGMA * noise,
+        )
+        superiority = sum(
+            1 for before in baseline_values for after in candidate_values if after < before
+        ) / (len(baseline_values) * len(candidate_values))
+        relative_gain = shift / baseline_median
+        improved = shift >= threshold and superiority > 0.5
+        regressed = -shift >= threshold
+        decision.update(
+            {
+                "comparison": "independent_samples",
+                "noise_threshold": threshold,
+                "superiority_probability": superiority,
+            }
+        )
+    decision["median_shift_ratio"] = relative_gain
+    decision["bucket_verdict"] = (
+        "regressed" if regressed else "improved" if improved else "no_material_difference"
+    )
+    return decision
 
 
 def classify_benchmark(
@@ -1000,173 +1221,428 @@ def classify_benchmark(
                 "inconclusive",
                 "full snapshot equivalence was not proven for every parameter case",
             )
+        if all(result.get("vacuous") is True for result in equivalence):
+            return (
+                "inconclusive",
+                "every tested parameter case returned zero rows on both sides, so the "
+                "match proves nothing; register parameter values that return rows",
+            )
 
     objective = normalize_tuning_objective(objective)
-    metric_name = OBJECTIVE_METRICS[objective]
+    if objective == "physical_reads":
+        return (
+            "inconclusive",
+            "cold-cache control is not supported in Azure SQL Database, so physical reads "
+            "after the first execution are near zero on both sides; use logical_reads",
+        )
     source_key, trusted_source = OBJECTIVE_SOURCE_REQUIREMENTS[objective]
-    conservative_gains: list[float] = []
-    relative_conservative_gains: list[float] = []
+    relative_gains: list[float] = []
+    shifts: list[float] = []
     weights: list[float] = []
-    material_regression_detected = False
-
-    def observed_bounds(
-        aggregate: Mapping[str, Any],
-    ) -> tuple[float, float] | None:
-        spread = aggregate.get("spread")
-        metric_spread = spread.get(metric_name) if isinstance(spread, Mapping) else None
-        if not isinstance(metric_spread, Mapping):
-            return None
-        observed_min = metric_spread.get("min")
-        observed_max = metric_spread.get("max")
-        if (
-            not isinstance(observed_min, (int, float))
-            or isinstance(observed_min, bool)
-            or not math.isfinite(float(observed_min))
-            or not isinstance(observed_max, (int, float))
-            or isinstance(observed_max, bool)
-            or not math.isfinite(float(observed_max))
-            or float(observed_min) > float(observed_max)
-        ):
-            return None
-        return float(observed_min), float(observed_max)
+    regressed_cases: list[str] = []
+    cpu_regressed_cases: list[str] = []
+    improved_cases = 0
 
     for result in parameter_results:
         baseline = result.get("baseline", {})
         candidate = result.get("candidate", {})
         if not isinstance(baseline, Mapping) or not isinstance(candidate, Mapping):
             return "inconclusive", "a parameter case did not return metric aggregates"
+        metric_name = OBJECTIVE_METRICS[objective]
+        metric_source = trusted_source
+        sources = [
+            aggregate.get("metric_sources", {}).get(source_key)
+            if isinstance(aggregate.get("metric_sources"), Mapping)
+            else None
+            for aggregate in (baseline, candidate)
+        ]
+        if sources != [[trusted_source], [trusted_source]]:
+            client_complete = all(
+                isinstance(aggregate.get("metric_coverage"), Mapping)
+                and aggregate["metric_coverage"].get("client_elapsed_ms", {}).get("complete")
+                for aggregate in (baseline, candidate)
+            )
+            if objective == "elapsed_time" and sources == [
+                [CLIENT_CLOCK_SOURCE],
+                [CLIENT_CLOCK_SOURCE],
+            ]:
+                pass  # neither plan has a statement time: both sides are client clock already
+            elif objective == "elapsed_time" and client_complete:
+                # One side has no statement time in its plan: time both on the client clock.
+                metric_name = "client_elapsed_ms"
+            else:
+                return (
+                    "inconclusive",
+                    f"{objective} metric provenance was missing, mixed, or untrusted",
+                )
+            metric_source = CLIENT_CLOCK_SOURCE
         before = baseline.get(metric_name)
         after = candidate.get(metric_name)
         if (
             not isinstance(before, (int, float))
             or isinstance(before, bool)
             or not math.isfinite(float(before))
-            or before <= 0
+            or before < 0
             or not isinstance(after, (int, float))
             or isinstance(after, bool)
             or not math.isfinite(float(after))
             or after < 0
         ):
             return "inconclusive", f"{objective} was unavailable for at least one parameter case"
-        for aggregate in (baseline, candidate):
-            sources = aggregate.get("metric_sources")
-            objective_sources = (
-                sources.get(source_key) if isinstance(sources, Mapping) else None
-            )
-            if objective_sources != [trusted_source]:
+        for coverage in (baseline.get("metric_coverage"), candidate.get("metric_coverage")):
+            metric_coverage = coverage.get(metric_name) if isinstance(coverage, Mapping) else None
+            if isinstance(metric_coverage, Mapping) and metric_coverage.get("complete") is False:
                 return (
                     "inconclusive",
-                    f"{objective} metric provenance was missing, mixed, or untrusted",
+                    f"{objective} did not have complete per-sample coverage",
                 )
-        baseline_coverage = baseline.get("metric_coverage", {})
-        candidate_coverage = candidate.get("metric_coverage", {})
-        for coverage in (baseline_coverage, candidate_coverage):
-            if isinstance(coverage, Mapping):
-                metric_coverage = coverage.get(metric_name)
-                if (
-                    isinstance(metric_coverage, Mapping)
-                    and metric_coverage.get("complete") is False
-                ):
-                    return (
-                        "inconclusive",
-                        f"{objective} did not have complete per-sample coverage",
-                    )
-        baseline_samples = int(baseline.get("sample_count", 0) or 0)
-        candidate_samples = int(candidate.get("sample_count", 0) or 0)
-        if min(baseline_samples, candidate_samples) < 2:
-            return "inconclusive", "at least two paired samples are required"
-        baseline_bounds = observed_bounds(baseline)
-        candidate_bounds = observed_bounds(candidate)
-        if baseline_bounds is None or candidate_bounds is None:
+        baseline_values = _run_values(baseline, metric_name)
+        candidate_values = _run_values(candidate, metric_name)
+        if min(len(baseline_values), len(candidate_values)) < 2:
+            return "inconclusive", "at least two measured samples per side are required"
+        if before <= 0:
             return (
                 "inconclusive",
-                f"{objective} observed ranges were missing or unusable",
+                f"baseline {objective} is zero at the resolution of the measurement, so a "
+                "relative gain is not defined; use the logical_reads objective",
             )
-        baseline_min, baseline_max = baseline_bounds
-        candidate_min, candidate_max = candidate_bounds
-        if (
-            baseline_min < 0
-            or candidate_min < 0
-            or not baseline_min <= float(before) <= baseline_max
-            or not candidate_min <= float(after) <= candidate_max
-        ):
-            return (
-                "inconclusive",
-                f"{objective} observed ranges were inconsistent with their aggregates",
-            )
-        conservative_gain = baseline_min - candidate_max
-        conservative_regression = candidate_min - baseline_max
-        relative_conservative_gain = conservative_gain / float(before)
-        relative_conservative_regression = (
-            conservative_regression / float(before)
-        )
+        paired = result.get("paired") is True
+        decision = _bucket_decision(objective, baseline_values, candidate_values, paired=paired)
         comparison_margin = {
             "objective": objective,
             "metric": metric_name,
-            "baseline_min": baseline_min,
-            "baseline_max": baseline_max,
-            "candidate_min": candidate_min,
-            "candidate_max": candidate_max,
-            "conservative_gain": conservative_gain,
-            "conservative_gain_ratio": relative_conservative_gain,
-            "conservative_regression": conservative_regression,
-            "conservative_regression_ratio": relative_conservative_regression,
+            "metric_source": metric_source,
+            "baseline_min": min(baseline_values),
+            "baseline_max": max(baseline_values),
+            "candidate_min": min(candidate_values),
+            "candidate_max": max(candidate_values),
+            **decision,
         }
+        if objective == "logical_reads":
+            cpu_baseline = _run_values(baseline, "cpu_ms")
+            cpu_candidate = _run_values(candidate, "cpu_ms")
+            if min(len(cpu_baseline), len(cpu_candidate)) >= 2 and statistics.median(cpu_baseline) > 0:
+                cpu_verdict = _bucket_decision("cpu", cpu_baseline, cpu_candidate, paired=paired)[
+                    "bucket_verdict"
+                ]
+                comparison_margin["cpu_guard"] = cpu_verdict
+                if cpu_verdict == "regressed":
+                    cpu_regressed_cases.append(str(result.get("parameter_case")))
+            else:
+                comparison_margin["cpu_guard"] = "not_evaluated"
         if isinstance(result, dict):
             result["comparison_margin"] = comparison_margin
             result["decision_basis"] = COMPARISON_DECISION_BASIS
-        conservative_gains.append(conservative_gain)
-        relative_conservative_gains.append(relative_conservative_gain)
+        relative_gains.append(decision["median_shift_ratio"])
+        shifts.append(decision["median_shift"])
         raw_weight = result.get("weight", 1.0)
-        weight = (
+        weights.append(
             float(raw_weight)
             if isinstance(raw_weight, (int, float))
             and not isinstance(raw_weight, bool)
             and float(raw_weight) > 0
             else 1.0
         )
-        weights.append(weight)
-        material_regression_detected = material_regression_detected or (
-            relative_conservative_regression > MIN_RELATIVE_IMPROVEMENT
-            and conservative_regression >= MIN_ABSOLUTE_IMPROVEMENT[objective]
-        )
-    if not relative_conservative_gains:
+        if decision["bucket_verdict"] == "regressed":
+            regressed_cases.append(str(result.get("parameter_case")))
+        elif decision["bucket_verdict"] == "improved":
+            improved_cases += 1
+    if not relative_gains:
         return "inconclusive", "no parameter cases were measured"
-    if material_regression_detected:
+    if regressed_cases:
         return (
             "regressed",
-            "candidate's observed range materially regressed at least one "
-            "tested parameter bucket",
+            f"candidate materially regressed {objective} for parameter case "
+            + ", ".join(regressed_cases),
+        )
+    if cpu_regressed_cases:
+        return (
+            "regressed",
+            "reads improved but CPU regressed for parameter case "
+            + ", ".join(cpu_regressed_cases),
         )
     total_weight = sum(weights)
     weighted_relative_gain = sum(
-        improvement * weight
-        for improvement, weight in zip(relative_conservative_gains, weights)
+        gain * weight for gain, weight in zip(relative_gains, weights)
     ) / total_weight
-    weighted_conservative_gain = sum(
-        improvement * weight
-        for improvement, weight in zip(conservative_gains, weights)
-    ) / total_weight
+    weighted_shift = sum(shift * weight for shift, weight in zip(shifts, weights)) / total_weight
     if (
         weighted_relative_gain > MIN_RELATIVE_IMPROVEMENT
-        and weighted_conservative_gain >= MIN_ABSOLUTE_IMPROVEMENT[objective]
+        and weighted_shift >= MIN_ABSOLUTE_IMPROVEMENT[objective]
+        and improved_cases
     ):
         if require_equivalence:
             return (
                 "improved",
-                "candidate's weighted observed-range separation exceeded "
-                "relative and absolute improvement thresholds",
+                "candidate's weighted median gain exceeded the relative and absolute "
+                "thresholds and at least one parameter case improved beyond noise",
             )
         return (
             "promising",
-            "screening observed-range separation exceeded improvement "
-            "thresholds; finalist equivalence is still required",
+            "screening median gain exceeded the improvement thresholds; finalist "
+            "equivalence is still required",
         )
     return (
         "neutral",
-        "candidate's observed ranges did not establish a material improvement "
+        "candidate's measured samples did not establish a material improvement "
         "or regression",
     )
+
+
+DEPLOYABLE_PROOF_SCOPES = frozenset({"constraint_backed", "unchanged_sql"})
+
+
+def deployment_readiness(
+    *,
+    proof_scope: str | None,
+    proof_blockers: Sequence[Mapping[str, Any]] = (),
+    added_plan_forcing_hints: Sequence[str] = (),
+    parity_status: str | None = None,
+) -> dict[str, Any]:
+    """Decide deployment_ready in one place (decision D2).
+
+    Ready needs all three: equality that follows from catalog-verified
+    constraints or from unchanged SQL, no plan-forcing hint added by the
+    candidate, and no failed parity check. A match on today's data is a test
+    result, not a proof. Other streams add inputs here; they do not set the
+    flag themselves.
+    """
+
+    if proof_scope is None:
+        return {"deployment_ready": False, "deployment_blockers": []}
+    blockers = [dict(item) for item in proof_blockers]
+    if proof_scope == "snapshot_matched" and not blockers:
+        blockers.append(
+            {
+                "code": "snapshot_match_only",
+                "reason": (
+                    "Results matched on the tested parameter cases and today's data only. "
+                    "No catalog-verified constraint backs the rewrite, so a reviewer must "
+                    "confirm it holds for all data."
+                ),
+            }
+        )
+    if proof_scope not in DEPLOYABLE_PROOF_SCOPES and not blockers:
+        blockers.append(
+            {"code": "equivalence_unproven", "reason": "Result equivalence was not proven."}
+        )
+    if added_plan_forcing_hints:
+        blockers.append(
+            {
+                "code": "hinted_candidate",
+                "reason": (
+                    "The candidate adds plan-forcing hints ("
+                    + ", ".join(added_plan_forcing_hints)
+                    + "). Its gain belongs to the hint; propose it through plan "
+                    "enforcement, not as a rewrite winner."
+                ),
+            }
+        )
+    if parity_status == "failed":
+        blockers.append(
+            {
+                "code": "parity_failed",
+                "reason": (
+                    "The benchmark database did not match production on schema, "
+                    "settings or statistics, so the measurement does not transfer."
+                ),
+            }
+        )
+    return {"deployment_ready": not blockers, "deployment_blockers": blockers}
+
+
+def _preflight_blockers(preflight: Any) -> list[dict[str, Any]]:
+    """Turn the stored preflight risks into named reasons a candidate stays unproven."""
+
+    blockers: dict[str, dict[str, Any]] = {}
+    for side in preflight.values() if isinstance(preflight, Mapping) else ():
+        if not isinstance(side, Mapping):
+            continue
+        described = {
+            str(item.get("risk")): str(
+                item.get("reason") or item.get("proof_requirement") or ""
+            )
+            for key in ("details", "risks")
+            for item in side.get(key) or ()
+            if isinstance(item, Mapping)
+        }
+        for code in side.get("risk_codes") or ():
+            blockers.setdefault(
+                str(code),
+                {
+                    "code": str(code),
+                    "reason": described.get(str(code))
+                    or "this SQL shape cannot be proven by a snapshot comparison",
+                },
+            )
+    return list(blockers.values())
+
+
+def _baseline_drift(
+    objective: str,
+    metric_name: str,
+    pooled_samples: Sequence[Mapping[str, Any]],
+    fresh_sample: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Compare one fresh baseline execution with the session's baseline samples.
+
+    A session baseline is reused only while the database still answers the
+    baseline as it did when the samples were taken. Missing values count as drift.
+    """
+
+    pooled = _numeric([sample.get(metric_name) for sample in pooled_samples])
+    fresh = _numeric([fresh_sample.get(metric_name)])
+    if len(pooled) != len(pooled_samples) or not fresh:
+        return {"metric": metric_name, "drifted": True, "reason": "metric_unavailable"}
+    median = float(statistics.median(pooled))
+    noise = float(statistics.median([abs(value - median) for value in pooled]))
+    threshold = max(
+        MIN_ABSOLUTE_IMPROVEMENT[objective],
+        MIN_RELATIVE_IMPROVEMENT * median,
+        NOISE_SIGMA_MULTIPLIER * MAD_TO_SIGMA * noise,
+    )
+    return {
+        "metric": metric_name,
+        "pooled_median": median,
+        "fresh_value": fresh[0],
+        "threshold": threshold,
+        "drifted": abs(fresh[0] - median) > threshold,
+    }
+
+
+def _cross_case_result(
+    objective: str,
+    compile_case: str,
+    run_case: str,
+    samples: Mapping[str, Sequence[Mapping[str, Any]]],
+    own_plan_result: Mapping[str, Any],
+) -> dict[str, Any]:
+    """One case measured on the plan compiled for another: the parameter-sensitivity test."""
+
+    result: dict[str, Any] = {
+        "parameter_case": run_case,
+        "compile_case": compile_case,
+        "run_case": run_case,
+        "paired": True,
+        "baseline": aggregate_samples(samples["baseline"]),
+        "candidate": aggregate_samples(samples["candidate"]),
+        "compile_state": {
+            "requested": "plan_compiled_for_another_parameter_case",
+            "baseline": sorted({str(item.get("compile_state")) for item in samples["baseline"]}),
+            "candidate": sorted({str(item.get("compile_state")) for item in samples["candidate"]}),
+        },
+    }
+    # Sets comparison_margin on the result; equivalence is the main run's job.
+    verdict, reason = classify_benchmark([result], [], objective=objective, require_equivalence=False)
+    result.setdefault("comparison_margin", {"bucket_verdict": verdict, "reason": reason})
+    metric_name = OBJECTIVE_METRICS[objective]
+    for side in ("baseline", "candidate"):
+        own = own_plan_result[side].get(metric_name)
+        cross = result[side].get(metric_name)
+        result[f"{side}_cross_to_own_ratio"] = (
+            float(cross) / float(own)
+            if isinstance(own, (int, float)) and isinstance(cross, (int, float)) and own > 0
+            else None
+        )
+    return result
+
+
+def _plan_brief(profile: ProfiledPlanResult | None) -> dict[str, Any] | None:
+    """The plan hash and the three operators with the most self time."""
+
+    if profile is None:
+        return None
+    statements = profile.plan.summary.get("statements")
+    digest = build_plan_digest(profile.plan.raw_xml or "", top_n=3, tree_budget=0)
+    operators = [
+        {
+            key: operator[key]
+            for key in ("node_id", "operator", "object", "self_elapsed_ms", "estimated_cost_share", "rows")
+            if key in operator
+        }
+        for statement in digest.get("statements") or ()
+        for operator in statement.get("top_operators") or ()
+    ]
+    return {
+        "query_plan_hashes": [
+            statement.get("query_plan_hash")
+            for statement in statements or ()
+            if isinstance(statement, Mapping) and statement.get("query_plan_hash")
+        ],
+        "plan_fingerprint": structural_plan_fingerprint(profile.plan.summary),
+        "ranking_basis": digest.get("ranking_basis"),
+        "top_operators": sorted(
+            operators,
+            key=lambda item: -float(item.get("self_elapsed_ms") or 0.0),
+        )[:3],
+        "warning_count": len(profile.plan.summary.get("warnings", [])),
+    }
+
+
+def plan_delta_from_profiles(
+    baseline: ProfiledPlanResult | None,
+    candidate: ProfiledPlanResult | None,
+) -> dict[str, Any]:
+    """A compact plan comparison: did the plan change, and where did each side spend time.
+
+    Operators are ranked by self time from the actual plan, never by
+    estimated cost. Object names are copied from the plan: data, not instructions.
+    """
+
+    before = _plan_brief(baseline)
+    after = _plan_brief(candidate)
+    return {
+        "plan_changed": (
+            before["plan_fingerprint"] != after["plan_fingerprint"]
+            if before is not None and after is not None
+            else None
+        ),
+        "baseline": before,
+        "candidate": after,
+    }
+
+
+def _evidence_summary(evidence: EvidenceEnvelopeV1) -> dict[str, Any]:
+    """One compact row for a benchmark result: the verdict and the medians behind it."""
+
+    metrics = evidence.metrics
+    metadata = evidence.metadata
+    metric_name = OBJECTIVE_METRICS.get(str(metrics.get("objective")), "elapsed_ms")
+    cases = []
+    for result in metrics.get("parameter_results") or ():
+        if not isinstance(result, Mapping):
+            continue
+        margin = result.get("comparison_margin")
+        name = margin.get("metric", metric_name) if isinstance(margin, Mapping) else metric_name
+        cases.append(
+            {
+                "parameter_case": result.get("parameter_case"),
+                "baseline": (result.get("baseline") or {}).get(name),
+                "candidate": (result.get("candidate") or {}).get(name),
+                "verdict": margin.get("bucket_verdict") if isinstance(margin, Mapping) else None,
+            }
+        )
+    summary = {
+        "evidence_id": evidence.evidence_id,
+        "candidate_id": metadata.get("candidate_id"),
+        "kind": evidence.kind,
+        "phase": metadata.get("phase"),
+        "captured_at_utc": evidence.captured_at_utc,
+        "classification": metrics.get("classification"),
+        "performance_classification": metrics.get("performance_classification"),
+        "objective": metrics.get("objective"),
+        "reason": metadata.get("reason"),
+        "executions": evidence.observed_execution_count,
+        "proof_scope": metadata.get("proof_scope"),
+        "failure_code": metadata.get("failure_code"),
+        "rewrite_requirements": [
+            item.get("code")
+            for item in metadata.get("rewrite_requirements") or ()
+            if isinstance(item, Mapping)
+        ],
+        "parameter_cases": cases,
+    }
+    return {key: value for key, value in summary.items() if value not in (None, [])}
 
 
 def compare_plan_summaries_payload(
@@ -1224,6 +1700,7 @@ class PerformanceWorkflowService:
         server_name: str = "unspecified",
         allow_legacy_state: bool = False,
         equivalence_analyzer: EquivalenceAnalyzer | None = None,
+        catalog: Any | None = None,
     ) -> None:
         self.executor = executor
         self.plans = plans
@@ -1241,6 +1718,11 @@ class PerformanceWorkflowService:
         self.server_name = server_name
         self.allow_legacy_state = allow_legacy_state
         self.equivalence_analyzer = equivalence_analyzer
+        self.catalog = catalog if catalog is not None else CatalogConstraintService(executor)
+        # Parameter values are never persisted. A case registered by this
+        # process can still be benchmarked by name, which is the only way for a
+        # caller that never saw auto-bound values.
+        self._registered_parameter_cases: dict[str, list[ParameterCase]] = {}
 
     async def _analyze_equivalence(
         self,
@@ -1323,7 +1805,7 @@ class PerformanceWorkflowService:
         }
         if case.query_store_query_id is not None:
             idempotency_request["query_store_query_id"] = case.query_store_query_id
-        return self.store.create_performance_case(
+        created = self.store.create_performance_case(
             case,
             idempotency_key=idempotency_key,
             request_fingerprint=request_fingerprint(
@@ -1331,6 +1813,36 @@ class PerformanceWorkflowService:
                 idempotency_request,
             ),
         )
+        self._registered_parameter_cases[created.case_id] = cases
+        while len(self._registered_parameter_cases) > MAX_REMEMBERED_CASES:
+            self._registered_parameter_cases.pop(next(iter(self._registered_parameter_cases)))
+        return created
+
+    def _resolve_parameter_cases(
+        self,
+        case_id: str,
+        parameter_cases: Sequence[ParameterCase] | None,
+    ) -> list[ParameterCase]:
+        """Fill in parameter cases the caller names without values."""
+
+        remembered = self._registered_parameter_cases.get(case_id)
+        if not parameter_cases:
+            return remembered or self._normalize_parameter_cases(None)
+        by_name = {str(item["name"]): item for item in remembered or ()}
+        resolved: list[ParameterCase] = []
+        for raw_case in parameter_cases:
+            if isinstance(raw_case, Mapping) and set(raw_case) == {"name"}:
+                name = str(raw_case["name"])
+                if name not in by_name:
+                    raise ValueError(
+                        f"Values for parameter case {name!r} are not held by this MCP "
+                        "process (values are never persisted). Pass the exact values "
+                        "and types the case was registered with."
+                    )
+                resolved.append(by_name[name])
+            else:
+                resolved.append(raw_case)
+        return self._normalize_parameter_cases(resolved)
 
     def get_case(self, case_id: str) -> dict[str, Any]:
         case = self.store.get_performance_case(case_id)
@@ -1391,6 +1903,10 @@ class PerformanceWorkflowService:
             raise ValueError("Database fingerprint does not match the performance case.")
         if window_minutes <= 0:
             raise ValueError("window_minutes must be greater than 0.")
+        if execute_query:
+            # Before any database read: a refused execution must not cost a
+            # dozen DMV and Query Store statements first.
+            self._require_benchmark_policy(database_name, 1)
         if (
             effective_query_store_query_id is not None
             and case.query_store_query_id is None
@@ -1475,6 +1991,7 @@ class PerformanceWorkflowService:
                     else {}
                 ),
                 "profile": committed_metadata.get("profile_summary"),
+                "outcome_basis": committed_metadata.get("outcome_basis"),
                 "incomplete_evidence_can_be_healthy": False,
                 "recovered_from_durable_evidence": True,
             }
@@ -1555,7 +2072,6 @@ class PerformanceWorkflowService:
         profile: dict[str, Any] | None = None
         observed_executions = 0
         if execute_query:
-            self._require_benchmark_policy(database_name, 1)
             if execution_contract is not None:
                 if not fingerprint_text_matches(
                     case.query_fingerprint,
@@ -1585,7 +2101,32 @@ class PerformanceWorkflowService:
         complete_count = sum(
             1 for section in sections.values() if section.get("complete") is True
         )
-        actionable = self._has_actionable_evidence(sections)
+        query_sections = {
+            name: section
+            for name, section in sections.items()
+            if name.casefold() in QUERY_SCOPED_SECTIONS
+            or (
+                isinstance(section.get("data"), Mapping)
+                and section["data"].get("recommendation_scope") == "query_store_query_id"
+            )
+        }
+        context_sections = {
+            name: section for name, section in sections.items() if name not in query_sections
+        }
+        profile_findings = (
+            len(profile["plan_findings"]["findings"]) + int(profile["metrics"]["warning_count"])
+            if profile is not None
+            else 0
+        )
+        outcome_basis = {
+            "query_scoped_sections": sorted(query_sections),
+            "database_context_sections": sorted(context_sections),
+            "database_context_actionable": self._has_actionable_evidence(context_sections),
+            "profile_findings": profile_findings,
+        }
+        # The case is one query. Its outcome comes from that query's own
+        # history and actual plan; database-wide collectors are context.
+        actionable = self._has_actionable_evidence(query_sections) or profile_findings > 0
         if available_count == 0 and profile is None:
             outcome = "inconclusive"
         elif complete_count < len(sections):
@@ -1608,6 +2149,7 @@ class PerformanceWorkflowService:
             },
             metadata={
                 "outcome": outcome,
+                "outcome_basis": outcome_basis,
                 "collection_started_at_utc": started,
                 "collection_completed_at_utc": utc_now(),
                 "collection_window_minutes": window_minutes,
@@ -1645,6 +2187,7 @@ class PerformanceWorkflowService:
                 else {}
             ),
             "profile": profile,
+            "outcome_basis": outcome_basis,
             "incomplete_evidence_can_be_healthy": False,
         }
 
@@ -1653,11 +2196,20 @@ class PerformanceWorkflowService:
         case_id: str,
         database_name: str,
         *,
-        max_candidates: int = DEFAULT_MAX_CANDIDATES,
-        execution_limit: int = DEFAULT_EXECUTIONS,
-        time_limit_minutes: int = DEFAULT_TIME_LIMIT_SECONDS // 60,
+        max_candidates: int | None = None,
+        execution_limit: int | None = None,
+        time_limit_minutes: int | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        """Open a tuning session.
+
+        A limit the caller leaves out takes its default, capped by the local
+        database policy. The default execution limit is 120, or what the
+        rewrite_plus_index lineage needs for the case's parameter cases when
+        that is more. A limit the caller states is checked as given: over the
+        policy it is refused, never trimmed.
+        """
+
         case = self.store.get_performance_case(case_id)
         if not database_fingerprint_matches(
             case.database_fingerprint or "",
@@ -1667,6 +2219,21 @@ class PerformanceWorkflowService:
         ):
             raise PermissionError("Performance case belongs to another database.")
         policy = self.database_policy.require(database_name)
+        if max_candidates is None:
+            max_candidates = min(DEFAULT_MAX_CANDIDATES, policy.max_tuning_candidates)
+        if execution_limit is None:
+            execution_limit = min(
+                max(
+                    DEFAULT_EXECUTIONS,
+                    lineage_execution_budget(len(case.parameter_case_fingerprints))["total"],
+                ),
+                policy.max_tuning_session_executions,
+            )
+        if time_limit_minutes is None:
+            time_limit_minutes = min(
+                DEFAULT_TIME_LIMIT_SECONDS // 60,
+                policy.max_tuning_session_minutes,
+            )
         if not policy.can_start_tuning_session(
             candidates=max_candidates,
             executions=execution_limit,
@@ -1693,6 +2260,45 @@ class PerformanceWorkflowService:
             **self._session_view(session, budget=budget),
             "budget": budget,
         }
+
+    def start_session_if_permitted(
+        self,
+        case_id: str,
+        database_name: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Open a default-sized session, or say why the policy does not allow one.
+
+        For a caller such as tune_query that has already collected read-only
+        evidence: a read-only policy is an answer, not an error.
+        """
+
+        policy = self.database_policy.policy_for(database_name)
+        if not policy.can_start_tuning_session(
+            candidates=max(1, min(DEFAULT_MAX_CANDIDATES, policy.max_tuning_candidates)),
+            executions=max(1, min(DEFAULT_EXECUTIONS, policy.max_tuning_session_executions)),
+            minutes=max(
+                1,
+                min(DEFAULT_TIME_LIMIT_SECONDS // 60, policy.max_tuning_session_minutes),
+            ),
+        ):
+            return {
+                "session_id": None,
+                "session_available": False,
+                "policy_reason": (
+                    "The local database policy does not permit a tuning session here: "
+                    "it needs allow_benchmark and non-zero candidate, execution and "
+                    "minute limits. The case and its read-only evidence are valid. "
+                    "Benchmark on a database whose policy allows it."
+                ),
+            }
+        session = self.start_session(
+            case_id,
+            database_name,
+            idempotency_key=idempotency_key,
+        )
+        return {**session, "session_available": True}
 
     def _session_view(
         self,
@@ -1765,7 +2371,16 @@ class PerformanceWorkflowService:
                 and execution_budget["remaining"] == 0
                 else "no_actionable_candidate"
             )
+        lineage = lineage_execution_budget(
+            len(self.store.get_performance_case(session.performance_case_id).parameter_case_fingerprints),
+            screen_runs=session.screen_runs_per_candidate,
+            finalist_runs=session.finalist_runs_per_candidate,
+        )
         return {
+            "rewrite_plus_index_lineage": {
+                **lineage,
+                "fits": session.execution_limit >= lineage["total"],
+            },
             "candidate_limit": session.max_candidates,
             "candidates_used": len(candidates),
             "candidate_slots_remaining": (
@@ -1792,7 +2407,17 @@ class PerformanceWorkflowService:
             "effective_status": availability["effective_status"],
         }
 
-    def get_session(self, session_id: str) -> dict[str, Any]:
+    def get_session(self, session_id: str, *, view: str = "summary") -> dict[str, Any]:
+        """Return the session, its leaderboard and its results.
+
+        ``summary`` (the default) returns one compact row for the latest result
+        of each candidate. ``full`` returns every evidence record and event; a
+        campaign that reads it after each benchmark pays for all earlier
+        results again on every call.
+        """
+
+        if view not in {"summary", "full"}:
+            raise ValueError("view must be summary or full.")
         session = self.sessions.get_session(session_id)
         candidates = self.sessions.list_candidates(session_id)
         candidate_ids = {
@@ -1863,13 +2488,14 @@ class PerformanceWorkflowService:
             if evidence.evidence_id not in attached_evidence_id_set
         ]
         budget = self._session_budget(session, candidates)
-        return {
+        events = self.store.list_events(
+            aggregate_type="session",
+            aggregate_id=session_id,
+        )
+        payload: dict[str, Any] = {
+            "view": view,
             "session": self._session_view(session, budget=budget),
             "leaderboard": [candidate.to_dict() for candidate in candidates],
-            "evidence": [
-                evidence.to_dict()
-                for evidence in ordered_evidence
-            ],
             "evidence_reconciliation": {
                 "attached_count": len(attached_evidence_ids),
                 "unattached_count": len(unattached_evidence_ids),
@@ -1877,13 +2503,26 @@ class PerformanceWorkflowService:
                 "unattached_evidence_ids": unattached_evidence_ids,
                 "reconciliation_required": bool(unattached_evidence_ids),
             },
-            "events": self.store.list_events(
-                aggregate_type="session",
-                aggregate_id=session_id,
-            ),
             "budget": budget,
             "raw_sql_persisted": False,
         }
+        if view == "full":
+            payload["evidence"] = [evidence.to_dict() for evidence in ordered_evidence]
+            payload["events"] = events
+            return payload
+        latest_by_candidate = {
+            str(evidence.metadata.get("candidate_id")): evidence
+            for evidence in ordered_evidence
+        }
+        payload["latest_results"] = [
+            _evidence_summary(latest_by_candidate[candidate.candidate_id])
+            for candidate in candidates
+            if candidate.candidate_id in latest_by_candidate
+        ]
+        payload["evidence_count"] = len(ordered_evidence)
+        payload["event_count"] = len(events)
+        payload["recent_events"] = events[-5:]
+        return payload
 
     def add_candidate(
         self,
@@ -2040,6 +2679,10 @@ class PerformanceWorkflowService:
             compare_order=compare_order,
         )
         result["parameter_case"] = case_name
+        # A match holds for this parameter case on today's data. It is a test
+        # result; the requirements name what would make it a proof.
+        result["equivalence_scope"] = "snapshot_matched_for_parameter_case"
+        result["rewrite_requirements"] = rewrite_requirements(baseline, candidate)
         if statically_zero_row:
             result["comparison_scope"] = "statically_zero_row"
             result["equivalence_preflight"] = preflight
@@ -2393,14 +3036,18 @@ class PerformanceWorkflowService:
             "phase": phase,
             "runs_per_parameter_case": runs,
             "executions": measured_executions,
+            "execution_protocol": metadata.get("execution_protocol"),
             "parameter_results": (
                 parameter_results if isinstance(parameter_results, list) else []
             ),
+            "cross_case_result": metrics.get("cross_case_result"),
             "parameter_case_receipts": metadata.get("parameter_case_receipts", []),
             "equivalence": equivalence if isinstance(equivalence, list) else [],
             "equivalence_deferred": bool(metadata.get("equivalence_deferred")),
             "equivalence_preflight": metadata.get("equivalence_preflight"),
             "proof_scope": metadata.get("proof_scope"),
+            "rewrite_requirements": metadata.get("rewrite_requirements", []),
+            "hint_profile": metadata.get("hint_profile"),
             "evidence_id": envelope.evidence_id,
             "execution_reservation_id": reservation["reservation_id"],
             "reservation_status": reservation_status,
@@ -2650,7 +3297,18 @@ class PerformanceWorkflowService:
         runs_override: int | None = None,
         prove_equivalence: bool | None = None,
         idempotency_key: str | None = None,
+        cross_case: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """Measure one rewrite against the baseline for each parameter case.
+
+        Per side and case, one execution is run first and left out of the
+        samples: it compiles the plan and warms the pages. Each case runs on
+        its own plan, compiled for its own values. ``cross_case`` asks for the
+        parameter-sensitivity test on purpose: ``{"compile_case": A,
+        "run_case": B}`` compiles a plan with the values of A and measures B
+        on it; a candidate that regresses there is rejected.
+        """
+
         if phase not in {"screening", "finalist"}:
             raise ValueError("phase must be screening or finalist.")
         allowed_session_statuses = {
@@ -2700,7 +3358,7 @@ class PerformanceWorkflowService:
             allow_legacy=self.allow_legacy_state,
         ):
             raise ValueError("Database fingerprint does not match the tuning session.")
-        cases = self._normalize_parameter_cases(parameter_cases)
+        cases = self._resolve_parameter_cases(case.case_id, parameter_cases)
         if len(cases) > session.parameter_case_limit:
             raise ValueError(
                 f"parameter_cases exceeds the session limit of {session.parameter_case_limit}."
@@ -2748,6 +3406,14 @@ class PerformanceWorkflowService:
             rewrite,
         )
         compare_order = effective_compare_order(baseline, compare_order)
+        requirements = rewrite_requirements(baseline, rewrite)
+        hint_profile = statement_hint_profile(rewrite)
+        baseline_hints = statement_hint_profile(baseline)["plan_forcing_hints"]
+        hint_profile["added_plan_forcing_hints"] = [
+            hint
+            for hint in hint_profile["plan_forcing_hints"]
+            if hint not in baseline_hints
+        ]
         direct_snapshot_supported = all(
             item["direct_snapshot_supported"]
             for item in equivalence_preflight.values()
@@ -2787,9 +3453,32 @@ class PerformanceWorkflowService:
             )
         if phase == "screening" and runs < 2:
             raise ValueError("Screening requires at least two paired runs.")
-        requested_executions = len(cases) * (
-            runs * 2 + (2 if compare_equivalence else 0)
+        cross_names: tuple[str, str] | None = None
+        if cross_case is not None:
+            cross_names = (
+                str(cross_case.get("compile_case") or ""),
+                str(cross_case.get("run_case") or ""),
+            )
+            measured_names = {parameter_case["name"] for parameter_case in cases}
+            if cross_names[0] == cross_names[1] or not set(cross_names) <= measured_names:
+                raise ValueError(
+                    "cross_case needs compile_case and run_case: two different "
+                    "parameter cases of this benchmark call."
+                )
+        comparison_executions = len(cases) * 2 if compare_equivalence else 0
+        # The worst case is reserved: a reused session baseline needs fewer.
+        requested_executions = (
+            len(cases) * (runs + WARMUP_RUNS_PER_SIDE) * 2
+            + comparison_executions
+            + ((runs + WARMUP_RUNS_PER_SIDE) * 2 if cross_names else 0)
         )
+        execution_protocol = {
+            "version": EXECUTION_PROTOCOL_VERSION,
+            "warmup_runs_per_side": WARMUP_RUNS_PER_SIDE,
+            "measured_runs": runs,
+            "comparison_executions": comparison_executions,
+            "expected_executions": requested_executions,
+        }
         self._require_benchmark_policy(database_name, requested_executions)
         benchmark_request_fingerprint = request_fingerprint(
             "tuning-candidate.benchmark",
@@ -2802,6 +3491,7 @@ class PerformanceWorkflowService:
                 "parameter_case_fingerprints": supplied_case_fingerprints,
                 "compare_order": compare_order,
                 "runs": runs,
+                "cross_case": cross_names,
                 "prove_equivalence": should_prove_equivalence,
                 "compare_equivalence": compare_equivalence,
                 "equivalence_preflight": equivalence_preflight,
@@ -2895,58 +3585,127 @@ class PerformanceWorkflowService:
         completed_parameter_cases = 0
         parameter_results: list[dict[str, Any]] = []
         equivalence: list[dict[str, Any]] = []
+        baseline_samples_by_case: dict[str, list[dict[str, Any]]] = {}
+        cross_case_result: dict[str, Any] | None = None
         objective = normalize_tuning_objective(case.metadata.get("objective"))
-        try:
-            for parameter_case in cases:
-                case_baseline, case_rewrite = await self._bind_comparison_case(
-                    database_name,
-                    baseline,
-                    rewrite,
-                    parameter_case,
+        objective_metric = OBJECTIVE_METRICS[objective]
+
+        async def run_once(contract: ParameterExecutionContract) -> ProfiledPlanResult:
+            nonlocal measured_executions
+            self.sessions.ensure_dispatch_allowed(session_id)
+            # Charge the attempt before awaiting it. A timeout may occur after
+            # SQL Server executed the query, and the hard budget must never
+            # under-count uncertain work.
+            measured_executions += 1
+            profiled = await self._profile_execution_contract(database_name, contract)
+            if profiled.user_query_executions != 1:
+                raise RuntimeError(
+                    "Profiled samples must execute the user query exactly once."
                 )
+            return profiled
+
+        def contracts_for(
+            bucket: TypedParameterBucket,
+            *compile_identity: str,
+        ) -> tuple[ParameterExecutionContract, ParameterExecutionContract]:
+            # The baseline text is stable for the session, so a later candidate's
+            # drift check runs on the plan the pooled baseline samples ran on.
+            return self._contracts_from_bucket(
+                mark_benchmark_sql(baseline, session_id, "baseline", *compile_identity),
+                mark_benchmark_sql(rewrite, session_id, candidate_id, *compile_identity),
+                bucket,
+            )
+
+        try:
+            baseline_pool = (
+                self._session_baseline_pool(session_id) if phase == "screening" else {}
+            )
+            buckets: dict[str, TypedParameterBucket] = {}
+            for case_ordinal, parameter_case in enumerate(cases):
+                case_name = str(parameter_case["name"])
+                bucket = await self._bind_bucket(database_name, baseline, parameter_case)
+                buckets[case_name] = bucket
+                case_baseline, case_rewrite = contracts_for(bucket, "case", case_name)
                 baseline_samples: list[dict[str, Any]] = []
                 rewrite_samples: list[dict[str, Any]] = []
-                baseline_plan: Mapping[str, Any] = {}
-                rewrite_plan: Mapping[str, Any] = {}
-                for run_number in range(runs):
-                    side_order = (
-                        (("baseline", case_baseline), ("candidate", case_rewrite))
-                        if run_number % 2 == 0
-                        else (("candidate", case_rewrite), ("baseline", case_baseline))
+                last_profiles: dict[str, ProfiledPlanResult] = {}
+                pooled = baseline_pool.get(case_name)
+                baseline_source = "measured"
+                drift_check: dict[str, Any] | None = None
+
+                async def measure(side: str) -> None:
+                    profiled = await run_once(
+                        case_baseline if side == "baseline" else case_rewrite
                     )
-                    for side, execution_contract in side_order:
-                        self.sessions.ensure_dispatch_allowed(session_id)
-                        # Charge the attempt before awaiting it. A timeout may
-                        # occur after SQL Server executed the query, and the
-                        # hard budget must never under-count uncertain work.
-                        measured_executions += 1
-                        profiled = await self._profile_execution_contract(
-                            database_name,
-                            execution_contract,
-                        )
-                        if profiled.user_query_executions != 1:
-                            raise RuntimeError(
-                                "Profiled samples must execute the user query exactly once."
-                            )
-                        sample = extract_profile_metrics(profiled)
-                        if side == "baseline":
-                            baseline_samples.append(sample)
-                            baseline_plan = profiled.plan.summary
-                        else:
-                            rewrite_samples.append(sample)
-                            rewrite_plan = profiled.plan.summary
-                parameter_results.append(
-                    {
-                        "parameter_case": parameter_case["name"],
-                        "weight": parameter_case["weight"],
-                        "baseline": aggregate_samples(baseline_samples),
-                        "candidate": aggregate_samples(rewrite_samples),
-                        "plan_delta": compare_plan_summaries_payload(
-                            {"summary": baseline_plan},
-                            {"summary": rewrite_plan},
+                    last_profiles[side] = profiled
+                    (baseline_samples if side == "baseline" else rewrite_samples).append(
+                        extract_profile_metrics(profiled)
+                    )
+
+                if pooled is None:
+                    # The discarded first execution compiles the plan and warms
+                    # the pages. Which side goes first alternates by case.
+                    warmup_order = (
+                        (case_baseline, case_rewrite)
+                        if case_ordinal % 2 == 0
+                        else (case_rewrite, case_baseline)
+                    )
+                    for contract in warmup_order:
+                        await run_once(contract)
+                    for run_number in range(runs):
+                        for side in (
+                            ("baseline", "candidate")
+                            if run_number % 2 == 0
+                            else ("candidate", "baseline")
+                        ):
+                            await measure(side)
+                else:
+                    await run_once(case_rewrite)
+                    for run_number in range(runs):
+                        await measure("candidate")
+                        if run_number == 0:
+                            await measure("baseline")
+                    drift_check = _baseline_drift(
+                        objective,
+                        objective_metric,
+                        pooled["samples"],
+                        baseline_samples[0],
+                    )
+                    if drift_check["drifted"]:
+                        baseline_source = "remeasured_after_drift"
+                        for _run_number in range(runs - 1):
+                            await measure("baseline")
+                    else:
+                        baseline_source = "session_pool"
+                        baseline_samples = [dict(item) for item in pooled["samples"]]
+                if baseline_source != "session_pool":
+                    baseline_samples_by_case[case_name] = baseline_samples
+                parameter_result: dict[str, Any] = {
+                    "parameter_case": case_name,
+                    "weight": parameter_case["weight"],
+                    "paired": baseline_source == "measured",
+                    "baseline_source": baseline_source,
+                    "baseline": aggregate_samples(baseline_samples),
+                    "candidate": aggregate_samples(rewrite_samples),
+                    "compile_state": {
+                        "requested": "fresh_plan_per_parameter_case",
+                        "baseline": sorted(
+                            {str(item.get("compile_state")) for item in baseline_samples}
                         ),
-                    }
-                )
+                        "candidate": sorted(
+                            {str(item.get("compile_state")) for item in rewrite_samples}
+                        ),
+                    },
+                    "plan_delta": plan_delta_from_profiles(
+                        last_profiles.get("baseline"),
+                        last_profiles.get("candidate"),
+                    ),
+                }
+                if pooled is not None:
+                    parameter_result["drift_check"] = drift_check
+                    if baseline_source == "session_pool":
+                        parameter_result["baseline_evidence_id"] = pooled["evidence_id"]
+                parameter_results.append(parameter_result)
                 if compare_equivalence:
                     self.sessions.ensure_dispatch_allowed(session_id)
                     measured_executions += 2
@@ -2971,6 +3730,34 @@ class PerformanceWorkflowService:
                     comparison["parameter_case"] = parameter_case["name"]
                     equivalence.append(comparison)
                 completed_parameter_cases += 1
+            if cross_names is not None:
+                compile_name, run_name = cross_names
+                # The request fingerprint makes the text new, so the first
+                # execution below is the one that compiles the plan.
+                cross_identity = ("cross", compile_name, benchmark_request_fingerprint)
+                for contract in contracts_for(buckets[compile_name], *cross_identity):
+                    await run_once(contract)
+                cross_baseline, cross_rewrite = contracts_for(buckets[run_name], *cross_identity)
+                cross_samples: dict[str, list[dict[str, Any]]] = {"baseline": [], "candidate": []}
+                for run_number in range(runs):
+                    for side in (
+                        ("baseline", "candidate")
+                        if run_number % 2 == 0
+                        else ("candidate", "baseline")
+                    ):
+                        profiled = await run_once(
+                            cross_baseline if side == "baseline" else cross_rewrite
+                        )
+                        cross_samples[side].append(extract_profile_metrics(profiled))
+                cross_case_result = _cross_case_result(
+                    objective,
+                    compile_name,
+                    run_name,
+                    cross_samples,
+                    next(
+                        item for item in parameter_results if item["parameter_case"] == run_name
+                    ),
+                )
             state, reason = classify_benchmark(
                 parameter_results,
                 equivalence,
@@ -2978,6 +3765,18 @@ class PerformanceWorkflowService:
                 require_equivalence=compare_equivalence,
                 require_snapshot_attestation=compare_equivalence,
             )
+            if (
+                cross_case_result is not None
+                and state in {"improved", "promising", "neutral"}
+                and cross_case_result["comparison_margin"].get("bucket_verdict") == "regressed"
+            ):
+                state = "regressed"
+                reason = (
+                    f"candidate regressed {objective} for parameter case "
+                    f"{cross_case_result['run_case']} on the plan compiled for parameter case "
+                    f"{cross_case_result['compile_case']}: it is more parameter-sensitive "
+                    "than the baseline"
+                )
         except asyncio.CancelledError:
             self._persist_benchmark_failure_receipt(
                 session_id=session_id,
@@ -3017,7 +3816,9 @@ class PerformanceWorkflowService:
                 completed_parameter_cases=completed_parameter_cases,
                 measured_executions=measured_executions,
                 failure_code=type(exc).__name__,
-                failure_diagnostic=extract_failure_diagnostic(exc),
+                failure_diagnostic=(
+                    session_failure_diagnostic(exc) or extract_failure_diagnostic(exc)
+                ),
                 reservation=reservation,
                 reservation_owner=reservation_owner,
                 benchmark_request_fingerprint=benchmark_request_fingerprint,
@@ -3067,10 +3868,14 @@ class PerformanceWorkflowService:
                 "objective": objective,
                 "decision_basis": COMPARISON_DECISION_BASIS,
                 "parameter_results": parameter_results,
+                "cross_case_result": cross_case_result,
+                # Kept for later candidates of this session; not returned.
+                "baseline_samples": baseline_samples_by_case,
             },
             metadata={
                 "session_id": session_id,
                 "candidate_id": candidate_id,
+                "execution_protocol": execution_protocol,
                 "parameter_case_receipts": [
                     parameter_case_receipt(parameter_case)
                     for parameter_case in cases
@@ -3083,6 +3888,8 @@ class PerformanceWorkflowService:
                     if not direct_snapshot_supported
                     else "direct_snapshot"
                 ),
+                "rewrite_requirements": requirements,
+                "hint_profile": hint_profile,
                 "phase": phase,
                 "reason": reason,
                 "performance_reason": performance_reason,
@@ -3147,7 +3954,12 @@ class PerformanceWorkflowService:
             "phase": phase,
             "runs_per_parameter_case": runs,
             "executions": measured_executions,
+            "execution_protocol": execution_protocol,
             "parameter_results": parameter_results,
+            "cross_case_result": cross_case_result,
+            # A forced plan or Query Store hint on the application's query does
+            # not apply to the marked benchmark text.
+            "plan_controls_not_applied": True,
             "parameter_case_receipts": [
                 parameter_case_receipt(parameter_case)
                 for parameter_case in cases
@@ -3160,6 +3972,8 @@ class PerformanceWorkflowService:
                 if not direct_snapshot_supported
                 else "direct_snapshot"
             ),
+            "rewrite_requirements": requirements,
+            "hint_profile": hint_profile,
             "evidence_id": envelope.evidence_id,
             "execution_reservation_id": reservation["reservation_id"],
             "session_continues": True,
@@ -3192,8 +4006,13 @@ class PerformanceWorkflowService:
             if selection_scope == "performance_only":
                 parameter_results = metrics.get("parameter_results")
                 multiplier = 3 if evidence.kind == "index_finalist" else 2
+                protocol = metadata.get("execution_protocol")
+                # Evidence from before protocol version 2 had no warm-up run.
                 expected_executions = (
-                    candidate.finalist_runs
+                    int(protocol["expected_executions"])
+                    if isinstance(protocol, Mapping)
+                    and isinstance(protocol.get("expected_executions"), int)
+                    else candidate.finalist_runs
                     * candidate.parameter_cases
                     * multiplier
                 )
@@ -3263,6 +4082,221 @@ class PerformanceWorkflowService:
                 return True
         return False
 
+    def _finalist_evidence(
+        self,
+        candidate: Any,
+        *,
+        pinned_evidence_id: str | None = None,
+    ) -> EvidenceEnvelopeV1 | None:
+        """The latest finalist evidence that belongs to this candidate."""
+
+        for evidence_id in reversed(candidate.evidence_ids):
+            if pinned_evidence_id is not None and evidence_id != pinned_evidence_id:
+                continue
+            try:
+                evidence = self.store.get_evidence(evidence_id)
+            except KeyError:
+                continue
+            if (
+                evidence.kind in {"tuning_finalist", "index_finalist"}
+                and evidence.metadata.get("phase") == "finalist"
+                and evidence.metadata.get("candidate_id") == candidate.candidate_id
+            ):
+                return evidence
+        return None
+
+    def _proof_owner(self, candidate: Any) -> tuple[Any, EvidenceEnvelopeV1 | None]:
+        """The candidate whose rewrite was compared with the original SQL.
+
+        An index child runs the same SQL as its rewrite parent, so the parent's
+        finalist evidence is what says how far the rewrite is proven.
+        """
+
+        if candidate.strategy in LINEAGE_BACKED_STRATEGIES and candidate.rewrite_artifact_ref:
+            parent = self.sessions.get_candidate(
+                parse_combined_parent_reference(candidate.rewrite_artifact_ref)
+            )
+            lineage = candidate.metadata.get("lineage")
+            pinned = lineage.get("parent_evidence_id") if isinstance(lineage, Mapping) else None
+            return parent, self._finalist_evidence(
+                parent,
+                pinned_evidence_id=str(pinned) if pinned else None,
+            )
+        return candidate, self._finalist_evidence(candidate)
+
+    async def verify_logical_preconditions(
+        self,
+        database_name: str,
+        session_id: str,
+        selected_candidate_id: str,
+        logical_preconditions: Sequence[Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Check, in the catalog, the data properties the selected rewrite depends on.
+
+        Two sources are verified: the requirements the benchmark inferred from
+        how the SQL shape changed, and the preconditions the caller declares.
+        Pass the result to ``finalize_session``. Only object names and verdicts
+        are returned; no SQL text and no row values.
+        """
+
+        candidate = self.sessions.get_candidate(selected_candidate_id)
+        if candidate.session_id != session_id:
+            raise ValueError("Selected candidate does not belong to the tuning session.")
+        owner, evidence = self._proof_owner(candidate)
+        facts_by_table: dict[tuple[str, str], Any] = {}
+
+        async def verify(item: Mapping[str, Any]) -> dict[str, Any]:
+            schema_name = str(item.get("schema_name") or "").strip()
+            table_name = str(item.get("table_name") or "").strip()
+            identity = (schema_name.casefold(), table_name.casefold())
+            if identity not in facts_by_table:
+                facts_by_table[identity] = await self.catalog.table_facts(
+                    database_name,
+                    schema_name,
+                    table_name,
+                )
+            return verify_precondition(facts_by_table[identity], item)
+
+        declared = [await verify(item) for item in logical_preconditions or ()]
+        declared_kinds = {item["kind"] for item in declared if item["verified"]}
+        stored = evidence.metadata.get("rewrite_requirements") if evidence is not None else None
+        requirements: list[dict[str, Any]] = []
+        verified_count = sum(1 for item in declared if item["verified"])
+        for requirement in stored if isinstance(stored, list) else ():
+            checks = [await verify(item) for item in requirement.get("preconditions") or ()]
+            if requirement.get("resolved"):
+                missing_kinds: list[str] = []
+                satisfied = bool(checks) and all(item["verified"] for item in checks)
+                verified_count += sum(1 for item in checks if item["verified"])
+            else:
+                missing_kinds = [
+                    kind
+                    for kind in requirement.get("required_kinds") or ()
+                    if kind not in declared_kinds
+                ]
+                satisfied = not missing_kinds
+            requirements.append(
+                {
+                    "code": requirement.get("code"),
+                    "reason": requirement.get("reason"),
+                    "resolved": bool(requirement.get("resolved")),
+                    "satisfied": satisfied,
+                    "preconditions": checks,
+                    "missing_kinds": missing_kinds,
+                }
+            )
+        requirements_known = isinstance(stored, list)
+        constraint_backed = (
+            requirements_known
+            and verified_count > 0
+            and all(item["satisfied"] for item in requirements)
+            and all(item["verified"] for item in declared)
+        )
+        if constraint_backed:
+            basis = "verified_constraints"
+        elif any(not item["verified"] for item in declared):
+            basis = "verification_failed"
+        elif logical_preconditions is not None and not declared and not requirements:
+            basis = "attested_none"
+        else:
+            basis = "not_declared"
+        return {
+            "candidate_id": selected_candidate_id,
+            "proof_candidate_id": owner.candidate_id,
+            "evidence_id": evidence.evidence_id if evidence is not None else None,
+            "constraint_backed": constraint_backed,
+            "precondition_basis": basis,
+            "relevance": (
+                "catalog-verified, agent-declared relevance"
+                if declared
+                else "catalog-verified, inferred from the rewrite shape"
+            ),
+            "requirements": requirements,
+            "declared": declared,
+        }
+
+    def _selected_proof(
+        self,
+        candidate: Any,
+        precondition_verification: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Proof scope, the reasons it is not higher, and what the scope rests on."""
+
+        owner, evidence = self._proof_owner(candidate)
+        metadata = evidence.metadata if evidence is not None else {}
+        hint_profile = metadata.get("hint_profile")
+        added_hints = (
+            list(hint_profile.get("added_plan_forcing_hints") or ())
+            if isinstance(hint_profile, Mapping)
+            else []
+        )
+        comparisons = metadata.get("equivalence")
+        basis: dict[str, Any] = {
+            "proof_candidate_id": owner.candidate_id,
+            "evidence_id": evidence.evidence_id if evidence is not None else None,
+            "tested_parameter_cases": [
+                {
+                    "parameter_case": item.get("parameter_case"),
+                    "row_count": item.get("baseline_row_count"),
+                    "snapshot_isolation_verified": item.get("snapshot_isolation_verified"),
+                }
+                for item in comparisons or ()
+                if isinstance(item, Mapping) and "same_snapshot" in item
+            ],
+            "precondition_basis": "not_declared",
+        }
+        if owner.state == "performance_only" or candidate.state == "performance_only":
+            return {
+                "scope": "performance_only",
+                "blockers": _preflight_blockers(metadata.get("equivalence_preflight")),
+                "added_hints": added_hints,
+                "basis": basis,
+            }
+        if owner.strategy == "index":
+            basis["precondition_basis"] = "not_applicable"
+            return {"scope": "unchanged_sql", "blockers": [], "added_hints": [], "basis": basis}
+        blockers: list[dict[str, Any]] = []
+        scope = "snapshot_matched"
+        if precondition_verification is not None:
+            basis["precondition_basis"] = precondition_verification.get("precondition_basis")
+            basis["relevance"] = precondition_verification.get("relevance")
+            basis["requirements"] = precondition_verification.get("requirements", [])
+            basis["declared_preconditions"] = precondition_verification.get("declared", [])
+            if precondition_verification.get("constraint_backed") is True:
+                scope = "constraint_backed"
+            for requirement in basis["requirements"]:
+                if requirement.get("satisfied"):
+                    continue
+                failed = [
+                    str(item.get("reason"))
+                    for item in requirement.get("preconditions") or ()
+                    if not item.get("verified")
+                ]
+                missing = requirement.get("missing_kinds") or []
+                detail = " ".join(failed) or (
+                    "Declare and verify a precondition of kind " + ", ".join(missing) + "."
+                )
+                blockers.append(
+                    {
+                        "code": str(requirement.get("code")),
+                        "reason": f"{requirement.get('reason')} Not verified: {detail}",
+                    }
+                )
+        else:
+            stored = metadata.get("rewrite_requirements")
+            basis["requirements"] = stored if isinstance(stored, list) else []
+            blockers.extend(
+                {
+                    "code": str(requirement.get("code")),
+                    "reason": (
+                        f"{requirement.get('reason')} Not verified: no precondition "
+                        "check was run for this selection."
+                    ),
+                }
+                for requirement in basis["requirements"]
+            )
+        return {"scope": scope, "blockers": blockers, "added_hints": added_hints, "basis": basis}
+
     def finalize_session(
         self,
         session_id: str,
@@ -3271,7 +4305,17 @@ class PerformanceWorkflowService:
         stopping_reason: str,
         selection_scope: str = "proven",
         idempotency_key: str | None = None,
+        precondition_verification: Mapping[str, Any] | None = None,
+        parity_status: str | None = None,
     ) -> dict[str, Any]:
+        """Complete the session and state how far the selected candidate is proven.
+
+        ``selection_scope`` keeps its two input values: ``proven`` selects an
+        improved finalist whose results matched, ``performance_only`` one
+        that could not be compared. The response reports the proof scope:
+        snapshot_matched, constraint_backed, unchanged_sql or performance_only.
+        """
+
         if not stopping_reason.strip():
             raise ValueError("stopping_reason is required.")
         selection_scope = selection_scope.strip().casefold()
@@ -3314,6 +4358,23 @@ class PerformanceWorkflowService:
                     "Proven selection requires complete direct-snapshot finalist "
                     "equivalence evidence."
                 )
+        if precondition_verification is not None:
+            if precondition_verification.get("candidate_id") != selected_candidate_id:
+                raise ValueError(
+                    "The precondition verification belongs to another candidate."
+                )
+            refuted = [
+                str(item.get("reason"))
+                for item in precondition_verification.get("declared") or ()
+                if not item.get("verified")
+            ]
+            if refuted:
+                # Raise before completion: the session stays open for a corrected
+                # declaration or another candidate.
+                raise ValueError(
+                    "A declared logical precondition is not backed by the catalog: "
+                    + " ".join(refuted)
+                )
         current_session = self.sessions.get_session(session_id)
         if candidates and current_session.status == "created":
             if not self.sessions.is_session_expired(current_session):
@@ -3331,11 +4392,16 @@ class PerformanceWorkflowService:
                         else None
                     ),
                 )
+        replay_metadata: dict[str, Any] = {"selection_scope": selection_scope}
+        if precondition_verification is not None:
+            replay_metadata["precondition_fingerprint"] = fingerprint_json(
+                precondition_verification
+            )
         session = self.sessions.complete_session(
             session_id,
             selected_candidate_id=selected_candidate_id,
             stopping_reason=stopping_reason.strip(),
-            replay_metadata={"selection_scope": selection_scope},
+            replay_metadata=replay_metadata,
             idempotency_key=idempotency_key,
         )
         candidates = self.sessions.list_candidates(session_id)
@@ -3347,12 +4413,17 @@ class PerformanceWorkflowService:
             ),
             None,
         )
-        selected_proof_scope = (
-            "performance_only"
-            if selected is not None and selected.state == "performance_only"
-            else "proven"
+        proof = (
+            self._selected_proof(selected, precondition_verification)
             if selected is not None
             else None
+        )
+        selected_proof_scope = proof["scope"] if proof is not None else None
+        readiness = deployment_readiness(
+            proof_scope=selected_proof_scope,
+            proof_blockers=proof["blockers"] if proof is not None else (),
+            added_plan_forcing_hints=proof["added_hints"] if proof is not None else (),
+            parity_status=parity_status,
         )
         return {
             "session": self._session_view(session),
@@ -3367,11 +4438,11 @@ class PerformanceWorkflowService:
             "semantic_equivalence": (
                 "unproven"
                 if selected_proof_scope == "performance_only"
-                else "proven"
-                if selected_proof_scope == "proven"
-                else None
+                else selected_proof_scope
             ),
-            "deployment_ready": selected_proof_scope == "proven",
+            **readiness,
+            "equivalence_basis": proof["basis"] if proof is not None else None,
+            "parity_status": parity_status or "not_evaluated",
             "automatic_deployment_approved": False,
             "stopping_reason": stopping_reason,
             "rejected_experiments": [
@@ -3458,6 +4529,23 @@ class PerformanceWorkflowService:
             )
         raise ValueError("Parameterized benchmark cases require a parameter binder.")
 
+    async def _bind_bucket(
+        self,
+        database_name: str,
+        baseline_sql: str,
+        parameter_case: ParameterCase,
+    ) -> TypedParameterBucket:
+        seed_contract = await self._bind_case(
+            database_name,
+            baseline_sql,
+            parameter_case,
+        )
+        return TypedParameterBucket(
+            bucket_id=seed_contract.bucket_id,
+            parameters=seed_contract.parameters,
+            provenance=seed_contract.provenance,
+        )
+
     async def _bind_comparison_case(
         self,
         database_name: str,
@@ -3467,17 +4555,23 @@ class PerformanceWorkflowService:
     ) -> tuple[ParameterExecutionContract, ParameterExecutionContract]:
         """Bind both sides from one canonical typed parameter bucket."""
 
-        seed_contract = await self._bind_case(
-            database_name,
-            baseline_sql,
-            parameter_case,
-        )
-        bucket = TypedParameterBucket(
-            bucket_id=seed_contract.bucket_id,
-            parameters=seed_contract.parameters,
-            provenance=seed_contract.provenance,
-        )
+        bucket = await self._bind_bucket(database_name, baseline_sql, parameter_case)
         return self._contracts_from_bucket(baseline_sql, candidate_sql, bucket)
+
+    def _session_baseline_pool(self, session_id: str) -> dict[str, dict[str, Any]]:
+        """The latest measured baseline samples of this session, by parameter case."""
+
+        pool: dict[str, dict[str, Any]] = {}
+        for evidence in self.store.list_evidence_for_session(session_id):
+            samples = evidence.metrics.get("baseline_samples")
+            if evidence.kind not in {"tuning_screening", "tuning_finalist"} or not isinstance(
+                samples, Mapping
+            ):
+                continue
+            for name, items in samples.items():
+                if isinstance(items, list) and len(items) >= 2:
+                    pool[str(name)] = {"samples": items, "evidence_id": evidence.evidence_id}
+        return pool
 
     @staticmethod
     def _contracts_from_bucket(
@@ -3594,6 +4688,7 @@ class PerformanceWorkflowService:
 
 __all__ = [
     "PerformanceWorkflowService",
+    "BENCHMARK_MARKER_PREFIX",
     "aggregate_samples",
     "classify_benchmark",
     "compare_plan_summaries_payload",
@@ -3601,15 +4696,18 @@ __all__ = [
     "compare_result_sets",
     "database_fingerprint",
     "database_fingerprint_matches",
+    "deployment_readiness",
     "extract_profile_metrics",
     "fingerprint_json",
     "fingerprint_text",
     "fingerprint_text_matches",
+    "mark_benchmark_sql",
     "normalize_tuning_objective",
     "canonical_parameter_case_template",
     "parameter_case_input_contract",
     "parameter_case_fingerprint",
     "parameter_case_mismatch",
     "parameter_case_receipt",
+    "plan_delta_from_profiles",
     "profile_payload",
 ]

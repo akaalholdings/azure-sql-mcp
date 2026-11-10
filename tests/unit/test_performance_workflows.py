@@ -831,7 +831,7 @@ def test_get_session_reconciles_unattached_candidate_evidence_read_only() -> Non
         expected_version=current_session.version,
     )
 
-    result = service.get_session(session_id)
+    result = service.get_session(session_id, view="full")
 
     assert {
         evidence["evidence_id"]
@@ -882,15 +882,14 @@ async def test_measured_sample_executes_each_query_exactly_once() -> None:
     )
 
     assert result["classification"] == "improved"
-    assert result["decision_basis"] == "observed_range_separation_v1"
+    assert result["decision_basis"] == "per_bucket_median_shift_v2"
     assert result["parameter_results"][0]["decision_basis"] == (
-        "observed_range_separation_v1"
+        "per_bucket_median_shift_v2"
     )
-    assert result["parameter_results"][0]["comparison_margin"][
-        "conservative_gain"
-    ] == 50.0
-    assert result["executions"] == 8
-    assert len(plans.calls) == 6
+    assert result["parameter_results"][0]["comparison_margin"]["median_shift"] == 50.0
+    # Per side: one discarded warm-up and three measured runs; then two comparison runs.
+    assert result["executions"] == 10
+    assert len(plans.calls) == 8
     assert len(executor.sessions) == 1
     assert result["equivalence"][0]["proven_for_parameter_case"] is True
 
@@ -1043,7 +1042,8 @@ async def test_session_deadline_is_checked_before_each_query_dispatch() -> None:
 
     assert result["state"] == "inconclusive"
     assert result["executions"] == 1
-    assert plans.calls == ["SELECT id FROM dbo.Items"]
+    assert len(plans.calls) == 1
+    assert plans.calls[0].endswith("*/ SELECT id FROM dbo.Items")
     assert store.get_candidate(candidate_id).state == "inconclusive"
     reservation = store.get_execution_reservation(result["execution_reservation_id"])
     assert reservation["status"] == "completed"
@@ -1061,7 +1061,7 @@ async def test_snapshot_deadline_is_checked_after_baseline_before_candidate() ->
     def expire_on_candidate_check(checked_session_id: str) -> Any:
         nonlocal checks
         checks += 1
-        if checks == 9:
+        if checks == 11:
             current = store.get_session(session_id)
             store.save_session(
                 replace(
@@ -1088,12 +1088,16 @@ async def test_snapshot_deadline_is_checked_after_baseline_before_candidate() ->
     )
 
     assert result["classification"] == "inconclusive"
-    assert result["executions"] == 7
+    assert result["executions"] == 9
     assert result["equivalence"][0]["executions"] == 1
-    assert checks == 9
+    assert checks == 11
     assert executor.baseline_completed is True
     assert executor.candidate_dispatches == 0
-    assert plans.calls == [
+    assert [sql.split("*/ ", 1)[1] for sql in plans.calls] == [
+        # the discarded warm-up of each side
+        "SELECT id FROM dbo.Items",
+        "SELECT id FROM dbo.Items AS candidate",
+        # three measured pairs, the first side alternating
         "SELECT id FROM dbo.Items",
         "SELECT id FROM dbo.Items AS candidate",
         "SELECT id FROM dbo.Items AS candidate",
@@ -1102,7 +1106,7 @@ async def test_snapshot_deadline_is_checked_after_baseline_before_candidate() ->
         "SELECT id FROM dbo.Items AS candidate",
     ]
     reservation = store.get_execution_reservation(result["execution_reservation_id"])
-    assert reservation["dispatched_attempt_count"] == 7
+    assert reservation["dispatched_attempt_count"] == 9
 
 
 @pytest.mark.asyncio
@@ -1256,7 +1260,7 @@ async def test_retry_recovers_evidence_commit_crash_without_rerunning_sql(
         )
 
     dispatched_calls = len(plans.calls)
-    assert dispatched_calls == 6
+    assert dispatched_calls == 8
     reservation = store._connection.execute(
         "SELECT status FROM execution_reservations WHERE candidate_id = ?",
         (candidate_id,),
@@ -1280,7 +1284,7 @@ async def test_retry_recovers_evidence_commit_crash_without_rerunning_sql(
     )
 
     assert recovered["classification"] == "promising"
-    assert recovered["decision_basis"] == "observed_range_separation_v1"
+    assert recovered["decision_basis"] == "per_bucket_median_shift_v2"
     persisted = store.get_evidence(recovered["evidence_id"])
     assert persisted.metrics["decision_basis"] == recovered["decision_basis"]
     assert persisted.metrics["parameter_results"] == recovered[
@@ -1288,11 +1292,11 @@ async def test_retry_recovers_evidence_commit_crash_without_rerunning_sql(
     ]
     assert recovered["recovered_from_durable_evidence"] is True
     assert recovered["reservation_status"] == "completed"
-    assert recovered["executions"] == 6
+    assert recovered["executions"] == 8
     assert len(plans.calls) == dispatched_calls
     assert executor.sessions == []
     candidate = store.get_candidate(candidate_id)
-    assert candidate.executions == 6
+    assert candidate.executions == 8
     assert candidate.evidence_ids == (recovered["evidence_id"],)
 
 
@@ -1568,7 +1572,7 @@ async def test_early_rewrite_failure_charges_only_dispatched_executions() -> Non
     assert result["reservation_status"] == "completed"
     assert store.get_candidate(candidate_id).executions == 2
     reservation = store.get_execution_reservation(result["execution_reservation_id"])
-    assert reservation["attempt_count"] == 6
+    assert reservation["attempt_count"] == 8
     assert reservation["dispatched_attempt_count"] == 2
     assert store.execution_budget_usage(session_id)["remaining"] == 78
     assert plans.profile_query.await_count == 2
@@ -1698,14 +1702,14 @@ async def test_expired_reservation_without_receipt_recovers_conservatively(
 
     assert replay["state"] == "inconclusive"
     assert replay["failure_code"] == "benchmark_request_expired"
-    assert replay["executions"] == 6
+    assert replay["executions"] == 8
     assert replay["reservation_status"] == "completed"
     evidence = store.get_evidence(replay["evidence_id"])
-    assert evidence.observed_execution_count == 6
+    assert evidence.observed_execution_count == 8
     assert evidence.metadata["execution_count_is_conservative"] is True
     candidate = store.get_candidate(candidate_id)
     assert candidate.state == "inconclusive"
-    assert candidate.executions == 6
+    assert candidate.executions == 8
     assert plans.profile_query.await_count == 1
 
 
@@ -1780,7 +1784,7 @@ async def test_common_rare_null_and_boundary_parameter_buckets_are_all_measured(
         "NULL",
         "boundary",
     ]
-    assert result["executions"] == 24
+    assert result["executions"] == 32
     assert result["equivalence_deferred"] is True
     assert len(bound_cases) == 4
 
@@ -1822,10 +1826,10 @@ async def test_adaptive_screening_and_four_bucket_finalist_fit_default_budget() 
         parameter_cases=parameter_cases,
     )
 
-    assert screening["executions"] == 6
-    assert finalist["executions"] == 48
+    assert screening["executions"] == 8
+    assert finalist["executions"] == 56
     stored = store.get_candidate(candidate_id)
-    assert stored.executions == 54
+    assert stored.executions == 64
     assert stored.parameter_cases == 4
     assert stored.state == "improved"
 
@@ -2078,10 +2082,10 @@ async def test_volatile_finalist_runs_performance_samples_without_snapshot_dispa
 
     assert screening["classification"] == "promising"
     assert result["classification"] == "performance_only"
-    assert result["executions"] == 10
+    assert result["executions"] == 12
     assert result["proof_scope"] == "performance_only"
     assert result["equivalence"] == []
-    assert len(plans.calls) == 16
+    assert len(plans.calls) == 20
     assert executor.sessions == []
     reservation_count = store._connection.execute(
         "SELECT COUNT(*) AS count FROM execution_reservations"
@@ -2144,7 +2148,7 @@ async def test_volatile_screening_is_explicitly_performance_only() -> None:
     assert replay["durable_state"] == "screening"
     assert replay["evidence_id"] == result["evidence_id"]
     assert replay["recovered_from_durable_evidence"] is True
-    assert len(_plans.calls) == 6
+    assert len(_plans.calls) == 8
 
 
 @pytest.mark.asyncio
@@ -2184,12 +2188,12 @@ async def test_unordered_top_screening_remains_finalist_eligible_and_runs_full_w
     assert finalist["performance_classification"] == "improved"
     assert finalist["proof_scope"] == "performance_only"
     assert finalist["equivalence"] == []
-    assert finalist["executions"] == 10
+    assert finalist["executions"] == 12
     stored = store.get_candidate(candidate_id)
     assert stored.finalist_runs == 5
     assert stored.state == "performance_only"
     assert stored.failure_code is None
-    assert len(plans.calls) == 16
+    assert len(plans.calls) == 20
     assert executor.sessions == []
 
 
@@ -2386,12 +2390,12 @@ async def test_exact_legacy_proof_contract_candidate_is_recovered_for_finalist()
 
     assert result["classification"] == "performance_only"
     assert result["proof_scope"] == "performance_only"
-    assert result["executions"] == 10
+    assert result["executions"] == 12
     stored = store.get_candidate(candidate_id)
     assert stored.state == "performance_only"
     assert stored.failure_code is None
-    assert stored.executions == 16
-    assert len(plans.calls) == 10
+    assert stored.executions == 18
+    assert len(plans.calls) == 12
 
 
 def _install_legacy_proof_contract_receipt(
@@ -3096,7 +3100,9 @@ async def test_tuning_recommendation_that_bears_on_the_case_makes_it_actionable(
     case_query_id: int | None,
 ) -> None:
     """An Active row (not applied; a DBA can apply it) whose regressed plan ran
-    in the window is a current regression, with the case's query known or not."""
+    in the window is a current regression of query 42. It makes the case
+    actionable only when the case is known to be that query; without the
+    query_id it is database context and does not decide the case."""
     state = '{"currentValue":"Active","reason":"AutomaticTuningOptionNotEnabled"}'
     service, _store, _plans, _executor = _service()
     sql = "SELECT id FROM dbo.Items"
@@ -3126,7 +3132,8 @@ async def test_tuning_recommendation_that_bears_on_the_case_makes_it_actionable(
         query_store_query_id=case_query_id,
     )
 
-    assert result["outcome"] == "actionable"
+    assert result["outcome"] == ("actionable" if case_query_id else "healthy")
+    assert result["outcome_basis"]["database_context_actionable"] is (case_query_id is None)
     data = result["sections"]["regressions"]["data"]
     assert [row["query_id"] for row in data["recommendations"]] == [42]
 
@@ -3256,22 +3263,23 @@ def test_classification_accepts_large_separation_despite_relative_candidate_nois
 
     assert state == "improved"
     assert parameter_results[0]["candidate"]["noise_ratio"] > 0.25
-    assert parameter_results[0]["decision_basis"] == (
-        "observed_range_separation_v1"
-    )
+    assert parameter_results[0]["decision_basis"] == "per_bucket_median_shift_v2"
     assert parameter_results[0]["comparison_margin"] == {
         "objective": "elapsed_time",
         "metric": "elapsed_ms",
+        "metric_source": "client_wall_clock",
         "baseline_min": 157_900.0,
         "baseline_max": 158_100.0,
         "candidate_min": 1_500.0,
         "candidate_max": 2_300.0,
-        "conservative_gain": 155_600.0,
-        "conservative_gain_ratio": pytest.approx(155_600.0 / 158_035.0),
-        "conservative_regression": -156_600.0,
-        "conservative_regression_ratio": pytest.approx(
-            -156_600.0 / 158_035.0
-        ),
+        "baseline_median": 158_035.0,
+        "candidate_median": 1_598.0,
+        "median_shift": 156_437.0,
+        "comparison": "independent_samples",
+        "noise_threshold": pytest.approx(15_803.5),
+        "superiority_probability": 1.0,
+        "median_shift_ratio": pytest.approx(156_437.0 / 158_035.0),
+        "bucket_verdict": "improved",
     }
 
 
@@ -3295,15 +3303,13 @@ def test_classification_treats_overlapping_observed_ranges_as_neutral() -> None:
     )
 
     assert state == "neutral"
-    assert parameter_results[0]["comparison_margin"]["conservative_gain"] == (
-        -30.0
+    assert parameter_results[0]["comparison_margin"]["median_shift"] == 0.0
+    assert parameter_results[0]["comparison_margin"]["bucket_verdict"] == (
+        "no_material_difference"
     )
-    assert parameter_results[0]["comparison_margin"][
-        "conservative_regression"
-    ] == -30.0
 
 
-def test_classification_fails_closed_without_observed_ranges() -> None:
+def test_classification_fails_closed_without_measured_samples() -> None:
     parameter_results = [
         {
             "baseline": {
@@ -3325,7 +3331,7 @@ def test_classification_fails_closed_without_observed_ranges() -> None:
     )
 
     assert state == "inconclusive"
-    assert "observed ranges" in reason
+    assert "at least two measured samples" in reason
     assert "comparison_margin" not in parameter_results[0]
 
 
@@ -3369,10 +3375,9 @@ def test_classification_rejects_materially_separated_bucket_regression() -> None
         ("elapsed_time", [100.0, 101.0], [70.0, 71.0]),
         ("cpu", [100.0, 101.0], [70.0, 71.0]),
         ("logical_reads", [1_000.0, 1_001.0], [700.0, 701.0]),
-        ("physical_reads", [100.0, 101.0], [70.0, 71.0]),
     ],
 )
-def test_classification_weights_conservative_gain_for_every_objective(
+def test_classification_weights_the_median_gain_for_every_objective(
     objective: str,
     baseline_values: list[float],
     candidate_values: list[float],
@@ -3398,46 +3403,26 @@ def test_classification_weights_conservative_gain_for_every_objective(
 
     assert state == "improved"
     assert all(
-        result["decision_basis"] == "observed_range_separation_v1"
+        result["decision_basis"] == "per_bucket_median_shift_v2"
         for result in parameter_results
     )
 
 
 def test_classification_uses_the_selected_objective() -> None:
-    parameter_results = [
-        {
-            "baseline": {
-                "elapsed_ms": 100.0,
-                "cpu_ms": 20.0,
-                "noise_ratio": 0.0,
-                "sample_count": 3,
-                "spread": {
-                    "elapsed_ms": {"min": 100.0, "max": 100.0},
-                    "cpu_ms": {"min": 20.0, "max": 20.0},
-                },
-                "metric_sources": {
-                    "elapsed_ms": ["client_wall_clock"],
-                    "cpu_ms": ["showplan_query_time_stats"],
-                    "reads": [],
-                },
-            },
-            "candidate": {
-                "elapsed_ms": 50.0,
-                "cpu_ms": 40.0,
-                "noise_ratio": 0.0,
-                "sample_count": 3,
-                "spread": {
-                    "elapsed_ms": {"min": 50.0, "max": 50.0},
-                    "cpu_ms": {"min": 40.0, "max": 40.0},
-                },
-                "metric_sources": {
-                    "elapsed_ms": ["client_wall_clock"],
-                    "cpu_ms": ["showplan_query_time_stats"],
-                    "reads": [],
-                },
-            },
-        }
-    ]
+    def side(elapsed_ms: float, cpu_ms: float) -> dict[str, Any]:
+        return aggregate_samples(
+            [
+                {
+                    "elapsed_ms": elapsed_ms,
+                    "cpu_ms": cpu_ms,
+                    "elapsed_source": "showplan_query_time_stats",
+                    "cpu_source": "showplan_query_time_stats",
+                }
+                for _ in range(3)
+            ]
+        )
+
+    parameter_results = [{"baseline": side(100.0, 20.0), "candidate": side(50.0, 40.0)}]
     equivalence = [{"status": "match"}]
 
     elapsed, _ = classify_benchmark(

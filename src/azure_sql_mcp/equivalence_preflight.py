@@ -14,10 +14,15 @@ from sqlglot import exp
 from sqlglot import parse
 from sqlglot.errors import ParseError
 
+from .catalog_constraints import CatalogConstraintService
+from .catalog_constraints import TableConstraintFacts
+from .catalog_constraints import deterministic_order_key
+from .catalog_constraints import order_tiebreaker
 from .equivalence_contract import EquivalencePreflight
 from .equivalence_contract import _CLOCK_FUNCTIONS
 from .equivalence_contract import _ROW_VOLATILE_FUNCTIONS
 from .equivalence_contract import analyze_equivalence_preflight
+from .equivalence_contract import parseable_sql
 
 MAX_VIEW_DEPENDENCY_DEPTH = 8
 
@@ -130,6 +135,8 @@ class DatabaseEquivalencePreflight:
     function_verdicts: tuple[FunctionVerdict, ...] = ()
     resolved_view_dependencies: tuple[Mapping[str, Any], ...] = ()
     unresolved_dependencies: tuple[Mapping[str, Any], ...] = ()
+    total_order_proofs: tuple[Mapping[str, Any], ...] = ()
+    total_order_gaps: tuple[Mapping[str, Any], ...] = ()
     contract_version: int = 2
 
     @property
@@ -164,6 +171,8 @@ class DatabaseEquivalencePreflight:
             "unresolved_dependencies": [
                 dict(item) for item in self.unresolved_dependencies
             ],
+            "total_order_proofs": [dict(item) for item in self.total_order_proofs],
+            "total_order_gaps": [dict(item) for item in self.total_order_gaps],
         }
 
 
@@ -206,6 +215,10 @@ class EquivalencePreflightService:
 
     The executor may provide fetch_all or be a callback accepting
     (database_name, query, params). Only metadata is queried through this path.
+
+    The catalog reader proves a TOP, OFFSET or window order deterministic when
+    its keys cover a unique NOT NULL key. It defaults to a reader on the
+    executor; without one, such an order stays unproven.
     """
 
     def __init__(
@@ -214,6 +227,7 @@ class EquivalencePreflightService:
         *,
         executor: Any | None = None,
         max_depth: int = MAX_VIEW_DEPENDENCY_DEPTH,
+        catalog: Any | None = None,
     ) -> None:
         if resolver is not None and executor is not None:
             raise ValueError("Provide resolver or executor, not both.")
@@ -227,16 +241,33 @@ class EquivalencePreflightService:
         self.resolver = resolver
         self.executor = executor
         self.max_depth = max_depth
+        if catalog is None and _has_fetch_all(executor):
+            catalog = CatalogConstraintService(executor)
+        self.catalog = catalog
 
     async def analyze(
         self,
         database_name: str,
         sql: str,
     ) -> DatabaseEquivalencePreflight:
+        sql = parseable_sql(sql)
         direct = analyze_equivalence_preflight(sql)
         observations = _collect_function_observations(sql, "query")
-        risk_codes: list[str] = list(direct.risk_codes)
-        risks: list[dict[str, Any]] = _static_risk_summaries(direct, "query")
+        total_order_proofs, total_order_gaps = await self._prove_total_orders(
+            database_name,
+            direct,
+        )
+        unproven_orders = {str(gap["risk"]) for gap in total_order_gaps}
+        risk_codes: list[str] = [
+            code
+            for code in direct.risk_codes
+            if code not in _TOTAL_ORDER_RISKS or code in unproven_orders
+        ]
+        risks: list[dict[str, Any]] = [
+            _with_ties(risk, total_order_gaps)
+            for risk in _static_risk_summaries(direct, "query")
+            if risk["risk"] in risk_codes
+        ]
         _add_function_risks(risk_codes, risks, observations)
         unresolved: list[dict[str, Any]] = []
         resolved: list[dict[str, Any]] = []
@@ -277,7 +308,109 @@ class EquivalencePreflightService:
             function_verdicts=tuple(_build_function_verdicts(observations)),
             resolved_view_dependencies=tuple(unique_resolved),
             unresolved_dependencies=tuple(unique_unresolved),
+            total_order_proofs=tuple(total_order_proofs),
+            total_order_gaps=tuple(total_order_gaps),
         )
+
+    async def _prove_total_orders(
+        self,
+        database_name: str,
+        direct: EquivalencePreflight,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Split each ordered row limit and window order into proven or still tied."""
+
+        proofs: list[dict[str, Any]] = []
+        gaps: list[dict[str, Any]] = []
+        facts_by_table: dict[tuple[str, str], TableConstraintFacts] = {}
+        for detail in direct.details:
+            requirement = detail.get("total_order")
+            if not isinstance(requirement, Mapping):
+                continue
+            instance = {
+                key: detail[key]
+                for key in ("risk", "statement_ordinal", "select_ordinal", "window_ordinal")
+                if key in detail
+            }
+            clause = (
+                "window ORDER BY"
+                if detail["risk"] == "window_order_total_order_unproven"
+                else "ORDER BY"
+            )
+            if not requirement.get("provable"):
+                gaps.append({**instance, "tie": str(requirement.get("unprovable_reason"))})
+                continue
+            if self.catalog is None:
+                gaps.append({**instance, "tie": "no catalog reader is configured"})
+                continue
+            keys: list[dict[str, Any]] = []
+            instance_gaps: list[dict[str, Any]] = []
+            for table in requirement["tables"]:
+                identity = (str(table["schema"]).casefold(), str(table["table"]).casefold())
+                if identity not in facts_by_table:
+                    facts_by_table[identity] = await self.catalog.table_facts(
+                        database_name,
+                        table["schema"],
+                        table["table"],
+                    )
+                facts = facts_by_table[identity]
+                name = f"{table['schema']}.{table['table']}"
+                columns = list(table["order_columns"])
+                if not facts.exists:
+                    instance_gaps.append(
+                        {**instance, "table": name, "tie": f"{name} could not be read from the catalog"}
+                    )
+                    continue
+                if facts.object_type != "USER_TABLE":
+                    instance_gaps.append(
+                        {
+                            **instance,
+                            "table": name,
+                            "tie": f"{name} is not a base table, so it has no key to order by",
+                        }
+                    )
+                    continue
+                key = deterministic_order_key(facts, columns)
+                if key is not None:
+                    keys.append(
+                        {
+                            "table": name,
+                            "key_name": key.name,
+                            "key_kind": key.kind,
+                            "key_columns": list(key.columns),
+                        }
+                    )
+                    continue
+                tiebreaker = order_tiebreaker(facts, columns)
+                instance_gaps.append(
+                    {
+                        **instance,
+                        "table": name,
+                        "tie": (
+                            f"rows of {name} with the same ({', '.join(columns)}) are tied, "
+                            "so which of them the row limit keeps is not defined"
+                            if columns and clause == "ORDER BY"
+                            else f"rows of {name} with the same ({', '.join(columns)}) are tied, "
+                            "so their order inside the window is not defined"
+                            if columns
+                            else f"the ordering has no column of {name}, so its rows are tied"
+                        ),
+                        "tiebreaker": (
+                            f"append {', '.join(tiebreaker['missing_columns'])} "
+                            f"({tiebreaker['key_kind']} {tiebreaker['key_name']}) to the {clause}"
+                            if tiebreaker is not None
+                            else f"{name} has no unique NOT NULL key; "
+                            "no ordering of its columns is deterministic"
+                        ),
+                        "tiebreaker_columns": (
+                            tiebreaker["missing_columns"] if tiebreaker is not None else []
+                        ),
+                    }
+                )
+            if instance_gaps:
+                gaps.extend(instance_gaps)
+            else:
+                proofs.append({**instance, "keys": keys})
+        return proofs, gaps
 
     async def _inspect_reference(
         self,
@@ -513,6 +646,27 @@ async def analyze_database_equivalence_preflight(
         executor=executor,
         max_depth=max_depth,
     ).analyze(database_name, sql)
+
+
+_TOTAL_ORDER_RISKS = frozenset(
+    {"row_limit_total_order_unproven", "window_order_total_order_unproven"}
+)
+
+
+def _with_ties(
+    risk: dict[str, Any],
+    gaps: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Put the exact tie and its tiebreaker into the risk the agent reads first."""
+
+    ties = [gap for gap in gaps if gap.get("risk") == risk["risk"]]
+    if not ties:
+        return risk
+    text = "; ".join(
+        f"{gap['tie']}; fix: {gap['tiebreaker']}" if gap.get("tiebreaker") else str(gap["tie"])
+        for gap in ties
+    )
+    return {**risk, "reason": f"{risk['reason']}: {text}"}
 
 
 def _has_fetch_all(value: Any) -> bool:
@@ -909,6 +1063,10 @@ def _static_risk_summaries(
         "unordered_row_limit": "unordered row limits do not define a stable result boundary",
         "row_limit_total_order_unproven": "ORDER BY keys have not been proven to form a unique total order",
         "window_order_total_order_unproven": "window ORDER BY keys have not been proven to form a unique total order",
+        "isolation_table_hint": (
+            "an isolation table hint (for example NOLOCK or READPAST) reads outside the "
+            "comparison snapshot, so a result match holds only while no other session writes"
+        ),
     }
     return [
         {

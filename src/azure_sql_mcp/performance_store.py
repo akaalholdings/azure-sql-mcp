@@ -42,6 +42,17 @@ class PerformanceStoreError(RuntimeError):
 class ContractNotFoundError(PerformanceStoreError, KeyError):
     """Raised when a requested contract does not exist."""
 
+    diagnostic_code = "not_found"
+
+    def __init__(self, message: str, *, aggregate: str | None = None) -> None:
+        super().__init__(message)
+        self.aggregate = aggregate
+
+    def __str__(self) -> str:
+        # KeyError shows the repr of its argument; the quoted text is then
+        # redacted as a literal and the caller sees only '[REDACTED]'.
+        return str(self.args[0]) if self.args else "Record not found."
+
 
 class IdempotencyConflictError(PerformanceStoreError):
     """Raised when one idempotency key is reused for another aggregate."""
@@ -689,7 +700,10 @@ class PerformanceStore:
         identifier: str,
     ) -> VersionedContract:
         if row is None:
-            raise ContractNotFoundError(f"Unknown {contract_cls.contract_type}: {identifier}.")
+            raise ContractNotFoundError(
+                f"Unknown {contract_cls.contract_type}: {identifier}.",
+                aggregate=contract_cls.contract_type,
+            )
         try:
             contract = deserialize_contract(row["payload"])
         except (TypeError, ValueError) as exc:
@@ -977,12 +991,15 @@ class PerformanceStore:
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError("session_id is required.")
         with self._lock:
+            # Filter in SQLite: every call used to parse every stored evidence record.
             rows = self._connection.execute(
                 """
                 SELECT evidence_id, payload
                 FROM evidence_envelopes
+                WHERE json_extract(payload, '$.metadata.session_id') = ?
                 ORDER BY evidence_id
-                """
+                """,
+                (session_id,),
             ).fetchall()
         evidence = [
             cast(

@@ -43,7 +43,7 @@ def test_defaults_and_candidate_failure_keep_session_and_rewrite_state(tmp_path)
         assert session.screen_runs_per_candidate == 3
         assert session.finalist_runs_per_candidate == 5
         assert session.parameter_case_limit == 4
-        assert session.execution_limit == 80
+        assert session.execution_limit == 120
         assert session.time_limit_seconds == 20 * 60
 
         candidate = machine.add_candidate(

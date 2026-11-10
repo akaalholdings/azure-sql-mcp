@@ -22,6 +22,7 @@ from .performance_contracts import (
     TuningSessionV1,
     new_id,
 )
+from .performance_store import ContractNotFoundError
 from .performance_store import PerformanceStore
 from .performance_store import ReservationError
 from .query_identity import request_fingerprint
@@ -31,12 +32,19 @@ DEFAULT_MAX_CANDIDATES = 10
 DEFAULT_SCREEN_RUNS = 3
 DEFAULT_FINALIST_RUNS = 5
 DEFAULT_PARAMETER_CASES = 4
-DEFAULT_EXECUTIONS = 80
+# Decision D3. The local database policy stays the cap.
+DEFAULT_EXECUTIONS = 120
 DEFAULT_TIME_LIMIT_SECONDS = 20 * 60
+# One discarded execution per side and parameter case compiles the plan and
+# warms the pages before the measured runs.
+WARMUP_RUNS_PER_SIDE = 1
+INDEX_ABA_PHASES = 3
 
 
 class TuningSessionError(RuntimeError):
     """Base class for state-machine errors."""
+
+    diagnostic_code = "invalid_session_state"
 
 
 class InvalidTransitionError(TuningSessionError):
@@ -45,6 +53,85 @@ class InvalidTransitionError(TuningSessionError):
 
 class TuningBudgetExceeded(TuningSessionError):
     """Raised when a hard tuning budget would be exceeded."""
+
+    diagnostic_code = "session_budget_exceeded"
+
+
+class TuningSessionExpired(TuningBudgetExceeded):
+    """Raised when the session's time budget has run out."""
+
+    diagnostic_code = "session_expired"
+
+
+_FAILURE_MESSAGES = {
+    "not_found": (
+        "The id was not found in this MCP state store. Check the id. A new MCP process "
+        "or another state directory does not hold ids created by another process. This "
+        "is a caller error, not a database failure: do not retry it."
+    ),
+    "session_expired": (
+        "The tuning session's time budget has expired. Read its committed results with "
+        "get_tuning_session, finalize it, and start a new session to continue."
+    ),
+    "session_budget_exceeded": (
+        "The tuning session's budget does not allow this work. Read the budget with "
+        "get_tuning_session."
+    ),
+    "invalid_session_state": (
+        "The tuning session or candidate is not in a state that allows this call. Read "
+        "its state with get_tuning_session."
+    ),
+}
+
+
+def session_failure_diagnostic(exc: BaseException) -> dict[str, Any] | None:
+    """Classify a state-store or session-state failure; None for anything else.
+
+    These are caller errors with a fixed, value-free message. Without this a
+    wrong id reaches the agent as ``sql_execution_failed`` and it blames the
+    database.
+    """
+
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        code = getattr(current, "diagnostic_code", None)
+        if isinstance(current, (TuningSessionError, ContractNotFoundError)) and code:
+            diagnostic = {
+                "diagnostic_code": code,
+                "retryable": False,
+                "message": _FAILURE_MESSAGES[code],
+            }
+            aggregate = getattr(current, "aggregate", None)
+            if aggregate:
+                diagnostic["aggregate"] = aggregate
+            return diagnostic
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def lineage_execution_budget(
+    parameter_cases: int,
+    *,
+    screen_runs: int = DEFAULT_SCREEN_RUNS,
+    finalist_runs: int = DEFAULT_FINALIST_RUNS,
+) -> dict[str, int]:
+    """Executions the documented rewrite_plus_index lineage needs.
+
+    Screen the rewrite on every parameter case, validate it as a finalist
+    with one snapshot comparison per case, then prove an index on the rewrite
+    with a finalist A-B-A run.
+    """
+
+    cases = max(1, parameter_cases)
+    plan = {
+        "rewrite_screening": cases * (screen_runs + WARMUP_RUNS_PER_SIDE) * 2,
+        "rewrite_finalist": cases * ((finalist_runs + WARMUP_RUNS_PER_SIDE) * 2 + 2),
+        "index_child_finalist": cases * finalist_runs * INDEX_ABA_PHASES,
+    }
+    plan["total"] = sum(plan.values())
+    return plan
 
 
 Clock = Callable[[], datetime]
@@ -767,7 +854,7 @@ class TuningSessionStateMachine:
         if allow_expired or not session.deadline_at_utc:
             return
         if self._clock() >= _parse_iso(session.deadline_at_utc):
-            raise TuningBudgetExceeded("The tuning session time budget has expired.")
+            raise TuningSessionExpired("The tuning session time budget has expired.")
 
     def _next_session(self, session: TuningSessionV1, **changes: Any) -> TuningSessionV1:
         changes.setdefault("updated_at_utc", _iso(self._clock()))
