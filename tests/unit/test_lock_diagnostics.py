@@ -119,7 +119,9 @@ class TestParseDeadlockXml:
         </deadlock>
         """
         result = LockDiagnosticsService._parse_deadlock_xml(xml)
-        assert result["victim_session_id"] == "process1"
+        # The victim is named by its session id (spid); the process id stays apart.
+        assert result["victim_session_id"] == "55"
+        assert result["victim_process_ids"] == ["process1"]
         assert len(result["participants"]) == 2
         assert result["participants"][0]["is_victim"] is True
         assert result["participants"][0]["session_id"] == "55"

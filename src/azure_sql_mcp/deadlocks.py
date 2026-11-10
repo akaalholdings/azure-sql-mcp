@@ -70,10 +70,42 @@ WHERE EXISTS (
 )
 """
 
+# The 'dl' telemetry holds every database of the logical server, so the filter
+# and the bound run in master. Parameters: row limit, then database name.
 MASTER_TELEMETRY_SQL = """
-SELECT CAST(t.event_data AS nvarchar(max)) AS event_data
-FROM sys.fn_xe_telemetry_blob_target_read_file(N'dl', NULL, NULL, NULL) AS t
+SELECT TOP (?) x.event_data
+FROM (
+    SELECT
+        CAST(t.event_data AS xml) AS event_xml,
+        CAST(t.event_data AS nvarchar(max)) AS event_data
+    FROM sys.fn_xe_telemetry_blob_target_read_file(N'dl', NULL, NULL, NULL) AS t
+) AS x
+WHERE x.event_xml.value('(/event/data[@name="database_name"]/value)[1]', 'sysname') = ?
+ORDER BY x.event_xml.value('(/event/@timestamp)[1]', 'datetime2') DESC
 """
+
+LOST_EVENTS_REMEDIATION = (
+    "The ring buffer lost or cut deadlock events. Recreate the capture session with a smaller "
+    "max_events_limit (a large ring buffer is cut when it is rendered as XML), or add an "
+    "event_file target for durable capture."
+)
+
+
+@dataclass(frozen=True)
+class RingBufferRead:
+    """One ring_buffer target document: its deadlock events and what it lost."""
+
+    events: list[dict[str, Any]]
+    parse_failed: bool = False
+    truncated: bool = False
+    event_count: int | None = None
+    dropped_count: int = 0
+    # Deadlock events whose graph could not be read.
+    unreadable_events: int = 0
+
+    @property
+    def lost_events(self) -> bool:
+        return self.parse_failed or self.truncated or self.dropped_count > 0 or self.unreadable_events > 0
 
 
 @dataclass
@@ -83,13 +115,19 @@ class _SourceResult:
     detail: str
     sessions: list[str] = field(default_factory=list)
     remediation: str | None = None
+    # Ring buffer loss counters; ``incomplete`` when events were cut, dropped or unreadable.
+    extra: dict[str, Any] = field(default_factory=dict)
+    incomplete: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "source": self.source,
             "status": self.status.value,
             "detail": self.detail,
+            **self.extra,
         }
+        if self.incomplete:
+            payload["incomplete"] = True
         if self.sessions:
             payload["sessions"] = self.sessions
         if self.remediation:
@@ -118,7 +156,7 @@ class DeadlockHistoryReader:
         events.extend(database_events)
 
         telemetry_source, telemetry_events = await self._read_master_telemetry(
-            database_name, master_available=master_available
+            database_name, master_available=master_available, limit=limit
         )
         sources.append(telemetry_source)
         events.extend(telemetry_events)
@@ -173,21 +211,55 @@ class DeadlockHistoryReader:
                 [],
             )
 
-        events: list[dict[str, Any]] = []
-        for row in ring_rows:
-            events.extend(
-                parse_ring_buffer(
-                    str(row.get("target_data") or ""),
-                    source=source,
-                    session_name=str(row.get("session_name") or ""),
-                )
+        reads = [
+            read_ring_buffer(
+                str(row.get("target_data") or ""),
+                source=source,
+                session_name=str(row.get("session_name") or ""),
             )
-        status = ResultStatus.OK if events else ResultStatus.EMPTY
+            for row in ring_rows
+        ]
+        events = [event for read in reads for event in read.events]
+        failed = sum(1 for read in reads if read.parse_failed)
+        dropped = sum(read.dropped_count for read in reads)
+        unreadable = sum(read.unreadable_events for read in reads)
+        truncated = any(read.truncated for read in reads)
+        incomplete = any(read.lost_events for read in reads)
         detail = (
             f"Read {len(ring_rows)} running ring_buffer target(s). Ring buffers hold recent "
             "events only and are cleared by failover or session restart."
         )
-        return _SourceResult(source, status, detail, sessions=sessions), events
+        if incomplete:
+            detail += (
+                f" Events were lost: {failed} target document(s) could not be parsed, truncated="
+                f"{'yes' if truncated else 'no'}, {dropped} dropped, {unreadable} with an "
+                "unreadable graph."
+            )
+        if events:
+            status = ResultStatus.OK
+        elif incomplete:
+            # Lost events with nothing left is not "no deadlocks".
+            status = ResultStatus.UNAVAILABLE
+        else:
+            status = ResultStatus.EMPTY
+        return (
+            _SourceResult(
+                source,
+                status,
+                detail,
+                sessions=sessions,
+                remediation=LOST_EVENTS_REMEDIATION if incomplete else None,
+                extra={
+                    "truncated": truncated,
+                    "event_count": sum(read.event_count or 0 for read in reads),
+                    "dropped_count": dropped,
+                    "unparsed_targets": failed,
+                    "unreadable_events": unreadable,
+                },
+                incomplete=incomplete,
+            ),
+            events,
+        )
 
     async def _missing_session_result(self, database_name: str, source: str) -> _SourceResult:
         try:
@@ -215,7 +287,7 @@ class DeadlockHistoryReader:
         )
 
     async def _read_master_telemetry(
-        self, database_name: str, *, master_available: bool
+        self, database_name: str, *, master_available: bool, limit: int
     ) -> tuple[_SourceResult, list[dict[str, Any]]]:
         source = "master_deadlock_telemetry"
         if not master_available:
@@ -230,7 +302,9 @@ class DeadlockHistoryReader:
                 [],
             )
         try:
-            rows = await self.executor.fetch_all("master", MASTER_TELEMETRY_SQL)
+            rows = await self.executor.fetch_all(
+                "master", MASTER_TELEMETRY_SQL, params=[limit, database_name]
+            )
         except Exception as exc:
             note_exception(exc, "deadlocks.master_telemetry")
             return (
@@ -256,31 +330,49 @@ class DeadlockHistoryReader:
             _SourceResult(
                 source,
                 status,
-                f"Read {len(rows)} telemetry event(s) from master; "
-                f"{len(events)} belong to {database_name}.",
+                f"Read the newest {limit} telemetry event(s) at most for {database_name} from "
+                f"master; {len(events)} returned. Events with no database name are not included.",
             ),
             events,
         )
 
 
-def parse_ring_buffer(target_data: str, *, source: str, session_name: str) -> list[dict[str, Any]]:
-    """Parse a ring_buffer target document into deadlock events."""
+def read_ring_buffer(target_data: str, *, source: str, session_name: str) -> RingBufferRead:
+    """Parse a ring_buffer target document and report what it lost.
 
-    if not target_data.strip():
-        return []
+    ``truncated`` and ``droppedCount`` are the target's own loss counters. Roll-off
+    under ``max_events_limit`` is retention, not loss, and is not counted.
+    """
+
     try:
         root = ET.fromstring(target_data)
     except ET.ParseError:
-        return []
+        # An empty or cut document: the target could not be read at all.
+        return RingBufferRead([], parse_failed=True)
     events: list[dict[str, Any]] = []
+    unreadable = 0
     for event in root.iter("event"):
         if event.get("name") not in {DEADLOCK_EVENT, SERVER_DEADLOCK_EVENT}:
             continue
         parsed = _event_payload(event, source=source)
-        if parsed is not None:
-            parsed["session_name"] = session_name
-            events.append(parsed)
-    return events
+        if parsed is None:
+            unreadable += 1
+            continue
+        parsed["session_name"] = session_name
+        events.append(parsed)
+    return RingBufferRead(
+        events,
+        truncated=str(root.get("truncated") or "0") not in {"0", ""},
+        event_count=_int_or_none(root.get("eventCount")),
+        dropped_count=_int_or_none(root.get("droppedCount")) or 0,
+        unreadable_events=unreadable,
+    )
+
+
+def parse_ring_buffer(target_data: str, *, source: str, session_name: str) -> list[dict[str, Any]]:
+    """The deadlock events of a ring_buffer target document."""
+
+    return read_ring_buffer(target_data, source=source, session_name=session_name).events
 
 
 def parse_telemetry_event(event_data: str, *, source: str) -> dict[str, Any] | None:
@@ -407,8 +499,14 @@ def parse_deadlock_graph(root: ET.Element) -> dict[str, Any]:
             }
         )
     objects = sorted({str(item["object_name"]) for item in resources if item.get("object_name")})
+    victim_sessions = [
+        str(item["session_id"]) for item in participants if item["is_victim"] and item["session_id"]
+    ]
     return {
-        "victim_session_id": victim_ids[0] if victim_ids else None,
+        # The spid, which get_active_sessions and application logs know; the
+        # process ids stay in victim_process_ids.
+        "victim_session_id": victim_sessions[0] if victim_sessions else None,
+        "victim_session_ids": victim_sessions,
         "victim_process_ids": victim_ids,
         "participants": participants,
         "resources": resources,
@@ -419,9 +517,29 @@ def parse_deadlock_graph(root: ET.Element) -> dict[str, Any]:
 def _overall_status(
     deadlocks: list[dict[str, Any]], sources: list[_SourceResult]
 ) -> dict[str, Any]:
+    lossy = [source for source in sources if source.incomplete]
+    loss = " ".join(source.detail for source in lossy)
     if deadlocks:
+        if lossy:
+            return {
+                "incomplete": True,
+                **status_payload(
+                    ResultStatus.OK,
+                    f"Found {len(deadlocks)} deadlock(s). This is an undercount: {loss}",
+                    remediation=LOST_EVENTS_REMEDIATION,
+                ),
+            }
         return status_payload(ResultStatus.OK, f"Found {len(deadlocks)} deadlock(s).")
     read_ok = [source for source in sources if source.status in {ResultStatus.OK, ResultStatus.EMPTY}]
+    if lossy and not read_ok:
+        return {
+            "incomplete": True,
+            **status_payload(
+                ResultStatus.UNAVAILABLE,
+                f"No deadlock could be read, and that is not a negative: {loss}",
+                remediation=LOST_EVENTS_REMEDIATION,
+            ),
+        }
     if read_ok:
         names = ", ".join(source.source for source in read_ok)
         return status_payload(

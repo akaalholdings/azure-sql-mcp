@@ -6,16 +6,20 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from .connection import AzureSqlExecutor
+from .locking_state import LOCKING_STATE_COLUMNS
+from .locking_state import summarize_locking_state
+from .result_status import ResultStatus
+from .result_status import status_payload
 
 
-CAPABILITY_METADATA_SQL = """
+CAPABILITY_METADATA_SQL = f"""
 SELECT
     d.name AS database_name,
     d.compatibility_level,
     d.is_auto_create_stats_on,
     d.is_auto_update_stats_on,
     d.is_auto_update_stats_async_on,
-    d.is_parameterization_forced,
+    d.is_parameterization_forced,{LOCKING_STATE_COLUMNS},
     CAST(SERVERPROPERTY('EngineEdition') AS int) AS engine_edition,
     CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)) AS product_version,
     CAST(DATABASEPROPERTYEX(DB_NAME(), 'Edition') AS nvarchar(128)) AS service_edition,
@@ -87,8 +91,10 @@ _MINIMUM_COMPATIBILITY_LEVEL = {
     "memory_grant_feedback": 140,
     "batch_mode_memory_grant_feedback": 140,
     "row_mode_memory_grant_feedback": 150,
-    "memory_grant_feedback_persistence": 150,
-    "memory_grant_feedback_percentile": 150,
+    # Percentile and persistence mode apply from 140 with Query Store READ_WRITE;
+    # only row mode feedback needs 150.
+    "memory_grant_feedback_persistence": 140,
+    "memory_grant_feedback_percentile": 140,
     "batch_mode_adaptive_joins": 140,
     "batch_mode_on_rowstore": 150,
     "table_variable_deferred_compilation": 150,
@@ -106,6 +112,47 @@ _QUERY_STORE_READ_WRITE_REQUIRED = frozenset(
         "degree_of_parallelism_feedback",
     }
 )
+
+
+SUPPORTED_ENGINE_EDITION = 5
+_ENGINE_PLATFORMS = {
+    1: "sql_server",
+    2: "sql_server",
+    3: "sql_server",
+    4: "sql_server",
+    5: "azure_sql_database_paas",
+    6: "azure_synapse_analytics",
+    8: "azure_sql_managed_instance",
+    9: "azure_sql_edge",
+    11: "azure_synapse_analytics",
+    12: "fabric_sql_database",
+}
+
+
+def platform_for_engine_edition(engine_edition: int | None) -> str:
+    """Name the engine behind ``SERVERPROPERTY('EngineEdition')``; unknown when unread."""
+
+    if engine_edition is None:
+        return "unknown"
+    return _ENGINE_PLATFORMS.get(engine_edition, "unsupported_engine")
+
+
+def unsupported_platform_reason(summary: Mapping[str, Any]) -> str | None:
+    """Why this connection must not be treated as Azure SQL Database, or None when it is one."""
+
+    if summary.get("platform_supported") is True:
+        return None
+    engine_edition = summary.get("engine_edition")
+    if engine_edition is None:
+        return (
+            "SERVERPROPERTY('EngineEdition') could not be read, so the engine is not confirmed as "
+            "Azure SQL Database. Treat Azure-specific results as unverified."
+        )
+    return (
+        f"This server supports Azure SQL Database only (EngineEdition {SUPPORTED_ENGINE_EDITION}). "
+        f"The connection reports EngineEdition {engine_edition} ({summary.get('platform')}): resource "
+        "limits, permission hints and platform advice from these tools do not apply to it."
+    )
 
 
 def _as_bool(value: Any) -> bool | None:
@@ -249,13 +296,15 @@ def summarize_azure_sql_capabilities(
     except (TypeError, ValueError):
         normalized_engine_edition = None
 
-    return {
-        "platform": "azure_sql_database_paas",
-        "platform_verified": (
-            normalized_engine_edition == 5
-            if normalized_engine_edition is not None
-            else None
-        ),
+    platform_supported = (
+        normalized_engine_edition == SUPPORTED_ENGINE_EDITION
+        if normalized_engine_edition is not None
+        else None
+    )
+    summary: dict[str, Any] = {
+        "platform": platform_for_engine_edition(normalized_engine_edition),
+        "platform_verified": platform_supported,
+        "platform_supported": platform_supported,
         "database_name": first.get("database_name"),
         "compatibility_level": compatibility_level,
         "engine_edition": normalized_engine_edition,
@@ -292,6 +341,7 @@ def summarize_azure_sql_capabilities(
                 "query_store_wait_stats_capture_mode"
             ),
         },
+        "locking": summarize_locking_state(first),
         "database_scoped_configurations": configurations,
         "features": features,
         "hint_policy": {
@@ -299,6 +349,14 @@ def summarize_azure_sql_capabilities(
             "message": "Use plan, runtime, and Query Store evidence before selecting a hint.",
         },
     }
+    if platform_supported is False:
+        summary.update(
+            status_payload(
+                ResultStatus.NOT_SUPPORTED,
+                unsupported_platform_reason(summary) or "",
+            )
+        )
+    return summary
 
 
 class PlatformCapabilitiesService:

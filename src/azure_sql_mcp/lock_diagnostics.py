@@ -3,12 +3,33 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 from typing import Any
 
+from .azure_tier import gated_read_unavailable
 from .connection import AzureSqlExecutor
 from .deadlocks import DeadlockHistoryReader
 from .deadlocks import parse_deadlock_graph
 
 
 MAX_ROW_LIMIT = 1000
+LOCKS_DMV = "sys.dm_tran_locks"
+DATABASE_TRANSACTIONS_DMV = "sys.dm_tran_database_transactions"
+
+# Totals over user sessions, apart from the bounded row read, so truncation
+# cannot hide a lock storm.
+LOCK_TOTALS_SQL = """
+SELECT
+    tl.resource_type,
+    COUNT_BIG(*) AS lock_count,
+    SUM(CASE WHEN tl.request_status = 'WAIT' THEN 1 ELSE 0 END) AS waiting_count
+FROM sys.dm_tran_locks AS tl
+WHERE tl.resource_database_id = DB_ID()
+  AND EXISTS (
+        SELECT 1
+        FROM sys.dm_exec_sessions AS us
+        WHERE us.session_id = tl.request_session_id
+          AND us.is_user_process = 1
+  )
+GROUP BY tl.resource_type
+"""
 
 
 def _clamp_limit(limit: int, default: int) -> int:
@@ -37,24 +58,25 @@ class LockDiagnosticsService:
         from the rows.
         """
         bounded_limit = _clamp_limit(limit, default=200)
-        totals = await self.executor.fetch_all(
-            database_name,
-            """
-        SELECT
-            tl.resource_type,
-            COUNT_BIG(*) AS lock_count,
-            SUM(CASE WHEN tl.request_status = 'WAIT' THEN 1 ELSE 0 END) AS waiting_count
-        FROM sys.dm_tran_locks AS tl
-        WHERE tl.resource_database_id = DB_ID()
-          AND EXISTS (
-                SELECT 1
-                FROM sys.dm_exec_sessions AS us
-                WHERE us.session_id = tl.request_session_id
-                  AND us.is_user_process = 1
-          )
-        GROUP BY tl.resource_type
-        """,
-        )
+        try:
+            totals = await self.executor.fetch_all(database_name, LOCK_TOTALS_SQL)
+        except Exception as exc:
+            blocked = await gated_read_unavailable(
+                self.executor, database_name, LOCKS_DMV, exc, site="lock_diagnostics.locks"
+            )
+            if blocked is None:
+                raise
+            return {
+                "database_name": database_name,
+                "total_locks": None,
+                "waiting_locks": None,
+                "locks_by_resource_type": {},
+                "returned_locks": 0,
+                "limit": bounded_limit,
+                "truncated": False,
+                "locks": [],
+                **blocked,
+            }
         # TOP is taken in the CTE so the joins and dm_exec_sql_text run for the
         # returned rows only, not once per lock. KEY, PAGE, RID and HOBT locks
         # carry a hobt_id, which sys.partitions maps to the object.
@@ -137,6 +159,8 @@ class LockDiagnosticsService:
 
         return {
             "database_name": database_name,
+            "source_dmv": LOCKS_DMV,
+            "collection_window": {"mode": "point_in_time"},
             "total_locks": sum(by_type.values()),
             "waiting_locks": sum(int(row.get("waiting_count") or 0) for row in totals),
             "locks_by_resource_type": by_type,
@@ -199,9 +223,29 @@ class LockDiagnosticsService:
         WHERE s.is_user_process = 1
         ORDER BY at.transaction_begin_time ASC
         """
-        rows = await self.executor.fetch_all(
-            database_name, query, params=[bounded_limit + 1],
-        )
+        try:
+            rows = await self.executor.fetch_all(
+                database_name, query, params=[bounded_limit + 1],
+            )
+        except Exception as exc:
+            blocked = await gated_read_unavailable(
+                self.executor,
+                database_name,
+                DATABASE_TRANSACTIONS_DMV,
+                exc,
+                site="lock_diagnostics.open_transactions",
+            )
+            if blocked is None:
+                raise
+            return {
+                "database_name": database_name,
+                "open_transaction_count": 0,
+                "limit": bounded_limit,
+                "truncated": False,
+                "transactions": [],
+                "warnings": [],
+                **blocked,
+            }
         truncated = len(rows) > bounded_limit
         rows = rows[:bounded_limit]
 
@@ -217,6 +261,8 @@ class LockDiagnosticsService:
 
         return {
             "database_name": database_name,
+            "source_dmv": DATABASE_TRANSACTIONS_DMV,
+            "collection_window": {"mode": "point_in_time"},
             "open_transaction_count": len(rows),
             "long_running_count": len(long_running),
             "idle_with_open_txn_count": len(idle_with_txn),

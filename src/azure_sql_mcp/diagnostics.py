@@ -3,8 +3,32 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+from .azure_tier import EITHER_PATH_HINT
+from .azure_tier import EITHER_PATH_SQL
+from .azure_tier import is_permission_error
 from .connection import AzureSqlExecutor
 from .observability import sanitize_error_message
+from .result_status import ResultStatus
+
+
+# sys.dm_exec_*_stats report time in microseconds. The old names carry no unit and
+# stay for one release beside the unit-bearing ones.
+DEPRECATED_TIME_FIELDS = {
+    "total_worker_time": "total_worker_time_us",
+    "avg_worker_time": "avg_worker_time_us",
+    "total_elapsed_time": "total_elapsed_time_us",
+    "avg_elapsed_time": "avg_elapsed_time_us",
+}
+
+
+def _name_units(section: dict[str, Any], renames: dict[str, str]) -> dict[str, Any]:
+    """Add the unit-bearing name beside each deprecated field of a section's rows."""
+
+    for row in section.get("rows", []):
+        for old, new in renames.items():
+            if old in row:
+                row[new] = row[old]
+    return section
 
 
 class DiagnosticQueryService:
@@ -314,12 +338,12 @@ class DiagnosticQueryService:
                 FROM sys.dm_exec_sessions AS es
                 CROSS APPLY sys.dm_exec_input_buffer(es.session_id, NULL) AS ib
                 WHERE es.database_id = DB_ID()
-                  AND es.session_id > 50
                   AND es.session_id <> @@SPID
                   AND es.is_user_process = 1
                 ORDER BY es.cpu_time DESC, es.logical_reads DESC
                 """,
             )
+            _name_units(input_buffers, {"cpu_time": "cpu_time_ms"})
         else:
             input_buffers = {
                 "available": False,
@@ -430,7 +454,8 @@ class DiagnosticQueryService:
             "database_name": database_name,
             "sort_by": sort_by,
             "limit": bounded_limit,
-            "cached_queries": rows,
+            "deprecated_fields": DEPRECATED_TIME_FIELDS,
+            "cached_queries": _name_units(rows, DEPRECATED_TIME_FIELDS),
         }, ("cached_queries",))
 
     async def get_cached_routine_stats(
@@ -471,8 +496,13 @@ class DiagnosticQueryService:
                             AS avg_logical_reads,
                         qs.total_physical_reads,
                         qs.total_logical_writes,
-                        ISNULL(qs.execution_count / NULLIF(DATEDIFF(MINUTE, qs.cached_time, GETDATE()), 0), 0)
-                            AS calls_per_minute,
+                        CAST(
+                            ISNULL(
+                                qs.execution_count * 1.0
+                                    / NULLIF(DATEDIFF(MINUTE, qs.cached_time, GETDATE()), 0),
+                                0
+                            ) AS DECIMAL(18, 2)
+                        ) AS calls_per_minute,
                         qs.cached_time,
                         qs.last_execution_time
                     FROM sys.procedures AS p
@@ -574,8 +604,9 @@ class DiagnosticQueryService:
             "routine_type": normalized_type,
             "sort_by": sort_by,
             "limit": bounded_limit,
-            "procedures": procedures,
-            "functions": functions,
+            "deprecated_fields": DEPRECATED_TIME_FIELDS,
+            "procedures": _name_units(procedures, DEPRECATED_TIME_FIELDS),
+            "functions": _name_units(functions, DEPRECATED_TIME_FIELDS),
         }, ("procedures", "functions"))
 
     async def get_object_index_diagnostics(
@@ -907,12 +938,18 @@ class DiagnosticQueryService:
         try:
             rows = await self.executor.fetch_all(database_name, query, params=params)
         except Exception as exc:
-            return {
+            section: dict[str, Any] = {
                 "available": False,
                 "row_count": 0,
                 "rows": [],
                 "error": sanitize_error_message(str(exc)),
             }
+            if is_permission_error(exc):
+                # The section does not know its tier, so both paths are given, labelled.
+                section["result_status"] = ResultStatus.UNAVAILABLE.value
+                section["permission_hint"] = EITHER_PATH_HINT
+                section["remediation"] = EITHER_PATH_SQL
+            return section
         return {
             "available": True,
             "row_count": len(rows),
@@ -970,6 +1007,7 @@ class DiagnosticQueryService:
             "total_physical_reads": "qs.total_physical_reads",
             "total_logical_writes": "qs.total_logical_writes",
         }
+        sort_map.update({new: sort_map[old] for old, new in DEPRECATED_TIME_FIELDS.items()})
         try:
             return sort_map[sort_by]
         except KeyError as exc:
@@ -987,6 +1025,7 @@ class DiagnosticQueryService:
             "total_physical_reads": "total_physical_reads",
             "total_logical_writes": "total_logical_writes",
         }
+        sort_map.update({new: sort_map[old] for old, new in DEPRECATED_TIME_FIELDS.items()})
         try:
             return sort_map[sort_by]
         except KeyError as exc:

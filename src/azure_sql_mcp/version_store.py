@@ -11,12 +11,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from .azure_tier import dmv_permission_hint
+from .azure_tier import gated_read_unavailable
 from .connection import AzureSqlExecutor
 from .incident_log import note_exception
 from .observability import sanitize_error_message
 from .result_status import ResultStatus
 from .result_status import status_payload
+
+PVS_DMV = "sys.dm_tran_persistent_version_store_stats"
 
 PVS_STATS_SQL = """
 SELECT *
@@ -75,17 +77,16 @@ class VersionStoreService:
         try:
             rows = await self.executor.fetch_all(database_name, PVS_STATS_SQL)
         except Exception as exc:
-            note_exception(exc, "version_store.pvs_stats")
-            return {
-                "database_name": database_name,
-                **status_payload(
+            blocked = await gated_read_unavailable(
+                self.executor, database_name, PVS_DMV, exc, site="version_store.pvs_stats"
+            )
+            if blocked is None:
+                note_exception(exc, "version_store.pvs_stats")
+                blocked = status_payload(
                     ResultStatus.UNAVAILABLE,
-                    "sys.dm_tran_persistent_version_store_stats could not be read: "
-                    + sanitize_error_message(str(exc))
-                    + ". "
-                    + dmv_permission_hint("sys.dm_tran_persistent_version_store_stats"),
-                ),
-            }
+                    f"{PVS_DMV} could not be read: {sanitize_error_message(str(exc))}",
+                )
+            return {"database_name": database_name, **blocked}
         if not rows:
             return {
                 "database_name": database_name,
@@ -139,6 +140,8 @@ class VersionStoreService:
         ]
         return {
             "database_name": database_name,
+            "source_dmv": PVS_DMV,
+            "collection_window": {"mode": "point_in_time"},
             "persistent_version_store": pvs,
             "data_used_mb": round(used_mb, 1) if space else None,
             "oldest_transactions": transactions,

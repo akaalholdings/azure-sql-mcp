@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from .azure_tier import gated_read_unavailable
 from .connection import AzureSqlExecutor
 
 
 MAX_SESSION_LIMIT = 1000
+SESSION_SPACE_DMV = "sys.dm_db_session_space_usage"
+TEMPDB_FILE_SPACE_DMV = "tempdb.sys.dm_db_file_space_usage"
+MEMORY_GRANTS_DMV = "sys.dm_exec_query_memory_grants"
 
 
 class TempdbMemoryService:
@@ -46,13 +50,34 @@ class TempdbMemoryService:
           )
         ORDER BY total_net_mb DESC
         """
-        rows = await self.executor.fetch_all(
-            database_name, query, params=[bounded_limit + 1],
-        )
+        try:
+            rows = await self.executor.fetch_all(
+                database_name, query, params=[bounded_limit + 1],
+            )
+        except Exception as exc:
+            blocked = await gated_read_unavailable(
+                self.executor, database_name, SESSION_SPACE_DMV, exc, site="tempdb_memory.usage"
+            )
+            if blocked is None:
+                raise
+            return {
+                "database_name": database_name,
+                "session_count": 0,
+                "limit": bounded_limit,
+                "truncated": False,
+                "sessions": [],
+                **blocked,
+            }
         truncated = len(rows) > bounded_limit
         rows = rows[:bounded_limit]
         return {
             "database_name": database_name,
+            "source_dmv": SESSION_SPACE_DMV,
+            "collection_window": {
+                "mode": "point_in_time",
+                "note": "Session counters include a task only after it ends; a running "
+                "request's use is in get_active_sessions (tempdb_allocated_mb).",
+            },
             "session_count": len(rows),
             "limit": bounded_limit,
             "truncated": truncated,
@@ -78,10 +103,20 @@ class TempdbMemoryService:
             ) * 8 / 1024.0 AS total_mb
         FROM tempdb.sys.dm_db_file_space_usage
         """
-        rows = await self.executor.fetch_all(database_name, query)
+        try:
+            rows = await self.executor.fetch_all(database_name, query)
+        except Exception as exc:
+            blocked = await gated_read_unavailable(
+                self.executor, database_name, TEMPDB_FILE_SPACE_DMV, exc, site="tempdb_memory.breakdown"
+            )
+            if blocked is None:
+                raise
+            return {"database_name": database_name, "breakdown": {}, **blocked}
         breakdown = rows[0] if rows else {}
         return {
             "database_name": database_name,
+            "source_dmv": TEMPDB_FILE_SPACE_DMV,
+            "collection_window": {"mode": "point_in_time"},
             "breakdown": breakdown,
         }
 
@@ -126,7 +161,22 @@ class TempdbMemoryService:
         OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) AS st
         ORDER BY mg.requested_memory_kb DESC
         """
-        rows = await self.executor.fetch_all(database_name, query)
+        try:
+            rows = await self.executor.fetch_all(database_name, query)
+        except Exception as exc:
+            blocked = await gated_read_unavailable(
+                self.executor, database_name, MEMORY_GRANTS_DMV, exc, site="tempdb_memory.grants"
+            )
+            if blocked is None:
+                raise
+            return {
+                "database_name": database_name,
+                "total_grants": 0,
+                "pending_count": None,
+                "grants": [],
+                "warnings": [],
+                **blocked,
+            }
 
         pending = [r for r in rows if r.get("grant_status") == "Pending"]
         granted = [r for r in rows if r.get("grant_status") == "Granted"]
@@ -140,6 +190,8 @@ class TempdbMemoryService:
 
         return {
             "database_name": database_name,
+            "source_dmv": MEMORY_GRANTS_DMV,
+            "collection_window": {"mode": "point_in_time"},
             "total_grants": len(rows),
             "pending_count": len(pending),
             "granted_count": len(granted),

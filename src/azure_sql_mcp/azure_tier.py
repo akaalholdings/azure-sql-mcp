@@ -16,6 +16,7 @@ with the alternative of accepting ``unavailable``; it is never a default.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from dataclasses import field
 from typing import Any
@@ -23,6 +24,8 @@ from typing import Any
 from .connection import AzureSqlExecutor
 from .incident_log import note_exception
 from .observability import sanitize_error_message
+from .result_status import ResultStatus
+from .result_status import status_payload
 
 TIER_SQL = """
 SELECT
@@ -65,6 +68,10 @@ SERVER_STATE_GATED_DMVS = frozenset(
         "sys.dm_os_waiting_tasks",
         "sys.dm_db_index_usage_stats",
         "sys.dm_os_sys_info",
+        "sys.dm_tran_locks",
+        "sys.dm_exec_query_resource_semaphores",
+        "sys.dm_os_memory_clerks",
+        "sys.dm_db_file_space_usage",
     }
 )
 # A server-level permission on every service objective.
@@ -75,7 +82,30 @@ SERVER_SCOPED_DMVS = {
 # Server admin or Entra admin on Basic and Standard; VIEW DATABASE STATE on Premium.
 ADMIN_ONLY_ON_BASIC_STANDARD_DMVS = frozenset({"sys.dm_exec_query_statistics_xml"})
 
+# Read in tempdb. A contained database user has no login in master and so no user
+# in tempdb: a grant in the user database does not reach these on any tier.
+TEMPDB_SCOPED_DMVS = frozenset({"tempdb.sys.dm_db_file_space_usage", "tempdb.sys.database_files"})
+
 DATABASE_STATE_HINT = "VIEW DATABASE STATE is required."
+PRINCIPAL_PLACEHOLDER = "<mcp_principal>"
+DATABASE_GRANT_SQL = f"GRANT VIEW DATABASE STATE TO [{PRINCIPAL_PLACEHOLDER}];"
+SERVER_ROLE_SQL = f"""-- In master, as the server admin or the Microsoft Entra admin:
+CREATE LOGIN [{PRINCIPAL_PLACEHOLDER}] FROM EXTERNAL PROVIDER;
+ALTER SERVER ROLE ##MS_ServerStateReader## ADD MEMBER [{PRINCIPAL_PLACEHOLDER}];
+-- In this database. A contained user of the same name must be dropped first
+-- and its grants applied again:
+CREATE USER [{PRINCIPAL_PLACEHOLDER}] FROM LOGIN [{PRINCIPAL_PLACEHOLDER}];
+-- The session must reconnect before the role applies."""
+# For a refusal whose tier or source DMV is not known: both paths, each labelled.
+EITHER_PATH_SQL = (
+    "-- On a single database above S1 (not in an elastic pool):\n"
+    f"{DATABASE_GRANT_SQL}\n"
+    "-- On Basic, S0, S1 or an elastic-pool database the grant above is not enough:\n"
+    f"{SERVER_ROLE_SQL}"
+)
+_PERMISSION_DENIED_TEXT = re.compile(
+    r"permission was denied|does not have permission to perform this action", re.IGNORECASE
+)
 _SERVER_ROLE = (
     "the server admin, the Microsoft Entra admin, or membership in the ##MS_ServerStateReader## "
     "server role (a login in master plus a user created FROM LOGIN in this database)"
@@ -84,6 +114,11 @@ _ROLE_SCOPE = (
     "##MS_ServerStateReader## gives VIEW DATABASE STATE in every database where that login has a "
     "user, so adding it is the owner's decision; the alternative is to accept that this source "
     "stays unavailable."
+)
+EITHER_PATH_HINT = (
+    "The engine refused the read. On a single database above S1, VIEW DATABASE STATE is the "
+    "grant for most diagnostic views. On Basic, S0, S1 and elastic-pool databases many of them "
+    f"need {_SERVER_ROLE}. {_ROLE_SCOPE}"
 )
 
 _EDITION_FAMILIES = {
@@ -199,6 +234,12 @@ def dmv_permission_hint(dmv: str, tier: TierContext | None = None) -> str:
 
     if tier is not None and tier.edition_family == "unknown" and not tier.pooled:
         tier = None  # cannot rule out Basic, S0, S1 or a pool
+    if dmv in TEMPDB_SCOPED_DMVS:
+        return (
+            f"{dmv} is read in tempdb, where a grant in this database does not apply: a contained "
+            f"database user cannot read it on any service objective. It needs {_SERVER_ROLE}. "
+            f"{_ROLE_SCOPE}"
+        )
     if dmv in SERVER_SCOPED_DMVS:
         return (
             f"{dmv} needs {SERVER_SCOPED_DMVS[dmv]}, which no database-level grant gives: it needs "
@@ -230,6 +271,101 @@ def dmv_permission_hint(dmv: str, tier: TierContext | None = None) -> str:
         f"This database is {where}, so {dmv} needs {_SERVER_ROLE}; VIEW DATABASE STATE is not "
         f"enough here. {_ROLE_SCOPE}"
     )
+
+
+def _needs_server_role(dmv: str, tier: TierContext | None) -> bool | None:
+    """True: only the server role path reads ``dmv``. None: the tier is unknown."""
+
+    if tier is not None and tier.edition_family == "unknown" and not tier.pooled:
+        tier = None
+    if dmv in TEMPDB_SCOPED_DMVS or dmv in SERVER_SCOPED_DMVS:
+        return True
+    if dmv not in SERVER_STATE_GATED_DMVS:
+        return False
+    return None if tier is None else tier.server_state_reader_required
+
+
+def dmv_permission_remediation(dmv: str, tier: TierContext | None = None) -> str:
+    """The statements a DBA runs to open ``dmv``. Text only: this server never runs them."""
+
+    needs_role = _needs_server_role(dmv, tier)
+    if needs_role is True:
+        return SERVER_ROLE_SQL
+    if needs_role is False:
+        return DATABASE_GRANT_SQL
+    return EITHER_PATH_SQL
+
+
+def is_permission_error(exc: BaseException) -> bool:
+    """True when the engine refused the read for permissions (errors 229, 262, 297, 300)."""
+
+    return isinstance(exc, PermissionError) or _PERMISSION_DENIED_TEXT.search(str(exc)) is not None
+
+
+async def gated_read_unavailable(
+    executor: AzureSqlExecutor,
+    database_name: str,
+    dmv: str,
+    exc: BaseException,
+    *,
+    site: str,
+) -> dict[str, Any] | None:
+    """Status fields for a read the engine refused; None for any other failure.
+
+    The tier is read only here, after a refusal, so the hint and the remediation
+    name the path that works on this database.
+    """
+
+    if not is_permission_error(exc):
+        return None
+    note_exception(exc, site)
+    tier: TierContext | None = None
+    try:
+        tier = (await read_tier_context(executor, database_name)).tier
+    except Exception as tier_exc:
+        note_exception(tier_exc, f"{site}.tier")
+    return {
+        "available": False,
+        "source_dmv": dmv,
+        **status_payload(
+            ResultStatus.UNAVAILABLE,
+            f"{dmv} could not be read: {sanitize_error_message(str(exc))}. "
+            + dmv_permission_hint(dmv, tier),
+            remediation=dmv_permission_remediation(dmv, tier),
+        ),
+    }
+
+
+async def read_dmv(
+    executor: AzureSqlExecutor,
+    database_name: str,
+    dmv: str,
+    query: str,
+    params: Sequence[Any] | None = None,
+    *,
+    site: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """One section of a collector: the rows, or the ``unavailable`` status fields.
+
+    A collector with several sources must not lose all of them to one failed
+    read, so every failure becomes a status; only a refusal carries remediation.
+    """
+
+    try:
+        return await executor.fetch_all(database_name, query, params=params), None
+    except Exception as exc:
+        blocked = await gated_read_unavailable(executor, database_name, dmv, exc, site=site)
+        if blocked is None:
+            note_exception(exc, site)
+            blocked = {
+                "available": False,
+                "source_dmv": dmv,
+                **status_payload(
+                    ResultStatus.UNAVAILABLE,
+                    f"{dmv} could not be read: {sanitize_error_message(str(exc))}",
+                ),
+            }
+        return [], blocked
 
 
 def _text(value: Any) -> str | None:

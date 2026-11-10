@@ -6,6 +6,9 @@ from typing import Any
 from .azure_tier import TIER_SQL
 from .azure_tier import classify_service_tier
 from .azure_tier import dmv_permission_hint
+from .azure_tier import dmv_permission_remediation
+from .azure_tier import gated_read_unavailable
+from .azure_tier import is_permission_error
 from .connection import AzureSqlExecutor
 from .incident_log import note_exception
 from .observability import sanitize_error_message
@@ -63,6 +66,9 @@ ORDER BY hour_start_utc DESC
 """
 
 GOVERNANCE_DMV = "sys.dm_user_db_resource_governance"
+IO_STATS_DMV = "sys.dm_io_virtual_file_stats"
+RECENT_RESOURCE_DMV = "sys.dm_db_resource_stats"
+LONG_TERM_RESOURCE_VIEW = "sys.resource_stats"
 GOVERNANCE_SQL = """
 SELECT TOP (1) *
 FROM sys.dm_user_db_resource_governance
@@ -204,7 +210,15 @@ class ResourceGovernanceService:
             ON fs.file_id = df.file_id
         ORDER BY fs.io_stall DESC
         """
-        rows = await self.executor.fetch_all(database_name, query)
+        try:
+            rows = await self.executor.fetch_all(database_name, query)
+        except Exception as exc:
+            blocked = await gated_read_unavailable(
+                self.executor, database_name, IO_STATS_DMV, exc, site="resource_governance.io_stats"
+            )
+            if blocked is None:
+                raise
+            return {"database_name": database_name, "files": [], "warnings": [], **blocked}
 
         warnings: list[dict[str, Any]] = []
         for row in rows:
@@ -231,6 +245,11 @@ class ResourceGovernanceService:
 
         return {
             "database_name": database_name,
+            "source_dmv": IO_STATS_DMV,
+            "collection_window": {
+                "mode": "cumulative",
+                "note": "Counters accumulate since the database came online on this replica.",
+            },
             "files": rows,
             "warnings": warnings,
         }
@@ -248,12 +267,14 @@ class ResourceGovernanceService:
         # current database must be selected explicitly.
         warnings: list[dict[str, Any]] = []
         governance_error: str | None = None
+        governance_refused = False
         try:
             governance_rows = await self.executor.fetch_all(database_name, GOVERNANCE_SQL)
         except Exception as exc:
             note_exception(exc, "resource_governance.limits")
             governance_rows = []
             governance_error = sanitize_error_message(str(exc))
+            governance_refused = is_permission_error(exc)
         try:
             slo_rows = await self.executor.fetch_all(database_name, TIER_SQL)
         except Exception as exc:
@@ -298,6 +319,11 @@ class ResourceGovernanceService:
                     ResultStatus.UNAVAILABLE,
                     f"{GOVERNANCE_DMV} could not be read: {governance_error}. "
                     + dmv_permission_hint(GOVERNANCE_DMV, tier),
+                    remediation=(
+                        dmv_permission_remediation(GOVERNANCE_DMV, tier)
+                        if governance_refused
+                        else None
+                    ),
                 )
             )
         return payload
@@ -339,15 +365,34 @@ class ResourceGovernanceService:
                 ),
             )
             resolved = "recent"
-        if resolved == "long_term":
-            rows = await self.executor.fetch_all(
-                "master", LONG_TERM_RESOURCE_SQL, params=[database_name, window_minutes]
+        source_dmv = LONG_TERM_RESOURCE_VIEW if resolved == "long_term" else RECENT_RESOURCE_DMV
+        try:
+            if resolved == "long_term":
+                rows = await self.executor.fetch_all(
+                    "master", LONG_TERM_RESOURCE_SQL, params=[database_name, window_minutes]
+                )
+                granularity = "hourly_buckets_from_5_minute_samples"
+            else:
+                query = RECENT_RESOURCE_SQL.format(window_minutes=window_minutes)
+                rows = await self.executor.fetch_all(database_name, query)
+                granularity = "15_second_samples"
+        except Exception as exc:
+            blocked = await gated_read_unavailable(
+                self.executor, database_name, source_dmv, exc, site="resource_governance.history"
             )
-            granularity = "hourly_buckets_from_5_minute_samples"
-        else:
-            query = RECENT_RESOURCE_SQL.format(window_minutes=window_minutes)
-            rows = await self.executor.fetch_all(database_name, query)
-            granularity = "15_second_samples"
+            if blocked is None:
+                raise
+            return {
+                "database_name": database_name,
+                "window_minutes": window_minutes,
+                "source": resolved,
+                "sample_count": 0,
+                "summary": {},
+                "warnings": [],
+                "informational": [],
+                "history": [],
+                **blocked,
+            }
 
         # Compute summary stats
         sample_seconds = RECENT_SAMPLE_SECONDS if resolved == "recent" else None
@@ -399,6 +444,7 @@ class ResourceGovernanceService:
             "database_name": database_name,
             "window_minutes": window_minutes,
             "source": resolved,
+            "source_dmv": source_dmv,
             "granularity": granularity,
             "sample_count": len(rows),
             "summary": summary,

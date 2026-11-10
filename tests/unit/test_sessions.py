@@ -161,16 +161,15 @@ async def test_blocking_chain_names_sessions_and_waits_without_repeating_rows() 
     assert chain["blocked_session_waits"][0] == {
         "session_id": 60,
         "wait_type": "LCK_M_U",
+        "lock_mode": "U",
         "wait_time_ms": 42_000,
         "wait_resource": "KEY: 5:72057594041925632 (8194443284a0)",
     }
     assert len(chain["blocked_session_waits"]) == 80
-    assert set(chain) == {
-        "head_blocker_session_id",
-        "head_blocker_has_active_request",
-        "blocked_session_ids",
-        "blocked_session_waits",
-    }
+    # 3.0 adds counts and one grouped resource per chain, never a session row.
+    assert chain["total_blocked_count"] == 80
+    assert chain["indirect_blocked_session_ids"] == []
+    assert len(chain["blocked_resources"]) == 1
     assert chain["head_blocker_has_active_request"] is True
     assert "current_statement" not in json.dumps(chain)
     assert len(json.dumps(chain)) * 4 < len(json.dumps(payload["sessions"]))
