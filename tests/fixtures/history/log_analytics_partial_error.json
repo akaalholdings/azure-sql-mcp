@@ -1,0 +1,24 @@
+{
+ "tables": [
+  {
+   "name": "PrimaryResult",
+   "columns": [
+    {
+     "name": "TimeGenerated",
+     "type": "datetime"
+    }
+   ],
+   "rows": []
+  }
+ ],
+ "error": {
+  "code": "PartialError",
+  "message": "There were some errors when processing your query.",
+  "details": [
+   {
+    "code": "EngineError",
+    "message": "Query result set has exceeded the internal limit"
+   }
+  ]
+ }
+}

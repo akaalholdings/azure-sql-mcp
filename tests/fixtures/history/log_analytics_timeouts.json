@@ -1,0 +1,57 @@
+{
+ "tables": [
+  {
+   "name": "PrimaryResult",
+   "columns": [
+    {
+     "name": "TimeGenerated",
+     "type": "datetime"
+    },
+    {
+     "name": "mcp_server",
+     "type": "string"
+    },
+    {
+     "name": "mcp_database",
+     "type": "string"
+    },
+    {
+     "name": "error_state_d",
+     "type": "string"
+    },
+    {
+     "name": "query_hash_s",
+     "type": "string"
+    },
+    {
+     "name": "query_plan_hash_s",
+     "type": "string"
+    },
+    {
+     "name": "AdditionalFields",
+     "type": "dynamic"
+    }
+   ],
+   "rows": [
+    [
+     "2026-11-09T02:12:31.0000000Z",
+     "contoso-sql01",
+     "SalesDb",
+     "2",
+     "-8112315231426414107",
+     "1234567890123",
+     null
+    ],
+    [
+     "2026-11-09T02:14:02.0000000Z",
+     "contoso-sql01",
+     "SalesDb",
+     "2",
+     "",
+     "",
+     null
+    ]
+   ]
+  }
+ ]
+}

@@ -1,0 +1,38 @@
+{
+ "tables": [
+  {
+   "name": "PrimaryResult",
+   "columns": [
+    {
+     "name": "TimeGenerated",
+     "type": "datetime"
+    },
+    {
+     "name": "mcp_server",
+     "type": "string"
+    },
+    {
+     "name": "mcp_database",
+     "type": "string"
+    },
+    {
+     "name": "deadlock_xml_s",
+     "type": "string"
+    },
+    {
+     "name": "AdditionalFields",
+     "type": "dynamic"
+    }
+   ],
+   "rows": [
+    [
+     "2026-11-09T02:16:43.0000000Z",
+     "contoso-sql01",
+     "SalesDb",
+     "<deadlock><victim-list><victimProcess id=\"process2a8c4f8ca8\"/></victim-list>\n<process-list>\n<process id=\"process2a8c4f8ca8\" spid=\"61\" waitresource=\"KEY: 5:72057594045661184 (8194443284a0)\" waittime=\"2843\" lockMode=\"U\" isolationlevel=\"read committed (2)\" trancount=\"2\" status=\"suspended\" lastbatchstarted=\"2026-11-09T02:16:40.110\" loginname=\"orders_app\" hostname=\"web-02\" clientapp=\"orders-api\">\n<executionStack><frame procname=\"SalesDb.dbo.usp_ship_order\" line=\"12\">UPDATE dbo.Orders SET Status = 2 WHERE OrderId = @id</frame></executionStack>\n<inputbuf>EXEC dbo.usp_ship_order @id = 48211</inputbuf></process>\n<process id=\"process2a8c4f9468\" spid=\"74\" waitresource=\"KEY: 5:72057594045726720 (a0c936a3c965)\" waittime=\"2810\" lockMode=\"S\" isolationlevel=\"read committed (2)\" trancount=\"1\" status=\"suspended\" lastbatchstarted=\"2026-11-09T02:16:40.320\" loginname=\"orders_app\" hostname=\"web-01\" clientapp=\"orders-api\">\n<executionStack><frame procname=\"adhoc\" line=\"1\">SELECT OrderId FROM dbo.Orders WHERE CustomerId = @c</frame></executionStack>\n<inputbuf>SELECT OrderId FROM dbo.Orders WHERE CustomerId = 9912</inputbuf></process>\n</process-list>\n<resource-list>\n<keylock hobtid=\"72057594045661184\" dbid=\"5\" objectname=\"SalesDb.dbo.Orders\" indexname=\"PK_Orders\" id=\"lock1\" mode=\"X\"><owner-list><owner id=\"process2a8c4f9468\" mode=\"X\"/></owner-list><waiter-list><waiter id=\"process2a8c4f8ca8\" mode=\"U\" requestType=\"wait\"/></waiter-list></keylock>\n<keylock hobtid=\"72057594045726720\" dbid=\"5\" objectname=\"SalesDb.dbo.Orders\" indexname=\"IX_Orders_CustomerId\" id=\"lock2\" mode=\"X\"><owner-list><owner id=\"process2a8c4f8ca8\" mode=\"X\"/></owner-list><waiter-list><waiter id=\"process2a8c4f9468\" mode=\"S\" requestType=\"wait\"/></waiter-list></keylock>\n</resource-list></deadlock>",
+     null
+    ]
+   ]
+  }
+ ]
+}

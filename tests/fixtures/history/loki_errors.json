@@ -1,0 +1,21 @@
+{
+ "status": "success",
+ "data": {
+  "resultType": "streams",
+  "result": [
+   {
+    "stream": {
+     "service_name": "mssql",
+     "category": "errors"
+    },
+    "values": [
+     [
+      "1794192180000000000",
+      "{\"time\": \"2026-11-09T02:13:00.0000000Z\", \"resourceId\": \"/SUBSCRIPTIONS/00000000-0000-0000-0000-000000000000/RESOURCEGROUPS/RG-SALES/PROVIDERS/MICROSOFT.SQL/SERVERS/CONTOSO-SQL01/DATABASES/SALESDB\", \"category\": \"Errors\", \"operationName\": \"ErrorEvent\", \"LogicalServerName\": \"contoso-sql01\", \"properties\": {\"ElasticPoolName\": \"\", \"DatabaseName\": \"SalesDb\", \"message\": \"Violation of PRIMARY KEY constraint 'PK_Orders'. The duplicate key value is (48211).\", \"user_defined\": false, \"error_number\": 2627, \"Severity\": 14, \"state\": 1, \"query_hash\": \"-8112315231426414107\"}}"
+     ]
+    ]
+   }
+  ],
+  "stats": {}
+ }
+}

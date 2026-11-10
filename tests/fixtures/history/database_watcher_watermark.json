@@ -1,0 +1,19 @@
+{
+ "Tables": [
+  {
+   "TableName": "Table_0",
+   "Columns": [
+    {
+     "ColumnName": "watermark",
+     "DataType": "DateTime",
+     "ColumnType": "datetime"
+    }
+   ],
+   "Rows": [
+    [
+     "2026-11-09T02:59:45Z"
+    ]
+   ]
+  }
+ ]
+}

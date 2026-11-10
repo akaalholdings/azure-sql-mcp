@@ -1,0 +1,22 @@
+{
+ "cost": 59,
+ "interval": "PT1M",
+ "namespace": "Microsoft.Sql/servers/databases",
+ "resourceregion": "uksouth",
+ "timespan": "2026-11-09T02:00:00Z/2026-11-09T02:30:00Z",
+ "value": [
+  {
+   "name": {
+    "localizedValue": "Workers percentage",
+    "value": "workers_percent"
+   },
+   "type": "Microsoft.Insights/metrics",
+   "displayDescription": "Workers percentage",
+   "errorCode": "InvalidSamplingType",
+   "id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sales/providers/Microsoft.Sql/servers/contoso-sql01/databases/SalesDb/providers/Microsoft.Insights/metrics/workers_percent",
+   "timeseries": [],
+   "unit": "Percent",
+   "errorMessage": "Sampling type is not found."
+  }
+ ]
+}

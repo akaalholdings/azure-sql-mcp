@@ -1,0 +1,85 @@
+{
+ "Tables": [
+  {
+   "TableName": "Table_0",
+   "Columns": [
+    {
+     "ColumnName": "sample_time_utc",
+     "DataType": "DateTime",
+     "ColumnType": "datetime"
+    },
+    {
+     "ColumnName": "avg_cpu_percent",
+     "DataType": "Double",
+     "ColumnType": "real"
+    },
+    {
+     "ColumnName": "max_cpu_percent",
+     "DataType": "Double",
+     "ColumnType": "real"
+    },
+    {
+     "ColumnName": "avg_instance_cpu_percent",
+     "DataType": "Double",
+     "ColumnType": "real"
+    },
+    {
+     "ColumnName": "max_instance_cpu_percent",
+     "DataType": "Double",
+     "ColumnType": "real"
+    },
+    {
+     "ColumnName": "avg_data_io_percent",
+     "DataType": "Double",
+     "ColumnType": "real"
+    },
+    {
+     "ColumnName": "max_data_io_percent",
+     "DataType": "Double",
+     "ColumnType": "real"
+    },
+    {
+     "ColumnName": "avg_log_write_percent",
+     "DataType": "Double",
+     "ColumnType": "real"
+    },
+    {
+     "ColumnName": "max_log_write_percent",
+     "DataType": "Double",
+     "ColumnType": "real"
+    },
+    {
+     "ColumnName": "max_worker_percent",
+     "DataType": "Double",
+     "ColumnType": "real"
+    }
+   ],
+   "Rows": [
+    [
+     "2026-11-09T02:09:00Z",
+     41.0,
+     55.0,
+     44.0,
+     58.0,
+     3.0,
+     9.0,
+     4.0,
+     11.0,
+     6.5
+    ],
+    [
+     "2026-11-09T02:10:00Z",
+     97.4,
+     100.0,
+     98.0,
+     100.0,
+     5.0,
+     12.0,
+     12.0,
+     19.0,
+     71.0
+    ]
+   ]
+  }
+ ]
+}

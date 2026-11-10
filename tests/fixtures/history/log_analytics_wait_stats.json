@@ -1,0 +1,81 @@
+{
+ "tables": [
+  {
+   "name": "PrimaryResult",
+   "columns": [
+    {
+     "name": "TimeGenerated",
+     "type": "datetime"
+    },
+    {
+     "name": "mcp_server",
+     "type": "string"
+    },
+    {
+     "name": "mcp_database",
+     "type": "string"
+    },
+    {
+     "name": "wait_type_s",
+     "type": "string"
+    },
+    {
+     "name": "start_utc_date_t",
+     "type": "string"
+    },
+    {
+     "name": "end_utc_date_t",
+     "type": "string"
+    },
+    {
+     "name": "delta_max_wait_time_ms_d",
+     "type": "string"
+    },
+    {
+     "name": "delta_signal_wait_time_ms_d",
+     "type": "string"
+    },
+    {
+     "name": "delta_wait_time_ms_d",
+     "type": "string"
+    },
+    {
+     "name": "delta_waiting_tasks_count_d",
+     "type": "string"
+    },
+    {
+     "name": "AdditionalFields",
+     "type": "dynamic"
+    }
+   ],
+   "rows": [
+    [
+     "2026-11-09T02:15:00.0000000Z",
+     "contoso-sql01",
+     "SalesDb",
+     "LCK_M_U",
+     "2026-11-09T02:10:00.0000000Z",
+     "2026-11-09T02:15:00.0000000Z",
+     "21044",
+     "12",
+     "184320",
+     "9",
+     null
+    ],
+    [
+     "2026-11-09T02:15:00.0000000Z",
+     "contoso-sql01",
+     "SalesDb",
+     "WRITELOG",
+     "2026-11-09T02:10:00.0000000Z",
+     "2026-11-09T02:15:00.0000000Z",
+     "41",
+     "310",
+     "5120",
+     "1900",
+     null
+    ]
+   ]
+  }
+ ]
+}

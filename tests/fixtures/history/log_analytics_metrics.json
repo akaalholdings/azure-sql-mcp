@@ -1,0 +1,80 @@
+{
+ "tables": [
+  {
+   "name": "PrimaryResult",
+   "columns": [
+    {
+     "name": "TimeGenerated",
+     "type": "datetime"
+    },
+    {
+     "name": "MetricName",
+     "type": "string"
+    },
+    {
+     "name": "Average",
+     "type": "real"
+    },
+    {
+     "name": "Minimum",
+     "type": "real"
+    },
+    {
+     "name": "Maximum",
+     "type": "real"
+    },
+    {
+     "name": "Total",
+     "type": "real"
+    },
+    {
+     "name": "Count",
+     "type": "real"
+    },
+    {
+     "name": "TimeGrain",
+     "type": "string"
+    },
+    {
+     "name": "UnitName",
+     "type": "string"
+    }
+   ],
+   "rows": [
+    [
+     "2026-11-09T02:10:00Z",
+     "cpu_percent",
+     97.4,
+     91.0,
+     100.0,
+     389.6,
+     4,
+     "PT1M",
+     "Percent"
+    ],
+    [
+     "2026-11-09T02:11:00Z",
+     "cpu_percent",
+     99.1,
+     97.0,
+     100.0,
+     396.4,
+     4,
+     "PT1M",
+     "Percent"
+    ],
+    [
+     "2026-11-09T02:10:00Z",
+     "log_write_percent",
+     12.0,
+     8.0,
+     19.0,
+     48.0,
+     4,
+     "PT1M",
+     "Percent"
+    ]
+   ]
+  }
+ ]
+}

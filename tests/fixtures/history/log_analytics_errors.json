@@ -1,0 +1,68 @@
+{
+ "tables": [
+  {
+   "name": "PrimaryResult",
+   "columns": [
+    {
+     "name": "TimeGenerated",
+     "type": "datetime"
+    },
+    {
+     "name": "mcp_server",
+     "type": "string"
+    },
+    {
+     "name": "mcp_database",
+     "type": "string"
+    },
+    {
+     "name": "Message",
+     "type": "string"
+    },
+    {
+     "name": "user_defined_b",
+     "type": "string"
+    },
+    {
+     "name": "error_number_d",
+     "type": "string"
+    },
+    {
+     "name": "Severity",
+     "type": "string"
+    },
+    {
+     "name": "state_d",
+     "type": "string"
+    },
+    {
+     "name": "query_hash_s",
+     "type": "string"
+    },
+    {
+     "name": "query_plan_hash_s",
+     "type": "string"
+    },
+    {
+     "name": "AdditionalFields",
+     "type": "dynamic"
+    }
+   ],
+   "rows": [
+    [
+     "2026-11-09T02:13:00.0000000Z",
+     "contoso-sql01",
+     "SalesDb",
+     "Violation of PRIMARY KEY constraint 'PK_Orders'. Cannot insert duplicate key in object 'dbo.Orders'. The duplicate key value is (48211).",
+     "False",
+     "2627",
+     "14",
+     "1",
+     "-8112315231426414107",
+     "1234567890123",
+     null
+    ]
+   ]
+  }
+ ]
+}

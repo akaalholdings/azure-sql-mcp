@@ -1,0 +1,50 @@
+{
+ "Tables": [
+  {
+   "TableName": "Table_0",
+   "Columns": [
+    {
+     "ColumnName": "wait_type",
+     "DataType": "String",
+     "ColumnType": "string"
+    },
+    {
+     "ColumnName": "bucket",
+     "DataType": "DateTime",
+     "ColumnType": "datetime"
+    },
+    {
+     "ColumnName": "wait_time_ms",
+     "DataType": "Int64",
+     "ColumnType": "long"
+    },
+    {
+     "ColumnName": "interval_start",
+     "DataType": "DateTime",
+     "ColumnType": "datetime"
+    },
+    {
+     "ColumnName": "interval_end",
+     "DataType": "DateTime",
+     "ColumnType": "datetime"
+    }
+   ],
+   "Rows": [
+    [
+     "LCK_M_U",
+     "2026-11-09T02:10:00Z",
+     184320,
+     "2026-11-09T02:10:10Z",
+     "2026-11-09T02:14:50Z"
+    ],
+    [
+     "WRITELOG",
+     "2026-11-09T02:10:00Z",
+     5120,
+     "2026-11-09T02:10:10Z",
+     "2026-11-09T02:14:50Z"
+    ]
+   ]
+  }
+ ]
+}

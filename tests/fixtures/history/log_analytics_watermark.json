@@ -1,0 +1,18 @@
+{
+ "tables": [
+  {
+   "name": "PrimaryResult",
+   "columns": [
+    {
+     "name": "watermark",
+     "type": "datetime"
+    }
+   ],
+   "rows": [
+    [
+     "2026-11-09T02:55:00Z"
+    ]
+   ]
+  }
+ ]
+}

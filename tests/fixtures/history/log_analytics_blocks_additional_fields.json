@@ -1,0 +1,53 @@
+{
+ "tables": [
+  {
+   "name": "PrimaryResult",
+   "columns": [
+    {
+     "name": "TimeGenerated",
+     "type": "datetime"
+    },
+    {
+     "name": "mcp_server",
+     "type": "string"
+    },
+    {
+     "name": "mcp_database",
+     "type": "string"
+    },
+    {
+     "name": "lock_mode_s",
+     "type": "string"
+    },
+    {
+     "name": "resource_owner_type_s",
+     "type": "string"
+    },
+    {
+     "name": "blocked_process_filtered_s",
+     "type": "string"
+    },
+    {
+     "name": "duration_d",
+     "type": "string"
+    },
+    {
+     "name": "AdditionalFields",
+     "type": "dynamic"
+    }
+   ],
+   "rows": [
+    [
+     "2026-11-09T02:10:05.4130000Z",
+     "contoso-sql01",
+     "SalesDb",
+     "",
+     "",
+     "",
+     "",
+     "{\"lock_mode\": \"U\", \"resource_owner_type\": \"LOCK\", \"blocked_process_filtered\": \"<blocked-process-report monitorLoop=\\\"48213\\\">\\n <blocked-process>\\n  <process id=\\\"process1f2a3b4c8\\\" taskpriority=\\\"0\\\" logused=\\\"0\\\" waitresource=\\\"KEY: 5:72057594045661184 (8194443284a0)\\\" waittime=\\\"21044\\\" ownerId=\\\"918273\\\" transactionname=\\\"UPDATE\\\" lasttranstarted=\\\"2026-11-09T02:09:40.113\\\" XDES=\\\"0x1d9c8e4a8\\\" lockMode=\\\"U\\\" schedulerid=\\\"2\\\" kpid=\\\"7712\\\" status=\\\"suspended\\\" spid=\\\"71\\\" sbid=\\\"0\\\" ecid=\\\"0\\\" priority=\\\"0\\\" trancount=\\\"2\\\" lastbatchstarted=\\\"2026-11-09T02:09:40.110\\\" lastbatchcompleted=\\\"2026-11-09T02:09:40.107\\\" lastattention=\\\"1900-01-01T00:00:00.107\\\" clientapp=\\\"orders-api\\\" hostname=\\\"web-02\\\" hostpid=\\\"4120\\\" loginname=\\\"orders_app\\\" isolationlevel=\\\"read committed (2)\\\" xactid=\\\"918273\\\" currentdb=\\\"5\\\" currentdbname=\\\"SalesDb\\\" lockTimeout=\\\"4294967295\\\" clientoption1=\\\"671088672\\\" clientoption2=\\\"128056\\\">\\n   <executionStack>\\n    <frame line=\\\"3\\\" stmtstart=\\\"118\\\" stmtend=\\\"262\\\" sqlhandle=\\\"0x0300050011a2b33c6d5e4f00a1b2000001000000000000000000000000000000000000000000000000000000\\\"/>\\n   </executionStack>\\n   <inputbuf>\\nUPDATE dbo.Orders SET Status = 3 WHERE OrderId = 48211   </inputbuf>\\n  </process>\\n </blocked-process>\\n <blocking-process>\\n  <process status=\\\"sleeping\\\" spid=\\\"64\\\" sbid=\\\"0\\\" ecid=\\\"0\\\" priority=\\\"0\\\" trancount=\\\"1\\\" lastbatchstarted=\\\"2026-11-09T02:08:55.900\\\" lastbatchcompleted=\\\"2026-11-09T02:08:55.913\\\" lastattention=\\\"1900-01-01T00:00:00.913\\\" clientapp=\\\"nightly-export\\\" hostname=\\\"batch-01\\\" hostpid=\\\"988\\\" loginname=\\\"export_svc\\\" isolationlevel=\\\"read committed (2)\\\" xactid=\\\"918101\\\" currentdb=\\\"5\\\" currentdbname=\\\"SalesDb\\\" lockTimeout=\\\"4294967295\\\" clientoption1=\\\"671088672\\\" clientoption2=\\\"128056\\\">\\n   <executionStack/>\\n   <inputbuf>\\nUPDATE dbo.Orders SET ExportedAt = '2026-11-09' WHERE CustomerId = 9912   </inputbuf>\\n  </process>\\n </blocking-process>\\n</blocked-process-report>\\n\", \"duration\": 21044000}"
+    ]
+   ]
+  }
+ ]
+}

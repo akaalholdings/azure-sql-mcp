@@ -1,0 +1,20 @@
+<blocked-process-report monitorLoop="48213">
+ <blocked-process>
+  <process id="process2c7d8e9f0" taskpriority="0" logused="0" waitresource="KEY: 5:72057594045661184 (61a06abd401c)" waittime="20312" ownerId="918311" transactionname="SELECT" lasttranstarted="2026-11-09T02:09:41.020" XDES="0x1d9c8f1b0" lockMode="S" schedulerid="1" kpid="6604" status="suspended" spid="83" sbid="0" ecid="0" priority="0" trancount="0" lastbatchstarted="2026-11-09T02:09:41.018" lastbatchcompleted="2026-11-09T02:09:41.011" clientapp="orders-api" hostname="web-01" hostpid="3980" loginname="orders_app" isolationlevel="read committed (2)" xactid="918311" currentdb="5" currentdbname="SalesDb" lockTimeout="4294967295">
+   <executionStack>
+    <frame line="1" stmtstart="0" stmtend="140" sqlhandle="0x020000004f1c2a0b7e6d5c4b3a2918070605040302010000000000000000000000000000000000000000"/>
+   </executionStack>
+   <inputbuf>
+SELECT OrderId, Status FROM dbo.Orders WHERE OrderId = 48211   </inputbuf>
+  </process>
+ </blocked-process>
+ <blocking-process>
+  <process status="suspended" waitresource="KEY: 5:72057594045661184 (8194443284a0)" waittime="21044" spid="71" sbid="0" ecid="0" priority="0" trancount="2" lastbatchstarted="2026-11-09T02:09:40.110" lastbatchcompleted="2026-11-09T02:09:40.107" clientapp="orders-api" hostname="web-02" hostpid="4120" loginname="orders_app" isolationlevel="read committed (2)" xactid="918273" currentdb="5" currentdbname="SalesDb" lockTimeout="4294967295">
+   <executionStack>
+    <frame line="3" stmtstart="118" stmtend="262" sqlhandle="0x0300050011a2b33c6d5e4f00a1b2000001000000000000000000000000000000000000000000000000000000"/>
+   </executionStack>
+   <inputbuf>
+UPDATE dbo.Orders SET Status = 3 WHERE OrderId = 48211   </inputbuf>
+  </process>
+ </blocking-process>
+</blocked-process-report>

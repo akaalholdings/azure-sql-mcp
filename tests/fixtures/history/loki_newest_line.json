@@ -1,0 +1,21 @@
+{
+ "status": "success",
+ "data": {
+  "resultType": "streams",
+  "result": [
+   {
+    "stream": {
+     "service_name": "mssql",
+     "category": "databasewaitstatistics"
+    },
+    "values": [
+     [
+      "1794194700000000000",
+      "{\"time\": \"2026-11-09T02:55:00.0000000Z\", \"resourceId\": \"/SUBSCRIPTIONS/00000000-0000-0000-0000-000000000000/RESOURCEGROUPS/RG-SALES/PROVIDERS/MICROSOFT.SQL/SERVERS/CONTOSO-SQL01/DATABASES/SALESDB\", \"category\": \"DatabaseWaitStatistics\", \"operationName\": \"DatabaseWaitStatisticsEvent\", \"LogicalServerName\": \"contoso-sql01\", \"properties\": {\"ElasticPoolName\": \"\", \"DatabaseName\": \"SalesDb\", \"wait_type\": \"WRITELOG\", \"start_utc_date\": \"2026-11-09T02:50:00.000Z\", \"end_utc_date\": \"2026-11-09T02:55:00.000Z\", \"delta_wait_time_ms\": 5120, \"delta_signal_wait_time_ms\": 310, \"delta_waiting_tasks_count\": 1900, \"delta_max_wait_time_ms\": 41}}"
+     ]
+    ]
+   }
+  ],
+  "stats": {}
+ }
+}

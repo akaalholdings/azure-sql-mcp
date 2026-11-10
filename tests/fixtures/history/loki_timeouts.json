@@ -1,0 +1,21 @@
+{
+ "status": "success",
+ "data": {
+  "resultType": "streams",
+  "result": [
+   {
+    "stream": {
+     "service_name": "mssql",
+     "category": "timeouts"
+    },
+    "values": [
+     [
+      "1794192151000000000",
+      "{\"time\": \"2026-11-09T02:12:31.0000000Z\", \"resourceId\": \"/SUBSCRIPTIONS/00000000-0000-0000-0000-000000000000/RESOURCEGROUPS/RG-SALES/PROVIDERS/MICROSOFT.SQL/SERVERS/CONTOSO-SQL01/DATABASES/SALESDB\", \"category\": \"Timeouts\", \"operationName\": \"TimeoutEvent\", \"LogicalServerName\": \"contoso-sql01\", \"properties\": {\"ElasticPoolName\": \"\", \"DatabaseName\": \"SalesDb\", \"error_state\": 2, \"query_hash\": \"-8112315231426414107\", \"query_plan_hash\": \"1234567890123\"}}"
+     ]
+    ]
+   }
+  ],
+  "stats": {}
+ }
+}

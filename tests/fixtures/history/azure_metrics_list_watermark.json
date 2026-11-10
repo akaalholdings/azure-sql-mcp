@@ -1,0 +1,41 @@
+{
+ "cost": 59,
+ "interval": "PT1M",
+ "namespace": "Microsoft.Sql/servers/databases",
+ "resourceregion": "uksouth",
+ "timespan": "2026-11-09T02:00:00Z/2026-11-09T03:00:00Z",
+ "value": [
+  {
+   "name": {
+    "localizedValue": "CPU percentage",
+    "value": "cpu_percent"
+   },
+   "type": "Microsoft.Insights/metrics",
+   "displayDescription": "CPU percentage",
+   "errorCode": "Success",
+   "id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-sales/providers/Microsoft.Sql/servers/contoso-sql01/databases/SalesDb/providers/Microsoft.Insights/metrics/cpu_percent",
+   "timeseries": [
+    {
+     "data": [
+      {
+       "timeStamp": "2026-11-09T02:55:00Z",
+       "average": 20.0
+      },
+      {
+       "timeStamp": "2026-11-09T02:56:00Z",
+       "average": 22.0
+      },
+      {
+       "timeStamp": "2026-11-09T02:57:00Z"
+      },
+      {
+       "timeStamp": "2026-11-09T02:58:00Z"
+      }
+     ],
+     "metadatavalues": []
+    }
+   ],
+   "unit": "Percent"
+  }
+ ]
+}
