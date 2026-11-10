@@ -393,6 +393,7 @@ async def test_capabilities_say_whether_a_view_experiment_is_allowed(
 
     assert yes == {
         "allowed": True,
+        "designs_forbidden": False,
         "blockers": [],
         "test_view_name_prefixes": ["v_Testing_"],
     }

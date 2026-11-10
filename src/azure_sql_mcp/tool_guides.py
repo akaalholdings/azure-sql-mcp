@@ -356,6 +356,13 @@ Read:
   (session_single_run). Only a gain of 50% or more then counts as improved.
 - candidate_sql may be a read-only IF / ELSE batch: see the branching_batch
   guide.
+- A further run on a candidate that has its verdict: the same call with
+  cross_case, or with measurement_only=true (benchmark_index_candidate:
+  measurement_only=true or plan_reuse first_case), and a new idempotency
+  key. classification is that run alone; candidate_classification is the
+  verdict of the candidate, which a regressed run lowers (verdict_changed)
+  and no run raises. The run is listed in the session as its own candidate
+  (measurement_candidate_id) and counts against the budget.
 Avoid:
 - Do not rerun a lost response with a new idempotency key. Read it back with
   get_tuning_session.
@@ -568,9 +575,12 @@ Read:
   as a multiset: ordered_rows_match and multiset_match. Under a preflight
   gap (possible ties, a changed or removed ORDER BY) a match is
   tested_match, proof_scope snapshot_test: true for the tested values on
-  today's data, with the reason in caveats. The candidate is then
-  performance_only. not_compared is left for a clock, NEWID, TABLESAMPLE, a
-  row limit with no ORDER BY, or a run that stopped.
+  today's data, with the reason in caveats. Same rows in the same order on
+  every case: improved, proof_scope snapshot_test; finalize with
+  selection_scope tested (never deployment_ready). A multiset-only match is
+  performance_only. TOP with no ORDER BY: compared as a multiset, tested
+  at most. Above the row limit: compared by digest (compared_by_digest).
+  not_compared: a clock, NEWID, TABLESAMPLE or a stopped run.
 - A candidate ends as improved, neutral, regressed, equivalence_failed,
   performance_only, inconclusive or cleanup_required.
 - finalize_tuning_session returns deployment_ready. It is true only when a
@@ -733,6 +743,11 @@ Read:
   indexes on that table stay online. It is refused before any run when the
   table already has a columnstore index or a column is (max), computed,
   sparse or of an unsupported type. The result has row_groups, no depth.
+- A date or id range predicate: add order_columns: [the range column] (it
+  must be in key_columns) so the build sorts by it and more row groups are
+  eliminated; with COLUMNSTORE_ARCHIVE the scan reads the fewest pages, at
+  more CPU to decompress. Measure the ordered archive form against the
+  plain one before choosing.
 - Keep SUM and COUNT on the bare column inside the scan: an expression
   inside the aggregate stops aggregate pushdown.
 Avoid:
@@ -899,8 +914,10 @@ Read:
   proof_scope direct_snapshot is a match on the tested cases and today's
   data. finalize_tuning_session reports it as snapshot_matched; only a
   catalog-verified precondition makes it constraint_backed.
-- performance_only with tested_match: the results matched, but the static
-  proof has a gap (caveats names it). The timing stands; the equality is a
+- tested_match: the results matched, but the static proof has a gap
+  (caveats names it). In the same order on every case the candidate is
+  improved with proof_scope snapshot_test (finalize: selection_scope
+  tested); as a multiset only it is performance_only. The equality is a
   test on today's data (guide proving_a_rewrite).
 - To measure the index alone and then the rewrite under one build, keep the
   index: guide session_held_objects.
@@ -929,14 +946,15 @@ depends on.
 Use when: a fixed aggregate over a large table returns few rows and is called
 often. An indexed view stores the aggregate; the statement reads a few pages.
 Steps:
-- check_capabilities: indexed_view_experiment.allowed, its blockers and
-  test_view_name_prefixes. It needs allow_test_indexes, allow_view_apply
-  and allow_offline_test_index (the first index of a view is built offline:
-  base-table writes wait).
+- First, check_capabilities indexed_view_experiment. designs_forbidden
+  true (policy allow_indexed_view_designs false): no indexed view here; do
+  not propose one. Else allowed, blockers and test_view_name_prefixes
+  (needs allow_test_indexes, allow_view_apply, allow_offline_test_index:
+  the first index is built offline).
 - benchmark_indexed_view_candidate with preview set to true and
   view_definition (the SELECT body: two-part names, COUNT_BIG(*), SUM over a
   NOT NULL column or with ISNULL). It returns the view name, findings and
-  setup_statements; nothing runs.
+  setup_statements.
 - add_tuning_candidate with strategy=rewrite_plus_index, no artifact_ref,
   and candidate_sql = the statement that reads <schema>.<view> WITH
   (NOEXPAND) (schema_name; default dbo).
@@ -956,9 +974,9 @@ Read:
   view; TRUNCATE, ALTER COLUMN and partition SWITCH fail while it exists.
   Quote them with the recommendation.
 - lease.status cleaned: the view is gone. cleanup_required: give the user
-  remediation (DROP VIEW) and stop sandbox work in that database.
-- failure_diagnostic: failed_step, native_error_code and engine_message of
-  a refused build; the lease is create_failed and nothing is left.
+  remediation (DROP VIEW) and stop sandbox work there.
+- failure_diagnostic: failed_step and engine_message of a refused build;
+  nothing is left.
 Avoid:
 - Do not recommend an indexed view on a table with heavy writes without the
   write warning and the covering index as the alternative.

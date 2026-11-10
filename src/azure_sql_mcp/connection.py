@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import inspect
+import json
 import logging
 import math
 import re
@@ -97,6 +99,71 @@ def driver_cancel_supported() -> bool:
     )
 
 
+# Rows above a row cap are fetched in batches of this size and digested.
+ROW_DIGEST_FETCH_ROWS = 2000
+# One digest per this many rows: it places the first difference of two streams.
+ROW_DIGEST_BLOCK_ROWS = 1000
+_ROW_DIGEST_MODULUS = 1 << 256
+
+
+def canonical_row(row: Sequence[Any]) -> str:
+    """One row as text that is equal only for equal values of equal Python types."""
+
+    typed = [
+        {
+            "ordinal": ordinal,
+            "python_type": f"{type(value).__module__}.{type(value).__qualname__}",
+            "value": value,
+        }
+        for ordinal, value in enumerate(row)
+    ]
+    return json.dumps(typed, separators=(",", ":"), default=str)
+
+
+class RowStreamDigest:
+    """A running digest of a row stream, in memory that does not grow with the rows.
+
+    ``ordered_digest`` changes with any value and with the order of the rows.
+    ``multiset_digest`` is the sum of the row digests modulo 2**256: with the
+    row count it is the same for the same rows in any order, duplicates
+    counted. ``block_digests`` holds 16 hexadecimal characters per
+    ``ROW_DIGEST_BLOCK_ROWS`` rows, so two ordered streams can be walked
+    together to the first block that differs. No row value is kept.
+    """
+
+    def __init__(self) -> None:
+        self.row_count = 0
+        self._ordered = hashlib.sha256()
+        self._multiset = 0
+        self._block = hashlib.sha256()
+        self._blocks: list[str] = []
+
+    def add(self, row: Sequence[Any]) -> None:
+        row_digest = hashlib.sha256(canonical_row(row).encode("utf-8")).digest()
+        self._ordered.update(row_digest)
+        self._block.update(row_digest)
+        self._multiset = (self._multiset + int.from_bytes(row_digest, "big")) % _ROW_DIGEST_MODULUS
+        self.row_count += 1
+        if self.row_count % ROW_DIGEST_BLOCK_ROWS == 0:
+            self._close_block()
+
+    def _close_block(self) -> None:
+        self._blocks.append(self._block.hexdigest()[:16])
+        self._block = hashlib.sha256()
+
+    def summary(self) -> dict[str, Any]:
+        blocks = list(self._blocks)
+        if self.row_count % ROW_DIGEST_BLOCK_ROWS:
+            blocks.append(self._block.hexdigest()[:16])
+        return {
+            "row_count": self.row_count,
+            "ordered_digest": self._ordered.hexdigest(),
+            "multiset_digest": f"{self._multiset:064x}",
+            "block_rows": ROW_DIGEST_BLOCK_ROWS,
+            "block_digests": tuple(blocks),
+        }
+
+
 @dataclass(frozen=True)
 class QueryResult:
     columns: tuple[str, ...]
@@ -104,6 +171,10 @@ class QueryResult:
     column_type_signatures: tuple[str, ...] = ()
     positional_rows: tuple[tuple[Any, ...], ...] | None = None
     positional_rows_exact: bool | None = None
+    # ``RowStreamDigest.summary()`` of every row of the result set, when it
+    # held more rows than the row cap and the caller asked for a digest.
+    # ``rows`` then holds the first rows up to the cap only.
+    row_digest: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         columns = tuple(self.columns)
@@ -582,6 +653,10 @@ class AzureSqlExecutor:
 
         This is the bounded comparison path: retrying the sequence after one
         statement ran would under-report executions and invalidate the budget.
+        A result set with more than ``max_rows`` rows keeps its first
+        ``max_rows`` rows; the others are fetched in batches of
+        ``ROW_DIGEST_FETCH_ROWS`` and only digested (``QueryResult.row_digest``
+        covers every row), so memory does not grow with the result.
         ``before_statement_dispatch`` runs synchronously in the worker thread
         immediately before the selected statement's driver dispatch. If it
         raises, that statement is not dispatched.
@@ -627,6 +702,7 @@ class AzureSqlExecutor:
                     cancel_event=cancel_event,
                     statement_timeout_seconds=statement_timeout_seconds,
                     sql_origin=sql_origin,
+                    digest_beyond_cap=True,
                 )
             )
             result = await asyncio.shield(execution_task)
@@ -984,6 +1060,7 @@ class AzureSqlExecutor:
         statement_timeout_seconds: int | None = None,
         sql_origin: str | None = None,
         read_only_envelope: bool = False,
+        digest_beyond_cap: bool = False,
     ) -> list[list[QueryResult]]:
         logger.debug(
             "Executing session",
@@ -1026,7 +1103,13 @@ class AzureSqlExecutor:
                         input_sizes=input_sizes,
                     )
                     per_statement_results.append(
-                        self._consume_batches(cursor, max_rows=max_rows, stop_on_cap=False)
+                        self._consume_batches(
+                            cursor,
+                            max_rows=max_rows,
+                            stop_on_cap=False,
+                            digest_beyond_cap=digest_beyond_cap,
+                            cancel_event=cancel_event,
+                        )
                     )
             finally:
                 cursor.close()
@@ -1380,6 +1463,8 @@ class AzureSqlExecutor:
         max_rows: int | None = None,
         stop_on_cap: bool = True,
         message_sink: list[Any] | None = None,
+        digest_beyond_cap: bool = False,
+        cancel_event: threading.Event | None = None,
     ) -> list[QueryResult]:
         results: list[QueryResult] = []
         captured_messages: tuple[Any, ...] = ()
@@ -1410,12 +1495,28 @@ class AzureSqlExecutor:
                     tuple(self._coerce_value(value) for value in raw_row)
                     for raw_row in raw_rows
                 )
+                row_digest: dict[str, Any] | None = None
+                if digest_beyond_cap and max_rows is not None and len(raw_rows) >= max_rows:
+                    # More rows than the cap: digest every row, hold no more of them.
+                    digest = RowStreamDigest()
+                    for row in positional_rows:
+                        digest.add(row)
+                    while True:
+                        # The cap of the call cancels through this event.
+                        self._raise_if_cancelled(cancel_event)
+                        batch = cursor.fetchmany(ROW_DIGEST_FETCH_ROWS)
+                        if not batch:
+                            break
+                        for raw_row in batch:
+                            digest.add(tuple(self._coerce_value(value) for value in raw_row))
+                    row_digest = digest.summary()
                 results.append(
                     QueryResult(
                         columns=columns,
                         rows=rows,
                         column_type_signatures=type_signatures,
                         positional_rows=positional_rows,
+                        row_digest=row_digest,
                     )
                 )
 

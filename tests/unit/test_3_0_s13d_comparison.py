@@ -96,7 +96,8 @@ def test_a_removed_order_by_no_longer_blocks_the_comparison_and_is_named() -> No
 
 @pytest.mark.parametrize(
     "code",
-    ["row_volatile_function", "statement_stable_clock", "unordered_row_limit"],
+    # S14: unordered_row_limit left this list; TOP without ORDER BY is now compared.
+    ["row_volatile_function", "statement_stable_clock"],
 )
 def test_a_result_that_is_unstable_by_construction_still_blocks(code: str) -> None:
     _gaps, blocking = preflight_gap_codes(
@@ -123,8 +124,12 @@ async def test_a_candidate_that_drops_the_order_by_is_compared_as_a_multiset_wit
 
 
 @pytest.mark.asyncio
-async def test_a_finalist_rewrite_under_a_tie_gap_is_compared_and_stays_performance_only() -> None:
-    """D08: TOP ... ORDER BY with possible ties was measured and never compared."""
+async def test_a_finalist_rewrite_under_a_tie_gap_is_compared_and_is_a_tested_match() -> None:
+    """D08: TOP ... ORDER BY with possible ties was measured and never compared.
+
+    S14: the same rows in the same order count as improved with a tested
+    match (selection_scope tested); before, the candidate was performance-only.
+    """
 
     executor = SnapshotExecutor(baseline_rows=_rows(1, 2), candidate_rows=_rows(1, 2))
     service, _store, _plans, _executor = _service(
@@ -139,7 +144,8 @@ async def test_a_finalist_rewrite_under_a_tie_gap_is_compared_and_stays_performa
     )
 
     assert len(executor.sessions) == 1
-    assert result["classification"] == "performance_only"
+    assert result["classification"] == "improved"
+    assert result["proof_scope"] == "snapshot_test"
     comparison = result["equivalence"][0]
     assert comparison["status"] == "match"
     assert comparison["tested_match"] is True
@@ -151,14 +157,15 @@ async def test_a_finalist_rewrite_under_a_tie_gap_is_compared_and_stays_performa
         "baseline_runs", "build", "candidate_runs", "comparison", "cleanup", "other", "total",
     }
     assert result["time_spent"]["build"] == 0.0
-    # The session can still select it, as performance-only evidence.
+    # The session can select it as a tested match, never as proven.
     final = service.finalize_session(
         session_id,
         selected_candidate_id=candidate["candidate_id"],
-        selection_scope="performance_only",
+        selection_scope="tested",
         stopping_reason="measured",
     )
     assert final["selected_candidate_id"] == candidate["candidate_id"]
+    assert final["deployment_ready"] is False
 
 
 @pytest.mark.asyncio

@@ -29,7 +29,7 @@ TuningStrategy = Literal[
     "rewrite_plus_index",
 ]
 BenchmarkPhase = Literal["screening", "finalist"]
-SelectionScope = Literal["proven", "performance_only"]
+SelectionScope = Literal["proven", "tested", "performance_only"]
 
 
 class ParameterCaseInput(BaseModel):

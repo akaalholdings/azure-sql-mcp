@@ -116,6 +116,7 @@ from .index_optimizer import build_test_index_statement
 from .index_optimizer import TRANSIENT_BUILD_ERRORS
 from .index_optimizer import classify_create_index_failure
 from .index_optimizer import columnstore_index_blockers
+from .index_optimizer import columnstore_order_column_names
 from .index_optimizer import expected_index_definition_matches
 from .index_optimizer import hint_candidate_index
 from .index_optimizer import plan_replacement_experiment
@@ -161,14 +162,17 @@ from .performance_store import PerformanceStore
 from .performance_store import PerformanceStoreError
 from .performance_store import ReservationError
 from .performance_workflows import COMPARISON_DECISION_BASIS
+from .performance_workflows import TESTED_PROOF_SCOPE
 from .performance_workflows import PerformanceWorkflowService
 from .performance_workflows import aba_result_status
 from .performance_workflows import aggregate_samples
 from .performance_workflows import classify_benchmark
+from .performance_workflows import classify_branching_benchmark
 from .performance_workflows import compact_benchmark_result
 from .performance_workflows import compact_evidence_result
 from .performance_workflows import compare_plan_summaries_payload
 from .performance_workflows import database_fingerprint
+from .performance_workflows import decisive_mismatch
 from .performance_workflows import database_fingerprint_matches
 from .performance_workflows import extract_profile_metrics
 from .performance_workflows import fingerprint_json
@@ -184,6 +188,9 @@ from .performance_workflows import plan_delta_from_profiles
 from .performance_workflows import preflight_gap_codes
 from .performance_workflows import profile_result_fingerprint
 from .performance_workflows import scope_case_regressions
+from .performance_workflows import tested_match_caveats
+from .performance_workflows import tested_ordered_match
+from .performance_workflows import tested_ordered_reason
 from .performance_workflows import with_order_contract
 from .view_experiments import LEASE_OBJECT_KIND
 from .view_experiments import MAX_VIEW_EXTRA_INDEXES
@@ -198,6 +205,8 @@ from .view_experiments import name_in_use_blocker
 from .view_experiments import plan_view_experiment
 from .view_experiments import read_view_catalog_state
 from .view_experiments import reconcile_view_experiment
+from .view_experiments import INDEXED_VIEW_DESIGNS_FORBIDDEN
+from .view_experiments import require_indexed_view_designs_allowed
 from .view_experiments import require_view_experiment_policy
 from .view_experiments import session_set_option_blockers
 from .view_experiments import validate_test_view_definition
@@ -223,6 +232,7 @@ from .plan_tree import parse_plan
 from .plan_tree import partition_access
 from .plans import PlansService
 from .plans import compact_plan_summary
+from .plans import executed_batch_branch
 from .platform_capabilities import PlatformCapabilitiesService
 from .platform_capabilities import unsupported_platform_reason
 from .prompts import register_prompts
@@ -265,6 +275,7 @@ from .tool_contracts import TuningStrategy
 from .tuning_sessions import FAST_STATEMENT_SECONDS
 from .tuning_sessions import INDEX_ABA_PHASES
 from .tuning_sessions import SLOW_STATEMENT_SECONDS
+from .tuning_sessions import MEASURED_VERDICT_STATES
 from .tuning_sessions import InvalidTransitionError
 from .tuning_sessions import TuningSessionStateMachine
 from .tuning_sessions import adaptive_run_count
@@ -357,6 +368,23 @@ _SLOW_BASELINE_DESCRIPTION = (
     "only a gain of 50% or more counts as improved. A baseline whose first run takes "
     "10 seconds or more is treated this way without being named here."
 )
+_ORDER_COLUMNS_DESCRIPTION = (
+    "nonclustered_columnstore only: ORDER (col, ...) of the index. The build sorts "
+    "by these columns, so a range predicate on the first one eliminates more row "
+    "groups; with data_compression COLUMNSTORE_ARCHIVE it reads the fewest pages. "
+    "Each must be in key_columns, without ASC or DESC; any other is refused before "
+    "any run. Part of the definition, so of the fingerprint and the built-index check."
+)
+_MEASUREMENT_ONLY_DESCRIPTION = (
+    "true adds one more run to a candidate that already has its measured verdict "
+    "(improved, performance_only, neutral or regressed), under the session budget. "
+    "The result has measurement_only, classification (this run alone), "
+    "candidate_classification_before, candidate_classification and verdict_changed: "
+    "a regressed run lowers the verdict of the candidate, and no run raises it. Use "
+    "a new idempotency_key. A cross_case run (benchmark_tuning_candidate) or a "
+    "plan_reuse first_case run (benchmark_index_candidate) on such a candidate is "
+    "taken the same way without this argument."
+)
 
 
 class IndexDefinitionInput(BaseModel):
@@ -393,6 +421,10 @@ class IndexDefinitionInput(BaseModel):
             "any run when the table already has a columnstore index or a column is "
             "(max), computed, sparse or of a type a columnstore index cannot hold."
         ),
+    )
+    order_columns: list[str] | None = Field(
+        default=None,
+        description=_ORDER_COLUMNS_DESCRIPTION,
     )
     partition_aligned: bool = Field(
         default=True,
@@ -3337,6 +3369,10 @@ class AzureSqlMcpApplication:
                 default=None,
                 description=_SLOW_BASELINE_DESCRIPTION,
             ),
+            measurement_only: bool = Field(
+                default=False,
+                description=_MEASUREMENT_ONLY_DESCRIPTION,
+            ),
             detail: Literal["summary", "full"] = Field(
                 default="summary",
                 description=(
@@ -3364,6 +3400,7 @@ class AzureSqlMcpApplication:
                     idempotency_key=idempotency_key,
                     cross_case=cross_case,
                     slow_baseline_cases=slow_baseline_cases,
+                    measurement_only=measurement_only,
                 )
                 return payload if detail == "full" else _compact_benchmark_payload(payload)
 
@@ -3484,6 +3521,13 @@ class AzureSqlMcpApplication:
                     "non_aligned_index_warning. The same field exists in each indexes entry."
                 ),
             ),
+            order_columns: list[str] | None = Field(
+                default=None,
+                description=(
+                    "One-index candidate. " + _ORDER_COLUMNS_DESCRIPTION
+                    + " The same field exists in each indexes entry."
+                ),
+            ),
             indexes: list[IndexDefinitionInput] | None = Field(
                 default=None,
                 description=(
@@ -3574,6 +3618,10 @@ class AzureSqlMcpApplication:
                     "the next call continues without a rebuild."
                 ),
             ),
+            measurement_only: bool = Field(
+                default=False,
+                description=_MEASUREMENT_ONLY_DESCRIPTION,
+            ),
             idempotency_key: str = Field(
                 description="Caller-generated key used to fence retries and cleanup."
             ),
@@ -3622,6 +3670,8 @@ class AzureSqlMcpApplication:
                     partition_aligned=partition_aligned,
                     keep_for_session=keep_for_session,
                     max_call_seconds=max_call_seconds,
+                    measurement_only=measurement_only,
+                    order_columns=order_columns,
                 )
                 return payload if detail == "full" else _compact_benchmark_payload(payload)
 
@@ -3646,7 +3696,10 @@ class AzureSqlMcpApplication:
                 "the schema-bound view, its unique clustered index and up to 3 more "
                 "indexes in one transaction, and drops the view on every path. Needs "
                 "allow_test_indexes, allow_view_apply and allow_offline_test_index in the "
-                "database policy (the first index of a view is built offline). "
+                "database policy (the first index of a view is built offline). Refused "
+                "when the policy sets allow_indexed_view_designs to false: check "
+                "check_capabilities indexed_view_experiment.designs_forbidden before "
+                "you propose an indexed view. "
                 "preview=true returns the names, the findings and the setup statements "
                 "and runs nothing. The result carries the write overhead warning: every "
                 "write to a base table also maintains the view."
@@ -3864,7 +3917,10 @@ class AzureSqlMcpApplication:
             selection_scope: SelectionScope = Field(
                 default="proven",
                 description=(
-                    "Select proven finalists by default. performance_only is an "
+                    "Select proven finalists by default. tested selects an improved "
+                    "finalist with proof_scope snapshot_test: the same rows in the same "
+                    "order on every measured case, with a static proof gap in caveats; "
+                    "it is never deployment_ready. performance_only is an "
                     "explicit opt-in and never asserts semantic equivalence."
                 ),
             ),
@@ -6674,6 +6730,19 @@ class AzureSqlMcpApplication:
                         "key_columns lists the columns of the index."
                     ),
                 ),
+                order_columns: list[str] | None = Field(
+                    default=None,
+                    description=_ORDER_COLUMNS_DESCRIPTION,
+                ),
+                data_compression: (
+                    Literal["NONE", "ROW", "PAGE", "COLUMNSTORE", "COLUMNSTORE_ARCHIVE"] | None
+                ) = Field(
+                    default=None,
+                    description=(
+                        "rowstore: NONE, ROW or PAGE. nonclustered_columnstore: "
+                        "COLUMNSTORE (default) or COLUMNSTORE_ARCHIVE."
+                    ),
+                ),
                 database_name: str | None = Field(
                     default=None,
                     description="Optional database name.",
@@ -6690,6 +6759,8 @@ class AzureSqlMcpApplication:
                         key_columns, include_columns, online, dry_run,
                         table_facts=table_facts,
                         index_kind=index_kind,
+                        order_columns=order_columns,
+                        data_compression=data_compression,
                     )
 
                 return await self._run_tool("create_test_index", database_name, preview)
@@ -9632,6 +9703,7 @@ class AzureSqlMcpApplication:
         indexes: list[dict[str, Any]] | None,
         index_kind: str | None = None,
         partition_aligned: bool | None = None,
+        order_columns: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """The 1 to 4 index definitions of one candidate, from either argument form."""
 
@@ -9647,6 +9719,7 @@ class AzureSqlMcpApplication:
                         filter_definition,
                         data_compression,
                         index_kind,
+                        order_columns,
                     )
                 )
                 or is_unique
@@ -9675,6 +9748,7 @@ class AzureSqlMcpApplication:
                     "data_compression": data_compression,
                     "kind": index_kind,
                     "partition_aligned": partition_aligned,
+                    "order_columns": order_columns,
                 }
             ]
         specs: list[dict[str, Any]] = []
@@ -9695,6 +9769,12 @@ class AzureSqlMcpApplication:
                 )
             if not columnstore and compression not in {"NONE", "ROW", "PAGE"}:
                 raise ValueError("data_compression must be NONE, ROW or PAGE.")
+            order = [str(column) for column in item.get("order_columns") or ()]
+            if order and not columnstore:
+                raise ValueError(
+                    f"order_columns belongs to kind {INDEX_KIND_NONCLUSTERED_COLUMNSTORE}; "
+                    "a rowstore index is ordered by its key columns."
+                )
             specs.append(
                 {
                     "schema": item.get("schema_name") or "dbo",
@@ -9706,6 +9786,7 @@ class AzureSqlMcpApplication:
                     "data_compression": None if compression == engine_default else compression,
                     "kind": kind,
                     "partition_aligned": item.get("partition_aligned") is not False,
+                    "order_columns": order,
                 }
             )
         return specs
@@ -10287,6 +10368,9 @@ class AzureSqlMcpApplication:
         partition_aligned: bool | None = None,
         keep_for_session: bool = False,
         max_call_seconds: float | None = None,
+        measurement_only: bool = False,
+        order_columns: list[str] | None = None,
+        _measurement_run: bool = False,
     ) -> dict[str, Any]:
         """Measure a query before, with and after a leased set of 1 to 4 test indexes.
 
@@ -10330,6 +10414,28 @@ class AzureSqlMcpApplication:
 
         if self.config.profile != McpProfile.SANDBOX:
             raise PermissionError("Index benchmarking requires the sandbox MCP profile.")
+        # The call as given: a further run on a candidate that has its verdict
+        # is made with the same arguments by a carrier candidate.
+        call_arguments = (
+            sql, schema_name, table_name, key_columns, include_columns, filter_definition,
+            is_unique, phase, online, compare_order, lease_minutes, idempotency_key,
+            parameter_cases,
+        )
+        call_options: dict[str, Any] = {
+            "indexes": indexes,
+            "data_compression": data_compression,
+            "index_name_prefix": index_name_prefix,
+            "replaces": replaces,
+            "slow_baseline_cases": slow_baseline_cases,
+            "candidate_sql": candidate_sql,
+            "runs": runs,
+            "plan_reuse": plan_reuse,
+            "index_kind": index_kind,
+            "partition_aligned": partition_aligned,
+            "keep_for_session": keep_for_session,
+            "max_call_seconds": max_call_seconds,
+            "order_columns": order_columns,
+        }
         clock = _CallClock(max_call_seconds)
         policy = self.database_policy.require(database_name)
         if not policy.is_non_production:
@@ -10368,6 +10474,10 @@ class AzureSqlMcpApplication:
             if candidate_sql is not None
             else None
         )
+        # The branches of the statement that runs while the index set exists.
+        candidate_branches = self.validator.validate_read_only_candidate(
+            candidate_sql if candidate_sql is not None else sql
+        ).branches
         compare_order = effective_compare_order(normalized_sql, compare_order)
         candidate = self.tuning_sessions.get_candidate(candidate_id)
         case = self.performance_store.get_performance_case(session.performance_case_id)
@@ -10498,6 +10608,7 @@ class AzureSqlMcpApplication:
             indexes,
             index_kind,
             partition_aligned,
+            order_columns,
         )
         if replaces is not None and len(index_specs) != 1:
             raise ValueError("replaces applies to a candidate of exactly one index.")
@@ -10842,7 +10953,11 @@ class AzureSqlMcpApplication:
                 compression=spec["data_compression"],
                 **table_facts.placement(),
                 index_kind=spec["kind"],
+                order_columns=tuple(spec["order_columns"]),
             )
+            if provisional_index.order_columns:
+                # Refused here, by name, before any run (engine error 1911 otherwise).
+                columnstore_order_column_names(provisional_index)
             held_index = held_indexes.get(provisional_index.definition_fingerprint)
             if spec["kind"] == INDEX_KIND_NONCLUSTERED_COLUMNSTORE and held_index is None:
                 # Refused here, before the request binds and before any run: one
@@ -11008,13 +11123,50 @@ class AzureSqlMcpApplication:
             else "aba_result_stability"
         )
         self._require_tuning_session_time(session_id)
-        self.performance_store.bind_index_benchmark_request(
-            session_id,
-            candidate_id,
-            phase,
-            request_fingerprint,
-            idempotency_key=idempotency_key,
-        )
+        if not _measurement_run:
+            if (
+                candidate.state in MEASURED_VERDICT_STATES
+                and candidate.executions > 0
+                and (measurement_only or plan_reuse == "first_case")
+            ):
+                # Every check of the call has passed; the carrier makes the run.
+                carrier = self.performance_workflows.measurement_candidate(
+                    candidate, idempotency_key
+                )
+                measured = await self._benchmark_index_candidate(
+                    database_name,
+                    session_id,
+                    carrier.candidate_id,
+                    *call_arguments,
+                    **call_options,
+                    _measurement_run=True,
+                )
+                if "evidence_id" not in measured:
+                    # Refused or replayed without a run: nothing to add to the candidate.
+                    return measured
+                return self.performance_workflows.apply_measurement(carrier, measured)
+            if measurement_only:
+                raise ValueError(
+                    "measurement_only adds a run to a candidate that already has a "
+                    f"measured verdict; this candidate is in state {candidate.state}. "
+                    "Benchmark it without measurement_only."
+                )
+        try:
+            self.performance_store.bind_index_benchmark_request(
+                session_id,
+                candidate_id,
+                phase,
+                request_fingerprint,
+                idempotency_key=idempotency_key,
+            )
+        except IdempotencyConflictError as exc:
+            if candidate.state in MEASURED_VERDICT_STATES and candidate.executions > 0:
+                raise IdempotencyConflictError(
+                    f"{exc} This candidate has its verdict ({candidate.state}): for a "
+                    "further run on it pass measurement_only=true or "
+                    "plan_reuse='first_case' with a new idempotency_key."
+                ) from None
+            raise
         existing_reservation = (
             self.performance_store.get_idempotent_execution_reservation(
                 session_id,
@@ -11042,11 +11194,18 @@ class AzureSqlMcpApplication:
                 }
             raise ValueError(
                 f"Index candidate already has a terminal benchmark result ({candidate.state}); "
-                "a candidate is measured once. For a further run (plan_reuse='first_case', "
-                "other parameter cases), register it again with add_tuning_candidate (the "
-                f"same SQL, strategy='{candidate.strategy}') and call benchmark_index_candidate "
-                "on the new candidate_id. With keep_for_session=true on the first call the "
-                "held index is reused, so nothing is built twice."
+                "a candidate gets its verdict once. "
+                + (
+                    "For a further run on it, call benchmark_index_candidate again with "
+                    "measurement_only=true or plan_reuse='first_case' and a new "
+                    "idempotency_key: the run is added to this candidate, can lower its "
+                    "verdict and never raises it. With keep_for_session=true on the first "
+                    "call the held index is reused, so nothing is built twice."
+                    if candidate.state in MEASURED_VERDICT_STATES
+                    else "This result is not a measured verdict, so no run can be added to "
+                    "it: register it again with add_tuning_candidate (the same SQL, "
+                    f"strategy='{candidate.strategy}') and benchmark the new candidate_id."
+                )
             )
         if (
             existing_reservation is None
@@ -11390,6 +11549,8 @@ class AzureSqlMcpApplication:
                 if member.candidate.index_kind != INDEX_KIND_ROWSTORE:
                     # Ownership recovery rebuilds the definition from these fields.
                     member.state["index_kind"] = member.candidate.index_kind
+                if member.candidate.order_columns:
+                    member.state["order_columns"] = list(member.candidate.order_columns)
                 if member.table_facts.data_space is not None:
                     # Not partition-aligned. Part of the definition fingerprint;
                     # ownership recovery rebuilds the request from these fields.
@@ -11888,6 +12049,10 @@ class AzureSqlMcpApplication:
                     for member in members
                 ]
                 measurement["plan_use"].append(_index_set_plan_use(uses) if is_set else uses[0])
+                if candidate_branches:
+                    measurement["executed_branch"] = executed_batch_branch(
+                        candidate_branches, profiled.plan.raw_xml
+                    )
             return profiled
 
         arms_left = len(measurements) * INDEX_ABA_PHASES
@@ -12144,6 +12309,8 @@ class AzureSqlMcpApplication:
                     create_options["data_compression"] = member.data_compression
                 if member.candidate.index_kind != INDEX_KIND_ROWSTORE:
                     create_options["index_kind"] = member.candidate.index_kind
+                if member.candidate.order_columns:
+                    create_options["order_columns"] = list(member.candidate.order_columns)
                 if member.table_facts.has_clustered_columnstore_index or member.table_facts.placement():
                     create_options["table_facts"] = member.table_facts
                 await build_member(member, create_options)
@@ -12446,6 +12613,11 @@ class AzureSqlMcpApplication:
                     else measurements[0]["parameter_case"]
                 ),
             }
+            if measurement.get("executed_branch"):
+                parameter_result["executed_branch"] = measurement["executed_branch"]
+                parameter_result["test_object_in_executed_branch"] = all(
+                    item.get("used") is True for item in measurement["plan_use"]
+                )
             if measurement["runs"]["candidate"] == 1:
                 # Ran once by rule (slow, runs=1 or the time left): the 2x rule applies.
                 parameter_result["candidate_single_sample"] = True
@@ -12556,27 +12728,34 @@ class AzureSqlMcpApplication:
                 "inconclusive",
                 "index candidate failed; reject this candidate and continue",
             )
-        elif not all(
-            comparison.get("plan_used_expected_index") is True
-            for comparison in equivalence
-        ):
-            state, reason = (
-                "inconclusive",
-                "the expected temporary index was not used in every measured bucket",
-            )
         else:
-            objective = str(case.metadata.get("objective") or "elapsed_time")
-            state, reason = classify_benchmark(
-                parameter_results,
-                equivalence,
-                objective=objective,
-                require_equivalence=(
+            classify_options: dict[str, Any] = {
+                "objective": str(case.metadata.get("objective") or "elapsed_time"),
+                "require_equivalence": (
                     compare_in_call
                     if normalized_rewrite is not None
                     else direct_snapshot_supported
                 ),
-                require_snapshot_attestation=compare_in_call,
-            )
+                "require_snapshot_attestation": compare_in_call,
+            }
+            if all(
+                comparison.get("plan_used_expected_index") is True
+                for comparison in equivalence
+            ):
+                state, reason = classify_benchmark(
+                    parameter_results, equivalence, **classify_options
+                )
+            else:
+                # A case on a branch that keeps the original statement cannot use the index.
+                state, reason = classify_branching_benchmark(
+                    parameter_results,
+                    equivalence,
+                    test_object="test index",
+                    **classify_options,
+                ) or (
+                    "inconclusive",
+                    "the expected temporary index was not used in every measured bucket",
+                )
 
         tested_statuses = (
             {str(comparison.get("status")) for comparison in equivalence} if tested_gaps else set()
@@ -12584,11 +12763,7 @@ class AzureSqlMcpApplication:
         if (
             compare_results
             and state in {"promising", "improved", "neutral", "regressed"}
-            and any(
-                comparison.get("status") == "mismatch"
-                and not comparison.get("mismatch_may_be_a_tie")
-                for comparison in equivalence
-            )
+            and any(decisive_mismatch(comparison) for comparison in equivalence)
         ):
             # Different rows on today's data: no proof gap excuses that.
             state, reason = (
@@ -12598,7 +12773,19 @@ class AzureSqlMcpApplication:
         performance_classification = state
         performance_reason = reason
         candidate_state = state
-        if (
+        tested_selection = (
+            phase == "finalist"
+            and performance_only_scope
+            and not hinted
+            and bool(tested_gaps)
+            and state in {"promising", "improved"}
+            and tested_ordered_match(equivalence)
+        )
+        if tested_selection:
+            state = candidate_state = performance_classification = "improved"
+            proof_scope_label = TESTED_PROOF_SCOPE
+            reason = tested_ordered_reason("Candidate", tested_gaps)
+        elif (
             phase == "finalist"
             and performance_only_scope
             and state in {"promising", "improved"}
@@ -12633,6 +12820,11 @@ class AzureSqlMcpApplication:
                     "filter_definition": member.filter_definition,
                     "is_unique": member.is_unique,
                     "index_kind": member.candidate.index_kind,
+                    **(
+                        {"order_columns": list(member.candidate.order_columns)}
+                        if member.candidate.order_columns
+                        else {}
+                    ),
                     **(
                         {"partition_aligned": member.table_facts.data_space is None}
                         if member.table_facts.data_space is not None
@@ -12761,7 +12953,7 @@ class AzureSqlMcpApplication:
                     "equivalence": equivalence,
                     "equivalence_preflight": equivalence_preflight,
                     "proof_scope": proof_scope_label,
-                    "equivalence_deferred": performance_only_scope,
+                    "equivalence_deferred": performance_only_scope and not tested_selection,
                     "lineage": lineage,
                     "phase": phase,
                     "reason": reason,
@@ -12847,8 +13039,13 @@ class AzureSqlMcpApplication:
             ],
             "equivalence": equivalence,
             "equivalence_preflight": equivalence_preflight,
-            "equivalence_deferred": performance_only_scope,
+            "equivalence_deferred": performance_only_scope and not tested_selection,
             "proof_scope": proof_scope_label,
+            **(
+                {"caveats": tested_match_caveats(equivalence, tested_gaps)}
+                if tested_selection
+                else {}
+            ),
             "lineage": lineage,
             "evidence_id": evidence.evidence_id,
             "lease": public_lease,
@@ -12916,9 +13113,15 @@ class AzureSqlMcpApplication:
     def _local_view_experiment_capability(self, policy: DatabasePolicy) -> dict[str, Any]:
         """What check_capabilities says about indexed-view experiments on one database."""
 
-        blockers = view_experiment_policy_blockers(policy)
+        forbidden = policy.configured and not policy.allow_indexed_view_designs
+        blockers = (
+            *((INDEXED_VIEW_DESIGNS_FORBIDDEN,) if forbidden else ()),
+            *view_experiment_policy_blockers(policy),
+        )
         return {
             "allowed": not blockers,
+            # True: do not test and do not propose an indexed view here.
+            "designs_forbidden": forbidden,
             "blockers": list(blockers),
             "test_view_name_prefixes": list(
                 view_name_prefixes(self._allowed_test_index_prefixes(policy))
@@ -12989,6 +13192,7 @@ class AzureSqlMcpApplication:
         self._require_test_index_database(database_name)
         clock = _CallClock(max_call_seconds)
         policy = self.database_policy.require(database_name)
+        require_indexed_view_designs_allowed(policy)
         require_view_experiment_policy(policy)
         if phase not in {"screening", "finalist"}:
             raise ValueError("phase must be screening or finalist.")
@@ -13073,6 +13277,10 @@ class AzureSqlMcpApplication:
         if not fingerprint_text_matches(case.query_fingerprint, original, allow_legacy=allow_legacy):
             raise ValueError("sql is the original statement: it must match the performance case.")
         noexpand = read_mode == READ_MODE_NOEXPAND
+        # The branches of the statement that runs while the view exists.
+        candidate_branches = self.validator.validate_read_only_candidate(
+            candidate_sql if noexpand and candidate_sql else sql
+        ).branches
         if noexpand:
             if not candidate_sql:
                 raise ValueError(
@@ -13592,6 +13800,10 @@ class AzureSqlMcpApplication:
                             for name in view_index_names
                         )
                     )
+                    if candidate_branches:
+                        measurement["executed_branch"] = executed_batch_branch(
+                            candidate_branches, profiled.plan.raw_xml
+                        )
                 run += 1
                 if target is None:
                     first_seconds = _sample_seconds(sample)
@@ -13991,6 +14203,14 @@ class AzureSqlMcpApplication:
                     name if plan_reuse == "per_case" else str(measurements[0]["parameter_case"])
                 ),
             }
+            executed_branch = measurement.get("executed_branch")
+            if executed_branch:
+                result_row["executed_branch"] = executed_branch
+                # A branch that names the view and still missed its index is not by design.
+                result_row["test_object_in_executed_branch"] = used or (
+                    plan.view_name.casefold()
+                    in candidate_branches[executed_branch["ordinal"] - 1].select_sql.casefold()
+                )
             if measurement["runs"]["candidate"] == 1:
                 result_row["candidate_single_sample"] = True
             if len(baseline_samples) == 1:
@@ -14069,31 +14289,33 @@ class AzureSqlMcpApplication:
                 f"the indexed-view experiment failed at step {failure.get('failed_step')}; "
                 "reject this candidate and continue",
             )
-        elif not all(item["plan_used_expected_index"] for item in equivalence):
-            state_name, reason = (
-                "inconclusive",
-                (
-                    "the optimizer did not match the view for every measured case; "
-                    "read it WITH (NOEXPAND) (read_mode noexpand)"
-                    if not noexpand
-                    else "the plan did not read an index of the view in every measured case"
-                ),
-            )
         else:
-            state_name, reason = classify_benchmark(
-                parameter_results,
-                equivalence,
-                objective=objective,
-                require_equivalence=compare_in_call if noexpand else direct_snapshot_supported,
-                require_snapshot_attestation=compare_in_call,
-            )
+            classify_options: dict[str, Any] = {
+                "objective": objective,
+                "require_equivalence": compare_in_call if noexpand else direct_snapshot_supported,
+                "require_snapshot_attestation": compare_in_call,
+            }
+            if all(item["plan_used_expected_index"] for item in equivalence):
+                state_name, reason = classify_benchmark(
+                    parameter_results, equivalence, **classify_options
+                )
+            else:
+                # A case on a branch that keeps the original statement cannot read the view.
+                state_name, reason = classify_branching_benchmark(
+                    parameter_results, equivalence, test_object="test view", **classify_options
+                ) or (
+                    "inconclusive",
+                    (
+                        "the optimizer did not match the view for every measured case; "
+                        "read it WITH (NOEXPAND) (read_mode noexpand)"
+                        if not noexpand
+                        else "the plan did not read an index of the view in every measured case"
+                    ),
+                )
         if (
             compare_results
             and state_name in {"promising", "improved", "neutral", "regressed"}
-            and any(
-                item.get("status") == "mismatch" and not item.get("mismatch_may_be_a_tie")
-                for item in equivalence
-            )
+            and any(decisive_mismatch(item) for item in equivalence)
         ):
             # Different rows on today's data: no phase and no proof gap excuses that.
             state_name, reason = (
@@ -14101,7 +14323,17 @@ class AzureSqlMcpApplication:
                 "at least one parameter case returned different results",
             )
         performance_classification = state_name
-        if phase == "finalist" and performance_only_scope and state_name in {"promising", "improved"}:
+        tested_selection = (
+            phase == "finalist"
+            and performance_only_scope
+            and bool(tested_gaps)
+            and state_name in {"promising", "improved"}
+            and tested_ordered_match(equivalence)
+        )
+        if tested_selection:
+            state_name = performance_classification = "improved"
+            reason = tested_ordered_reason("The view statement", tested_gaps)
+        elif phase == "finalist" and performance_only_scope and state_name in {"promising", "improved"}:
             state_name, performance_classification = "performance_only", "improved"
             reason = (
                 _tested_match_reason(
@@ -14118,7 +14350,9 @@ class AzureSqlMcpApplication:
                 )
             )
         proof_scope = (
-            "performance_only"
+            TESTED_PROOF_SCOPE
+            if tested_selection
+            else "performance_only"
             if performance_only_scope
             else "direct_snapshot"
             if noexpand
@@ -14206,7 +14440,7 @@ class AzureSqlMcpApplication:
                     "equivalence": equivalence,
                     "equivalence_preflight": equivalence_preflight,
                     "proof_scope": proof_scope,
-                    "equivalence_deferred": performance_only_scope,
+                    "equivalence_deferred": performance_only_scope and not tested_selection,
                     "rewrite_requirements": rewrite_requirements(original, measured) if noexpand else [],
                     "hint_profile": hint_profile,
                     "phase": phase,
@@ -14261,8 +14495,13 @@ class AzureSqlMcpApplication:
             "parameter_results": parameter_results,
             "equivalence": equivalence,
             "equivalence_preflight": equivalence_preflight,
-            "equivalence_deferred": performance_only_scope,
+            "equivalence_deferred": performance_only_scope and not tested_selection,
             "proof_scope": proof_scope,
+            **(
+                {"caveats": tested_match_caveats(equivalence, tested_gaps)}
+                if tested_selection
+                else {}
+            ),
             "evidence_id": evidence_envelope.evidence_id,
             "lease": self._public_index_lease(lease),
             "view": view_report,
@@ -15041,6 +15280,7 @@ class AzureSqlMcpApplication:
         data_compression: str | None = None,
         table_facts: _TestIndexTable | None = None,
         index_kind: str = INDEX_KIND_ROWSTORE,
+        order_columns: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         """Preview or, for the leased workflow, build one test index.
 
@@ -15083,6 +15323,7 @@ class AzureSqlMcpApplication:
             compression=data_compression,
             **(table_facts.placement() if table_facts is not None else {}),
             index_kind=index_kind,
+            order_columns=tuple(order_columns or ()),
         )
         if renamed:
             prefix = policy.test_index_name_prefixes[0]
@@ -16511,6 +16752,11 @@ class AzureSqlMcpApplication:
             index_kind = metadata.get("index_kind", INDEX_KIND_ROWSTORE)
             if index_kind not in TEST_INDEX_KINDS:
                 raise ValueError("pending CREATE lease index kind is invalid")
+            order_columns = metadata.get("order_columns") or ()
+            if not isinstance(order_columns, (list, tuple)) or not all(
+                isinstance(column, str) for column in order_columns
+            ):
+                raise ValueError("pending CREATE lease order columns are invalid")
             candidate = IndexCandidate(
                 schema=schema_name,
                 table=table_name,
@@ -16521,6 +16767,7 @@ class AzureSqlMcpApplication:
                 index_name=index_name,
                 compression=data_compression,
                 index_kind=index_kind,
+                order_columns=tuple(order_columns),
                 **_TestIndexTable(
                     schema_name,
                     table_name,

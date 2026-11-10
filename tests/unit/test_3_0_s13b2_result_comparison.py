@@ -136,8 +136,9 @@ async def test_statements_with_a_total_order_are_compared_as_ordered_rows() -> N
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "code",
+    # S14: unordered_row_limit left this list; TOP without ORDER BY is now compared.
     ["row_volatile_function", "statement_stable_clock", "nonrepeatable_table_sample",
-     "unordered_row_limit", "isolation_table_hint", "clock_function_in_view"],
+     "isolation_table_hint", "clock_function_in_view"],
 )
 async def test_a_gap_no_comparison_can_settle_is_still_refused_and_named(code: str) -> None:
     service, _store, _plans, executor = _service(equivalence_analyzer=_gap(code))

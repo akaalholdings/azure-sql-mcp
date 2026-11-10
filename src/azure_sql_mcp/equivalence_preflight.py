@@ -59,17 +59,21 @@ WHERE o.object_id = CASE
 END
 """
 
+# sys.sql_modules keeps a module as it was created, with the comments above
+# CREATE. A header that is not removed leaves the module's own name in its
+# body, which the dependency walk then reads as a cycle.
+_MODULE_PREAMBLE = r"^(?:\s+|--[^\n]*\n?|/\*.*?\*/)*"
 _CREATE_VIEW_HEADER = re.compile(
-    r"^\s*(?:CREATE|ALTER)\s+(?:OR\s+ALTER\s+)?VIEW\b.*?\bAS\s+",
+    _MODULE_PREAMBLE + r"(?:CREATE|ALTER)\s+(?:OR\s+ALTER\s+)?VIEW\b.*?\bAS\s+",
     re.IGNORECASE | re.DOTALL,
 )
 _CREATE_INLINE_FUNCTION_HEADER = re.compile(
-    r"^\s*(?:CREATE|ALTER)\s+(?:OR\s+ALTER\s+)?FUNCTION\b.*?"
+    _MODULE_PREAMBLE + r"(?:CREATE|ALTER)\s+(?:OR\s+ALTER\s+)?FUNCTION\b.*?"
     r"\bRETURNS\s+TABLE\b.*?\bAS\s+RETURN\b",
     re.IGNORECASE | re.DOTALL,
 )
 _CREATE_MULTI_STATEMENT_FUNCTION = re.compile(
-    r"^\s*(?:CREATE|ALTER)\s+(?:OR\s+ALTER\s+)?FUNCTION\b.*?"
+    _MODULE_PREAMBLE + r"(?:CREATE|ALTER)\s+(?:OR\s+ALTER\s+)?FUNCTION\b.*?"
     r"\bRETURNS\s+@\w+\s+TABLE\b.*?\bAS\s+BEGIN\b(?P<body>.*)\bEND\s*;?\s*$",
     re.IGNORECASE | re.DOTALL,
 )

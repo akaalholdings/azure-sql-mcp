@@ -460,6 +460,7 @@ def test_metadata_sql_keeps_its_result_columns() -> None:
         "is_included_column",
         "is_descending_key",
         "partition_ordinal",
+        "column_store_order_ordinal",
         "column_name",
         "data_space_name",
         "data_space_type",

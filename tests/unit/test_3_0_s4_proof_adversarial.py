@@ -138,8 +138,13 @@ async def test_data_dependent_rewrite_is_never_deployment_ready(
     )
     # The rewrite is faster and, where it could be compared, returned the same rows.
     assert finalist["classification"] in {"improved", "performance_only"}
+    # S14: an ordered match under a static gap is improved with a tested match.
     selection_scope = (
-        "proven" if finalist["classification"] == "improved" else "performance_only"
+        "performance_only"
+        if finalist["classification"] == "performance_only"
+        else "tested"
+        if finalist["proof_scope"] == "snapshot_test"
+        else "proven"
     )
     verification = await service.verify_logical_preconditions(
         "appdb", session_id, candidate_id, None
@@ -153,6 +158,8 @@ async def test_data_dependent_rewrite_is_never_deployment_ready(
     )
 
     assert final["deployment_ready"] is False
-    assert final["selected_candidate_proof_scope"] in {"snapshot_matched", "performance_only"}
+    assert final["selected_candidate_proof_scope"] in {
+        "snapshot_matched", "snapshot_test", "performance_only",
+    }
     blocker = next(item for item in final["deployment_blockers"] if item["code"] == code)
     assert named_reason in blocker["reason"]

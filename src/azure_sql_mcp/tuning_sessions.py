@@ -214,6 +214,10 @@ def _parse_iso(value: str) -> datetime:
     return _as_utc(datetime.fromisoformat(value.replace("Z", "+00:00")))
 
 
+# The verdicts a benchmark measured. A later measurement may be added to these.
+MEASURED_VERDICT_STATES = frozenset({"improved", "performance_only", "neutral", "regressed"})
+
+
 def _unique_strings(values: Iterable[str]) -> tuple[str, ...]:
     result: list[str] = []
     seen: set[str] = set()
@@ -726,6 +730,58 @@ class TuningSessionStateMachine:
             evidence_ids=evidence_ids,
             idempotency_key=idempotency_key,
         )
+
+    def record_candidate_measurement(
+        self,
+        session_id: str,
+        candidate_id: str,
+        *,
+        evidence_ids: Iterable[str] = (),
+        regressed: bool = False,
+    ) -> TuningCandidateV1:
+        """Attach a later measurement to a candidate that already has its verdict.
+
+        The verdict can only stay or drop to ``regressed``: a later run never
+        raises it. Run counts and executions are not changed here; the
+        candidate that carried the run holds them. Recording the same
+        measurement again changes nothing.
+        """
+
+        session = self._active_session(
+            session_id,
+            allowed={"created", "screening", "finalist_validation"},
+        )
+        candidate = self._candidate_in_session(session, candidate_id)
+        if candidate.state not in MEASURED_VERDICT_STATES:
+            raise InvalidTransitionError(
+                "A measurement is added only to a candidate with a measured verdict."
+            )
+        next_state = "regressed" if regressed else candidate.state
+        next_evidence = _unique_strings((*candidate.evidence_ids, *evidence_ids))
+        if next_state == candidate.state and next_evidence == tuple(candidate.evidence_ids):
+            return candidate
+        updated_candidate = self._next_candidate(
+            candidate, state=next_state, evidence_ids=next_evidence
+        )
+        _session, updated_candidate = self.store.save_session_and_candidate(
+            self._next_session(session),
+            updated_candidate,
+            expected_session_version=session.version,
+            expected_candidate_version=candidate.version,
+            idempotency_key=None,
+            request_fingerprint=request_fingerprint(
+                "tuning-session.record-candidate-measurement",
+                {
+                    "session_id": session_id,
+                    "candidate_id": candidate_id,
+                    "evidence_ids": next_evidence,
+                    "state": next_state,
+                },
+            ),
+            event_type="candidate.measurement",
+            event_payload={"candidate_id": candidate_id, "state": next_state},
+        )
+        return updated_candidate
 
     def recover_candidate_for_finalist(
         self,

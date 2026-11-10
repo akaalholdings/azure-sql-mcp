@@ -31,7 +31,12 @@ SELECT = "SELECT u.Id FROM dbo.Users AS u WHERE u.DisplayName LIKE '%john%'"
 
 
 @pytest.mark.asyncio
-async def test_a_cross_case_after_the_finalist_is_refused_with_the_call_that_does_it() -> None:
+async def test_a_second_finalist_is_refused_with_the_call_that_adds_a_run() -> None:
+    """S14: a cross case after the finalist is now measured (test_3_0_s14_measure_after_finalist).
+
+    What is still refused is a plain second finalist; the refusal names the argument.
+    """
+
     plans = ScriptedPlans(lambda side, _case, _call: 400 if side == "baseline" else 100)
     service, _store, _plans, _executor = _service(plans=plans, binder=_typed_binder())
     session_id, (candidate_id,) = _session(service, CANDIDATE)
@@ -45,15 +50,13 @@ async def test_a_cross_case_after_the_finalist_is_refused_with_the_call_that_doe
         await service.benchmark_candidate(
             session_id, candidate_id, "appdb", BASELINE, CANDIDATE,
             phase="finalist", parameter_cases=CASES,
-            cross_case={"compile_case": "rare", "run_case": "common"},
         )
 
     message = str(refusal.value)
     assert "terminal benchmark result (improved)" in message
-    assert "add_tuning_candidate" in message and "cross_case" in message
-    assert "new candidate_id" in message
+    assert "measurement_only" in message and "cross_case" in message
 
-    # The route the refusal names works: the same statement, a second candidate.
+    # Registering the same statement again still works: a second candidate.
     again = service.add_candidate(session_id, CANDIDATE, strategy="predicate")
     assert again["candidate_id"] != candidate_id
     crossed = await service.benchmark_candidate(

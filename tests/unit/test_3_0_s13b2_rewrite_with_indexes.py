@@ -430,21 +430,26 @@ async def _union_all_one_call(
 
 
 @pytest.mark.asyncio
-async def test_a_union_all_rewrite_is_tested_in_the_same_call_and_stays_performance_only(
+async def test_a_union_all_rewrite_is_tested_in_the_same_call_and_is_a_tested_match(
     server_config_factory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """O04: the static proof has a gap, so the results are tested, not proven."""
+    """O04: the static proof has a gap, so the results are tested, not proven.
+
+    S14: the same rows in the same order on every case count as improved with
+    a tested match; before, the candidate was performance-only.
+    """
 
     result = await _union_all_one_call(server_config_factory, monkeypatch, None)
 
-    assert result["classification"] == "performance_only", result["reason"]
+    assert result["classification"] == "improved", result["reason"]
     comparison = result["equivalence"][0]
     assert comparison["status"] == "match"
     assert comparison["proof_scope"] == "snapshot_test"
     assert comparison["proven_for_parameter_case"] is False
     assert comparison["comparison_basis"] == "multiset_with_duplicate_counts"
-    assert result["proof_scope"] == "performance_only"
+    assert result["proof_scope"] == "snapshot_test"
     assert "tested" in result["reason"] and "order_contract_changed" in result["reason"]
+    assert any("order_contract_changed" in caveat for caveat in result["caveats"])
 
 
 @pytest.mark.asyncio

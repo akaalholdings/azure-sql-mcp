@@ -19,6 +19,7 @@ Version 1 documents a small, database-scoped allowlist::
           "test_index_maxdop": 0,
           "allow_offline_test_index": false,
           "allow_view_apply": false,
+          "allow_indexed_view_designs": true,
           "allow_plan_apply": false,
           "allow_index_history_write": false,
           "application_intent": "read_write",
@@ -39,6 +40,14 @@ name. ``test_index_maxdop`` caps the build (0 leaves the database default).
 ``allow_offline_test_index`` permits an offline build, which blocks every
 writer of the table while it runs. A table with a columnstore index can only
 be built offline, so a test index on it needs this field.
+
+``allow_indexed_view_designs`` (default true) says whether an indexed view may
+be proposed or tested for this database at all. Set it to false where indexed
+views cannot be used: the queries are too complex for one, or the loads use
+partition SWITCH, which fails while an indexed view exists on the table. The
+indexed-view benchmark then refuses before any statement, check_capabilities
+reports ``designs_forbidden``, and no advice may propose one. It is a design
+restriction, not a permission: true grants nothing by itself.
 
 ``application_intent`` is optional. ``read_only`` connects with
 ApplicationIntent=ReadOnly, so a read scale-out replica is the diagnosis
@@ -74,6 +83,7 @@ _DATABASE_FIELDS = frozenset(
         "test_index_maxdop",
         "allow_offline_test_index",
         "allow_view_apply",
+        "allow_indexed_view_designs",
         "allow_plan_apply",
         "allow_index_history_write",
         "application_intent",
@@ -227,6 +237,8 @@ class DatabasePolicy:
     test_index_name_prefixes: tuple[str, ...] = (WORKFLOW_TEST_INDEX_PREFIX,)
     test_index_maxdop: int = 0
     allow_offline_test_index: bool = False
+    # False: no indexed view may be proposed or tested for this database.
+    allow_indexed_view_designs: bool = True
     # Recorders this database's history can be read from: source name -> its
     # validated binding (history_sources.py). Empty when none is mapped.
     history_sources: Mapping[str, Any] = field(
@@ -258,6 +270,7 @@ class DatabasePolicy:
             "allow_plan_apply",
             "allow_index_history_write",
             "allow_offline_test_index",
+            "allow_indexed_view_designs",
         ):
             if not isinstance(getattr(self, field_name), bool):
                 raise DatabasePolicyValidationError(f"{field_name} must be a boolean.")
@@ -350,6 +363,7 @@ class DatabasePolicy:
             test_index_name_prefixes=tuple(prefixes),
             test_index_maxdop=value.get("test_index_maxdop", 0),
             allow_offline_test_index=value.get("allow_offline_test_index", False),
+            allow_indexed_view_designs=value.get("allow_indexed_view_designs", True),
             history_sources=_parse_history_sources(
                 database_name, value.get("history_sources")
             ),

@@ -217,6 +217,9 @@ class IndexCandidate:
     # One of the INDEX_KIND_ values. For a nonclustered columnstore index,
     # ``key_columns`` holds the columns of the index.
     index_kind: str = INDEX_KIND_ROWSTORE
+    # ORDER (...) of a nonclustered columnstore index: columns of the index,
+    # in the order the build sorts by. Empty: an index with no order.
+    order_columns: tuple[str, ...] = ()
 
     @property
     def definition_fingerprint(self) -> str:
@@ -241,6 +244,7 @@ class IndexCandidate:
             partition_scheme_name=self.partition_scheme_name,
             partition_function_name=self.partition_function_name,
             partition_compression=partition_compression,
+            columnstore_order_columns=self.order_columns,
         )
 
     @property
@@ -267,6 +271,7 @@ class IndexCandidate:
             "partition_scheme_name": self.partition_scheme_name,
             "partition_function_name": self.partition_function_name,
             "index_kind": self.index_kind,
+            **({"order_columns": list(self.order_columns)} if self.order_columns else {}),
             "definition_fingerprint": self.definition_fingerprint,
         }
 
@@ -1525,6 +1530,11 @@ def build_index_candidate_statement(
             low_priority_wait_minutes=low_priority_wait_minutes,
             maxdop=maxdop,
         )
+    if candidate.order_columns:
+        raise ValueError(
+            f"order_columns belongs to index kind {INDEX_KIND_NONCLUSTERED_COLUMNSTORE}; "
+            "a rowstore index is ordered by its key columns"
+        )
 
     if not candidate.key_columns:
         raise ValueError("an index candidate requires at least one key column")
@@ -1611,6 +1621,32 @@ def _columnstore_column_names(candidate: IndexCandidate) -> tuple[str, ...]:
     return tuple(names)
 
 
+def columnstore_order_column_names(candidate: IndexCandidate) -> tuple[str, ...]:
+    """The validated ORDER (...) column names of a columnstore candidate.
+
+    Each must be a column of the index (the engine refuses any other with
+    error 1911), named once, with no ASC or DESC.
+    """
+
+    index_columns = {name.casefold() for name in _columnstore_column_names(candidate)}
+    names: list[str] = []
+    for column in candidate.order_columns:
+        if re.search(r"\s(?:ASC|DESC)\s*$", str(column), re.IGNORECASE):
+            raise ValueError(
+                f"a columnstore ORDER column takes no ASC or DESC: {str(column).strip()}"
+            )
+        name = _parse_identifier_input(column)
+        if name.casefold() not in index_columns:
+            raise ValueError(
+                f"order column {name} is not in the index column list; ORDER takes "
+                "columns of the columnstore index only (engine error 1911)"
+            )
+        if name.casefold() in {item.casefold() for item in names}:
+            raise ValueError(f"column {name} is named twice in order_columns")
+        names.append(name)
+    return tuple(names)
+
+
 def _columnstore_index_statement(
     candidate: IndexCandidate,
     *,
@@ -1618,11 +1654,12 @@ def _columnstore_index_statement(
     low_priority_wait_minutes: int | None,
     maxdop: int | None,
 ) -> str:
-    """CREATE NONCLUSTERED COLUMNSTORE INDEX with DATA_COMPRESSION (COLUMNSTORE or
-    COLUMNSTORE_ARCHIVE), ONLINE and MAXDOP.
+    """CREATE NONCLUSTERED COLUMNSTORE INDEX with an optional ORDER (...),
+    DATA_COMPRESSION (COLUMNSTORE or COLUMNSTORE_ARCHIVE), ONLINE and MAXDOP.
 
     Azure SQL Database accepts the WAIT_AT_LOW_PRIORITY form of ONLINE for
-    this statement (observed), though its documented syntax does not list it.
+    this statement, also with ORDER (observed), though its documented syntax
+    does not list it.
     """
 
     if candidate.include_columns:
@@ -1646,11 +1683,18 @@ def _columnstore_index_statement(
     compression = _validate_columnstore_compression(candidate.compression)
     index_name = candidate.index_name or _derived_index_name(candidate)
     columns = ", ".join(_quote_validated_identifier(name) for name in names)
+    order_names = columnstore_order_column_names(candidate)
+    order_clause = (
+        " ORDER (" + ", ".join(_quote_validated_identifier(name) for name in order_names) + ")"
+        if order_names
+        else ""
+    )
     with_clause = _with_clause(compression, online, low_priority_wait_minutes, maxdop)
     return (
         f"CREATE NONCLUSTERED COLUMNSTORE INDEX {_quote_identifier(index_name)} "
         f"ON {_quote_identifier(candidate.schema)}.{_quote_identifier(candidate.table)} "
-        f"({columns}){_filter_clause(candidate)}{with_clause}{_on_clause(candidate)};"
+        f"({columns}){order_clause}{_filter_clause(candidate)}{with_clause}"
+        f"{_on_clause(candidate)};"
     )
 
 
@@ -2260,6 +2304,14 @@ def expected_index_definition_matches(
     expected_keys = tuple(parse_candidate_key(column) for column in expected.key_columns)
     if columnstore:
         if not _columnstore_columns_match(actual, expected_keys):
+            return False
+        # The built order must be the requested one, column for column.
+        if tuple(
+            _canonical_catalog_identifier(column) for column in actual.columnstore_order_columns
+        ) != tuple(
+            _canonical_catalog_identifier(parse_candidate_key(column).name)
+            for column in expected.order_columns
+        ):
             return False
     elif len(actual.key_columns) != len(expected_keys) or any(
         _canonical_catalog_identifier(actual_key.name)

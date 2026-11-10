@@ -27,6 +27,7 @@ from .catalog_constraints import verify_precondition
 from .connection import AzureSqlExecutor
 from .connection import QueryResult
 from .connection import StatementDispatchPrevented
+from .connection import canonical_row
 from .database_policy import DatabasePolicySet
 from .equivalence_contract import analyze_equivalence_preflight
 from .equivalence_contract import effective_compare_order
@@ -59,6 +60,7 @@ from .safe_sql import SafeSqlValidator
 from .tuning_sessions import DEFAULT_EXECUTIONS
 from .tuning_sessions import DEFAULT_MAX_CANDIDATES
 from .tuning_sessions import DEFAULT_TIME_LIMIT_SECONDS
+from .tuning_sessions import MEASURED_VERDICT_STATES
 from .tuning_sessions import SLOW_STATEMENT_SECONDS
 from .tuning_sessions import WARMUP_RUNS_PER_SIDE
 from .tuning_sessions import InvalidTransitionError
@@ -112,14 +114,18 @@ MAX_COMPARISON_CASES = 4
 # Preflight gaps under which compare_query_results still runs. In one snapshot
 # the rows of each statement are fixed, so a duplicate-aware comparison settles
 # today's data for the tested values. It is a test, never a proof: the gap
-# stays in the result. Every other gap (a clock, NEWID, TABLESAMPLE, a row
-# limit with no ORDER BY, an isolation hint) makes the result itself unstable.
+# stays in the result. Every other gap (a clock, NEWID, TABLESAMPLE, an
+# isolation hint) makes the result itself unstable.
 COMPARABLE_PREFLIGHT_GAPS = frozenset(
     {
         "result_order_ties",
         "row_limit_total_order_unproven",
         "window_order_total_order_unproven",
         "order_contract_changed",
+        # TOP with no ORDER BY: inside one snapshot each statement still
+        # returns fixed rows, so they are compared as multisets. Which rows
+        # the engine picks is not promised: a match is a test, never a proof.
+        "unordered_row_limit",
     }
 )
 # Rows tied on the ORDER BY key at a row limit may differ between two correct runs.
@@ -480,16 +486,8 @@ def scope_case_regressions(data: Any, query_store_query_id: int | None) -> Any:
     }
 
 
-def _canonical_row(row: Sequence[Any]) -> str:
-    typed = [
-        {
-            "ordinal": ordinal,
-            "python_type": f"{type(value).__module__}.{type(value).__qualname__}",
-            "value": value,
-        }
-        for ordinal, value in enumerate(row)
-    ]
-    return json.dumps(typed, separators=(",", ":"), default=str)
+# One definition for the row comparison and for the driver's row digest.
+_canonical_row = canonical_row
 
 
 def _first_tabular_result(results: Sequence[QueryResult]) -> QueryResult | None:
@@ -657,6 +655,31 @@ def compare_result_sets(
     else:
         rows_match = multiset_match
     truncated = baseline_truncated or candidate_truncated
+    # Rows above the limit were not kept: the driver boundary digested every
+    # row of a result that went past it. The digests then decide.
+    baseline_digest = getattr(baseline, "row_digest", None)
+    candidate_digest = getattr(candidate, "row_digest", None)
+    compared_by_digest = truncated and (
+        baseline_digest is not None or candidate_digest is not None
+    )
+    baseline_total, candidate_total = len(baseline_rows), len(candidate_rows)
+    if compared_by_digest:
+        if baseline_digest is not None:
+            baseline_total = int(baseline_digest["row_count"])
+        if candidate_digest is not None:
+            candidate_total = int(candidate_digest["row_count"])
+        # One side within the limit and one above it: the row counts differ.
+        multiset_match = ordered_match = False
+        if baseline_digest is not None and candidate_digest is not None:
+            multiset_match = (
+                baseline_total == candidate_total
+                and baseline_digest["multiset_digest"] == candidate_digest["multiset_digest"]
+            )
+            ordered_match = (
+                baseline_digest["ordered_digest"] == candidate_digest["ordered_digest"]
+            )
+        rows_match = ordered_match if compare_order else multiset_match
+        truncated = False
     if (
         not rows_match
         and multiset_match
@@ -711,16 +734,39 @@ def compare_result_sets(
         "types_match": types_match,
         "type_differences": type_differences,
         "rows_match": rows_match,
-        "baseline_row_count": len(baseline_rows),
-        "candidate_row_count": len(candidate_rows),
-        # Rows beyond the first copy of each distinct row.
-        "baseline_duplicate_rows": len(baseline_rows) - len(baseline_counts),
-        "candidate_duplicate_rows": len(candidate_rows) - len(candidate_counts),
+        "baseline_row_count": baseline_total,
+        "candidate_row_count": candidate_total,
+        # Rows beyond the first copy of each distinct row. Not known for a
+        # result compared by digest: its rows were not kept.
+        "baseline_duplicate_rows": (
+            None if compared_by_digest else len(baseline_rows) - len(baseline_counts)
+        ),
+        "candidate_duplicate_rows": (
+            None if compared_by_digest else len(candidate_rows) - len(candidate_counts)
+        ),
         "truncated": truncated,
     }
+    if compared_by_digest:
+        result["compared_by_digest"] = True
+        result["row_limit"] = row_limit
+        result["digest_note"] = (
+            f"A result held more rows than the comparison row limit of {row_limit}. "
+            f"Every row ({baseline_total} baseline, {candidate_total} candidate) was "
+            "compared by a running digest of the ordered rows and by a digest that "
+            "ignores order; only the first rows up to the limit were kept."
+        )
     if nullability_only:
         result["metadata_difference"] = "nullability_only"
-    if status == "mismatch" and columns_match and row_widths_match and not rows_match:
+    if compared_by_digest and status == "mismatch" and columns_match and row_widths_match:
+        result["first_differences"] = _digest_first_differences(
+            baseline_canonical,
+            candidate_canonical,
+            baseline_digest,
+            candidate_digest,
+            (baseline_total, candidate_total),
+            compare_order,
+        )
+    elif status == "mismatch" and columns_match and row_widths_match and not rows_match:
         # Where the results part, without any row value: counts, the first
         # row that differs and the columns that differ in it.
         differences: dict[str, Any] = {
@@ -749,6 +795,57 @@ def compare_result_sets(
                     ]
         result["first_differences"] = differences
     return result
+
+
+def _digest_first_differences(
+    baseline_kept: Sequence[str],
+    candidate_kept: Sequence[str],
+    baseline_digest: Mapping[str, Any] | None,
+    candidate_digest: Mapping[str, Any] | None,
+    totals: tuple[int, int],
+    compare_order: bool,
+) -> dict[str, Any]:
+    """Where two results compared by digest part: positions only, never a value.
+
+    The rows that were kept give the exact first row. Past them the block
+    digests of the two ordered streams are walked together, which gives the
+    block of ``block_rows`` rows that holds the first difference.
+    """
+
+    differences: dict[str, Any] = {
+        "baseline_row_count": totals[0],
+        "candidate_row_count": totals[1],
+    }
+    if not compare_order:
+        return differences
+    shared = min(len(baseline_kept), len(candidate_kept))
+    kept = next(
+        (position for position in range(shared) if baseline_kept[position] != candidate_kept[position]),
+        None,
+    )
+    if kept is not None:
+        differences["first_differing_row"] = kept + 1
+    elif baseline_digest is None or candidate_digest is None:
+        differences["first_differing_row"] = min(totals) + 1
+    else:
+        block_rows = int(baseline_digest["block_rows"])
+        blocks = zip(baseline_digest["block_digests"], candidate_digest["block_digests"])
+        block = next((index for index, (before, after) in enumerate(blocks) if before != after), None)
+        if block is not None and (block + 1) * block_rows <= min(totals):
+            differences["first_differing_row_range"] = {
+                "from": block * block_rows + 1,
+                "to": (block + 1) * block_rows,
+            }
+        elif block is not None:
+            # The last, partial block of the shorter stream: a changed row in
+            # it, or the first row that only the longer stream has.
+            differences["first_differing_row_range"] = {
+                "from": block * block_rows + 1,
+                "to": min(totals) + 1,
+            }
+        elif totals[0] != totals[1]:
+            differences["first_differing_row"] = min(totals) + 1
+    return differences
 
 
 def compare_result_collections(
@@ -910,10 +1007,11 @@ def preflight_gap_codes(
     """The risk codes of a two-sided preflight, and those no comparison can settle.
 
     Only a result that is unstable by construction blocks: a clock or a
-    row-volatile function, TABLESAMPLE, a row limit with no ORDER BY, an
-    isolation hint. Inside one snapshot every other statement returns fixed
-    rows, so it is compared: possible ties, a changed ORDER BY, and a removed
-    ORDER BY too (as a multiset; ``order_contract_removed`` adds the caveat).
+    row-volatile function, TABLESAMPLE, an isolation hint. Inside one snapshot
+    every other statement returns fixed rows, so it is compared: possible
+    ties, a changed ORDER BY, a removed ORDER BY (as a multiset;
+    ``order_contract_removed`` adds the caveat) and a row limit with no ORDER
+    BY (as a multiset; a match is a test, the row choice is not promised).
     """
 
     sides = [side for side in preflight.values() if isinstance(side, Mapping)]
@@ -946,10 +1044,30 @@ _ORDER_KEYS_CAVEAT = (
     "the ORDER BY keys of the two statements could not be shown to be the same, so "
     "the same order on this data is a test, not a proof"
 )
+_UNORDERED_LIMIT_CAVEAT = (
+    "TOP without ORDER BY: the rows a statement returns are not deterministic. The "
+    "two statements returned the same rows in this run; another run or plan may "
+    "return other rows, so this is a tested match at most"
+)
 _ORDER_REMOVED_CAVEAT = (
     "the candidate has no outer ORDER BY: its rows matched as a multiset, and the "
     "order it returns is not promised even where it matched here"
 )
+
+
+def decisive_mismatch(comparison: Mapping[str, Any]) -> bool:
+    """True for a mismatch that shows the two statements return other results.
+
+    Rows tied at a row limit, and rows picked under TOP without ORDER BY, may
+    differ between two correct statements: such a mismatch is reported and
+    does not fail the candidate.
+    """
+
+    return (
+        comparison.get("status") == "mismatch"
+        and not comparison.get("mismatch_may_be_a_tie")
+        and not comparison.get("mismatch_may_be_row_choice")
+    )
 
 
 def label_comparison(
@@ -996,11 +1114,27 @@ def label_comparison(
     if result.get("status") == "match":
         result["tested_match"] = True
         caveats = []
-        if set(gaps) - {"order_contract_changed"}:
+        if set(gaps) - {"order_contract_changed", "unordered_row_limit"}:
             caveats.append(_TIE_CAVEAT)
+        if "unordered_row_limit" in gaps:
+            caveats.append(_UNORDERED_LIMIT_CAVEAT)
         if "order_contract_changed" in gaps:
             caveats.append(_ORDER_REMOVED_CAVEAT if order_removed else _ORDER_KEYS_CAVEAT)
         result["caveats"] = caveats
+    if (
+        result.get("status") == "mismatch"
+        and "unordered_row_limit" in gaps
+        and result.get("baseline_row_count") == result.get("candidate_row_count")
+    ):
+        # The same number of rows, other rows: either statement may pick any
+        # qualifying rows, so this does not show a different result.
+        result["mismatch_may_be_row_choice"] = True
+        result["reason"] = (
+            f"{result.get('reason')}. Under TOP without ORDER BY each statement may "
+            "return any qualifying rows, so other rows are not proof of another "
+            "result: add an ORDER BY on a unique key to both statements to make the "
+            "comparison decisive"
+        )
     if result.get("status") == "mismatch" and set(gaps) & _TIE_AT_LIMIT_GAPS:
         result["mismatch_may_be_a_tie"] = True
         result["reason"] = (
@@ -1008,6 +1142,63 @@ def label_comparison(
             "may be returned by either statement: add a unique tiebreaker to both "
             "to make the comparison decisive"
         )
+
+
+TESTED_PROOF_SCOPE = "snapshot_test"
+
+
+def tested_ordered_match(equivalence: Sequence[Mapping[str, Any]]) -> bool:
+    """True when every measured case returned the same rows in the same order.
+
+    Each case must have been compared in one verified snapshot, and at least
+    one case must have returned rows. An untested or mismatched case, or rows
+    that matched only as a multiset, is not a tested ordered match. Neither
+    is a candidate with no outer ORDER BY where the original has one: the
+    order it returned is not promised by its text, so the match is chance.
+    """
+
+    return (
+        bool(equivalence)
+        and all(
+            item.get("status") == "match"
+            and item.get("ordered_rows_match") is True
+            and item.get("same_snapshot") is True
+            and item.get("snapshot_isolation_verified") is True
+            and _ORDER_REMOVED_CAVEAT not in (item.get("caveats") or ())
+            for item in equivalence
+        )
+        and not all(item.get("vacuous") is True for item in equivalence)
+    )
+
+
+def tested_match_caveats(
+    equivalence: Sequence[Mapping[str, Any]], gaps: Sequence[str]
+) -> list[str]:
+    """What a tested ordered match leaves open: the static gap, then each case caveat."""
+
+    caveats = [
+        "tested match, not a proof: the static check could not settle "
+        + ", ".join(gaps)
+        + "; the match holds for the tested parameter cases on today's data"
+    ]
+    for item in equivalence:
+        for caveat in item.get("caveats") or ():
+            if caveat not in caveats:
+                caveats.append(str(caveat))
+    return caveats
+
+
+def tested_ordered_reason(subject: str, gaps: Sequence[str]) -> str:
+    """Why a candidate under a static proof gap is improved with a tested match."""
+
+    return (
+        f"{subject} improved the measured objective, and returned the same rows in "
+        "the same order as the original in one snapshot for every measured parameter "
+        "case. That is a tested match on today's data: the static proof still has a "
+        "gap (" + ", ".join(gaps) + "), listed in caveats. Select it with "
+        "selection_scope 'tested'; it is not deployment-ready until a reviewer "
+        "settles the gap."
+    )
 
 
 def _time_spent(call_started: float, phase_seconds: Mapping[str, float]) -> dict[str, float]:
@@ -1745,6 +1936,77 @@ def classify_benchmark(
     )
 
 
+UNCHANGED_BY_DESIGN = "unchanged_by_design"
+_WITHIN_NOISE_VERDICTS = frozenset({"no_material_difference", "unchanged_at_zero"})
+
+
+def classify_branching_benchmark(
+    parameter_results: Sequence[dict[str, Any]],
+    equivalence: Sequence[Mapping[str, Any]],
+    *,
+    test_object: str,
+    objective: str = "elapsed_time",
+    require_equivalence: bool = True,
+    require_snapshot_attestation: bool = False,
+) -> tuple[str, str] | None:
+    """Classify a branching candidate whose plan missed the test object in some cases.
+
+    A case with ``test_object_in_executed_branch`` false ran a branch of the
+    batch that does not use the test object: the original statement, kept for
+    the parameter values the new object does not serve. Such a case is
+    ``unchanged_by_design`` while its cost stays within noise of the baseline;
+    the cases that used the object then decide the candidate. A regression
+    in any case, on any branch, is still a regression, and the result
+    comparison covers every case.
+
+    Returns None when the rule does not apply: no case ran such a branch, no
+    case used the test object, or a case off the object measured a gain it
+    cannot explain. The caller then keeps its own verdict.
+    """
+
+    by_design = [
+        result
+        for result in parameter_results
+        if result.get("test_object_in_executed_branch") is False
+    ]
+    decided_by = [
+        result
+        for result in parameter_results
+        if result.get("test_object_in_executed_branch") is not False
+    ]
+    if not by_design or not decided_by:
+        return None
+    options: dict[str, Any] = {
+        "objective": objective,
+        "require_equivalence": require_equivalence,
+        "require_snapshot_attestation": require_snapshot_attestation,
+    }
+    state, reason = classify_benchmark(parameter_results, equivalence, **options)
+    if state not in {"promising", "improved", "neutral"}:
+        return state, reason
+    for result in by_design:
+        margin = result.get("comparison_margin")
+        if not isinstance(margin, Mapping) or margin.get("bucket_verdict") not in _WITHIN_NOISE_VERDICTS:
+            return None
+    state, reason = classify_benchmark(decided_by, equivalence, **options)
+    names: list[str] = []
+    for result in by_design:
+        branch = result.get("executed_branch")
+        ordinal = branch.get("ordinal") if isinstance(branch, Mapping) else None
+        result["case_verdict"] = UNCHANGED_BY_DESIGN
+        result["case_verdict_note"] = (
+            f"this case ran branch {ordinal} of the batch, which does not use the "
+            f"{test_object}, and its cost stayed within noise of the baseline. The "
+            "other cases decide the candidate."
+        )
+        names.append(f"{result.get('parameter_case')} (branch {ordinal})")
+    return (
+        state,
+        f"{reason}; unchanged by design, on a branch that does not use the "
+        f"{test_object}: parameter case {', '.join(names)}",
+    )
+
+
 DEPLOYABLE_PROOF_SCOPES = frozenset({"constraint_backed", "unchanged_sql"})
 
 
@@ -1975,7 +2237,8 @@ def _evidence_summary(evidence: EvidenceEnvelopeV1) -> dict[str, Any]:
                 "parameter_case": result.get("parameter_case"),
                 "baseline": (result.get("baseline") or {}).get(name),
                 "candidate": (result.get("candidate") or {}).get(name),
-                "verdict": margin.get("bucket_verdict") if isinstance(margin, Mapping) else None,
+                "verdict": result.get("case_verdict")
+                or (margin.get("bucket_verdict") if isinstance(margin, Mapping) else None),
             }
         )
     summary = {
@@ -2088,7 +2351,7 @@ def compact_benchmark_result(result: Mapping[str, Any]) -> dict[str, Any]:
         before, after = margin.get("baseline_median"), margin.get("candidate_median")
         case: dict[str, Any] = {
             "parameter_case": item.get("parameter_case"),
-            "verdict": margin.get("bucket_verdict"),
+            "verdict": item.get("case_verdict") or margin.get("bucket_verdict"),
             "speedup": (
                 round(float(before) / float(after), 2)
                 if isinstance(before, (int, float)) and isinstance(after, (int, float)) and after > 0
@@ -2111,6 +2374,8 @@ def compact_benchmark_result(result: Mapping[str, Any]) -> dict[str, Any]:
             }
         if item.get("baseline_note"):
             case["baseline_note"] = item["baseline_note"]
+        if item.get("executed_branch"):
+            case["executed_branch"] = item["executed_branch"]
         cases.append(case)
     preflight = result.get("equivalence_preflight")
     risk_codes = list(
@@ -2149,6 +2414,11 @@ def compact_benchmark_result(result: Mapping[str, Any]) -> dict[str, Any]:
     }
     if len(bases) == 1:
         decision["equivalence"]["comparison_basis"] = next(iter(bases))
+    if result.get("measurement_only"):
+        # A run added to a candidate that already had its verdict.
+        decision["measurement_only"] = True
+        for key in ("candidate_classification_before", "candidate_classification", "verdict_changed"):
+            decision[key] = result.get(key)
     metadata_differences = [
         {"parameter_case": comparison.get("parameter_case"), **difference}
         for comparison in result.get("equivalence") or ()
@@ -4047,8 +4317,16 @@ class PerformanceWorkflowService:
         idempotency_key: str | None = None,
         cross_case: Mapping[str, Any] | None = None,
         slow_baseline_cases: Mapping[str, float] | None = None,
+        measurement_only: bool = False,
+        _measurement_run: bool = False,
     ) -> dict[str, Any]:
         """Measure one rewrite against the baseline for each parameter case.
+
+        A candidate gets its verdict once. ``measurement_only``, or a
+        ``cross_case``, on a candidate that already has a measured verdict
+        adds one more run to it (``measurement_candidate``,
+        ``apply_measurement``): the verdict can drop to regressed and is
+        never raised.
 
         Per side and case, one execution is run first and left out of the
         samples: it compiles the plan and warms the pages. Each case runs on
@@ -4107,6 +4385,34 @@ class PerformanceWorkflowService:
             allow_legacy=self.allow_legacy_state,
         ):
             raise ValueError("Candidate SQL fingerprint does not match the stored candidate.")
+        if not _measurement_run:
+            if candidate.state in MEASURED_VERDICT_STATES and (
+                measurement_only or cross_case is not None
+            ):
+                carrier = self.measurement_candidate(candidate, idempotency_key)
+                measured = await self.benchmark_candidate(
+                    session_id,
+                    carrier.candidate_id,
+                    database_name,
+                    baseline_sql,
+                    candidate_sql,
+                    phase=phase,
+                    parameter_cases=parameter_cases,
+                    compare_order=compare_order,
+                    runs_override=runs_override,
+                    prove_equivalence=prove_equivalence,
+                    idempotency_key=idempotency_key,
+                    cross_case=cross_case,
+                    slow_baseline_cases=slow_baseline_cases,
+                    _measurement_run=True,
+                )
+                return self.apply_measurement(carrier, measured)
+            if measurement_only:
+                raise ValueError(
+                    "measurement_only adds a run to a candidate that already has a "
+                    f"measured verdict; this candidate is in state {candidate.state}. "
+                    "Benchmark it without measurement_only."
+                )
         if not database_fingerprint_matches(
             case.database_fingerprint or "",
             database_name,
@@ -4353,12 +4659,17 @@ class PerformanceWorkflowService:
         if candidate.is_terminal:
             raise ValueError(
                 f"Candidate already has a terminal benchmark result ({candidate.state}); a "
-                "candidate is measured once. A cross_case run, or any other further run, is "
-                "part of one benchmark call: register the same statement again with "
-                f"add_tuning_candidate(session_id, candidate_sql=<the same SQL>, strategy="
-                f"'{candidate.strategy}') and call benchmark_tuning_candidate on the new "
-                "candidate_id with the phase and cross_case={'compile_case': <case>, "
-                "'run_case': <case>} you need. Both results stay in the session."
+                "candidate gets its verdict once. "
+                + (
+                    "For a further run on it, call benchmark_tuning_candidate again with "
+                    "measurement_only=true or with cross_case={'compile_case': <case>, "
+                    "'run_case': <case>}: the run is added to this candidate, can lower "
+                    "its verdict and never raises it."
+                    if candidate.state in MEASURED_VERDICT_STATES
+                    else "This result is not a measured verdict, so no run can be added to "
+                    "it: register the statement again with add_tuning_candidate (strategy="
+                    f"'{candidate.strategy}') and benchmark the new candidate_id."
+                )
             )
         if phase == "screening" and candidate.screen_runs:
             raise ValueError("Candidate screening has already been measured.")
@@ -4731,11 +5042,7 @@ class PerformanceWorkflowService:
             if (
                 test_equivalence
                 and state in {"improved", "promising", "neutral", "regressed"}
-                and any(
-                    comparison.get("status") == "mismatch"
-                    and not comparison.get("mismatch_may_be_a_tie")
-                    for comparison in equivalence
-                )
+                and any(decisive_mismatch(comparison) for comparison in equivalence)
             ):
                 # Different rows on today's data: no proof gap excuses that.
                 state, reason = (
@@ -4814,7 +5121,18 @@ class PerformanceWorkflowService:
         performance_classification = state
         performance_reason = reason
         candidate_state = state
-        if (
+        proof_scope = "direct_snapshot" if direct_snapshot_supported else "performance_only"
+        tested_selection = (
+            phase == "finalist"
+            and test_equivalence
+            and state == "promising"
+            and tested_ordered_match(equivalence)
+        )
+        if tested_selection:
+            state = candidate_state = performance_classification = "improved"
+            proof_scope = TESTED_PROOF_SCOPE
+            reason = tested_ordered_reason("Candidate", gap_codes)
+        elif (
             phase == "finalist"
             and not compare_equivalence
             and state == "promising"
@@ -4876,13 +5194,9 @@ class PerformanceWorkflowService:
                     for parameter_case in cases
                 ],
                 "equivalence": equivalence,
-                "equivalence_deferred": not compare_equivalence,
+                "equivalence_deferred": not compare_equivalence and not tested_selection,
                 "equivalence_preflight": equivalence_preflight,
-                "proof_scope": (
-                    "performance_only"
-                    if not direct_snapshot_supported
-                    else "direct_snapshot"
-                ),
+                "proof_scope": proof_scope,
                 "rewrite_requirements": requirements,
                 "hint_profile": hint_profile,
                 "phase": phase,
@@ -4961,12 +5275,13 @@ class PerformanceWorkflowService:
                 for parameter_case in cases
             ],
             "equivalence": equivalence,
-            "equivalence_deferred": not compare_equivalence,
+            "equivalence_deferred": not compare_equivalence and not tested_selection,
             "equivalence_preflight": equivalence_preflight,
-            "proof_scope": (
-                "performance_only"
-                if not direct_snapshot_supported
-                else "direct_snapshot"
+            "proof_scope": proof_scope,
+            **(
+                {"caveats": tested_match_caveats(equivalence, gap_codes)}
+                if tested_selection
+                else {}
             ),
             "rewrite_requirements": requirements,
             "hint_profile": hint_profile,
@@ -4974,6 +5289,74 @@ class PerformanceWorkflowService:
             "execution_reservation_id": reservation["reservation_id"],
             "session_continues": True,
             "candidate": updated_candidate.to_dict(),
+        }
+
+    def measurement_candidate(self, candidate: Any, idempotency_key: str | None) -> Any:
+        """The session candidate that carries one further run of ``candidate``.
+
+        A benchmark call owns one candidate: its reservation, its run counts
+        and its evidence. A further run on a candidate that already has its
+        verdict therefore runs on a carrier: the same statement, strategy and
+        lineage, marked ``measurement_of``. The same ``idempotency_key`` finds
+        the same carrier, so a retried call replays and runs nothing.
+        """
+
+        key = (
+            fingerprint_json(
+                {"measurement_of": candidate.candidate_id, "idempotency_key": idempotency_key}
+            )
+            if idempotency_key
+            else None
+        )
+        if key is not None:
+            for item in self.sessions.list_candidates(candidate.session_id):
+                if item.metadata.get("measurement_key") == key:
+                    return item
+        return self.sessions.add_candidate(
+            candidate.session_id,
+            strategy=candidate.strategy,
+            rewrite_fingerprint=candidate.rewrite_fingerprint,
+            rewrite_artifact_ref=candidate.rewrite_artifact_ref,
+            metadata={
+                **candidate.metadata,
+                "measurement_of": candidate.candidate_id,
+                "measurement_of_state": candidate.state,
+                **({"measurement_key": key} if key is not None else {}),
+            },
+        )
+
+    def apply_measurement(self, carrier: Any, measured: Mapping[str, Any]) -> dict[str, Any]:
+        """Add a carrier's benchmark result to the candidate it measured.
+
+        The evidence is attached to that candidate. A regressed measurement
+        (a slower case, or a slower run on a plan compiled for another case)
+        lowers its verdict to regressed; nothing raises it.
+        """
+
+        candidate_id = str(carrier.metadata["measurement_of"])
+        before = str(carrier.metadata["measurement_of_state"])
+        evidence_id = measured.get("evidence_id")
+        updated = self.sessions.record_candidate_measurement(
+            carrier.session_id,
+            candidate_id,
+            evidence_ids=(str(evidence_id),) if evidence_id else (),
+            regressed=measured.get("classification") == "regressed",
+        )
+        return {
+            **measured,
+            "candidate_id": candidate_id,
+            "measurement_only": True,
+            "measurement_candidate_id": carrier.candidate_id,
+            "candidate_classification_before": before,
+            "candidate_classification": updated.state,
+            "verdict_changed": updated.state != before,
+            "measurement_note": (
+                f"This run was added to candidate {candidate_id}, which already had its "
+                f"verdict ({before}). classification is the verdict of this run alone. A "
+                "later run lowers the verdict of a candidate when it regressed and never "
+                f"raises it. The run is kept in the session as {carrier.candidate_id}."
+            ),
+            "candidate": updated.to_dict(),
         }
 
     def _candidate_has_selection_evidence(
@@ -5056,6 +5439,19 @@ class PerformanceWorkflowService:
                     return True
                 continue
             comparisons = metadata.get("equivalence")
+            if selection_scope == "tested":
+                if (
+                    candidate.state == "improved"
+                    and metrics.get("classification") == "improved"
+                    and metadata.get("proof_scope") == TESTED_PROOF_SCOPE
+                    and isinstance(comparisons, (list, tuple))
+                    and tested_ordered_match(
+                        [item for item in comparisons if isinstance(item, Mapping)]
+                    )
+                    and all(isinstance(item, Mapping) for item in comparisons)
+                ):
+                    return True
+                continue
             if (
                 candidate.state == "improved"
                 and metrics.get("classification") == "improved"
@@ -5282,6 +5678,25 @@ class PerformanceWorkflowService:
                 "added_hints": added_hints,
                 "basis": basis,
             }
+        if metadata.get("proof_scope") == TESTED_PROOF_SCOPE:
+            # Compared and matched in order, under a static gap: never more than a test.
+            return {
+                "scope": TESTED_PROOF_SCOPE,
+                "blockers": [
+                    {
+                        "code": "tested_match_only",
+                        "reason": (
+                            "The results matched in the same order for every tested "
+                            "parameter case. That was tested on today's data only: the "
+                            "static proof has a gap, so a reviewer must confirm the "
+                            "rewrite holds for all data."
+                        ),
+                    },
+                    *_preflight_blockers(metadata.get("equivalence_preflight")),
+                ],
+                "added_hints": added_hints,
+                "basis": basis,
+            }
         if owner.strategy == "index":
             basis["precondition_basis"] = "not_applicable"
             return {"scope": "unchanged_sql", "blockers": [], "added_hints": [], "basis": basis}
@@ -5378,18 +5793,21 @@ class PerformanceWorkflowService:
     ) -> dict[str, Any]:
         """Complete the session and state how far the selected candidate is proven.
 
-        ``selection_scope`` keeps its two input values: ``proven`` selects an
-        improved finalist whose results matched, ``performance_only`` one
-        that could not be compared. The response reports the proof scope:
-        snapshot_matched, constraint_backed, unchanged_sql or performance_only.
+        ``selection_scope``: ``proven`` selects an improved finalist whose
+        results matched with no static proof gap; ``tested`` one that returned
+        the same rows in the same order on every measured case while a static
+        gap remained; ``performance_only`` one that was not compared or
+        matched only as a multiset. The response reports the proof scope:
+        snapshot_matched, constraint_backed, unchanged_sql, snapshot_test or
+        performance_only. A tested selection is never deployment-ready.
         """
 
         if not stopping_reason.strip():
             raise ValueError("stopping_reason is required.")
         selection_scope = selection_scope.strip().casefold()
-        if selection_scope not in {"proven", "performance_only"}:
+        if selection_scope not in {"proven", "tested", "performance_only"}:
             raise ValueError(
-                "selection_scope must be proven or performance_only."
+                "selection_scope must be proven, tested or performance_only."
             )
         candidates = self.sessions.list_candidates(session_id)
         if selected_candidate_id is not None:
@@ -5421,6 +5839,23 @@ class PerformanceWorkflowService:
                     raise ValueError(
                         "Performance-only selection requires evidence-backed finalist "
                         "execution with a nonzero execution count."
+                    )
+                other_scope = "proven" if selection_scope == "tested" else "tested"
+                if self._candidate_has_selection_evidence(selected, selection_scope=other_scope):
+                    raise ValueError(
+                        f"This finalist's evidence is {other_scope}, not {selection_scope}: "
+                        f"select it with selection_scope '{other_scope}'."
+                        + (
+                            " Its results matched in order on every measured case, "
+                            "but the static proof has a gap."
+                            if other_scope == "tested"
+                            else ""
+                        )
+                    )
+                if selection_scope == "tested":
+                    raise ValueError(
+                        "Tested selection requires a finalist whose results matched in "
+                        "the same order, in one snapshot, for every measured case."
                     )
                 raise ValueError(
                     "Proven selection requires complete direct-snapshot finalist "

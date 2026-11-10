@@ -483,6 +483,28 @@ def view_experiment_policy_blockers(policy: DatabasePolicy) -> tuple[str, ...]:
     return tuple(blockers)
 
 
+INDEXED_VIEW_DESIGNS_FORBIDDEN = (
+    "allow_indexed_view_designs is false in the database policy: indexed views are "
+    "not a design option for this database, so none is tested or proposed. Use a "
+    "rewrite, a rowstore index or a nonclustered columnstore index."
+)
+
+
+def require_indexed_view_designs_allowed(policy: DatabasePolicy) -> None:
+    """Refuse a new indexed-view experiment where the policy forbids the design.
+
+    Kept apart from ``require_view_experiment_policy``: the drop of a leased
+    view reads that one, and a view built before the field was set to false
+    must still be dropped.
+    """
+
+    if policy.configured and not policy.allow_indexed_view_designs:
+        raise PermissionError(
+            f"{INDEXED_VIEW_DESIGNS_FORBIDDEN} Database: {policy.database_name}. "
+            "No query and no DDL was run."
+        )
+
+
 def require_view_experiment_policy(policy: DatabasePolicy) -> None:
     blockers = view_experiment_policy_blockers(policy)
     if blockers:

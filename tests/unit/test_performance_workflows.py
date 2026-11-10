@@ -1947,10 +1947,6 @@ async def test_outer_top_zero_comparison_returns_shape_type_mismatch() -> None:
             "SELECT TOP (1) id FROM dbo.Items AS candidate",
         ),
         (
-            "SELECT TOP (@row_count) id FROM dbo.Items",
-            "SELECT TOP (@row_count) id FROM dbo.Items AS candidate",
-        ),
-        (
             "SELECT id FROM (SELECT TOP (0) id FROM dbo.Items) AS picked",
             (
                 "SELECT id FROM "
@@ -1963,10 +1959,16 @@ async def test_outer_top_zero_comparison_returns_shape_type_mismatch() -> None:
         ),
     ],
 )
-async def test_top_zero_shape_scope_rejects_unsupported_variants(
+async def test_top_without_order_by_is_compared_as_a_test_and_never_proven(
     baseline_sql: str,
     candidate_sql: str,
 ) -> None:
+    """S14 6c: these shapes were refused with no execution; now they are compared.
+
+    The TOP (@row_count) pair left the list: without parameter values it is
+    refused by the parameter check, as every parameterized statement is.
+    """
+
     service, _store, _plans, executor = _service()
 
     result = await service.compare_query_results(
@@ -1975,9 +1977,12 @@ async def test_top_zero_shape_scope_rejects_unsupported_variants(
         candidate_sql,
     )
 
-    assert result["status"] == "proof_contract_required"
-    assert result["executions"] == 0
-    assert executor.sessions == []
+    assert result["status"] == "match"
+    assert result["proof_scope"] == "snapshot_test"
+    assert result["proven_for_parameter_case"] is False
+    assert any("TOP without ORDER BY" in caveat for caveat in result["caveats"])
+    assert result["executions"] == 2
+    assert len(executor.sessions) == 1
 
 
 @pytest.mark.asyncio
@@ -2187,14 +2192,17 @@ async def test_unordered_top_screening_remains_finalist_eligible_and_runs_full_w
     assert finalist["classification"] == "performance_only"
     assert finalist["performance_classification"] == "improved"
     assert finalist["proof_scope"] == "performance_only"
-    assert finalist["equivalence"] == []
-    assert finalist["executions"] == 12
+    # S14 6c: the two statements are compared as multisets; a test, not a proof.
+    [comparison] = finalist["equivalence"]
+    assert comparison["tested_match"] is True
+    assert comparison["proven_for_parameter_case"] is False
+    assert finalist["executions"] == 12 + 2
     stored = store.get_candidate(candidate_id)
     assert stored.finalist_runs == 5
     assert stored.state == "performance_only"
     assert stored.failure_code is None
     assert len(plans.calls) == 20
-    assert executor.sessions == []
+    assert len(executor.sessions) == 1
 
 
 @pytest.mark.asyncio
@@ -2390,11 +2398,12 @@ async def test_exact_legacy_proof_contract_candidate_is_recovered_for_finalist()
 
     assert result["classification"] == "performance_only"
     assert result["proof_scope"] == "performance_only"
-    assert result["executions"] == 12
+    # S14 6c: the finalist also runs the two statements of the comparison.
+    assert result["executions"] == 12 + 2
     stored = store.get_candidate(candidate_id)
     assert stored.state == "performance_only"
     assert stored.failure_code is None
-    assert stored.executions == 18
+    assert stored.executions == 18 + 2
     assert len(plans.calls) == 12
 
 

@@ -988,7 +988,8 @@ def test_optimizer_inputs_publish_closed_enums(
     selection = tools["finalize_tuning_session"].parameters["properties"][
         "selection_scope"
     ]
-    assert selection["enum"] == ["proven", "performance_only"]
+    # "tested": a match on every measured case, selectable, not a proof.
+    assert selection["enum"] == ["proven", "tested", "performance_only"]
     assert selection["default"] == "proven"
     stopping_reason = tools["finalize_tuning_session"].parameters["properties"][
         "stopping_reason"

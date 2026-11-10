@@ -59,6 +59,7 @@ SELECT
     d.is_included_column,
     d.is_descending_key,
     d.partition_ordinal,
+    d.column_store_order_ordinal,
     d.column_name,
     ds.name AS data_space_name,
     ds.type_desc AS data_space_type,
@@ -107,6 +108,7 @@ LEFT JOIN (
         ic.is_included_column,
         ic.is_descending_key,
         ic.partition_ordinal,
+        ic.column_store_order_ordinal,
         c.name AS column_name,
         NULL AS partition_number,
         NULL AS partition_row_count,
@@ -126,6 +128,7 @@ LEFT JOIN (
         NULL AS is_included_column,
         NULL AS is_descending_key,
         NULL AS partition_ordinal,
+        NULL AS column_store_order_ordinal,
         NULL AS column_name,
         p.partition_number,
         p.rows AS partition_row_count,
@@ -431,6 +434,9 @@ class ExistingIndex:
     key_columns: tuple[IndexKeyColumn, ...]
     include_columns: tuple[str, ...] = ()
     nonkey_columns: tuple[str, ...] = ()
+    # ORDER (...) columns of an ordered columnstore index, in order
+    # (sys.index_columns.column_store_order_ordinal); empty when it has none.
+    columnstore_order_columns: tuple[str, ...] = ()
     filter_definition: str | None = None
     is_unique: bool | None = False
     is_primary_key: bool | None = False
@@ -600,6 +606,11 @@ class ExistingIndex:
             "key_columns": [column.as_dict() for column in self.key_columns],
             "include_columns": list(self.include_columns),
             "nonkey_columns": list(self.nonkey_columns),
+            **(
+                {"columnstore_order_columns": list(self.columnstore_order_columns)}
+                if self.columnstore_order_columns
+                else {}
+            ),
             "filter_definition": self.filter_definition,
             "is_unique": self.is_unique,
             "is_primary_key": self.is_primary_key,
@@ -878,6 +889,7 @@ def parse_existing_index_rows(
                 "partition_rows": {},
                 "partition_pages": {},
                 "partition_columns": {},
+                "order_columns": {},
             },
         )
         column_name = str(row.get("column_name") or "")
@@ -895,6 +907,9 @@ def parse_existing_index_rows(
         partition_ordinal = _as_int(row.get("partition_ordinal"))
         if column_name and partition_ordinal > 0:
             item["partition_columns"][partition_ordinal] = column_name
+        order_ordinal = _as_int(row.get("column_store_order_ordinal"))
+        if column_name and order_ordinal > 0:
+            item["order_columns"][order_ordinal] = column_name
         partition_number = _as_int(row.get("partition_number"))
         compression = row.get("data_compression_desc")
         if partition_number > 0 and compression:
@@ -943,6 +958,9 @@ def parse_existing_index_rows(
                 ),
                 nonkey_columns=tuple(
                     item["nonkeys"][ordinal] for ordinal in sorted(item["nonkeys"])
+                ),
+                columnstore_order_columns=tuple(
+                    item["order_columns"][ordinal] for ordinal in sorted(item["order_columns"])
                 ),
                 filter_definition=(
                     str(row["filter_definition"])
@@ -1385,12 +1403,17 @@ def index_definition_payload(
     partition_scheme_name: str | None = None,
     partition_function_name: str | None = None,
     partition_compression: Iterable[tuple[int, str]] = (),
+    columnstore_order_columns: Iterable[str] = (),
 ) -> dict[str, Any]:
     parsed_keys = tuple(
         column if isinstance(column, IndexKeyColumn) else parse_candidate_key(column)
         for column in key_columns
     )
+    order_columns = [_clean_identifier(column) for column in columnstore_order_columns]
     return {
+        # Present only for an ordered columnstore index: every other
+        # definition keeps the token it always had.
+        **({"columnstore_order_columns": order_columns} if order_columns else {}),
         "schema": _clean_identifier(schema),
         "table": _clean_identifier(table),
         "index_type": str(index_type).strip().upper(),
