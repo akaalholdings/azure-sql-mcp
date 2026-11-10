@@ -6,14 +6,17 @@ import re
 import unicodedata
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from datetime import timedelta
 from typing import Any
 from xml.sax.saxutils import unescape
 
 from .connection import AzureSqlExecutor
+from .incident_log import note_exception
 from .index_optimizer import INDEX_CANDIDATE_IMPACT_FLOOR_PCT
 from .index_optimizer import score_index_candidate
+from .observability import sanitize_error_message
 from .plans import parse_showplan_index_evidence
 from .time_windows import sql_utc
 
@@ -102,6 +105,102 @@ SORT_BY_EXPRESSIONS = {
     "logical_io": "SUM(rs.avg_logical_io_reads * rs.count_executions)",
     "physical_io": "SUM(rs.avg_physical_io_reads * rs.count_executions)",
     "memory": _WEIGHTED_AVG_MEMORY,
+}
+
+
+_TEXT_PREVIEW_CHARS = 300
+# sort_by -> the output column that carries the same value, for the outer sort.
+_TOP_QUERY_SORT_COLUMNS = {
+    "total_duration": "total_duration_us",
+    "avg_duration": "avg_duration_us",
+    "cpu": "total_cpu_us",
+    "executions": "executions",
+    "logical_io": "total_logical_io_reads",
+    "physical_io": "total_physical_io_reads",
+    "memory": "avg_query_max_used_memory",
+}
+_TOP_QUERY_METRICS = f"""SUM(rs.count_executions) AS executions,
+                SUM(rs.avg_duration * rs.count_executions) AS total_duration_us,
+                {_WEIGHTED_AVG_DURATION} AS avg_duration_us,
+                {_EXECUTION_OUTCOME_COLUMNS}
+                SUM(rs.avg_cpu_time * rs.count_executions) AS total_cpu_us,
+                SUM(rs.avg_logical_io_reads * rs.count_executions) AS total_logical_io_reads,
+                SUM(rs.avg_physical_io_reads * rs.count_executions) AS total_physical_io_reads,
+                {_WEIGHTED_AVG_LOGICAL_READS} AS avg_logical_io_reads,
+                {_WEIGHTED_AVG_PHYSICAL_READS} AS avg_physical_io_reads,
+                {_WEIGHTED_AVG_MEMORY} AS avg_query_max_used_memory,
+                {_WEIGHTED_AVG_ROWS} AS avg_rowcount,
+                CAST(MAX(rsi.end_time) AS datetime2(7)) AS last_seen_utc"""
+_TOP_QUERY_METRIC_NAMES = (
+    "executions",
+    "total_duration_us",
+    "avg_duration_us",
+    "aborted_executions",
+    "exception_executions",
+    "regular_avg_duration_us",
+    "total_cpu_us",
+    "total_logical_io_reads",
+    "total_physical_io_reads",
+    "avg_logical_io_reads",
+    "avg_physical_io_reads",
+    "avg_query_max_used_memory",
+    "avg_rowcount",
+    "last_seen_utc",
+)
+# The maxima come from the same aggregation pass (a window over the groups),
+# so the runtime statistics are read once.
+_BLEND_MAXIMA = """,
+                MAX(SUM(rs.avg_cpu_time * rs.count_executions)) OVER () AS max_cpu_us,
+                MAX(SUM(rs.avg_logical_io_reads * rs.count_executions)) OVER ()
+                    AS max_logical_io_reads,
+                MAX(SUM(rs.avg_duration * rs.count_executions)) OVER () AS max_duration_us"""
+_BLEND_SCORE = """(
+                    COALESCE(CAST(metrics.total_cpu_us AS FLOAT) / NULLIF(metrics.max_cpu_us, 0), 0.0)
+                    + COALESCE(
+                        CAST(metrics.total_logical_io_reads AS FLOAT)
+                        / NULLIF(metrics.max_logical_io_reads, 0),
+                        0.0
+                    )
+                    + COALESCE(
+                        CAST(metrics.total_duration_us AS FLOAT) / NULLIF(metrics.max_duration_us, 0),
+                        0.0
+                    )
+                ) / 3.0"""
+# group_by -> the grouping key, its columns, and the query whose text is shown.
+# sample_query_id is the newest query_id of the family.
+_TOP_QUERY_GROUPINGS: dict[str, dict[str, str]] = {
+    "plan": {
+        "group_by": "p.query_id, p.plan_id",
+        "inner_keys": "p.query_id,\n                p.plan_id,",
+        "inner_join": "",
+        "outer_keys": "ranked.query_id,\n            ranked.plan_id,",
+        "text_query_id": "query_id",
+    },
+    "query": {
+        "group_by": "p.query_id",
+        "inner_keys": (
+            "p.query_id,\n                COUNT(DISTINCT rs.plan_id) AS plan_count,"
+        ),
+        "inner_join": "",
+        "outer_keys": "ranked.query_id,\n            ranked.plan_count,",
+        "text_query_id": "query_id",
+    },
+    "query_hash": {
+        "group_by": "qh.query_hash",
+        "inner_keys": """MAX(p.query_id) AS sample_query_id,
+                COUNT(DISTINCT p.query_id) AS distinct_query_count,
+                COUNT(DISTINCT rs.plan_id) AS distinct_plan_count,
+                COUNT(DISTINCT CASE WHEN qh.query_parameterization_type_desc = 'None'
+                                    THEN p.query_id END) AS unparameterized_query_count,""",
+        "inner_join": (
+            "INNER JOIN sys.query_store_query AS qh\n                ON qh.query_id = p.query_id"
+        ),
+        "outer_keys": """ranked.sample_query_id,
+            ranked.distinct_query_count,
+            ranked.distinct_plan_count,
+            ranked.unparameterized_query_count,""",
+        "text_query_id": "sample_query_id",
+    },
 }
 
 
@@ -691,9 +790,271 @@ WHERE s.name = ? AND t.name = ? AND c.name IN ({placeholders})
 """
 
 
+# Query Store for readable secondaries writes one replica_group_id per replica
+# set. Both probes read the catalog, so a database without the dimension is
+# found before any statement names a column it does not have.
+REPLICA_DIMENSION_PROBE_SQL = """
+SELECT
+    (SELECT COUNT(*)
+     FROM sys.all_columns AS c
+     WHERE c.object_id = OBJECT_ID(N'sys.query_store_runtime_stats')
+       AND c.name = N'replica_group_id') AS runtime_stats_has_replica_group_id,
+    (SELECT COUNT(*)
+     FROM sys.all_objects AS o
+     WHERE o.object_id = OBJECT_ID(N'sys.query_store_replicas')) AS has_query_store_replicas
+"""
+QUERY_STORE_REPLICAS_SQL = """
+SELECT replica_group_id, role_type, replica_name
+FROM sys.query_store_replicas
+ORDER BY replica_group_id
+"""
+# sys.query_store_replicas.role_type.
+REPLICA_ROLE_TYPES = {
+    "primary": 1,
+    "secondary": 2,
+    "geo_secondary": 3,
+    "geo_ha_secondary": 4,
+}
+_REPLICA_GROUPS_OF_ROLE = (
+    "SELECT qsr.replica_group_id FROM sys.query_store_replicas AS qsr WHERE qsr.role_type = ?"
+)
+
+
+@dataclass(frozen=True)
+class ReplicaScope:
+    """A WHERE fragment (with its parameters) that keeps one replica role."""
+
+    predicate: str = ""
+    params: tuple[Any, ...] = ()
+    info: dict[str, Any] | None = None
+    unsupported_reason: str | None = None
+
+
+class QueryStoreReplicaScope:
+    """Limit Query Store runtime reads to one replica role where the catalog can."""
+
+    def __init__(self, executor: AzureSqlExecutor):
+        self.executor = executor
+        self._has_dimension: dict[str, bool] = {}
+
+    async def probe(self, database_name: str) -> dict[str, Any]:
+        cached = self._has_dimension.get(database_name)
+        if cached is not None:
+            return {"available": cached}
+        try:
+            rows = await self.executor.fetch_all(database_name, REPLICA_DIMENSION_PROBE_SQL)
+        except Exception as exc:
+            # Not cached: a transient failure is probed again on the next read.
+            note_exception(exc, "query_store.replica_dimension_probe")
+            return {"available": False, "probe_error": sanitize_error_message(str(exc))}
+        row = rows[0] if rows else {}
+        available = bool(row.get("runtime_stats_has_replica_group_id")) and bool(
+            row.get("has_query_store_replicas")
+        )
+        self._has_dimension[database_name] = available
+        return {"available": available}
+
+    async def scope(
+        self,
+        database_name: str,
+        replica_role: str | None,
+        *,
+        alias: str = "rs",
+    ) -> ReplicaScope:
+        """Return the filter for ``replica_role``; ``None`` reads every role.
+
+        Without the dimension every stored run is a primary run, so "primary"
+        reads unfiltered and any other role is unsupported.
+        """
+
+        if replica_role is None:
+            return ReplicaScope()
+        role = str(replica_role).strip().casefold()
+        if role not in REPLICA_ROLE_TYPES:
+            raise ValueError(f"replica_role must be one of {sorted(REPLICA_ROLE_TYPES)}.")
+        probe = await self.probe(database_name)
+        if not probe["available"]:
+            failed = "probe_error" in probe
+            info = {
+                "replica_role": role,
+                "replica_filter": "probe_failed" if failed else "not_available",
+                **({"probe_error": probe["probe_error"]} if failed else {}),
+            }
+            if role == "primary" and not failed:
+                return ReplicaScope(info=info)
+            return ReplicaScope(
+                info=info,
+                unsupported_reason=(
+                    "The Query Store replica dimension could not be probed: "
+                    f"{probe['probe_error']}"
+                    if failed
+                    else "This database's Query Store has no replica dimension "
+                    "(replica_group_id, sys.query_store_replicas), so it holds no "
+                    f"{role} runtime statistics."
+                ),
+            )
+        members = f"{alias}.replica_group_id IN ({_REPLICA_GROUPS_OF_ROLE})"
+        if role == "primary":
+            # An empty sys.query_store_replicas means secondaries are not
+            # captured: every row is then a primary row.
+            members = f"(NOT EXISTS (SELECT 1 FROM sys.query_store_replicas) OR {members})"
+        return ReplicaScope(
+            predicate=f"AND {members}",
+            params=(REPLICA_ROLE_TYPES[role],),
+            info={"replica_role": role, "replica_filter": "replica_group_id"},
+        )
+
+
+# The stored text of a parameterized statement is '(@p type, ...)' + statement.
+_EXACT_TEXT = (
+    "DATALENGTH(qt.query_sql_text) = DATALENGTH(@sql) "
+    "AND qt.query_sql_text COLLATE Latin1_General_100_BIN2 "
+    "= @sql COLLATE Latin1_General_100_BIN2"
+)
+_PARAMETERIZED_TEXT = (
+    "DATALENGTH(qt.query_sql_text) > DATALENGTH(@sql) "
+    "AND LEFT(qt.query_sql_text, 2) = N'(@' "
+    "AND RIGHT(qt.query_sql_text, DATALENGTH(@sql) / 2) COLLATE Latin1_General_100_BIN2 "
+    "= @sql COLLATE Latin1_General_100_BIN2"
+)
+# Rows whose text matches sort first, so TOP keeps them in a large hash family.
+_IDENTITY_SQL = f"""
+DECLARE @sql nvarchar(max) = ?;
+SELECT TOP (20)
+    m.query_id,
+    m.query_hash,
+    m.context_settings_id,
+    m.object_id,
+    m.query_parameterization_type_desc,
+    m.text_match,
+    m.parameter_prefix,
+    COUNT(*) OVER () AS candidate_count
+FROM (
+    SELECT
+        q.query_id,
+        CONVERT(varchar(18), q.query_hash, 1) AS query_hash,
+        q.context_settings_id,
+        q.object_id,
+        q.query_parameterization_type_desc,
+        q.last_execution_time,
+        CASE
+            WHEN {_EXACT_TEXT} THEN 'exact'
+            WHEN {_PARAMETERIZED_TEXT} THEN 'parameterized'
+        END AS text_match,
+        CASE
+            WHEN {_PARAMETERIZED_TEXT}
+            THEN LEFT(
+                qt.query_sql_text,
+                (DATALENGTH(qt.query_sql_text) - DATALENGTH(@sql)) / 2
+            )
+        END AS parameter_prefix
+    FROM sys.query_store_query_text AS qt
+    INNER JOIN sys.query_store_query AS q
+        ON q.query_text_id = qt.query_text_id
+    {{hash_filter}}
+) AS m
+{{match_filter}}
+ORDER BY
+    CASE WHEN m.text_match IS NULL THEN 1 ELSE 0 END,
+    m.last_execution_time DESC,
+    m.query_id DESC
+"""
+
+def split_parameter_prefix(prefix: Any) -> str | None:
+    """Return ``prefix`` when it is one whole ``(@p type, ...)`` block, else None.
+
+    A stored text that only ends with the SQL (a different, longer statement)
+    leaves a prefix whose first parenthesis closes before the end.
+    """
+
+    if not isinstance(prefix, str) or not prefix.startswith("(@") or not prefix.endswith(")"):
+        return None
+    depth = 0
+    for position, character in enumerate(prefix):
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0 and position != len(prefix) - 1:
+                return None
+    return prefix if depth == 0 else None
+
+
+def _identity_rows(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Keep a 'parameterized' match only when its prefix is a declaration block."""
+
+    result: list[dict[str, Any]] = []
+    for raw in rows:
+        row = dict(raw)
+        row["query_id"] = int(row["query_id"])
+        row["query_hash"] = str(row["query_hash"])
+        prefix = row.pop("parameter_prefix", None)
+        row["declared_parameters"] = None
+        if row.get("text_match") == "parameterized":
+            row["declared_parameters"] = split_parameter_prefix(prefix)
+            if row["declared_parameters"] is None:
+                row["text_match"] = None
+        result.append(row)
+    return result
+
+
+def _resolved_identity(rows: list[dict[str, Any]], matched_by: str) -> dict[str, Any]:
+    first = rows[0]
+    return {
+        "status": "resolved",
+        "identity_kind": "query_id",
+        "query_id": first["query_id"],
+        "query_hash": first["query_hash"],
+        "matched_by": matched_by,
+        "text_match": first.get("text_match"),
+        "declared_parameters": first.get("declared_parameters"),
+        "matches": rows,
+    }
+
+
+def _identity_from_hash(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    query_ids = {row["query_id"] for row in rows}
+    if len(query_ids) == 1:
+        return _resolved_identity(rows, "query_hash")
+    text_rows = [row for row in rows if row["text_match"] is not None]
+    if len({row["query_id"] for row in text_rows}) == 1:
+        return _resolved_identity(text_rows, "query_hash_and_text")
+    # Literal variants, or one statement under several SET option contexts.
+    candidate_count = int(rows[0].get("candidate_count") or len(rows))
+    return {
+        "status": "ambiguous",
+        "identity_kind": "query_hash",
+        "matched_by": "query_hash",
+        "query_hash": rows[0]["query_hash"],
+        "query_ids": sorted(query_ids),
+        "query_count_under_hash": candidate_count,
+        "query_ids_truncated": candidate_count > len(rows),
+        "matches": text_rows or rows,
+    }
+
+
 class QueryStoreService:
     def __init__(self, executor: AzureSqlExecutor):
         self.executor = executor
+        self.replicas = QueryStoreReplicaScope(executor)
+
+    async def get_replica_dimension(self, database_name: str) -> dict[str, Any]:
+        """Report whether Query Store separates replicas here, and the replica sets."""
+
+        probe = await self.replicas.probe(database_name)
+        if not probe["available"]:
+            return {"database_name": database_name, **probe, "replicas": []}
+        roles: dict[Any, str] = {
+            role_type: role for role, role_type in REPLICA_ROLE_TYPES.items()
+        }
+        rows = await self.executor.fetch_all(database_name, QUERY_STORE_REPLICAS_SQL)
+        return {
+            "database_name": database_name,
+            "available": True,
+            "replicas": [
+                {**row, "role": roles.get(row.get("role_type"), "unknown")} for row in rows
+            ],
+        }
 
     async def get_status(self, database_name: str) -> dict[str, Any]:
         query = """
@@ -723,58 +1084,60 @@ class QueryStoreService:
         self,
         database_name: str,
         sql: str,
+        *,
+        query_hash: str | None = None,
     ) -> dict[str, Any]:
-        """Resolve exact Query Store text to one stable query identity.
+        """Resolve SQL text to one stable Query Store query identity.
 
-        Similar-text matching is deliberately excluded. Multiple exact
-        identities are returned as ambiguous rather than silently selecting
-        one context/settings combination.
+        ``query_hash`` (the QueryHash of the statement's plan) is tried first:
+        it survives whitespace, casing and parameter-name changes. Text is the
+        fallback: the stored text equals the SQL, or it is the SQL behind the
+        ``(@p type, ...)`` block that Query Store keeps for a parameterized
+        statement. Similar-text matching is excluded. Several identities are
+        returned as ambiguous; one is never picked silently.
         """
 
         if not isinstance(sql, str) or not sql:
             raise ValueError("sql must not be empty.")
-        rows = await self.executor.fetch_all(
-            database_name,
-            """
-            SELECT TOP (20)
-                q.query_id,
-                CONVERT(varchar(18), q.query_hash, 1) AS query_hash,
-                q.context_settings_id,
-                q.object_id
-            FROM sys.query_store_query_text AS qt
-            INNER JOIN sys.query_store_query AS q
-                ON q.query_text_id = qt.query_text_id
-            WHERE DATALENGTH(qt.query_sql_text)
-                    = DATALENGTH(CAST(? AS nvarchar(max)))
-              AND qt.query_sql_text COLLATE Latin1_General_100_BIN2
-                    = CAST(? AS nvarchar(max)) COLLATE Latin1_General_100_BIN2
-            ORDER BY q.last_execution_time DESC, q.query_id DESC
-            """,
-            params=[sql, sql],
-        )
+        if query_hash:
+            rows = _identity_rows(
+                await self.executor.fetch_all(
+                    database_name,
+                    _IDENTITY_SQL.format(
+                        hash_filter="WHERE q.query_hash = CONVERT(BINARY(8), ?, 1)",
+                        match_filter="",
+                    ),
+                    params=[sql, _validate_query_hash(query_hash)],
+                )
+            )
+            if rows:
+                return _identity_from_hash(rows)
+        rows = [
+            row
+            for row in _identity_rows(
+                await self.executor.fetch_all(
+                    database_name,
+                    _IDENTITY_SQL.format(
+                        hash_filter="", match_filter="WHERE m.text_match IS NOT NULL"
+                    ),
+                    params=[sql],
+                )
+            )
+            if row["text_match"] is not None
+        ]
         if not rows:
             return {
                 "status": "not_found",
-                "identity_kind": "exact_query_store_text",
+                "identity_kind": "query_store_text",
                 "matches": [],
             }
-        identities = {
-            (int(row["query_id"]), str(row["query_hash"])) for row in rows
-        }
-        if len(identities) != 1:
+        if len({(row["query_id"], row["query_hash"]) for row in rows}) != 1:
             return {
                 "status": "ambiguous",
-                "identity_kind": "exact_query_store_text",
+                "identity_kind": "query_store_text",
                 "matches": rows,
             }
-        query_id, query_hash = next(iter(identities))
-        return {
-            "status": "resolved",
-            "identity_kind": "query_id",
-            "query_id": query_id,
-            "query_hash": query_hash,
-            "matches": rows,
-        }
+        return _resolved_identity(rows, f"{rows[0]['text_match']}_text")
 
     async def get_top_queries(
         self,
@@ -784,11 +1147,24 @@ class QueryStoreService:
         limit: int,
         *,
         window_end: datetime | None = None,
+        group_by: str = "plan",
+        replica_role: str | None = None,
     ) -> list[dict[str, Any]]:
-        query = self._build_top_queries_query(sort_by)
-        blend = sort_by == "resource_blend"
+        """Rank Query Store consumers per plan, per query or per query_hash.
+
+        ``group_by="query_hash"`` folds the literal variants of one statement
+        into one row; per query_id each variant is small and the family is
+        never the top consumer. Rows carry ids and a text preview, never the
+        full text. ``replica_role`` limits the read to one replica role.
+        """
+        scope = await self.replicas.scope(database_name, replica_role)
+        if scope.unsupported_reason is not None:
+            raise ValueError(scope.unsupported_reason)
+        query = self._build_top_queries_query(
+            sort_by, group_by, replica_predicate=scope.predicate
+        )
         if window_end is None:
-            params: list[Any] = [window_minutes, limit] if blend else [limit, window_minutes]
+            params: list[Any] = [limit, window_minutes]
         else:
             # A past window: replace "the last N minutes" with an explicit range.
             if query.count(_RELATIVE_WINDOW_PREDICATE) != 1:
@@ -796,11 +1172,11 @@ class QueryStoreService:
             query = query.replace(_RELATIVE_WINDOW_PREDICATE, _ABSOLUTE_WINDOW_PREDICATE)
             start = sql_utc(window_end - timedelta(minutes=window_minutes))
             end = sql_utc(window_end)
-            params = [start, end, limit] if blend else [limit, start, end]
+            params = [limit, start, end]
         return await self.executor.fetch_all(
             database_name,
             query,
-            params=params,
+            params=[*params, *scope.params],
         )
 
     async def get_query_history(
@@ -1890,107 +2266,67 @@ class QueryStoreService:
                 f"limit must not exceed {_MAX_INDEX_EVIDENCE_ROWS} for index evidence."
             )
 
-    def _build_top_queries_query(self, sort_by: str) -> str:
-        if sort_by == "resource_blend":
-            return f"""
-            WITH QueryMetrics AS (
-                SELECT
-                    q.query_id,
-                    p.plan_id,
-                    qt.query_sql_text,
-                    SUM(rs.count_executions) AS executions,
-                    SUM(rs.avg_duration * rs.count_executions) AS total_duration_us,
-                    {_WEIGHTED_AVG_DURATION} AS avg_duration_us,
-                    {_EXECUTION_OUTCOME_COLUMNS}
-                    SUM(rs.avg_cpu_time * rs.count_executions) AS total_cpu_us,
-                    SUM(rs.avg_logical_io_reads * rs.count_executions) AS total_logical_io_reads,
-                    SUM(rs.avg_physical_io_reads * rs.count_executions) AS total_physical_io_reads,
-                    {_WEIGHTED_AVG_LOGICAL_READS} AS avg_logical_io_reads,
-                    {_WEIGHTED_AVG_PHYSICAL_READS} AS avg_physical_io_reads,
-                    {_WEIGHTED_AVG_MEMORY} AS avg_query_max_used_memory,
-                    {_WEIGHTED_AVG_ROWS} AS avg_rowcount,
-                    CAST(MAX(rsi.end_time) AS datetime2(7)) AS last_seen_utc
-                FROM sys.query_store_query_text AS qt
-                INNER JOIN sys.query_store_query AS q
-                    ON qt.query_text_id = q.query_text_id
-                INNER JOIN sys.query_store_plan AS p
-                    ON q.query_id = p.query_id
-                INNER JOIN sys.query_store_runtime_stats AS rs
-                    ON p.plan_id = rs.plan_id
-                INNER JOIN sys.query_store_runtime_stats_interval AS rsi
-                    ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
-                WHERE rsi.end_time >= DATEADD(MINUTE, -?, SYSUTCDATETIME())
-                GROUP BY q.query_id, p.plan_id, qt.query_sql_text
-            ),
-            MaxMetrics AS (
-                SELECT
-                    MAX(total_cpu_us) AS max_cpu_us,
-                    MAX(total_logical_io_reads) AS max_logical_io_reads,
-                    MAX(total_duration_us) AS max_duration_us
-                FROM QueryMetrics
+    def _build_top_queries_query(
+        self,
+        sort_by: str,
+        group_by: str = "plan",
+        *,
+        replica_predicate: str = "",
+    ) -> str:
+        grouping = _TOP_QUERY_GROUPINGS.get(group_by)
+        if grouping is None:
+            raise ValueError(
+                f"Unsupported group_by. Use {', '.join(_TOP_QUERY_GROUPINGS)}."
             )
-            SELECT TOP (?)
-                qm.*,
-                (
-                    COALESCE(CAST(qm.total_cpu_us AS FLOAT) / NULLIF(mm.max_cpu_us, 0), 0.0)
-                    + COALESCE(
-                        CAST(qm.total_logical_io_reads AS FLOAT)
-                        / NULLIF(mm.max_logical_io_reads, 0),
-                        0.0
-                    )
-                    + COALESCE(
-                        CAST(qm.total_duration_us AS FLOAT) / NULLIF(mm.max_duration_us, 0),
-                        0.0
-                    )
-                ) / 3.0 AS resource_blend_score
-            FROM QueryMetrics AS qm
-            CROSS JOIN MaxMetrics AS mm
-            ORDER BY resource_blend_score DESC, qm.total_cpu_us DESC
-            """
-
-        order_expression = SORT_BY_EXPRESSIONS.get(sort_by)
-        if order_expression is None:
-            supported = ", ".join(
-                [
-                    "total_duration",
-                    "avg_duration",
-                    "cpu",
-                    "executions",
-                    "logical_io",
-                    "physical_io",
-                    "memory",
-                    "resource_blend",
-                ]
-            )
+        blend = sort_by == "resource_blend"
+        if not blend and sort_by not in SORT_BY_EXPRESSIONS:
+            supported = ", ".join([*SORT_BY_EXPRESSIONS, "resource_blend"])
             raise ValueError(f"Unsupported sort_by. Use {supported}.")
-
+        aggregate = f"""
+                {grouping["inner_keys"]}
+                {_TOP_QUERY_METRICS}{_BLEND_MAXIMA if blend else ""}
+            FROM sys.query_store_runtime_stats AS rs
+            INNER JOIN sys.query_store_runtime_stats_interval AS rsi
+                ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
+            INNER JOIN sys.query_store_plan AS p
+                ON p.plan_id = rs.plan_id
+            {grouping["inner_join"]}
+            WHERE {_RELATIVE_WINDOW_PREDICATE}
+              {replica_predicate}
+            GROUP BY {grouping["group_by"]}"""
+        if blend:
+            ranked = f"""
+            SELECT TOP (?)
+                metrics.*,
+                {_BLEND_SCORE} AS resource_blend_score
+            FROM (
+                SELECT{aggregate}
+            ) AS metrics
+            ORDER BY resource_blend_score DESC, metrics.total_cpu_us DESC"""
+            outer_order = "ranked.resource_blend_score DESC, ranked.total_cpu_us DESC"
+        else:
+            ranked = f"""
+            SELECT TOP (?){aggregate}
+            ORDER BY {SORT_BY_EXPRESSIONS[sort_by]} DESC"""
+            outer_order = f"ranked.{_TOP_QUERY_SORT_COLUMNS[sort_by]} DESC"
+        metric_columns = ",\n            ".join(
+            f"ranked.{name}"
+            for name in (*_TOP_QUERY_METRIC_NAMES, *(("resource_blend_score",) if blend else ()))
+        )
+        # The text is joined after TOP: it is read once per returned row and
+        # is never a GROUP BY or sort key.
         return f"""
-        SELECT TOP (?)
-            q.query_id,
-            p.plan_id,
-            qt.query_sql_text,
-            SUM(rs.count_executions) AS executions,
-            SUM(rs.avg_duration * rs.count_executions) AS total_duration_us,
-            {_WEIGHTED_AVG_DURATION} AS avg_duration_us,
-            {_EXECUTION_OUTCOME_COLUMNS}
-            SUM(rs.avg_cpu_time * rs.count_executions) AS total_cpu_us,
-            SUM(rs.avg_logical_io_reads * rs.count_executions) AS total_logical_io_reads,
-            SUM(rs.avg_physical_io_reads * rs.count_executions) AS total_physical_io_reads,
-            {_WEIGHTED_AVG_LOGICAL_READS} AS avg_logical_io_reads,
-            {_WEIGHTED_AVG_PHYSICAL_READS} AS avg_physical_io_reads,
-            {_WEIGHTED_AVG_MEMORY} AS avg_query_max_used_memory,
-            {_WEIGHTED_AVG_ROWS} AS avg_rowcount,
-            CAST(MAX(rsi.end_time) AS datetime2(7)) AS last_seen_utc
-        FROM sys.query_store_query_text AS qt
+        SELECT
+            {grouping["outer_keys"]}
+            CONVERT(varchar(18), q.query_hash, 1) AS query_hash,
+            q.query_text_id,
+            LEFT(qt.query_sql_text, {_TEXT_PREVIEW_CHARS}) AS query_text_preview,
+            {metric_columns}
+        FROM ({ranked}
+        ) AS ranked
         INNER JOIN sys.query_store_query AS q
+            ON q.query_id = ranked.{grouping["text_query_id"]}
+        INNER JOIN sys.query_store_query_text AS qt
             ON qt.query_text_id = q.query_text_id
-        INNER JOIN sys.query_store_plan AS p
-            ON q.query_id = p.query_id
-        INNER JOIN sys.query_store_runtime_stats AS rs
-            ON p.plan_id = rs.plan_id
-        INNER JOIN sys.query_store_runtime_stats_interval AS rsi
-            ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
-        WHERE rsi.end_time >= DATEADD(MINUTE, -?, SYSUTCDATETIME())
-        GROUP BY q.query_id, p.plan_id, qt.query_sql_text
-        ORDER BY {order_expression} DESC
+        ORDER BY {outer_order}
         """

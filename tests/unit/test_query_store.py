@@ -394,11 +394,13 @@ async def test_top_queries_uses_resource_blend_query_shape():
 
     await service.get_top_queries("appdb", "resource_blend", 60, 7)
 
-    assert "WITH QueryMetrics AS" in executor.query
     assert "resource_blend_score" in executor.query
-    assert "MAX(total_logical_io_reads) AS max_logical_io_reads" in executor.query
+    # The maxima are a window over the same aggregation: the runtime
+    # statistics are read once, not once more for a second CTE reference.
+    assert "MAX(SUM(rs.avg_logical_io_reads * rs.count_executions)) OVER ()" in executor.query
+    assert executor.query.count("FROM sys.query_store_runtime_stats AS rs") == 1
     assert "CAST(MAX(rsi.end_time) AS datetime2(7)) AS last_seen_utc" in executor.query
-    assert executor.params == [60, 7]
+    assert executor.params == [7, 60]
 
 
 @pytest.mark.asyncio
@@ -489,7 +491,7 @@ async def test_exact_query_identity_uses_binary_length_aware_comparison() -> Non
 
     assert "DATALENGTH(qt.query_sql_text)" in executor.query
     assert "Latin1_General_100_BIN2" in executor.query
-    assert executor.params == [sql, sql]
+    assert executor.params == [sql]
 
 
 @pytest.mark.asyncio

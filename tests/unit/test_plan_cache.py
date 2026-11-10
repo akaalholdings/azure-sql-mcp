@@ -77,12 +77,12 @@ async def test_get_plan_cache_analysis_no_warning_when_reuse_good():
 @pytest.mark.asyncio
 async def test_get_query_compilation_stats_flags_excessive():
     rows = [
-        {"query_hash": b"\x01\x02", "recompile_count": 100, "execution_count": 150, "recompile_ratio": 0.67, "creation_time": "2026-04-01", "last_execution_time": "2026-04-01", "total_elapsed_ms": 5000, "total_cpu_ms": 3000, "total_logical_reads": 100000, "sql_text_preview": "SELECT ..."},
-        {"query_hash": b"\x03\x04", "recompile_count": 5, "execution_count": 1000, "recompile_ratio": 0.005, "creation_time": "2026-04-01", "last_execution_time": "2026-04-01", "total_elapsed_ms": 100, "total_cpu_ms": 50, "total_logical_reads": 500, "sql_text_preview": "INSERT ..."},
+        {"query_hash": b"\x01\x02", "recompile_count": 100, "execution_count": 150, "minutes_since_last_compile": 3, "creation_time": "2026-04-01", "last_execution_time": "2026-04-01", "total_elapsed_ms": 5000, "total_cpu_ms": 3000, "total_logical_reads": 100000, "sql_text_preview": "SELECT ..."},
+        {"query_hash": b"\x03\x04", "recompile_count": 5, "execution_count": 1000, "minutes_since_last_compile": 3, "creation_time": "2026-04-01", "last_execution_time": "2026-04-01", "total_elapsed_ms": 100, "total_cpu_ms": 50, "total_logical_reads": 500, "sql_text_preview": "INSERT ..."},
     ]
     service = PlanCacheService(FakeExecutor([rows]))
     result = await service.get_query_compilation_stats("testdb", top_n=20)
 
     assert result["recompiled_query_count"] == 2
-    assert result["excessive_recompile_count"] == 1  # Only first (0.67 > 0.5 and 150 > 10)
+    assert result["excessive_recompile_count"] == 1  # Only the first: 100 generations, compiled 3 minutes ago
     assert len(result["warnings"]) == 1

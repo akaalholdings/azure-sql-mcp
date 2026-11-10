@@ -105,6 +105,21 @@ class StateExecutor:
         self.runtime_rows = list(runtime_rows or [])
         self.statements: list[list[str]] = []
         self.fetches: list[tuple[str, tuple[Any, ...]]] = []
+        # Force precheck reads. The default is a healthy target: the plan
+        # belongs to query 42, ran an hour ago, and the query ran one plan.
+        self.plan_row: dict[str, Any] | None = {
+            "query_id": 42,
+            "plan_type_desc": "Compiled Plan",
+            "force_failure_count": 0,
+            "last_force_failure_reason_desc": "NONE",
+            "minutes_since_last_execution": 60,
+            "has_option_recompile": 0,
+            "plan_uses_temp_table": 0,
+            "query_store_state": "READ_WRITE",
+        }
+        self.variant_rows: list[dict[str, Any]] = []
+        self.bucket_rows: list[dict[str, Any]] | None = None
+        self.precheck_error: Exception | None = None
 
     async def fetch_all(
         self,
@@ -115,6 +130,17 @@ class StateExecutor:
         max_rows: int | None = None,
     ) -> list[dict[str, Any]]:
         assert max_rows is not None
+        if "minutes_since_last_execution" in query:
+            if self.precheck_error is not None:
+                raise self.precheck_error
+            plan_id = tuple(params or ())[0]
+            return [] if self.plan_row is None else [{"plan_id": plan_id, **self.plan_row}]
+        if "query_store_query_variant" in query:
+            return [dict(row) for row in self.variant_rows]
+        if "avg_rowcount" in query:
+            if self.bucket_rows is None:
+                return [{"plan_id": 7, "executions": 100, "avg_rowcount": 10.0}]
+            return [dict(row) for row in self.bucket_rows]
         self.fetches.append((query, tuple(params or ())))
         return [dict(row) for row in self.runtime_rows]
 

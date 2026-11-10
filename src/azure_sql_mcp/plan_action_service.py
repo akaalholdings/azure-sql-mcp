@@ -13,6 +13,8 @@ from .admin_policy import AdminAction, AdminPolicy
 from .config import AccessMode, McpProfile, ServerConfig, WritePolicy
 from .connection import AzureSqlExecutor, QueryResult
 from .database_policy import DatabasePolicySet
+from .incident_log import note_exception
+from .observability import sanitize_error_message
 from .performance_contracts import PlanActionIntentV1, redact_metadata, utc_now
 from .performance_store import ConcurrencyError, PerformanceStore
 from .plan_verification import decide_verification, hash_evidence
@@ -67,6 +69,71 @@ ORDER BY window_name, rs.plan_id
 """
 
 
+# Force precheck: a forced plan must have run within MAX_FORCED_PLAN_AGE, and
+# a query whose plans return row counts PARAMETER_SENSITIVE_ROW_SPREAD apart
+# needs a plan per value range, so no single plan is forced for it.
+FORCE_PRECHECK_WINDOW = timedelta(days=7)
+MAX_FORCED_PLAN_AGE = timedelta(days=4)
+PARAMETER_SENSITIVE_ROW_SPREAD = 10.0
+_PRECHECK_PLAN_SQL = """
+SELECT
+    p.plan_id,
+    p.query_id,
+    p.plan_type_desc,
+    p.force_failure_count,
+    p.last_force_failure_reason_desc,
+    DATEDIFF(MINUTE, p.last_execution_time, SYSUTCDATETIME()) AS minutes_since_last_execution,
+    CASE
+        WHEN qt.query_sql_text COLLATE Latin1_General_CI_AS LIKE N'%OPTION%(%RECOMPILE%'
+        THEN 1 ELSE 0
+    END AS has_option_recompile,
+    CASE
+        WHEN CAST(p.query_plan AS nvarchar(max)) LIKE N'%Table="[[]#%' THEN 1 ELSE 0
+    END AS plan_uses_temp_table,
+    (SELECT TOP (1) o.actual_state_desc FROM sys.database_query_store_options AS o)
+        AS query_store_state
+FROM sys.query_store_plan AS p
+INNER JOIN sys.query_store_query AS q
+    ON q.query_id = p.query_id
+INNER JOIN sys.query_store_query_text AS qt
+    ON qt.query_text_id = q.query_text_id
+WHERE p.plan_id = ?
+"""
+_PRECHECK_VARIANT_SQL = """
+SELECT qv.parent_query_id, qv.dispatcher_plan_id
+FROM sys.query_store_query_variant AS qv
+WHERE qv.query_variant_query_id = ?
+"""
+# One row per plan of the query: Regular runs and rows per execution.
+_PRECHECK_PLAN_BUCKETS_SQL = """
+SELECT
+    rs.plan_id,
+    SUM(rs.count_executions) AS executions,
+    SUM(rs.avg_rowcount * rs.count_executions)
+        / NULLIF(SUM(rs.count_executions), 0) AS avg_rowcount
+FROM sys.query_store_runtime_stats AS rs
+INNER JOIN sys.query_store_runtime_stats_interval AS rsi
+    ON rsi.runtime_stats_interval_id = rs.runtime_stats_interval_id
+INNER JOIN sys.query_store_plan AS p
+    ON p.plan_id = rs.plan_id
+WHERE p.query_id = ?
+  AND rs.execution_type = 0
+  AND rsi.end_time >= DATEADD(MINUTE, -?, SYSUTCDATETIME())
+GROUP BY rs.plan_id
+"""
+
+# Enforcement guardrails, kept as events in the performance store.
+ACTION_COOLDOWN = timedelta(hours=24)
+DAILY_ACTION_CAP = 3
+FAILURE_COOLDOWN = timedelta(hours=168)
+FAILURES_FOR_LONG_COOLDOWN = 2
+_GUARDRAIL_AGGREGATE = "plan_action_guardrail"
+# The guardrails limit new interventions. Removing one (unforce, clear hints,
+# rollback) is never delayed.
+_GUARDED_OPERATIONS = frozenset({"force_plan", "set_hints"})
+_TIMEOUT_MARKERS = ("HYT00", "HYT01", "QUERY TIMEOUT", "TIMED OUT")
+
+
 class PlanActionOutcomeUnknownError(RuntimeError):
     """A plan action was dispatched, then its outcome could not be recorded."""
 
@@ -113,6 +180,250 @@ def _pooled_stdev(count: float, total: float, total_sq: float | None) -> float |
         return None
     mean = total / count
     return math.sqrt(max(total_sq / count - mean * mean, 0.0))
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    """True when the statement may still be running on the server."""
+
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, TimeoutError):
+            return True
+        text = " ".join(str(argument) for argument in current.args).upper()
+        if any(marker in text for marker in _TIMEOUT_MARKERS):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def evaluate_force_precheck(
+    plan_row: Mapping[str, Any] | None,
+    variant_rows: Sequence[Mapping[str, Any]] | None,
+    bucket_rows: Sequence[Mapping[str, Any]],
+    *,
+    query_id: int,
+    plan_id: int,
+) -> dict[str, Any]:
+    """Grade a force_plan target. A blocker rejects the intent; a warning does not.
+
+    ``variant_rows`` is None when the variant catalog could not be read.
+    """
+
+    blockers: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    facts: dict[str, Any] = {"query_id": query_id, "plan_id": plan_id}
+    if plan_row is None:
+        blockers.append(
+            {
+                "code": "target_plan_not_found",
+                "message": f"Plan {plan_id} is not in Query Store, so it cannot be forced.",
+            }
+        )
+    elif int(_as_number(plan_row.get("query_id"))) != query_id:
+        owner = int(_as_number(plan_row.get("query_id")))
+        blockers.append(
+            {
+                "code": "plan_belongs_to_another_query",
+                "message": (
+                    f"Plan {plan_id} belongs to query {owner}, not query {query_id}; the "
+                    "engine refuses this pair."
+                ),
+                "owning_query_id": owner,
+            }
+        )
+    else:
+        minutes = plan_row.get("minutes_since_last_execution")
+        facts["minutes_since_last_execution"] = minutes
+        facts["plan_type_desc"] = plan_row.get("plan_type_desc")
+        max_minutes = MAX_FORCED_PLAN_AGE.total_seconds() / 60
+        if minutes is None or _as_number(minutes) > max_minutes:
+            age = "has no recorded execution" if minutes is None else (
+                f"last ran {_as_number(minutes) / 1440:.1f} days ago"
+            )
+            blockers.append(
+                {
+                    "code": "plan_not_run_recently",
+                    "message": (
+                        f"Plan {plan_id} {age}. A forced plan must have run in the last "
+                        f"{MAX_FORCED_PLAN_AGE.days} days: an older plan is not proven "
+                        "against the current data and schema."
+                    ),
+                }
+            )
+        if plan_row.get("has_option_recompile"):
+            warnings.append(
+                {
+                    "code": "option_recompile",
+                    "message": (
+                        "The statement has OPTION (RECOMPILE): it compiles on every run, "
+                        "so a plan problem here is a per-value problem. Check that one "
+                        "forced plan fits every value."
+                    ),
+                }
+            )
+        if plan_row.get("plan_uses_temp_table"):
+            warnings.append(
+                {
+                    "code": "temp_table_in_plan",
+                    "message": (
+                        "The plan reads a #temp table. Its schema and statistics change "
+                        "per session, so forcing often fails; watch force_failure_count."
+                    ),
+                }
+            )
+        if str(plan_row.get("query_store_state") or "").upper() == "READ_ONLY":
+            warnings.append(
+                {
+                    "code": "query_store_read_only",
+                    "message": (
+                        "Query Store is READ_ONLY: it records no new runtime statistics, "
+                        "so the action cannot be verified until it is READ_WRITE again."
+                    ),
+                }
+            )
+        failures = int(_as_number(plan_row.get("force_failure_count")))
+        if failures > 0:
+            warnings.append(
+                {
+                    "code": "prior_force_failures",
+                    "message": (
+                        f"Forcing this plan failed {failures} time(s) before (last reason: "
+                        f"{plan_row.get('last_force_failure_reason_desc') or 'unknown'})."
+                    ),
+                    "force_failure_count": failures,
+                }
+            )
+    if variant_rows is None:
+        warnings.append(
+            {
+                "code": "variant_lookup_unavailable",
+                "message": (
+                    "sys.query_store_query_variant could not be read, so it is not known "
+                    "whether this query is a parameter-sensitive plan variant."
+                ),
+            }
+        )
+    elif variant_rows:
+        parent = variant_rows[0].get("parent_query_id")
+        warnings.append(
+            {
+                "code": "psp_variant",
+                "message": (
+                    f"Query {query_id} is a parameter-sensitive plan variant of query "
+                    f"{parent}. A forced variant gets no executions once the parent "
+                    "statement dispatches to another variant; review the parent first."
+                ),
+                "parent_query_id": parent,
+                "dispatcher_plan_id": variant_rows[0].get("dispatcher_plan_id"),
+            }
+        )
+    rows_per_plan = [
+        _as_number(row.get("avg_rowcount"))
+        for row in bucket_rows
+        if _as_number(row.get("executions")) > 0
+    ]
+    facts["plans_in_window"] = len(rows_per_plan)
+    if len(rows_per_plan) > 1:
+        # Under one row per execution the spread is noise.
+        spread = max(max(rows_per_plan), 1.0) / max(min(rows_per_plan), 1.0)
+        facts["rows_per_execution_spread"] = round(spread, 1)
+        if spread >= PARAMETER_SENSITIVE_ROW_SPREAD:
+            blockers.append(
+                {
+                    "code": "parameter_sensitive_query",
+                    "message": (
+                        f"The query ran {len(rows_per_plan)} plans whose rows per execution "
+                        f"differ {spread:.0f}x: it is parameter-sensitive, and one forced "
+                        "plan is wrong for part of its values. Use a Query Store hint or "
+                        "fix the statement instead of forcing a plan."
+                    ),
+                }
+            )
+    return {
+        "status": "block" if blockers else "warn" if warnings else "pass",
+        "blockers": blockers,
+        "warnings": warnings,
+        "facts": facts,
+    }
+
+
+def evaluate_guardrails(
+    events: Sequence[Mapping[str, Any]],
+    *,
+    query_id: int,
+    now: datetime,
+) -> dict[str, Any]:
+    """Decide whether one more plan action may be applied on this database.
+
+    An action is a dispatched apply attempt, unless that attempt failed with
+    the state unchanged; such an attempt is not a failed action either.
+    Limits: one action per query per ACTION_COOLDOWN, DAILY_ACTION_CAP actions
+    per database per 24 hours, and FAILURE_COOLDOWN for a query after
+    FAILURES_FOR_LONG_COOLDOWN failed actions (rolled back after a regression,
+    or forcing failed after apply).
+    """
+
+    unchanged: set[tuple[Any, Any]] = set()
+    failures: list[datetime] = []
+    dispatched: list[tuple[datetime, Any, tuple[Any, Any]]] = []
+    for event in events:
+        payload = event.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        at = _parse_utc(payload.get("at_utc"))
+        if at is None:
+            continue
+        attempt = (payload.get("intent_id"), payload.get("attempt"))
+        if event.get("event_type") == "plan_action.failed":
+            if payload.get("state_changed") is False:
+                unchanged.add(attempt)
+            elif payload.get("query_id") == query_id:
+                failures.append(at)
+        elif event.get("event_type") == "plan_action.dispatched":
+            dispatched.append((at, payload.get("query_id"), attempt))
+    actions = [(at, query) for at, query, attempt in dispatched if attempt not in unchanged]
+    day_ago = now - timedelta(hours=24)
+    recent = sorted(at for at, _query in actions if at > day_ago)
+    recent_failures = sorted(at for at in failures if at > now - FAILURE_COOLDOWN)
+    query_actions = [at for at, query in actions if query == query_id]
+    result: dict[str, Any] = {
+        "allowed": True,
+        "actions_last_24h": len(recent),
+        "daily_action_cap": DAILY_ACTION_CAP,
+        "failed_actions": len(recent_failures),
+    }
+    blocked: tuple[str, datetime, str] | None = None
+    if len(recent_failures) >= FAILURES_FOR_LONG_COOLDOWN:
+        blocked = (
+            "failure_cooldown",
+            recent_failures[-1] + FAILURE_COOLDOWN,
+            f"{len(recent_failures)} plan actions failed for query {query_id} in the last "
+            f"{int(FAILURE_COOLDOWN.total_seconds() // 3600)} hours.",
+        )
+    elif query_actions and max(query_actions) + ACTION_COOLDOWN > now:
+        blocked = (
+            "query_cooldown",
+            max(query_actions) + ACTION_COOLDOWN,
+            f"A plan action was applied to query {query_id} in the last "
+            f"{int(ACTION_COOLDOWN.total_seconds() // 3600)} hours.",
+        )
+    elif len(recent) >= DAILY_ACTION_CAP:
+        blocked = (
+            "daily_action_cap",
+            recent[-DAILY_ACTION_CAP] + timedelta(hours=24),
+            f"{len(recent)} plan actions were applied to this database in the last 24 hours.",
+        )
+    if blocked is not None:
+        code, retry_after, reason = blocked
+        result.update(
+            allowed=False,
+            blocked_by=code,
+            reason=reason,
+            retry_after_utc=retry_after.isoformat(),
+        )
+    return result
 
 
 def _first_rows(results: Sequence[QueryResult]) -> list[dict[str, Any]]:
@@ -180,13 +491,23 @@ class PlanActionService:
         )
         prior_state = await self._capture_control_state(database_name, query_id)
         ownership = str(prior_state["ownership"])
+        precheck = (
+            await self._force_precheck(database_name, query_id, int(plan_id or 0))
+            if operation == "force_plan"
+            else None
+        )
         baseline_evidence = redact_metadata(evidence)
         evidence_hash = hash_evidence(baseline_evidence)
         database_fingerprint = _database_fingerprint(self.config.server, database_name)
         intent_id = "intent-" + _hash_text(
             f"{database_fingerprint}:{idempotency_key}"
         )[:32]
-        status = "prepared" if ownership == "manual" else "rejected"
+        rejection_reason = None
+        if ownership != "manual":
+            rejection_reason = "automatic or unknown ownership is review-only"
+        elif precheck is not None and precheck["blockers"]:
+            rejection_reason = "force precheck: " + precheck["blockers"][0]["message"]
+        status = "prepared" if rejection_reason is None else "rejected"
         created_at = utc_now()
         expires_at = (datetime.fromisoformat(created_at) + self.intent_ttl).isoformat()
         intent = PlanActionIntentV1(
@@ -211,11 +532,8 @@ class PlanActionService:
                 "reviewed_by": reviewed_by,
                 "reason": reason,
                 "idempotency_fingerprint": _hash_text(idempotency_key),
-                "rejection_reason": (
-                    None
-                    if status == "prepared"
-                    else "automatic or unknown ownership is review-only"
-                ),
+                "rejection_reason": rejection_reason,
+                **({"force_precheck": precheck} if precheck is not None else {}),
             },
         )
         intent = self.store.create_plan_action_intent(
@@ -237,13 +555,20 @@ class PlanActionService:
                 },
             ),
         )
-        return {
+        result = {
             "intent": intent.to_dict(),
             "prepared": intent.status == "prepared",
             "expires_at_utc": intent.metadata.get("expires_at_utc"),
             "apply_gates": self._gate_status(database_name),
+            # What apply would decide now for force_plan and set_hints; apply
+            # checks again. unforce_plan and clear_hints are never delayed.
+            "guardrails": self._guardrails(database_fingerprint, query_id),
             "raw_sql_persisted": False,
         }
+        stored_precheck = intent.metadata.get("force_precheck")
+        if stored_precheck is not None:
+            result["force_precheck"] = stored_precheck
+        return result
 
     async def apply(
         self,
@@ -276,6 +601,12 @@ class PlanActionService:
                 },
             )
             return {"intent": updated.to_dict(), "confirmed": False, "expired": True}
+        database_fingerprint = str(intent.metadata.get("database_fingerprint") or "")
+        guarded = intent.action in _GUARDED_OPERATIONS
+        guardrail = self._guardrails(database_fingerprint, int(intent.metadata["query_id"]))
+        if guarded and not guardrail["allowed"]:
+            # Nothing is read or changed, and the intent stays prepared.
+            return {"intent": intent.to_dict(), "confirmed": False, "guardrail": guardrail}
         try:
             intent = self._save_status(
                 intent,
@@ -328,6 +659,9 @@ class PlanActionService:
                 },
             )
             return {"intent": updated.to_dict(), "confirmed": False}
+        if guarded:
+            # Recorded before dispatch, so an interrupted apply still counts.
+            self._record_guardrail_event("dispatched", intent, per_attempt=True)
         try:
             await self._execute_action(
                 database_name,
@@ -345,6 +679,11 @@ class PlanActionService:
             )
             raise
         except Exception as exc:
+            failed = await self._apply_failed_without_change(
+                database_name, intent, prior_state, exc
+            )
+            if failed is not None:
+                return failed
             return self._unknown_after_dispatch(
                 intent,
                 {
@@ -474,6 +813,10 @@ class PlanActionService:
         elif applied_at is None:
             hold_reason = "Intent has no valid applied_at_utc; post-apply evidence cannot be read."
         if hold_reason is not None:
+            if forced_plan_id is not None and failures_now > failures_at_apply:
+                self._record_guardrail_event(
+                    "failed", intent, per_attempt=False, failure="force_failed"
+                )
             return self._verification_hold(intent, hold_reason, evidence)
         assert applied_at is not None
         mcp_baseline, mcp_candidate, collected = await self._collect_runtime_evidence(
@@ -565,6 +908,9 @@ class PlanActionService:
                 },
             )
             return {"intent": updated.to_dict(), "decision": "keep", "evidence": evidence}
+        self._record_guardrail_event(
+            "failed", intent, per_attempt=False, failure="rolled_back_after_regression"
+        )
         rollback = await self.rollback(
             database_name,
             intent_id,
@@ -921,6 +1267,149 @@ class PlanActionService:
             # The restore was sent: a retry could undo someone else's change.
             raise PlanActionOutcomeUnknownError(_OUTCOME_UNKNOWN) from exc
         return {"intent": updated.to_dict(), "confirmed": True, "idempotent": False}
+
+    async def _force_precheck(
+        self,
+        database_name: str,
+        query_id: int,
+        plan_id: int,
+    ) -> dict[str, Any]:
+        """Read the force target and grade it; a failed read blocks (fail closed)."""
+
+        try:
+            plan_rows = await self.executor.fetch_all(
+                database_name, _PRECHECK_PLAN_SQL, params=[plan_id], max_rows=2
+            )
+            bucket_rows = await self.executor.fetch_all(
+                database_name,
+                _PRECHECK_PLAN_BUCKETS_SQL,
+                params=[query_id, int(FORCE_PRECHECK_WINDOW.total_seconds() // 60)],
+                max_rows=_MAX_EVIDENCE_ROWS,
+            )
+        except Exception as exc:
+            note_exception(exc, "plan_action_service.force_precheck")
+            return {
+                "status": "block",
+                "blockers": [
+                    {
+                        "code": "precheck_unavailable",
+                        "message": (
+                            "The force precheck could not read Query Store "
+                            f"({sanitize_error_message(str(exc))}); prepare again."
+                        ),
+                    }
+                ],
+                "warnings": [],
+                "facts": {"query_id": query_id, "plan_id": plan_id},
+            }
+        variant_rows: list[dict[str, Any]] | None
+        try:
+            variant_rows = await self.executor.fetch_all(
+                database_name, _PRECHECK_VARIANT_SQL, params=[query_id], max_rows=2
+            )
+        except Exception as exc:
+            note_exception(exc, "plan_action_service.force_precheck_variant")
+            variant_rows = None
+        return evaluate_force_precheck(
+            plan_rows[0] if plan_rows else None,
+            variant_rows,
+            bucket_rows,
+            query_id=query_id,
+            plan_id=plan_id,
+        )
+
+    def _guardrails(self, database_fingerprint: str, query_id: int) -> dict[str, Any]:
+        events = self.store.list_events(
+            aggregate_type=_GUARDRAIL_AGGREGATE,
+            aggregate_id=database_fingerprint,
+        )
+        return evaluate_guardrails(events, query_id=query_id, now=datetime.now(UTC))
+
+    def _record_guardrail_event(
+        self,
+        kind: str,
+        intent: PlanActionIntentV1,
+        *,
+        per_attempt: bool,
+        **payload: Any,
+    ) -> None:
+        """Append one guardrail event.
+
+        An apply attempt is named by the intent version at dispatch, so a
+        refused attempt and a later retry of the same intent stay apart. A
+        verification failure is recorded once per intent, however often verify
+        is repeated.
+        """
+
+        label = str(payload.get("failure") or kind)
+        key = f"{intent.intent_id}:guardrail:{label}"
+        if per_attempt:
+            payload["attempt"] = intent.version
+            key += f":{intent.version}"
+        self.store.append_event(
+            event_type=f"plan_action.{kind}",
+            aggregate_type=_GUARDRAIL_AGGREGATE,
+            aggregate_id=str(intent.metadata.get("database_fingerprint") or ""),
+            payload={
+                "intent_id": intent.intent_id,
+                "query_id": int(intent.metadata["query_id"]),
+                "at_utc": utc_now(),
+                **payload,
+            },
+            idempotency_key=key,
+        )
+
+    async def _apply_failed_without_change(
+        self,
+        database_name: str,
+        intent: PlanActionIntentV1,
+        prior_state: Mapping[str, Any],
+        exc: Exception,
+    ) -> dict[str, Any] | None:
+        """Return the intent to prepared when a failed apply changed nothing.
+
+        A timeout may still be running on the server, so it stays unknown. For
+        any other error the control state is read again: equal to the prior
+        state means the engine did not apply the action.
+        """
+
+        if _is_timeout(exc):
+            return None
+        try:
+            observed = await self._capture_control_state(
+                database_name, int(intent.metadata["query_id"])
+            )
+        except Exception as read_exc:
+            note_exception(read_exc, "plan_action_service.apply_failure_read")
+            return None
+        if not self._control_state_matches(observed, prior_state):
+            return None
+        try:
+            self._record_guardrail_event(
+                "failed", intent, per_attempt=True, failure="apply_failed", state_changed=False
+            )
+            updated = self._save_status(
+                intent,
+                "prepared",
+                {
+                    "apply_confirmation": "failed_no_change",
+                    "apply_error_type": type(exc).__name__,
+                    "apply_error": sanitize_error_message(str(exc)),
+                    "apply_failed_at_utc": utc_now(),
+                },
+            )
+        except Exception as save_exc:
+            note_exception(save_exc, "plan_action_service.apply_failure_record")
+            return None
+        return {
+            "intent": updated.to_dict(),
+            "confirmed": False,
+            "apply_failed": True,
+            "reason": (
+                "The engine refused the action and the Query Store control state is "
+                "unchanged, so nothing was applied. Fix the cause and apply again."
+            ),
+        }
 
     def _unknown_after_dispatch(
         self,
@@ -1310,4 +1799,12 @@ class PlanActionService:
         return normalized
 
 
-__all__ = ["DEFAULT_INTENT_TTL", "PlanActionService"]
+__all__ = [
+    "ACTION_COOLDOWN",
+    "DAILY_ACTION_CAP",
+    "DEFAULT_INTENT_TTL",
+    "FAILURE_COOLDOWN",
+    "PlanActionService",
+    "evaluate_force_precheck",
+    "evaluate_guardrails",
+]

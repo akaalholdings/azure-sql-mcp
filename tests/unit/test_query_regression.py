@@ -472,9 +472,11 @@ def _translate_tsql(query: str, params: list) -> tuple[str, list]:
     import re
 
     params = list(params)
-    q = re.sub(r"(?i)nvarchar\s*\(\s*max\s*\)", "TEXT", query)
+    q = re.sub(r"(?i)n?varchar\s*\(\s*max\s*\)", "TEXT", query)
     q = q.replace("TODATETIMEOFFSET(CAST(? AS datetime2), 0)", "replace(?, 'T', ' ')")
     q = q.replace("CONVERT(BINARY(8), ?, 1)", "?")
+    q = q.replace(" COLLATE Latin1_General_CI_AS", "").replace("N'", "'")
+    q = re.sub(r"CONVERT\(varchar\(18\), ([\w.]+), 1\)", r"\1", q)
     q = re.sub(r"'%' \+ (.+?) \+ '%'", r"'%' || \1 || '%'", q)
     q = re.sub(
         r"(?i)DATEADD\(MINUTE,\s*-\?,\s*(SYSUTCDATETIME|GETUTCDATE)\(\)\)",

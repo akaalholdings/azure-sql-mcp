@@ -222,7 +222,7 @@ class CapturingExecutor:
     ("sort_by", "expected"),
     [
         ("cpu", [10, "2026-09-30T04:00:00", "2026-09-30T05:00:00"]),
-        ("resource_blend", ["2026-09-30T04:00:00", "2026-09-30T05:00:00", 10]),
+        ("resource_blend", [10, "2026-09-30T04:00:00", "2026-09-30T05:00:00"]),
     ],
 )
 async def test_top_queries_read_an_explicit_past_window(sort_by: str, expected: list[Any]) -> None:

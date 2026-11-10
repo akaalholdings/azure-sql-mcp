@@ -232,6 +232,101 @@ ORDER BY {order_by}
 """
 
 
+# Averages are execution-weighted over Regular runs; max_duration_ms is the
+# single slowest run. Runtime statistics age out of Query Store, so the last
+# execution falls back to the time kept on the plan row.
+_FORCED_PLAN_STATS_CTE = """
+WITH ForcedPlanStats AS (
+    SELECT
+        p.plan_id,
+        p.query_id,
+        qt.query_sql_text,
+        p.is_forced_plan,
+        p.plan_forcing_type_desc,
+        p.force_failure_count,
+        p.last_force_failure_reason_desc,
+        SUM(CASE WHEN rs.execution_type = 0 THEN rs.avg_duration * rs.count_executions END)
+            / NULLIF(SUM(CASE WHEN rs.execution_type = 0 THEN rs.count_executions END), 0)
+            / 1000.0 AS avg_duration_ms,
+        SUM(CASE WHEN rs.execution_type = 0 THEN rs.avg_cpu_time * rs.count_executions END)
+            / NULLIF(SUM(CASE WHEN rs.execution_type = 0 THEN rs.count_executions END), 0)
+            / 1000.0 AS avg_cpu_ms,
+        SUM(CASE WHEN rs.execution_type = 0 THEN rs.avg_logical_io_reads * rs.count_executions END)
+            / NULLIF(SUM(CASE WHEN rs.execution_type = 0 THEN rs.count_executions END), 0)
+            AS avg_logical_io_reads,
+        MAX(rs.max_duration) / 1000.0 AS max_duration_ms,
+        SUM(rs.count_executions) AS count_executions,
+        SUM(CASE WHEN rs.execution_type = 3 THEN rs.count_executions ELSE 0 END)
+            AS aborted_executions,
+        SUM(CASE WHEN rs.execution_type = 4 THEN rs.count_executions ELSE 0 END)
+            AS exception_executions,
+        SUM(
+            CASE
+                WHEN rsi.end_time >= DATEADD(MINUTE, -?, SYSUTCDATETIME())
+                THEN rs.count_executions
+                ELSE 0
+            END
+        ) AS recent_execution_count,
+        COALESCE(MAX(rs.last_execution_time), MAX(p.last_execution_time)) AS last_execution_time
+    FROM sys.query_store_plan AS p
+    INNER JOIN sys.query_store_query AS q
+        ON p.query_id = q.query_id
+    INNER JOIN sys.query_store_query_text AS qt
+        ON q.query_text_id = qt.query_text_id
+    LEFT JOIN sys.query_store_runtime_stats AS rs
+        ON p.plan_id = rs.plan_id
+    LEFT JOIN sys.query_store_runtime_stats_interval AS rsi
+        ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
+    WHERE p.is_forced_plan = 1
+    GROUP BY
+        p.plan_id,
+        p.query_id,
+        qt.query_sql_text,
+        p.is_forced_plan,
+        p.plan_forcing_type_desc,
+        p.force_failure_count,
+        p.last_force_failure_reason_desc
+)
+"""
+_FORCED_PLANS_SQL = (
+    _FORCED_PLAN_STATS_CTE
+    + """SELECT
+    f.plan_id,
+    f.query_id,
+    f.query_sql_text,
+    f.is_forced_plan,
+    f.plan_forcing_type_desc,
+    f.force_failure_count,
+    f.last_force_failure_reason_desc,
+    f.avg_duration_ms,
+    f.avg_cpu_ms,
+    f.avg_logical_io_reads,
+    f.max_duration_ms,
+    f.count_executions,
+    f.aborted_executions,
+    f.exception_executions,
+    f.recent_execution_count,
+    ISNULL(qa.query_recent_execution_count, 0) AS query_recent_execution_count,
+    f.last_execution_time,
+    DATEDIFF(DAY, f.last_execution_time, SYSUTCDATETIME()) AS days_since_last_exec
+FROM ForcedPlanStats AS f
+OUTER APPLY (
+    -- Executions of any plan of the query: the query runs while the
+    -- forced plan does not when forcing is failing now.
+    SELECT SUM(rs2.count_executions) AS query_recent_execution_count
+    FROM sys.query_store_plan AS p2
+    INNER JOIN sys.query_store_runtime_stats AS rs2
+        ON rs2.plan_id = p2.plan_id
+    INNER JOIN sys.query_store_runtime_stats_interval AS rsi2
+        ON rs2.runtime_stats_interval_id = rsi2.runtime_stats_interval_id
+    WHERE p2.query_id = f.query_id
+      AND rsi2.end_time >= DATEADD(MINUTE, -?, SYSUTCDATETIME())
+) AS qa
+ORDER BY f.last_execution_time DESC
+"""
+)
+
+
 class QueryRegressionService:
     def __init__(self, executor: AzureSqlExecutor):
         self.executor = executor
@@ -407,83 +502,18 @@ class QueryRegressionService:
         """List all forced plans with execution stats and staleness check."""
         if window_minutes <= 0:
             raise ValueError("window_minutes must be greater than 0.")
-        query = """
-        WITH ForcedPlanStats AS (
-            SELECT
-                p.plan_id,
-                p.query_id,
-                qt.query_sql_text,
-                p.is_forced_plan,
-                p.plan_forcing_type_desc,
-                p.force_failure_count,
-                p.last_force_failure_reason_desc,
-                MAX(rs.avg_duration) / 1000.0 AS avg_duration_ms,
-                MAX(rs.avg_cpu_time) / 1000.0 AS avg_cpu_ms,
-                MAX(rs.avg_logical_io_reads) AS avg_logical_io_reads,
-                SUM(rs.count_executions) AS count_executions,
-                SUM(
-                    CASE
-                        WHEN rsi.end_time >= DATEADD(MINUTE, -?, SYSUTCDATETIME())
-                        THEN rs.count_executions
-                        ELSE 0
-                    END
-                ) AS recent_execution_count,
-                MAX(rs.last_execution_time) AS last_execution_time
-            FROM sys.query_store_plan AS p
-            INNER JOIN sys.query_store_query AS q
-                ON p.query_id = q.query_id
-            INNER JOIN sys.query_store_query_text AS qt
-                ON q.query_text_id = qt.query_text_id
-            LEFT JOIN sys.query_store_runtime_stats AS rs
-                ON p.plan_id = rs.plan_id
-            LEFT JOIN sys.query_store_runtime_stats_interval AS rsi
-                ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
-            WHERE p.is_forced_plan = 1
-            GROUP BY
-                p.plan_id,
-                p.query_id,
-                qt.query_sql_text,
-                p.is_forced_plan,
-                p.plan_forcing_type_desc,
-                p.force_failure_count,
-                p.last_force_failure_reason_desc
-        )
-        SELECT
-            f.plan_id,
-            f.query_id,
-            f.query_sql_text,
-            f.is_forced_plan,
-            f.plan_forcing_type_desc,
-            f.force_failure_count,
-            f.last_force_failure_reason_desc,
-            f.avg_duration_ms,
-            f.avg_cpu_ms,
-            f.avg_logical_io_reads,
-            f.count_executions,
-            f.recent_execution_count,
-            ISNULL(qa.query_recent_execution_count, 0) AS query_recent_execution_count,
-            f.last_execution_time,
-            DATEDIFF(DAY, f.last_execution_time, SYSUTCDATETIME()) AS days_since_last_exec
-        FROM ForcedPlanStats AS f
-        OUTER APPLY (
-            -- Executions of any plan of the query: the query runs while the
-            -- forced plan does not when forcing is failing now.
-            SELECT SUM(rs2.count_executions) AS query_recent_execution_count
-            FROM sys.query_store_plan AS p2
-            INNER JOIN sys.query_store_runtime_stats AS rs2
-                ON rs2.plan_id = p2.plan_id
-            INNER JOIN sys.query_store_runtime_stats_interval AS rsi2
-                ON rs2.runtime_stats_interval_id = rsi2.runtime_stats_interval_id
-            WHERE p2.query_id = f.query_id
-              AND rsi2.end_time >= DATEADD(MINUTE, -?, SYSUTCDATETIME())
-        ) AS qa
-        ORDER BY f.last_execution_time DESC
-        """
+        query = _FORCED_PLANS_SQL
         rows = await self.executor.fetch_all(
             database_name, query, params=[int(window_minutes), int(window_minutes)]
         )
 
-        stale = [r for r in rows if (r.get("days_since_last_exec") or 0) > 7]
+        for row in rows:
+            # No runtime statistics and no last execution time on the plan row:
+            # the age is unknown, which is not the same as zero days.
+            row["last_execution_unknown"] = row.get("days_since_last_exec") is None
+        stale = [
+            r for r in rows if r["last_execution_unknown"] or r["days_since_last_exec"] > 7
+        ]
         failing = [r for r in rows if (r.get("force_failure_count") or 0) > 0]
 
         warnings: list[dict[str, Any]] = []
@@ -492,8 +522,9 @@ class QueryRegressionService:
                 {
                     "type": "stale_forced_plans",
                     "message": (
-                        f"{len(stale)} forced plan(s) haven't executed in over 7 days — "
-                        "may be stale or the query pattern changed"
+                        f"{len(stale)} forced plan(s) haven't executed in over 7 days, or "
+                        "have no execution left in Query Store — may be stale or the "
+                        "query pattern changed"
                     ),
                     "plan_ids": [r.get("plan_id") for r in stale],
                 }

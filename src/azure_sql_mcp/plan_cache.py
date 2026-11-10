@@ -4,6 +4,9 @@ from typing import Any
 
 from .connection import AzureSqlExecutor
 
+RECOMPILING_MIN_GENERATIONS = 10
+RECOMPILING_WINDOW_MINUTES = 60
+
 
 class PlanCacheService:
     def __init__(self, executor: AzureSqlExecutor):
@@ -141,17 +144,22 @@ class PlanCacheService:
         database_name: str,
         top_n: int = 20,
     ) -> dict[str, Any]:
-        """Identify excessively recompiled queries from sys.dm_exec_query_stats."""
+        """Rank cached statements by recompiles and flag the ones recompiling now.
+
+        plan_generation_num counts every recompile of the statement, while
+        execution_count restarts at each compile, so the two never form a
+        ratio. A statement is recompiling now when it has at least
+        ``RECOMPILING_MIN_GENERATIONS`` plan generations and its current plan
+        was compiled in the last ``RECOMPILING_WINDOW_MINUTES`` minutes.
+        OPTION (RECOMPILE) statements are never cached and do not appear here.
+        """
         query = """
         SELECT TOP ({top_n})
             qs.query_hash,
             qs.plan_generation_num AS recompile_count,
             qs.execution_count,
-            CASE WHEN qs.execution_count > 0
-                 THEN CAST(qs.plan_generation_num * 1.0 / qs.execution_count AS DECIMAL(10, 4))
-                 ELSE 0
-            END AS recompile_ratio,
             qs.creation_time,
+            DATEDIFF(MINUTE, qs.creation_time, GETDATE()) AS minutes_since_last_compile,
             qs.last_execution_time,
             qs.total_elapsed_time / 1000.0 AS total_elapsed_ms,
             qs.total_worker_time / 1000.0 AS total_cpu_ms,
@@ -165,25 +173,34 @@ class PlanCacheService:
 
         rows = await self.executor.fetch_all(database_name, query)
 
-        excessive = [
-            r
-            for r in rows
-            if (float(r.get("recompile_ratio") or 0)) > 0.5
-            and (r.get("execution_count") or 0) > 10
-        ]
+        for row in rows:
+            minutes = row.get("minutes_since_last_compile")
+            row["recompiling_now"] = (
+                (row.get("recompile_count") or 0) >= RECOMPILING_MIN_GENERATIONS
+                and minutes is not None
+                and minutes <= RECOMPILING_WINDOW_MINUTES
+            )
+        excessive = [r for r in rows if r["recompiling_now"]]
 
         return {
             "database_name": database_name,
             "recompiled_query_count": len(rows),
             "excessive_recompile_count": len(excessive),
+            "recompiling_now_rule": {
+                "min_plan_generations": RECOMPILING_MIN_GENERATIONS,
+                "compiled_within_minutes": RECOMPILING_WINDOW_MINUTES,
+            },
             "queries": rows,
             "warnings": (
                 [
                     {
                         "type": "excessive_recompilation",
                         "message": (
-                            f"{len(excessive)} queries recompile more than 50% of executions. "
-                            "Check for schema changes, temp table usage, or RECOMPILE hints."
+                            f"{len(excessive)} cached statement(s) have many plan generations "
+                            "and compiled again in the last "
+                            f"{RECOMPILING_WINDOW_MINUTES} minutes. "
+                            "Check for temp table or schema changes, statistics updates, "
+                            "or changing SET options."
                         ),
                     }
                 ]
