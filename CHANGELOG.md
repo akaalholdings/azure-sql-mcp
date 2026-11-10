@@ -6,6 +6,45 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [3.0.0rc2] - 2026-11-10
+
+Second release candidate. Use it on a non-production copy only.
+
+### Added
+
+- Database policy field `allow_indexed_view_designs` (default true). When it is
+  false, no indexed view is tested or proposed, and `check_capabilities`
+  reports `indexed_view_experiment.designs_forbidden`.
+- A nonclustered columnstore test index takes `order_columns` and
+  `data_compression` `COLUMNSTORE_ARCHIVE`.
+- `measurement_only` on `benchmark_tuning_candidate` and
+  `benchmark_index_candidate`: a further run on a finalist. It can lower the
+  verdict and cannot raise it.
+- `selection_scope: "tested"` on `finalize_tuning_session`: selects a finalist
+  whose results matched on every measured case. It is not a proof, and the
+  result is not deployment-ready.
+
+### Changed
+
+- A candidate with IF / ELSE branches is judged for each case on the branch
+  that ran. A case on the unchanged original branch is `unchanged_by_design`
+  and no longer makes the candidate inconclusive.
+- A result above the comparison row limit is compared in full by digest.
+- A statement with TOP and no ORDER BY is compared as a multiset, as a tested
+  match at most.
+
+### Fixed
+
+- A statement over a view whose definition starts with a comment was refused
+  as a cyclic view dependency.
+
+### Known limits
+
+- `measurement_only` with held test objects is refused for a `plan_reuse` mode
+  that has no baseline from before the objects were built.
+- The view tool does not take `measurement_only`.
+- `max_call_seconds` does not hold when a connection stalls.
+
 ## [3.0.0rc1] - 2026-11-10
 
 Release candidate. It has run on one Azure SQL Database (General Purpose

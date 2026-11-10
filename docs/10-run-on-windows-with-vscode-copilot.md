@@ -1,6 +1,6 @@
 # Run the 3.0 release candidate on Windows with VS Code Copilot
 
-This guide installs `azure-sql-mcp` 3.0.0rc1 and the four skills on a Windows
+This guide installs `azure-sql-mcp` 3.0.0rc2 and the four skills on a Windows
 machine, connects them to a copy of a database, and tells you what to bring
 back from a trial.
 
@@ -36,7 +36,7 @@ install.
 In PowerShell, in a folder of your choice:
 
 You need two files from the release: the wheel and
-`requirements-3.0.0rc1.txt`. The requirements file holds the exact dependency
+`requirements-3.0.0rc2.txt`. The requirements file holds the exact dependency
 versions the release was tested with. Install those first, then the wheel
 without its dependencies. A plain `pip install` of the wheel can pull newer
 dependency versions that were not tested.
@@ -44,8 +44,8 @@ dependency versions that were not tested.
 ```powershell
 py -3.12 -m venv C:\tools\azure-sql-mcp
 C:\tools\azure-sql-mcp\Scripts\python.exe -m pip install --upgrade pip
-C:\tools\azure-sql-mcp\Scripts\python.exe -m pip install -r .\requirements-3.0.0rc1.txt
-C:\tools\azure-sql-mcp\Scripts\python.exe -m pip install --no-deps .\azure_sql_mcp-3.0.0rc1-py3-none-any.whl
+C:\tools\azure-sql-mcp\Scripts\python.exe -m pip install -r .\requirements-3.0.0rc2.txt
+C:\tools\azure-sql-mcp\Scripts\python.exe -m pip install --no-deps .\azure_sql_mcp-3.0.0rc2-py3-none-any.whl
 ```
 
 Use Python 3.12: the release was tested on 3.12 only.
@@ -56,19 +56,19 @@ Use Python 3.12: the release was tested on 3.12 only.
 C:\tools\azure-sql-mcp\Scripts\python.exe -c "import azure_sql_mcp.server, importlib.metadata as m; print(m.version('azure-sql-mcp'), m.version('mcp'))"
 ```
 
-Expected output: `3.0.0rc1 1.26.0`. An import error here means the
+Expected output: `3.0.0rc2 1.26.0`. An import error here means the
 dependencies are not the tested ones: repeat step 2 in a new virtual
 environment.
 
 ## 4. Install the skills
 
-The release has `sql-skills-3.0.0rc1-installed.zip`. It holds the four skill
+The release has `sql-skills-3.0.0rc2-installed.zip`. It holds the four skill
 folders in their installed form. Unpack it into the Copilot skills folder. If
 a folder of the same name is already there, rename the old one first.
 
 ```powershell
 New-Item -ItemType Directory -Force "$env:USERPROFILE\.copilot\skills" | Out-Null
-Expand-Archive .\sql-skills-3.0.0rc1-installed.zip -DestinationPath "$env:USERPROFILE\.copilot\skills"
+Expand-Archive .\sql-skills-3.0.0rc2-installed.zip -DestinationPath "$env:USERPROFILE\.copilot\skills"
 Get-ChildItem "$env:USERPROFILE\.copilot\skills" -Directory | Select-Object Name
 ```
 
@@ -103,6 +103,7 @@ environment.
       "allow_test_indexes": true,
       "allow_offline_test_index": true,
       "allow_view_apply": true,
+      "allow_indexed_view_designs": true,
       "allow_plan_apply": false,
       "allow_index_history_write": false,
       "test_index_name_prefixes": ["IX_Testing_"],
@@ -119,8 +120,9 @@ environment.
 - `allow_offline_test_index` is needed for a test index on a table that has a
   clustered columnstore index. Azure SQL Database refuses an online build
   there. An offline build blocks writes to the table while it runs.
-- `allow_view_apply` allows the indexed-view experiment. Set it to `false` if
-  indexed views are not a design you can use.
+- `allow_indexed_view_designs` set to `false` forbids indexed views as a design:
+  none is tested or proposed. Use it when your queries or your loads (partition
+  switch, truncate-and-load) cannot take one.
 - `test_index_maxdop` caps each test build. Set it for the size of the copy.
 
 ## 6. Connect VS Code
@@ -156,7 +158,7 @@ it.
 Reload VS Code, start the server in the MCP list, and ask Copilot to run these
 three tools in order:
 
-1. `check_runtime_status`: `package_version` is `3.0.0rc1` and `profile` is
+1. `check_runtime_status`: `package_version` is `3.0.0rc2` and `profile` is
    `sandbox`.
 2. `list_databases`: only the copy is listed.
 3. `check_capabilities` for the copy: Query Store is on, and

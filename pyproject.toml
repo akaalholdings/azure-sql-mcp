@@ -1,6 +1,6 @@
 [project]
 name = "azure-sql-mcp"
-version = "3.0.0rc1"
+version = "3.0.0rc2"
 description = "Typed Azure SQL performance tuning, triage, and reviewed plan enforcement over MCP"
 readme = "README.md"
 requires-python = ">=3.12"
