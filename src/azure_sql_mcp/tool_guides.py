@@ -385,8 +385,9 @@ Read:
   used. It does not show that the optimizer will choose it.
 Avoid:
 - Never run this on production. Use a copy with production-like data.
-- Never create or drop a test index with other DDL. The lease is what
-  guarantees the cleanup.
+- Prefer this tool for every test index: its lease guarantees the cleanup.
+  If it refuses, report the refusal. Other DDL is only for an engagement
+  that permits it, and that result is labelled measured outside the tool.
 - One query cannot justify a production index: state the write cost and the
   size, and check the other queries on the table.
 - Take keys and includes from review_workload_indexes, not from a
@@ -803,7 +804,8 @@ Read:
 Avoid:
 - Do not test the indexes of one design one at a time when the plan needs
   them together. The set is the candidate.
-- Do not fall back to other DDL when the tool refuses. Report the refusal.
+- When the tool refuses, report the refusal first. Use other DDL only where
+  the engagement permits it, drop what you created, and label the result.
 - A set with an unused index is larger than the design needs. Test it again
   without that index.
 Next: get_tuning_session, then finalize_tuning_session. For a rewrite that
