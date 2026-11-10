@@ -37,6 +37,8 @@ class IndexDef:
     included_columns: tuple[str, ...]
     filter_definition: str | None = None
     data_compression: str = "NONE"
+    # ASC or DESC per key column; empty when the capture did not read it (all ASC).
+    key_directions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -278,6 +280,7 @@ async def _fetch_snapshot_rows(
         i.is_primary_key,
         ic.key_ordinal,
         ic.is_included_column,
+        ic.is_descending_key,
         ic.index_column_id AS index_column_ordinal,
         c.name AS column_name,
         i.filter_definition,
@@ -543,14 +546,14 @@ def _build_tables(
         if row["is_included_column"]:
             group["included_columns"].append((int(row["index_column_ordinal"]), column_name))
         else:
-            group["key_columns"].append((int(row["key_ordinal"]), column_name))
+            group["key_columns"].append(
+                (int(row["key_ordinal"]), column_name, bool(row.get("is_descending_key")))
+            )
 
     for (schema_name, table_name, _), group in index_groups.items():
         table_key = (schema_name, table_name)
-        key_columns = tuple(
-            column_name
-            for _, column_name in sorted(group["key_columns"], key=lambda item: item[0])
-        )
+        ordered_keys = sorted(group["key_columns"], key=lambda item: item[0])
+        key_columns = tuple(column_name for _, column_name, _ in ordered_keys)
         included_columns = tuple(
             column_name
             for _, column_name in sorted(group["included_columns"], key=lambda item: item[0])
@@ -565,6 +568,9 @@ def _build_tables(
                 included_columns=included_columns,
                 filter_definition=group.get("filter_definition"),
                 data_compression=group.get("data_compression", "NONE"),
+                key_directions=tuple(
+                    "DESC" if descending else "ASC" for _, _, descending in ordered_keys
+                ),
             )
         )
 

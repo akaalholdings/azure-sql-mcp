@@ -6,6 +6,7 @@ from enum import Enum
 import re
 from typing import Any
 
+from .schema_snapshot import IndexDef
 from .schema_snapshot import ProgrammableObjectSnapshot
 from .schema_snapshot import SchemaSnapshot
 from .schema_snapshot import SequenceDef
@@ -286,6 +287,10 @@ def _compare_table(
         if source_index.key_columns != target_index.key_columns:
             changes.append(
                 f"key_columns: {source_index.key_columns} -> {target_index.key_columns}"
+            )
+        if _key_directions(source_index) != _key_directions(target_index):
+            changes.append(
+                f"key_directions: {_key_directions(source_index)} -> {_key_directions(target_index)}"
             )
         if source_index.included_columns != target_index.included_columns:
             changes.append(
@@ -592,6 +597,12 @@ def _compare_programmable_group(
             )
 
     return differences
+
+
+def _key_directions(index: IndexDef) -> tuple[str, ...]:
+    """Sort direction per key column; a capture without directions is all ascending."""
+
+    return index.key_directions or tuple("ASC" for _ in index.key_columns)
 
 
 def _normalize_definition(value: str | None) -> str:

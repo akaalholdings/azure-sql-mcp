@@ -1378,9 +1378,26 @@ def test_consolidation_requires_strict_coverage_and_independent_drop_gate() -> N
         for item in review_index_portfolio("appdb", snapshots).subjects
     }
     states = {name: item["state"] for name, item in subjects.items()}
+    # Neither index is read: the covering one is not kept only because it covers.
+    assert states == {"IX_A": "drop_candidate", "IX_B": "drop_candidate"}
+
+    def covering_in_use(day: int) -> dict[str, object]:
+        covering = _index(name="IX_B", reads=day)
+        covering["definition"]["reversible_definition"]["include_columns"] = ["CreatedAt"]
+        return covering
+
+    subjects = {
+        item["index_name"]: item
+        for item in review_index_portfolio(
+            "appdb",
+            [_snapshot(day, subjects=(first, covering_in_use(day))) for day in range(91)],
+        ).subjects
+    }
+    states = {name: item["state"] for name, item in subjects.items()}
     assert states == {"IX_A": "consolidate_candidate", "IX_B": "keep"}
     assert subjects["IX_A"]["overlap_relation"] == "strict_coverage"
     assert subjects["IX_A"]["reason_codes"] == ["strict_coverage_overlap"]
+    assert subjects["IX_A"]["survivor_reference"] == "[dbo].[Orders].[IX_B]"
 
     blocked = [
         _snapshot(
@@ -1901,7 +1918,8 @@ def _service_over(
 @pytest.mark.asyncio
 async def test_get_review_reconstructs_deterministically_after_restart() -> None:
     snapshots = [_snapshot(day) for day in range(90)]
-    service = _service_over(snapshots)
+    # Within the 48-hour reuse window; an older capture is returned marked historical.
+    service = _service_over(snapshots, clock=lambda: _BASE_TIME + timedelta(days=89, hours=1))
     first = review_index_portfolio("appdb", snapshots)
     restored = await service.get_review("appdb", first.review_id)
     assert restored.review_id == first.review_id
@@ -2006,6 +2024,10 @@ def test_index_review_remote_surface_is_exactly_the_base_tools(monkeypatch) -> N
         "check_statistics_health",
         "get_top_queries",
         "get_query_store_trend",
+        # 3.0: read-only additions. The guide is static text; columnstore
+        # health feeds the index review of a columnstore table.
+        "get_tool_guide",
+        "get_columnstore_health",
     }
 
 

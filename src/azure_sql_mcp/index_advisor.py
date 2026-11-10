@@ -28,15 +28,22 @@ from datetime import datetime
 from datetime import timezone
 from typing import Any
 from typing import Iterable
+from typing import Mapping
 
 from .index_ddl import quote_identifier
 from .index_ddl import render_reverse_index_ddl
 from .index_metadata import ExistingIndex
 from .index_metadata import IndexKeyColumn
+from .index_metadata import is_test_index_name
+from .index_metadata import normalize_index_definition
 from .showplan_access import PlanAccessSummary
 from .showplan_access import TableAccess
 
 CONTRACT = "workload_index_advice_v1"
+CHANGE_PLAN_CONTRACT = "index_change_plan_v1"
+# Days to watch the workload after the creates and rebuilds, before any removal
+# (heuristic; extend it to the next business-cycle event such as month-end).
+CHANGE_PLAN_SOAK_DAYS = 7
 
 OBJECTIVES: dict[str, tuple[str, str]] = {
     "cpu": ("total_cpu_us", "cpu_microseconds"),
@@ -52,6 +59,27 @@ LOW_SELECTIVITY_DISTINCT = 10
 LOB_TYPES = {"text", "ntext", "image", "xml", "geography", "geometry"}
 KEY_INELIGIBLE_TYPES = LOB_TYPES | {"sql_variant", "hierarchyid_lob"}
 ROWSTORE_NONCLUSTERED = 2
+COLUMNSTORE_TYPE_CODES = frozenset({5, 6})
+# A B-tree on a columnstore table pays only for a lookup that returns a few rows.
+COLUMNSTORE_LOOKUP_MAX_ROWS = 10_000
+COLUMNSTORE_LOOKUP_MAX_FRACTION = 0.001
+# Nonclustered columnstore lead (heuristics, W6 owner decision): below about one
+# full row group columnstore rarely helps, and a write-heavy table pays too much.
+COLUMNSTORE_MIN_ROWS = 1_000_000
+COLUMNSTORE_MIN_SHARE_PCT = 1.0
+COLUMNSTORE_MAX_CHURN_PER_DAY = 0.10
+COLUMNSTORE_SCAN_MIN_FRACTION = 0.10
+# The query returns at most this share of the rows its scan reads: it aggregates.
+COLUMNSTORE_MAX_RETURNED_FRACTION = 0.01
+ROW_GROUP_MAX_ROWS = 1_048_576
+# Physical design leads (heuristics).
+COMPRESSION_MIN_SIZE_MB = 1024.0
+COMPRESSION_MIN_SAVING_PCT = 25
+COMPRESSION_MAX_INDEXES = 3
+# Page splits: leaf allocations beyond what the inserts need as new pages.
+FILL_FACTOR_MIN_SPLITS = 10_000
+FILL_FACTOR_TRIAL = 90
+COLUMNSTORE_INELIGIBLE_TYPES = LOB_TYPES | {"sql_variant", "hierarchyid", "timestamp", "rowversion"}
 UNUSED_MIN_UPTIME_DAYS = 7
 # Index removal window (owner decision 2026-10-02): one full month-end plus a
 # buffer for close jobs and one missed capture.
@@ -233,6 +261,11 @@ class AdvisorInputs:
     # readable_replica_status(): "possible", "none" or "unknown"; None when the
     # caller did not check. Usage counters and Query Store see only the primary.
     readable_replicas: str | None = None
+    # columnstore_health.summarize_columnstore_indexes() entries; None when unread.
+    columnstore_health: list[dict[str, Any]] | None = None
+    # (schema, table, index) -> leaf_insert_count and leaf_allocation_count from
+    # sys.dm_db_index_operational_stats since the engine started; None when unread.
+    index_leaf_activity: dict[tuple[str, str, str], dict[str, int]] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -328,15 +361,22 @@ def build_index_advice(inputs: AdvisorInputs) -> dict[str, Any]:
     rate_days = _rate_days(inputs)
     recommendations: list[dict[str, Any]] = []
     tables_out: list[dict[str, Any]] = []
+    unread_columnstore_health = False
+    fill_factor_unread = False
     for key in sorted(table_keys, key=lambda k: -sum(a.attributed for a in by_table.get(k, []))):
         info = inputs.tables.get(key)
         table_accesses = by_table.get(key, [])
         schema, table = _display_identity(key, info, table_accesses, existing_by_table.get(key, []))
         columns = inputs.columns.get(key, {})
+        leftover = [
+            index
+            for index in existing_by_table.get(key, [])
+            if not index.is_hypothetical and is_test_index_name(index.name)
+        ]
         existing = [
             index
             for index in existing_by_table.get(key, [])
-            if not index.is_hypothetical
+            if not index.is_hypothetical and index not in leftover
         ]
         table_writes = writes.get(key, {"dml_statements": 0, "rows": 0.0, "executions": 0.0})
         table_recs: list[dict[str, Any]] = []
@@ -358,7 +398,41 @@ def build_index_advice(inputs: AdvisorInputs) -> dict[str, Any]:
                     accesses=table_accesses, rate_days=rate_days,
                 )
             )
+            table_recs.extend(_columnstore_scan_findings(schema, table, info, table_accesses, total))
+            lead = _columnstore_design_lead(
+                schema, table, info, existing, table_accesses, columns, table_writes, total,
+                rate_days=rate_days, settings=settings,
+            )
+            if lead is not None:
+                table_recs.append(lead)
         if settings.include_existing_index_review:
+            table_recs.extend(
+                _review_recommendation(
+                    schema,
+                    table,
+                    index.name,
+                    "leftover_test_index",
+                    f"{index.name} has the name of a sandbox test index, so an index experiment "
+                    "left it behind. It is not part of the design and this review ignores it. "
+                    "Remove it with drop_test_index; while it exists it changes plans and "
+                    "baselines on this table.",
+                )
+                for index in leftover
+            )
+            table_recs.extend(_columnstore_index_findings(schema, table, existing, inputs))
+            table_recs.extend(
+                _physical_design_leads(
+                    schema, table, info, existing, inputs, table_writes, uptime_days, rate_days=rate_days
+                )
+            )
+            fill_factor_unread = fill_factor_unread or (
+                inputs.index_leaf_activity is None
+                and any(0 < index.fill_factor < 100 for index in existing if index.index_type_code in {1, 2})
+            )
+            unread_columnstore_health = unread_columnstore_health or (
+                inputs.columnstore_health is None
+                and any(_is_columnstore_index(index) for index in existing)
+            )
             table_recs.extend(
                 _existing_index_findings(
                     schema,
@@ -376,8 +450,8 @@ def build_index_advice(inputs: AdvisorInputs) -> dict[str, Any]:
             table_recs.extend(_foreign_key_findings(schema, table, existing, inputs, writes))
 
         table_recs.sort(key=lambda rec: (-_ACTION_PRIORITY.get(rec["action"], 0), -rec["score"]))
-        actionable = [rec for rec in table_recs if rec["action"] != "review_index"]
-        advisory = [rec for rec in table_recs if rec["action"] == "review_index"]
+        actionable = [rec for rec in table_recs if rec["action"] not in _LEAD_ACTIONS]
+        advisory = [rec for rec in table_recs if rec["action"] in _LEAD_ACTIONS]
         table_recs = actionable[: settings.max_recommendations_per_table] + advisory
         if not table_accesses and not table_recs:
             continue
@@ -392,6 +466,7 @@ def build_index_advice(inputs: AdvisorInputs) -> dict[str, Any]:
                 "row_count": info.row_count if info else None,
                 "size_mb": info.size_mb if info else None,
                 "is_heap": bool(info.is_heap) if info else None,
+                "partitioning": _partition_summary(base) if (base := _table_partitioning(existing)) else None,
                 "workload_share_pct": _pct(sum(a.attributed for a in table_accesses), total),
                 "access_summary": _access_summary(table_accesses),
                 "write_activity": {
@@ -418,10 +493,25 @@ def build_index_advice(inputs: AdvisorInputs) -> dict[str, Any]:
         key=lambda rec: -rec["score"],
     )
     cleanup = [rec for rec in recommendations if rec["action"] in _CLEANUP_ACTIONS]
+    lead_gaps = (
+        [
+            "columnstore row-group health was not read, so deleted rows, undersized row groups "
+            "and delta stores were not checked"
+        ]
+        if unread_columnstore_health
+        and not any("columnstore row-group health" in gap for gap in inputs.gaps)
+        else []
+    )
+    if fill_factor_unread:
+        lead_gaps.append(
+            "page-split counters (sys.dm_db_index_operational_stats) were not read, so indexes with "
+            "a fill factor below 100 were not reviewed"
+        )
     gaps = list(
         dict.fromkeys(
             inputs.gaps
             + _coverage_gaps(inputs, analyzed_total, total, parse_failures, uptime_days)
+            + lead_gaps
         )
     )
     return {
@@ -449,6 +539,11 @@ def build_index_advice(inputs: AdvisorInputs) -> dict[str, Any]:
             "recommendation_counts": dict(sorted(counts.items())),
             "top_improvement_ids": [rec["id"] for rec in improvements[:10]],
             "cleanup_ids": [rec["id"] for rec in cleanup],
+            "lead_ids": [
+                rec["id"]
+                for rec in recommendations
+                if rec["action"] in _LEAD_ACTIONS and rec["action"] != "review_index"
+            ],
         },
         "tables": tables_out,
         "recommendations": recommendations,
@@ -462,6 +557,10 @@ _IMPROVEMENT_ACTIONS = frozenset(
     {"create_index", "extend_index", "widen_index", "create_clustered_index"}
 )
 _CLEANUP_ACTIONS = frozenset({"consolidate_index", "drop_index"})
+# Advisory: no executable change, so the per-table cap does not count them.
+_LEAD_ACTIONS = frozenset(
+    {"review_index", "columnstore_maintenance", "consider_columnstore_index", "physical_design_lead"}
+)
 
 _ACTION_PRIORITY = {
     "extend_index": 6,
@@ -470,6 +569,9 @@ _ACTION_PRIORITY = {
     "consolidate_index": 3,
     "create_clustered_index": 3,
     "drop_index": 2,
+    "consider_columnstore_index": 1,
+    "columnstore_maintenance": 1,
+    "physical_design_lead": 1,
     "review_index": 0,
 }
 
@@ -632,7 +734,12 @@ def _candidates_for_table(
         access = item.access
         if item.attributed <= 0 and item.query.executions <= 0:
             continue
-        if (access.storage or "").lower() == "columnstore":
+        columnstore_scan = _is_columnstore_access(access) and access.operation not in {
+            "lookup",
+            "rid_lookup",
+        }
+        if columnstore_scan and not _selective_columnstore_lookup(access, table_rows):
+            # An analytic scan is what the columnstore is for; see _columnstore_scan_findings.
             continue
         if id(item) in paired_feeder_ids:
             # Evaluated together with the lookup it feeds.
@@ -653,6 +760,8 @@ def _candidates_for_table(
             candidate = None
         if candidate is None:
             continue
+        if columnstore_scan:
+            candidate.kinds = {"columnstore_selective_lookup"}
         candidate.hint_agreement = any(
             _hint_agrees(candidate, hint) for hint in hints
         )
@@ -1096,6 +1205,7 @@ def _reconcile_with_existing(
         if not index.is_disabled and index.index_type_code in {1, 2}
     ]
     clustering = _clustering_keys(existing)
+    partitioning = _table_partitioning(existing)
     taken_names = {_norm(index.name) for index in existing}
     recommendations: list[dict[str, Any]] = []
     by_target: dict[tuple[str, str], tuple[ExistingIndex, _Candidate]] = {}
@@ -1196,7 +1306,8 @@ def _reconcile_with_existing(
         taken_names.add(_norm(name))
         recommendations.append(
             _create_recommendation(
-                candidate, name, columns, info, writes, settings, total, rate_days=rate_days
+                candidate, name, columns, info, writes, settings, total,
+                rate_days=rate_days, partitioning=partitioning,
             )
         )
     return recommendations
@@ -1302,6 +1413,9 @@ def _existing_index_findings(
     removed: set[str] = set()
     survivors: set[str] = set()
     rebuilt: set[str] = set()
+    # flagged: indexes on a partition scheme reported as redundant leads; they
+    # get no statement, and they are never named as a survivor.
+    flagged: set[str] = set()
 
     def consolidate(redundant: ExistingIndex, survivor: ExistingIndex, reason: str) -> None:
         consumed.add(_norm(redundant.name))
@@ -1336,6 +1450,21 @@ def _existing_index_findings(
             if needed:
                 rebuilt.add(_norm(survivor.name))
 
+    def partition_lead(redundant: ExistingIndex, survivor: ExistingIndex, reason: str) -> None:
+        consumed.add(_norm(redundant.name))
+        flagged.add(_norm(redundant.name))
+        rec = _consolidate_recommendation(
+            schema, table, redundant, survivor, reason, accesses, total,
+            needed=_absorbed_columns(redundant, survivor, clustering),
+            columns=columns, settings=inputs.settings,
+        )
+        if rec["action"] != "consolidate_index":
+            findings.append(rec)
+            return
+        findings.append(
+            _partition_removal_lead(rec, redundant, kind="consolidate", merge_into=survivor.name)
+        )
+
     # Exact duplicates first: same keys (order and direction) and same filter.
     groups: dict[tuple[Any, ...], list[ExistingIndex]] = defaultdict(list)
     for index in nonclustered:
@@ -1343,7 +1472,9 @@ def _existing_index_findings(
             continue
         signature = (
             tuple((_norm(c.name), c.direction) for c in index.key_columns),
-            (index.filter_definition or "").strip().casefold(),
+            # Literals keep their case: under a case-sensitive collation
+            # Code = 'a' and Code = 'A' are different filters.
+            normalize_index_definition(index.filter_definition) or "",
         )
         groups[signature].append(index)
     for indexes in groups.values():
@@ -1353,7 +1484,11 @@ def _existing_index_findings(
         # its value without breaking that query.
         keeper = max(indexes, key=lambda index: _keeper_rank(index, pins))
         for duplicate in indexes:
-            if duplicate is keeper or not _removable_into(duplicate, keeper):
+            if duplicate is keeper:
+                continue
+            if not _removable_into(duplicate, keeper):
+                if not _hard_protected(duplicate) and _fk_support_ids(duplicate) <= _fk_support_ids(keeper):
+                    partition_lead(duplicate, keeper, "exact_duplicate_keys")
                 continue
             pin = pins.get(_norm(duplicate.name))
             if pin is not None and _norm(keeper.name) in pins:
@@ -1380,7 +1515,7 @@ def _existing_index_findings(
             _norm(narrow.name) in consumed
             or _norm(narrow.name) in survivors
             or narrow.is_disabled
-            or _constraint_protected(narrow)
+            or _hard_protected(narrow)
         ):
             continue
         if narrow.filter_definition:
@@ -1391,8 +1526,9 @@ def _existing_index_findings(
             if other is not narrow
             and not other.is_disabled
             and _norm(other.name) not in removed
+            and _norm(other.name) not in flagged
             and not other.filter_definition
-            and _removable_into(narrow, other)
+            and _fk_support_ids(narrow) <= _fk_support_ids(other)
             and len(other.key_columns) > len(narrow.key_columns)
             and all(
                 _norm(a.name) == _norm(b.name) and a.direction == b.direction
@@ -1402,7 +1538,10 @@ def _existing_index_findings(
         if not extensions:
             continue
         wider = max(extensions, key=lambda other: len(other.key_columns))
-        consolidate(narrow, wider, "left_prefix_of_wider_index")
+        if _partition_placed(narrow):
+            partition_lead(narrow, wider, "left_prefix_of_wider_index")
+        else:
+            consolidate(narrow, wider, "left_prefix_of_wider_index")
 
     # Unused nonclustered indexes. A survivor stays: it now serves the seeks of
     # the index consolidated into it.
@@ -1462,17 +1601,85 @@ def _keeper_rank(index: ExistingIndex, pins: dict[str, _Pin]) -> tuple[int, int,
 def _constraint_protected(index: ExistingIndex) -> bool:
     """Protections that no other index can take over."""
 
+    return _hard_protected(index) or _partition_placed(index)
+
+
+def _hard_protected(index: ExistingIndex) -> bool:
+    """A constraint or engine-owned index: removal is never even a lead."""
+
     evidence = index.protection_evidence or {}
     return bool(
         index.is_primary_key
         or index.is_unique_constraint
         or index.is_unique
         or evidence.get("referenced_foreign_keys")
-        or evidence.get("partition_switch_dependency")
         or evidence.get("indexed_view")
         or evidence.get("auto_created")
         or index.is_auto_created
     )
+
+
+def _partition_placed(index: ExistingIndex) -> bool:
+    """On a partition scheme: tables that switch partitions with this one need the same index."""
+
+    evidence = index.protection_evidence or {}
+    return bool(evidence.get("partition_switch_dependency")) or (
+        (index.data_space_type or "").upper().replace(" ", "_") == "PARTITION_SCHEME"
+    )
+
+
+def _table_partitioning(existing: list[ExistingIndex]) -> ExistingIndex | None:
+    """The index that shows how the table is partitioned, or None for an unpartitioned table.
+
+    The clustered or clustered columnstore index is the table. A heap has no
+    row here, so its partitioning is read from the first partitioned index.
+    """
+
+    base = next((index for index in existing if index.index_type_code in {1, 5}), None)
+    source = base or next((index for index in existing if _partition_placed(index)), None)
+    if source is None or not _partition_placed(source) or not source.partition_columns:
+        return None
+    return source
+
+
+def _partition_summary(base: ExistingIndex) -> dict[str, Any]:
+    return {
+        "partition_scheme": base.partition_scheme_name or base.data_space_name,
+        "partition_columns": list(base.partition_columns),
+        "partition_count": len(base.partition_page_counts) or len(base.partition_compression) or None,
+    }
+
+
+def _partition_removal_lead(
+    rec: dict[str, Any], index: ExistingIndex, *, kind: str, merge_into: str | None = None
+) -> dict[str, Any]:
+    """Turn a removal finding for an index on a partition scheme into a lead with no statement.
+
+    The protection stays; the index is shown with its reason instead of left out.
+    """
+
+    scheme = index.partition_scheme_name or index.data_space_name or "a partition scheme"
+    lead = dict(rec)
+    lead["removal_lead"] = {
+        "kind": kind,
+        "merge_into": merge_into,
+        "evidence_confidence": rec["confidence"],
+    }
+    lead["action"] = "review_index"
+    lead["confidence"] = "low"
+    lead["ddl"] = None
+    lead["rollback_ddl"] = None
+    lead["reason_codes"] = ["partitioned_index_removal_needs_switch_review", *rec["reason_codes"]]
+    lead["blockers"] = list(dict.fromkeys([*rec["blockers"], "partition_switch_dependency"]))
+    lead["rationale"] = (
+        f"{rec['rationale']} It is on partition scheme {scheme}, so this advisor gives no DROP "
+        "statement: ALTER TABLE ... SWITCH needs matching indexes on both tables, and dropping it "
+        f"here without the same change on every staging and archive table that switches with "
+        f"{index.schema}.{index.table} can fail the switch (Msg 4947). Confirm how the table is "
+        "loaded and archived. If nothing switches, or once those tables are changed too, remove "
+        "it through change control."
+    )
+    return lead
 
 
 def _fk_support_ids(index: ExistingIndex) -> frozenset[int]:
@@ -1650,7 +1857,7 @@ def _unused_drop_recommendation(
             "No reads since the counters reset, but filtered indexes often serve rare, "
             "valuable queries. Confirm with the application owner before any change.",
         )
-    if _constraint_protected(index):
+    if _hard_protected(index):
         return None
     other_support: set[int] = set()
     for other in existing:
@@ -1764,7 +1971,7 @@ def _unused_drop_recommendation(
         confidence = "medium"
     updates = int(index.usage.get("user_updates") or 0)
     size_mb = _index_size_mb(index)
-    rendered = render_reverse_index_ddl(index)
+    rendered = render_reverse_index_ddl(index, online=True)
     executable = rendered.get("executable") is True
     if not executable:
         blockers.extend(rendered.get("blockers") or [])
@@ -1837,6 +2044,8 @@ def _unused_drop_recommendation(
     }
     _withhold_for_incomplete_protection(rec, index)
     _apply_removal_dependencies(rec, pin, inputs)
+    if _partition_placed(index):
+        return _partition_removal_lead(rec, index, kind="drop")
     return rec
 
 
@@ -1914,6 +2123,8 @@ def _consolidate_recommendation(
     survivor_includes = list(survivor.include_columns) + list(needed)
     survivor_change: dict[str, Any] | None = None
     if needed:
+        if survivor.is_unique_constraint and not survivor.is_primary_key and not redundant.filter_definition:
+            return _unique_merge_lead(schema, table, survivor, redundant)
         if survivor.is_primary_key or survivor.is_unique_constraint:
             return _consolidation_review(
                 schema, table, redundant, survivor, reason,
@@ -1944,7 +2155,7 @@ def _consolidate_recommendation(
                 f"({', '.join(survivor_change['blockers'])}). Keep {redundant.name}.",
                 needed, accesses, total,
             )
-    rendered = render_reverse_index_ddl(redundant)
+    rendered = render_reverse_index_ddl(redundant, online=True)
     reads = _reads(redundant)
     uses = [item for item in accesses if _norm(item.access.index_name or "") == _norm(redundant.name)]
     confidence = "high" if reason == "exact_duplicate_keys" else "medium"
@@ -2002,6 +2213,7 @@ def _consolidate_recommendation(
                 "over equal windows."
             ),
             "regression_set": _query_shares(uses, total),
+            "replaces": [redundant.name] + ([survivor.name] if survivor_change else []),
         },
         "evidence_sources": ["index_definitions", "index_usage_dmv"],
     }
@@ -2124,6 +2336,599 @@ def _foreign_key_findings(
 
 
 # ---------------------------------------------------------------------------
+# Columnstore
+# ---------------------------------------------------------------------------
+
+
+def _is_columnstore_index(index: ExistingIndex) -> bool:
+    return (
+        index.index_type_code in COLUMNSTORE_TYPE_CODES
+        or "COLUMNSTORE" in (index.index_type or "").upper()
+    )
+
+
+def _is_columnstore_access(access: TableAccess) -> bool:
+    return (access.storage or "").lower() == "columnstore"
+
+
+def _selective_columnstore_lookup(access: TableAccess, table_rows: float | None) -> bool:
+    """True for a scan of a columnstore index that filters down to a few rows."""
+
+    rows = table_rows or access.table_cardinality
+    if not rows or rows <= 0:
+        return False
+    filtered = bool(
+        _equality_columns(access) or access.seek_range_columns or access.residual_range_columns
+    )
+    return (
+        filtered
+        and access.estimated_rows <= COLUMNSTORE_LOOKUP_MAX_ROWS
+        and access.estimated_rows / rows <= COLUMNSTORE_LOOKUP_MAX_FRACTION
+    )
+
+
+def _columnstore_scan_findings(
+    schema: str,
+    table: str,
+    info: TableInfo | None,
+    accesses: list[_Access],
+    total: float,
+) -> list[dict[str, Any]]:
+    """Say why the analytic scans of a columnstore index get no B-tree."""
+
+    table_rows = float(info.row_count) if info and info.row_count else None
+    by_index: dict[str, list[_Access]] = defaultdict(list)
+    for item in accesses:
+        access = item.access
+        if (
+            _is_columnstore_access(access)
+            and access.operation not in {"lookup", "rid_lookup"}
+            and not _selective_columnstore_lookup(access, table_rows)
+        ):
+            by_index[access.index_name or ""].append(item)
+    findings = []
+    for index_name, items in by_index.items():
+        count = len({item.query.query_id for item in items})
+        findings.append(
+            _review_recommendation(
+                schema,
+                table,
+                index_name or None,
+                "columnstore_scan_not_a_btree_candidate",
+                (
+                    f"{count} quer{'y scans' if count == 1 else 'ies scan'} columnstore index "
+                    f"{index_name or '(unnamed)'} and read a large share of {schema}.{table}. That is "
+                    "the work a columnstore index is built for, so no B-tree index is proposed. If "
+                    "these queries are slow, read their plans with analyze_query_plan: the findings "
+                    "columnstore_no_segment_elimination, columnstore_predicate_not_pushed and "
+                    "columnstore_row_mode name the cause (row groups not aligned with the filter, a "
+                    "predicate the scan cannot evaluate, or row mode)."
+                ),
+                supports=items,
+                total=total,
+            )
+        )
+    return findings
+
+
+def _columnstore_index_findings(
+    schema: str, table: str, existing: list[ExistingIndex], inputs: AdvisorInputs
+) -> list[dict[str, Any]]:
+    """Columnstore indexes are protected from removal; row-group health gives maintenance leads."""
+
+    findings: list[dict[str, Any]] = []
+    health = {
+        _norm(str(entry.get("index_name") or "")): entry
+        for entry in inputs.columnstore_health or []
+        if _table_key(str(entry.get("schema_name") or ""), str(entry.get("table_name") or ""))
+        == _table_key(schema, table)
+    }
+    for index in existing:
+        if not _is_columnstore_index(index):
+            continue
+        never = "This advisor never proposes dropping, disabling or replacing a columnstore index."
+        if index.index_type_code == 5 or "NONCLUSTERED" not in (index.index_type or "").upper():
+            rationale = (
+                f"{index.name} is a clustered columnstore index: it is the table's storage. {never} "
+                "Usage counters do not change that. A move back to rowstore is a table redesign "
+                "with the report owners, not index cleanup."
+            )
+        else:
+            rationale = (
+                f"{index.name} is a nonclustered columnstore index. {never} The analytic queries "
+                "that need it often run only at period end, so usage counters and a short Query "
+                "Store window do not prove non-use, and bringing it back means compressing the "
+                "whole table again. Treat a removal as a design decision with the report owners."
+            )
+        findings.append(
+            _review_recommendation(schema, table, index.name, "columnstore_index_protected", rationale)
+        )
+        entry = health.get(_norm(index.name))
+        lead = _columnstore_maintenance_lead(schema, table, index, entry) if entry else None
+        if lead is not None:
+            findings.append(lead)
+    return findings
+
+
+def _columnstore_maintenance_lead(
+    schema: str, table: str, index: ExistingIndex, entry: dict[str, Any]
+) -> dict[str, Any] | None:
+    flags = [str(flag) for flag in entry.get("flags") or []]
+    delta_rows = int(entry.get("delta_store_rows") or 0)
+    delta = delta_rows >= ROW_GROUP_MAX_ROWS
+    if delta:
+        flags.append("delta_store_rows_at_or_above_one_row_group")
+    if not flags:
+        return None
+    deleted = "deleted_rows_20_percent_or_more" in flags
+    undersized = "undersized_row_groups" in flags
+    trimmed = [flag for flag in flags if flag in {"dictionary_size_trims", "memory_limited_trims"}]
+    size_mb = entry.get("size_mb")
+    target = f"{quote_identifier(index.name)} ON {quote_identifier(schema)}.{quote_identifier(table)}"
+    parts: list[str] = []
+    if deleted:
+        parts.append(
+            f"{float(entry.get('deleted_rows_percent') or 0.0):.1f}% of the compressed rows "
+            f"({int(entry.get('deleted_rows') or 0):,} of {int(entry.get('compressed_rows') or 0):,}) are "
+            "deleted but still stored: every scan reads them and then discards them."
+        )
+    if undersized:
+        parts.append(
+            f"{int(entry.get('compressed_row_groups') or 0):,} compressed row groups average "
+            f"{int(entry.get('avg_rows_per_compressed_row_group') or 0):,} rows (a full row group holds "
+            f"{ROW_GROUP_MAX_ROWS:,}): compression and segment elimination are weaker."
+        )
+    if delta:
+        parts.append(
+            f"{delta_rows:,} rows sit in {int(entry.get('open_delta_stores') or 0)} open and "
+            f"{int(entry.get('closed_delta_stores') or 0)} closed delta store(s): they are "
+            "uncompressed and read in row mode."
+        )
+    if "dictionary_size_trims" in trimmed:
+        parts.append(
+            "Row groups were cut short by the dictionary size limit (trim reason DICTIONARY_SIZE): a "
+            "wide or high-cardinality string column fills the dictionary. REORGANIZE cannot merge "
+            "them; the lead is the column (shorten it, or keep it out of the columnstore index)."
+        )
+    if "memory_limited_trims" in trimmed:
+        parts.append(
+            "Row groups were cut short for memory (trim reason MEMORY_LIMITATION): the load or "
+            "rebuild ran without enough memory. Rebuild at a higher service objective or with a "
+            "lower MAXDOP; REORGANIZE alone does not fix the cause."
+        )
+    ddl: str | None
+    if delta:
+        ddl = f"ALTER INDEX {target} REORGANIZE WITH (COMPRESS_ALL_ROW_GROUPS = ON);"
+    elif deleted or (undersized and not trimmed):
+        ddl = f"ALTER INDEX {target} REORGANIZE;"
+    else:
+        ddl = None
+    size_text = f"the index is {size_mb} MB" if size_mb is not None else "the index size was not read"
+    cost = (
+        "REORGANIZE is online. It uses CPU and writes transaction log in proportion to the row "
+        f"groups it rewrites ({size_text}); the log rate limit of the service objective sets how "
+        "long it takes."
+    )
+    if delta:
+        cost += (
+            " COMPRESS_ALL_ROW_GROUPS also compresses open delta stores that are not full, which "
+            "leaves small row groups; run it after the load ends, and a later REORGANIZE merges them."
+        )
+    alternative = None
+    if deleted:
+        alternative = f"ALTER INDEX {target} REBUILD WITH (ONLINE = ON);"
+        cost += (
+            " REBUILD removes every deleted row but rewrites the whole index: about that much new "
+            "space and log, and a short schema-modification lock at the end. On a partitioned "
+            "index rebuild only the affected partitions (REBUILD PARTITION = n)."
+        )
+    return {
+        "action": "columnstore_maintenance",
+        "schema": schema,
+        "table": table,
+        "index_name": index.name,
+        "target_index": index.name,
+        "key_columns": [],
+        "include_columns": [],
+        "supporting_queries": [],
+        "workload_share_pct": None,
+        "estimated_max_benefit_pct": None,
+        "estimated_size_mb": size_mb,
+        "write_impact": {},
+        "score": float(len(flags)),
+        "confidence": "medium",
+        "reason_codes": flags,
+        "blockers": [] if ddl else ["no_maintenance_statement_fixes_the_cause"],
+        "rationale": " ".join(parts),
+        "cost": cost,
+        "risks": [
+            "Maintenance changes no definition, so there is no rollback; a statement that is "
+            "stopped keeps the work it has done."
+        ],
+        "ddl": ddl,
+        "alternative_ddl": alternative,
+        "rollback_ddl": None,
+        "validation": {
+            "after_change": (
+                "Read the row-group health again: the deleted-row share, the average rows per "
+                "compressed row group and the delta store rows should have moved."
+            )
+        },
+        "evidence_sources": ["columnstore_row_group_physical_stats"],
+    }
+
+
+def _columnstore_design_lead(
+    schema: str,
+    table: str,
+    info: TableInfo | None,
+    existing: list[ExistingIndex],
+    accesses: list[_Access],
+    columns: dict[str, ColumnInfo],
+    writes: dict[str, float],
+    total: float,
+    *,
+    rate_days: float,
+    settings: AdvisorSettings,
+) -> dict[str, Any] | None:
+    """A nonclustered columnstore index as a design lead for scan-and-aggregate workloads.
+
+    The gain cannot be estimated from rowstore plan costs, so this is never DDL.
+    """
+
+    if info is None or not info.row_count or info.row_count < COLUMNSTORE_MIN_ROWS:
+        return None
+    if any(_is_columnstore_index(index) for index in existing):
+        return None
+    rows = float(info.row_count)
+    supports = [
+        item
+        for item in accesses
+        if item.statement_type == "SELECT"
+        and not _is_columnstore_access(item.access)
+        and item.access.operation in {"scan", "heap_scan"}
+        and item.access.spool_node_id is None
+        and item.access.estimated_rows / rows >= COLUMNSTORE_SCAN_MIN_FRACTION
+        and item.query.executions > 0
+        and item.query.total_rowcount / item.query.executions
+        <= COLUMNSTORE_MAX_RETURNED_FRACTION * item.access.estimated_rows
+    ]
+    share = _pct(sum(item.attributed for item in supports), total)
+    if not supports or (share or 0.0) < COLUMNSTORE_MIN_SHARE_PCT:
+        return None
+    rows_per_day = float(writes.get("rows", 0.0)) / rate_days
+    churn = rows_per_day / rows
+    if churn >= COLUMNSTORE_MAX_CHURN_PER_DAY:
+        return None
+    candidate_columns: list[str] = []
+    excluded: list[str] = []
+    for item in supports:
+        access = item.access
+        for column in (
+            list(access.output_columns)
+            + list(access.residual)
+            + list(access.nonsargable)
+            + list(access.join_columns)
+            + [name for name, _ in access.order_columns]
+        ):
+            if _norm(column) in {_norm(name) for name in candidate_columns + excluded}:
+                continue
+            column_info = columns.get(_norm(column))
+            eligible = column_info is None or not (
+                column_info.is_lob
+                or column_info.is_computed
+                or column_info.type_name.lower() in COLUMNSTORE_INELIGIBLE_TYPES
+            )
+            (candidate_columns if eligible else excluded).append(column)
+    query_ids = {item.query.query_id for item in supports}
+    recurring = any(item.query.active_days >= 2 for item in supports) or settings.lookback_days < 2
+    proof_set = _proof_set(supports)
+    count = len(query_ids)
+    return {
+        "action": "consider_columnstore_index",
+        "schema": schema,
+        "table": table,
+        "index_name": None,
+        "target_index": None,
+        "key_columns": [],
+        "include_columns": [],
+        "candidate_columns": candidate_columns,
+        "excluded_columns": excluded,
+        "supporting_queries": _supporting_queries(supports, total),
+        "workload_share_pct": share,
+        "estimated_max_benefit_pct": None,
+        "estimated_size_mb": None,
+        "write_impact": {
+            "dml_rows_per_day": round(rows_per_day, 1),
+            "table_churn_per_day": round(churn, 4),
+        },
+        "score": round(share or 0.0, 4),
+        "confidence": "medium" if count >= 2 and recurring else "low",
+        "reason_codes": ["large_rowstore_table_scanned_and_reduced", "heuristic_thresholds"],
+        "blockers": ["design_lead_requires_sandbox_proof"],
+        "conditions": [
+            f"The table is large enough to fill row groups: at least {COLUMNSTORE_MIN_ROWS:,} rows. "
+            f"Measured: {int(rows):,} rows.",
+            "The queries read a large share of the table and return few rows (aggregates or "
+            f"reporting joins), not single rows. Measured: {count} quer{'y reads' if count == 1 else 'ies read'} "
+            f"at least {COLUMNSTORE_SCAN_MIN_FRACTION:.0%} of the rows and return{'s' if count == 1 else ''} under "
+            f"{COLUMNSTORE_MAX_RETURNED_FRACTION:.0%} of what {'it reads' if count == 1 else 'they read'}.",
+            f"Writes are light: under {COLUMNSTORE_MAX_CHURN_PER_DAY:.0%} of the rows change per day. "
+            f"Measured: about {churn:.1%} per day in this window. Each UPDATE on a columnstore index "
+            "is a delete plus an insert into a delta store.",
+            "The service objective supports columnstore indexes and has memory to compress row "
+            "groups: any vCore tier, Premium, or Standard S3 and above; not Basic or Standard S0 to "
+            "S2. This review did not check it: confirm with check_capabilities.",
+            "A measured gain on a non-production copy for every query in proof_set, with the cost "
+            "on the table's load and on its UPDATE and DELETE statements.",
+        ],
+        "rationale": (
+            f"{count} quer{'y scans' if count == 1 else 'ies scan'} most of {schema}.{table} "
+            f"({int(rows):,} rows) and return{'s' if count == 1 else ''} a small part of what "
+            f"{'it reads' if count == 1 else 'they read'}, about {share or 0:.2f}% of the analysed "
+            "workload. No B-tree index removes a scan without a selective predicate. A nonclustered "
+            "columnstore index on the columns these queries read lets them run in batch mode on "
+            "compressed data. This is a design lead: whether it pays depends on the conditions."
+        ),
+        "risks": [
+            "Batch mode on rowstore (compatibility level 150 or higher) may already give part of "
+            "the gain with no index; measure against that baseline.",
+            "New and updated rows go to a delta store and are compressed later; on a hot table "
+            "COMPRESSION_DELAY keeps recent rows out of the compressed row groups.",
+            "The build reads the whole table and needs memory per thread; on a small service "
+            "objective it is slow or cuts row groups short.",
+        ],
+        "ddl": None,
+        "rollback_ddl": None,
+        "validation": {
+            "sandbox": (
+                "On a non-production copy, create a nonclustered columnstore index on "
+                "candidate_columns and compare every query in proof_set before and after "
+                "(benchmark_query_rewrite or a tuning session). Measure the load and the DML too."
+            ),
+            "proof_set": proof_set,
+            "after_change": _after_change_text(with_regression=False),
+        },
+        "evidence_sources": ["query_store_plan_access", "query_store_runtime_stats"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Physical design leads
+# ---------------------------------------------------------------------------
+
+
+def _design_lead(
+    schema: str, table: str, index_name: str | None, reason: str, rationale: str, **extra: Any
+) -> dict[str, Any]:
+    lead = _review_recommendation(schema, table, index_name, reason, rationale)
+    lead["action"] = "physical_design_lead"
+    lead["blockers"] = ["design_lead_requires_change_review"]
+    lead.update(extra)
+    return lead
+
+
+def _sql_literal(value: str) -> str:
+    return "N'" + value.replace("'", "''") + "'"
+
+
+def _unique_merge_lead(
+    schema: str, table: str, constraint: ExistingIndex, twin: ExistingIndex
+) -> dict[str, Any]:
+    """A unique constraint and a covering index on the same key: one unique index can do both jobs.
+
+    A constraint index cannot take INCLUDE columns, a unique index can. The
+    index becomes unique first, so uniqueness is enforced at every moment.
+    """
+
+    target = f"{quote_identifier(schema)}.{quote_identifier(table)}"
+    constraint_name = constraint.constraint_name or constraint.name
+    rendered = _drop_existing_ddl(replace(twin, is_unique=True), twin)
+    blockers = ["design_lead_requires_change_review", *rendered["blockers"]]
+    if (constraint.protection_evidence or {}).get("referenced_foreign_keys"):
+        # The foreign key is bound to the constraint's index; it must be dropped
+        # and created again on the unique index, which is a schema change of its own.
+        blockers.append("foreign_key_references_the_constraint")
+    statements: list[str] = []
+    rollback: list[str] = []
+    if len(blockers) == 1:
+        keys_sql = ", ".join(
+            f"{quote_identifier(column.name)} {column.direction}" for column in constraint.key_columns
+        )
+        statements = [
+            rendered["ddl"],
+            f"ALTER TABLE {target} DROP CONSTRAINT {quote_identifier(constraint_name)};",
+        ]
+        rollback = [
+            f"ALTER TABLE {target} ADD CONSTRAINT {quote_identifier(constraint_name)} UNIQUE NONCLUSTERED "
+            f"({keys_sql}) WITH (ONLINE = ON);",
+            rendered["rollback_ddl"],
+        ]
+    size_mb = _index_size_mb(constraint)
+    return _design_lead(
+        schema,
+        table,
+        twin.name,
+        "unique_index_can_replace_constraint_and_twin",
+        (
+            f"{constraint.name} enforces a unique constraint on the same key as {twin.name}, which "
+            f"also carries {', '.join(twin.include_columns)}. A constraint index cannot take INCLUDE "
+            "columns, so both are maintained on every write. One unique index with those INCLUDE "
+            f"columns enforces the same rule and covers the same queries: make {twin.name} unique, "
+            "then drop the constraint"
+            + (f"; that frees about {size_mb} MB" if size_mb is not None else "")
+            + "."
+        ),
+        blockers=blockers,
+        design_statements=statements,
+        rollback_statements=rollback,
+        estimated_size_mb=size_mb,
+        risks=[
+            "Code that names the constraint (ALTER TABLE ... DROP CONSTRAINT in deployment scripts, "
+            "or error handling that reads the constraint name from Msg 2627) sees a unique index "
+            "name in Msg 2601 after the change.",
+            "The rollback statement recreates the constraint with default options; copy its fill "
+            "factor, compression and placement from the catalog if they differ.",
+        ],
+        validation={
+            "before_change": "Confirm no foreign key references the constraint and no hint names its index.",
+            "after_change": "Confirm the queries that used either index seek the unique index.",
+        },
+        evidence_sources=["index_definitions"],
+    )
+
+
+def _physical_design_leads(
+    schema: str,
+    table: str,
+    info: TableInfo | None,
+    existing: list[ExistingIndex],
+    inputs: AdvisorInputs,
+    writes: dict[str, float],
+    uptime_days: float | None,
+    *,
+    rate_days: float,
+) -> list[dict[str, Any]]:
+    """Compression and fill factor leads for the rowstore indexes of one table."""
+
+    leads: list[dict[str, Any]] = []
+    rowstore = [
+        index for index in existing if index.index_type_code in {1, 2} and not index.is_disabled
+    ]
+    target = f"{quote_identifier(schema)}.{quote_identifier(table)}"
+
+    uncompressed = sorted(
+        (
+            (size, index)
+            for index in rowstore
+            if (size := _index_size_mb(index)) is not None
+            and size >= COMPRESSION_MIN_SIZE_MB
+            and index.partition_compression
+            and all(str(value).upper() == "NONE" for _, value in index.partition_compression)
+        ),
+        key=lambda item: -item[0],
+    )[:COMPRESSION_MAX_INDEXES]
+    if uncompressed:
+        table_rows = float(info.row_count) if info and info.row_count else None
+        churn = (float(writes.get("rows", 0.0)) / rate_days) / table_rows if table_rows else None
+        churn_text = f"measured: about {churn:.1%} per day" if churn is not None else "not measured here"
+        leads.append(
+            _design_lead(
+                schema,
+                table,
+                None,
+                "large_uncompressed_rowstore_index",
+                (
+                    f"{len(uncompressed)} index(es) of {schema}.{table} of {COMPRESSION_MIN_SIZE_MB:g} MB "
+                    "or more store their pages uncompressed. Estimate first, and act when the "
+                    f"estimate saves at least {COMPRESSION_MIN_SAVING_PCT}%: PAGE for a table that changes "
+                    f"under {COLUMNSTORE_MAX_CHURN_PER_DAY:.0%} of its rows per day ({churn_text}), ROW for "
+                    "a write-heavy one. Compression costs CPU on writes and gives fewer pages to read, "
+                    "cache and back up."
+                ),
+                indexes=[
+                    {"name": index.name, "index_id": index.index_id, "size_mb": size}
+                    for size, index in uncompressed
+                ],
+                estimate_statements=[
+                    "EXEC sys.sp_estimate_data_compression_savings "
+                    f"@schema_name = {_sql_literal(schema)}, @object_name = {_sql_literal(table)}, "
+                    f"@index_id = {index.index_id}, @partition_number = NULL, "
+                    f"@data_compression = N'{setting}';"
+                    for _, index in uncompressed
+                    for setting in ("PAGE", "ROW")
+                ],
+                apply_template=(
+                    f"ALTER INDEX <index> ON {target} REBUILD WITH (DATA_COMPRESSION = <PAGE or ROW>, ONLINE = ON);"
+                ),
+                cost=(
+                    "sp_estimate_data_compression_savings copies a sample of the index into tempdb "
+                    "and compresses it there: run it off-peak on a small service objective or in an "
+                    "elastic pool. This tool never runs it. The rebuild that applies a setting "
+                    "rewrites the whole index and logs it."
+                ),
+                evidence_sources=["index_definitions", "partition_stats"],
+            )
+        )
+
+    activity = inputs.index_leaf_activity
+    if activity is None or uptime_days is None or uptime_days < UNUSED_MIN_UPTIME_DAYS:
+        return leads
+    for index in rowstore:
+        counters = activity.get((_norm(schema), _norm(table), _norm(index.name)))
+        pages = sum(count for _, count in index.partition_page_counts if count)
+        rows = sum(count for _, count in index.partition_row_counts if count)
+        if counters is None or not pages or not rows:
+            continue
+        inserts = int(counters.get("leaf_insert_count") or 0)
+        allocations = int(counters.get("leaf_allocation_count") or 0)
+        appended = inserts * pages / rows
+        splits = max(0, round(allocations - appended))
+        split_evidence = splits >= FILL_FACTOR_MIN_SPLITS and splits >= appended
+        name = quote_identifier(index.name)
+        evidence = {
+            "days_of_counters": round(uptime_days, 1),
+            "leaf_insert_count": inserts,
+            "leaf_allocation_count": allocations,
+            "pages_needed_by_inserts": round(appended),
+            "estimated_page_splits": splits,
+        }
+        fill_factor = index.fill_factor or 100
+
+        def rebuild(value: int) -> str:
+            return f"ALTER INDEX {name} ON {target} REBUILD WITH (FILLFACTOR = {value}, ONLINE = ON);"
+
+        if split_evidence and fill_factor == 100:
+            leads.append(
+                _design_lead(
+                    schema,
+                    table,
+                    index.name,
+                    "page_splits_measured",
+                    (
+                        f"{index.name} allocated {allocations:,} leaf pages for {inserts:,} leaf inserts in "
+                        f"{uptime_days:.0f} day(s). The inserts alone need about {round(appended):,} new "
+                        f"pages, so about {splits:,} allocations were page splits: rows arrive in the "
+                        "middle of full pages, or updates make rows longer. A fill factor leaves room "
+                        f"for them. Try {FILL_FACTOR_TRIAL}, then read the counters again."
+                    ),
+                    ddl=rebuild(FILL_FACTOR_TRIAL),
+                    rollback_ddl=rebuild(100),
+                    evidence=evidence,
+                    cost=(
+                        f"A fill factor of {FILL_FACTOR_TRIAL} makes the index about "
+                        f"{100 - FILL_FACTOR_TRIAL}% larger on disk and in memory, and the rebuild "
+                        "rewrites and logs the whole index."
+                    ),
+                    evidence_sources=["index_operational_stats", "partition_stats"],
+                )
+            )
+        elif not split_evidence and fill_factor < 100:
+            reserved = round(pages * 8 / 1024 * (100 - fill_factor) / 100, 1)
+            leads.append(
+                _design_lead(
+                    schema,
+                    table,
+                    index.name,
+                    "fill_factor_without_page_split_evidence",
+                    (
+                        f"{index.name} has fill factor {fill_factor}, which keeps about {reserved} MB of its "
+                        f"pages empty. In {uptime_days:.0f} day(s) it allocated {allocations:,} leaf pages "
+                        f"for {inserts:,} leaf inserts, about what the inserts need as new pages: no "
+                        "measurable page splits. The reserved space is read, cached and backed up for "
+                        "nothing."
+                    ),
+                    ddl=rebuild(100),
+                    rollback_ddl=rebuild(fill_factor),
+                    evidence={**evidence, "reserved_mb": reserved},
+                    cost="The rebuild rewrites and logs the whole index.",
+                    evidence_sources=["index_operational_stats", "partition_stats"],
+                )
+            )
+    return leads
+
+
+# ---------------------------------------------------------------------------
 # Rendering recommendations
 # ---------------------------------------------------------------------------
 
@@ -2138,6 +2943,7 @@ def _create_recommendation(
     total: float,
     *,
     rate_days: float,
+    partitioning: ExistingIndex | None = None,
 ) -> dict[str, Any]:
     keys_sql = ", ".join(f"{quote_identifier(n)} {d}" for n, d in candidate.keys)
     include_sql = (
@@ -2180,7 +2986,66 @@ def _create_recommendation(
             "key value exceeds the limit. Narrow the column type, or index a persisted computed "
             "hash of the column instead."
         ]
+    if partitioning is not None:
+        _add_partition_advice(rec, candidate, partitioning)
     return rec
+
+
+def _add_partition_advice(
+    rec: dict[str, Any], candidate: _Candidate, base: ExistingIndex
+) -> None:
+    """A new index on a partitioned table is aligned by default; say when that costs."""
+
+    summary = _partition_summary(base)
+    partition_columns = {_norm(column) for column in base.partition_columns}
+    filtered: dict[int, bool] = {}
+    for item in candidate.supports:
+        access = item.access
+        constrained = {
+            _norm(column)
+            for column in _equality_columns(access)
+            + list(access.seek_range_columns)
+            + list(access.residual_range_columns)
+        }
+        query_id = item.query.query_id
+        filtered[query_id] = filtered.get(query_id, False) or bool(constrained & partition_columns)
+    unfiltered = sum(1 for value in filtered.values() if not value)
+    shown = ", ".join(base.partition_columns)
+    count = summary["partition_count"]
+    partitions = f"all {count} partitions" if count else "every partition"
+    alternative: dict[str, Any] | None = None
+    if unfiltered and rec["ddl"]:
+        alternative = {
+            "when_better": (
+                f"{unfiltered} of the {len(filtered)} supporting quer"
+                f"{'y does' if len(filtered) == 1 else 'ies do'} not filter on the partitioning "
+                f"column ({shown}). An aligned index is one B-tree per partition, so each of "
+                f"their seeks probes {partitions}. A non-aligned index is one B-tree and answers "
+                "them with one seek. Choose it only when these lookups matter more than partition "
+                "switching."
+            ),
+            "breaks": (
+                "While a non-aligned index exists, ALTER TABLE ... SWITCH fails (Msg 7733) and "
+                "TRUNCATE TABLE ... WITH (PARTITIONS ...) is refused. A load or archive job must "
+                "disable or drop the index before the switch and rebuild it after, and the index "
+                "cannot be rebuilt one partition at a time."
+            ),
+            "ddl": rec["ddl"][:-1] + " ON [PRIMARY];",
+        }
+        rec["risks"] = list(rec["risks"]) + [
+            f"The index is aligned with the table's partitions: a query that does not filter on "
+            f"{shown} seeks every partition."
+        ]
+    rec["partitioning"] = {
+        **summary,
+        "alignment": "aligned",
+        "note": (
+            "The statement has no ON clause, so the index is created on the table's partition "
+            "scheme: it is aligned, partition switching and partition-level maintenance keep "
+            "working, and SQL Server adds the partitioning column to the index."
+        ),
+        "non_aligned_alternative": alternative,
+    }
 
 
 def _change_existing_recommendation(
@@ -2250,6 +3115,8 @@ def _change_existing_recommendation(
     )
     validation = rec["validation"]
     validation["regression_set"] = regression
+    # The new definition takes the place of this index: a proof must hide it.
+    validation["replaces"] = [target.name]
     if regression:
         validation["sandbox"] += (
             " Queries in regression_set read the index this rebuild changes; benchmark them "
@@ -2324,6 +3191,9 @@ def _candidate_recommendation(
         confidence = "medium"
     else:
         confidence = "low"
+    if "columnstore_selective_lookup" in candidate.kinds and confidence == "high":
+        # The cost of a columnstore scan is a rough guide, and the load cost is unmeasured.
+        confidence = "medium"
     reason_codes = sorted(candidate.kinds)
     if candidate.hint_agreement:
         reason_codes.append("optimizer_missing_index_hint_agrees")
@@ -2440,6 +3310,8 @@ def _candidate_rationale(
         reasons.append("moves residual filters into the seek")
     if "cover_lookup" in kinds:
         reasons.append("removes key or RID lookups")
+    if "columnstore_selective_lookup" in kinds:
+        reasons.append("gives selective lookups a B-tree seek instead of a scan of the columnstore index")
     if not reasons:
         joined = "serves the workload's access pattern"
     elif len(reasons) == 1:
@@ -2471,6 +3343,14 @@ def _candidate_risks(action: str, candidate: _Candidate, penalty: float) -> list
             "Rebuilding the existing index is one online DROP_EXISTING statement that keeps "
             "its current compression; it takes time, log space, and room for a second copy "
             "of the index while it runs."
+        )
+    if "columnstore_selective_lookup" in candidate.kinds:
+        risks.append(
+            "The table is a columnstore table. Every bulk load then also inserts into this B-tree "
+            "row by row, fully logged, so loads get slower, and the engine keeps a mapping index so "
+            "the B-tree still finds rows after they move between row groups. Measure the load on a "
+            "copy first. If the table is loaded by partition switching, the staging table needs "
+            "the same index."
         )
     if penalty >= 0.3:
         risks.append("The table is write-heavy relative to its size; weigh the write cost.")
@@ -2881,7 +3761,228 @@ def _next_steps(recommendations: list[dict[str, Any]], rewrites: list[dict[str, 
         steps.append(
             "Route non-SARGable predicates and implicit conversions to sql-optimizer; an index cannot fix them."
         )
+    if any(r["action"] == "consider_columnstore_index" for r in recommendations):
+        steps.append(
+            "A columnstore lead is a design question, not a statement to run: check its conditions, "
+            "then measure it on a non-production copy with the queries in its proof_set."
+        )
+    if any(r["action"] == "columnstore_maintenance" for r in recommendations):
+        steps.append(
+            "Columnstore maintenance statements are inert: schedule them in a quiet window and "
+            "watch the log rate."
+        )
     steps.append("Every DDL statement is inert advice: a DBA applies changes through change control.")
     return steps
 
 
+# ---------------------------------------------------------------------------
+# Client change plan
+# ---------------------------------------------------------------------------
+
+_PLAN_PHASES = {
+    "create_index": "create",
+    "extend_index": "change",
+    "widen_index": "change",
+    "consolidate_index": "remove",
+    "drop_index": "remove",
+}
+
+
+def build_index_change_plan(
+    report: Mapping[str, Any], *, soak_days: int = CHANGE_PLAN_SOAK_DAYS
+) -> dict[str, Any]:
+    """Order one index review into a change plan a client can schedule.
+
+    ``report`` is the result of ``build_index_advice`` (the review_workload_indexes
+    payload). The plan creates first, rebuilds existing indexes next, observes
+    for ``soak_days``, and removes last, one index per step. Every statement is
+    inert text from the review. A recommendation with no executable statement
+    is never a step: it is listed in ``not_planned`` with its blockers. Leads
+    and review notes are listed in ``open_questions``.
+    """
+
+    if soak_days < 1:
+        raise ValueError("soak_days must be at least 1")
+    window = report.get("window") or {}
+    counters = report.get("usage_counters") or {}
+    query_store_days = window.get("query_store_effective_days")
+    if query_store_days is None:
+        query_store_days = window.get("requested_days")
+    objective = report.get("objective")
+    recommendations = [rec for rec in report.get("recommendations") or [] if isinstance(rec, Mapping)]
+
+    def base(rec: Mapping[str, Any], phase: str) -> dict[str, Any]:
+        validation = rec.get("validation") or {}
+        return {
+            "phase": phase,
+            "recommendation_id": rec.get("id"),
+            "action": rec.get("action"),
+            "schema": rec.get("schema"),
+            "table": rec.get("table"),
+            "index_name": rec.get("index_name"),
+            "confidence": rec.get("confidence"),
+            "statement": rec.get("ddl"),
+            "rollback": rec.get("rollback_ddl"),
+            "risk_of_acting": list(rec.get("risks") or []),
+            "proof_set": list(validation.get("proof_set") or []),
+            "regression_set": list(validation.get("regression_set") or []),
+            "verify": validation.get("after_change"),
+        }
+
+    ordered: dict[str, list[dict[str, Any]]] = {"create": [], "change": [], "remove": []}
+    not_planned: list[dict[str, Any]] = []
+    open_questions: list[dict[str, Any]] = []
+    for rec in sorted(recommendations, key=lambda item: -float(item.get("score") or 0.0)):
+        phase = _PLAN_PHASES.get(str(rec.get("action")))
+        if phase is None:
+            open_questions.append(
+                {
+                    "recommendation_id": rec.get("id"),
+                    "action": rec.get("action"),
+                    "table": rec.get("table"),
+                    "index_name": rec.get("index_name"),
+                    "reason_codes": list(rec.get("reason_codes") or []),
+                    "question": rec.get("rationale"),
+                    "statement": rec.get("ddl"),
+                }
+            )
+            continue
+        if not rec.get("ddl"):
+            not_planned.append(
+                {
+                    "recommendation_id": rec.get("id"),
+                    "action": rec.get("action"),
+                    "table": rec.get("table"),
+                    "index_name": rec.get("index_name"),
+                    "blockers": list(rec.get("blockers") or []),
+                    "prerequisites": list(rec.get("prerequisites") or []),
+                }
+            )
+            continue
+        step = base(rec, phase)
+        if phase == "remove":
+            writes = (rec.get("write_impact") or {}).get("user_updates_since_reset")
+            size = rec.get("estimated_size_mb")
+            step["risk_of_not_acting"] = (
+                f"The index stays: {writes if writes is not None else 'an unknown number of'} write(s) "
+                "maintained it since the usage counters reset"
+                + (f", and it holds {size} MB of storage and backup" if size is not None else "")
+                + "."
+            )
+            step["evidence_window"] = {
+                "usage_counter_days": counters.get("days_since_reset"),
+                "plan_reference_days": rec.get("reference_window_days", query_store_days),
+                "required_days": UNUSED_HIGH_CONFIDENCE_DAYS,
+            }
+            # The evidence ages while the plan waits: an index may have been read since.
+            step["recheck_before_acting"] = True
+            step["observe_after_days"] = soak_days
+            if rec.get("merge_into"):
+                step["merge_into"] = rec["merge_into"]
+        else:
+            share = rec.get("workload_share_pct")
+            benefit = rec.get("estimated_max_benefit_pct")
+            count = len(rec.get("supporting_queries") or [])
+            step["risk_of_not_acting"] = (
+                f"{count} supporting quer{'y keeps its' if count == 1 else 'ies keep their'} current plan: "
+                f"about {share if share is not None else 'an unknown share'}% of the analysed workload "
+                f"({objective}), of which at most {benefit if benefit is not None else 'an unknown part'}% "
+                "is the estimated gain. The estimate comes from the optimizer cost model, not a measurement."
+            )
+            step["evidence_window"] = {
+                "query_store_days": query_store_days,
+                "start_utc": window.get("start_utc"),
+                "end_utc": window.get("end_utc"),
+            }
+            step["estimated_size_mb"] = rec.get("estimated_max_size_mb")
+        ordered[phase].append(step)
+
+    steps: list[dict[str, Any]] = []
+    for phase in ("create", "change"):
+        for step in ordered[phase]:
+            step["step"] = len(steps) + 1
+            step["depends_on"] = []
+            steps.append(step)
+    observe_step: int | None = None
+    if steps:
+        query_ids = sorted(
+            {
+                int(item["query_id"])
+                for step in steps
+                for item in step["proof_set"] + step["regression_set"]
+                if isinstance(item, Mapping) and item.get("query_id") is not None
+            }
+        )
+        observe_step = len(steps) + 1
+        steps.append(
+            {
+                "step": observe_step,
+                "phase": "observe",
+                "depends_on": [step["step"] for step in steps],
+                "observe_days": soak_days,
+                "query_ids": query_ids,
+                "what": (
+                    "Compare Query Store CPU, duration and reads per execution for these queries "
+                    "over equal windows before and after the changes, and confirm each new or "
+                    "rebuilt index appears in their plans."
+                ),
+                "rollback_trigger": (
+                    f"Run the rollback of a step when CPU per execution of one of its queries rises "
+                    f"more than {ROLLBACK_CPU_INCREASE_PCT}%."
+                ),
+                "extend_when": (
+                    "The tables serve period-end jobs (month-end, quarter-end): observe until the "
+                    "next one has run."
+                ),
+            }
+        )
+    for step in ordered["remove"]:
+        step["step"] = len(steps) + 1
+        step["depends_on"] = [observe_step] if observe_step is not None else []
+        steps.append(step)
+
+    added = [step.get("estimated_size_mb") for step in ordered["create"]]
+    reclaimed = [
+        rec.get("estimated_size_mb")
+        for rec in recommendations
+        if rec.get("id") in {step["recommendation_id"] for step in ordered["remove"]}
+    ]
+    return {
+        "contract": CHANGE_PLAN_CONTRACT,
+        "recommend_only": True,
+        "database_name": report.get("database_name"),
+        "objective": objective,
+        "evidence_window": {
+            "start_utc": window.get("start_utc"),
+            "end_utc": window.get("end_utc"),
+            "query_store_days": query_store_days,
+            "usage_counter_days": counters.get("days_since_reset"),
+            "removal_required_days": UNUSED_HIGH_CONFIDENCE_DAYS,
+        },
+        "steps": steps,
+        "not_planned": not_planned,
+        "open_questions": open_questions,
+        "summary": {
+            "steps": len(steps),
+            "creates": len(ordered["create"]),
+            "changes": len(ordered["change"]),
+            "removals": len(ordered["remove"]),
+            "observe_days": soak_days if observe_step is not None else None,
+            "estimated_size_added_mb": _total_or_none(added, 1),
+            "estimated_size_reclaimed_mb": _total_or_none(reclaimed, 2),
+        },
+        "gaps": list(report.get("gaps") or []),
+        "notes": [
+            "Every statement is inert text from the review. A DBA runs each step through change control.",
+            "Run one removal per change window and keep its rollback ready; re-run the review "
+            "before the first removal.",
+        ],
+    }
+
+
+def _total_or_none(values: list[Any], digits: int) -> float | None:
+    """The sum, or None when the list is empty or one value is unknown."""
+
+    if not values or any(not isinstance(value, (int, float)) for value in values):
+        return None
+    return round(float(sum(values)), digits)

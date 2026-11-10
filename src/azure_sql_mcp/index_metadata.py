@@ -337,6 +337,17 @@ def index_protection_metadata_sql(*, scoped: bool = False) -> str:
 
 INDEX_PROTECTION_METADATA_SQL = index_protection_metadata_sql()
 
+# Names the tool gives its own sandbox test indexes. An index with one of these
+# names is an experiment (or its leftover), never part of the design.
+TEST_INDEX_NAME_PREFIXES = ("IX_Testing_", "IX_Tuning_")
+
+
+def is_test_index_name(name: str | None) -> bool:
+    return bool(name) and str(name).casefold().startswith(
+        tuple(prefix.casefold() for prefix in TEST_INDEX_NAME_PREFIXES)
+    )
+
+
 _DIRECTION_PATTERN = re.compile(
     r"^(?:\[(?P<bracketed>(?:[^\]\r\n]|\]\])+)\]|"
     r"(?P<plain>[A-Za-z_][A-Za-z0-9_]*))"
@@ -1029,7 +1040,8 @@ def existing_index_covers_candidate(
     partition_columns: Iterable[str] = (),
     exact_catalog_names: bool = False,
 ) -> bool:
-    if index.is_disabled:
+    # A test index is dropped when its experiment ends, so it covers nothing.
+    if index.is_disabled or is_test_index_name(index.name):
         return False
     normalize_identifier = (
         _exact_catalog_identifier if exact_catalog_names else _clean_identifier
@@ -1854,6 +1866,7 @@ __all__ = [
     "collect_existing_indexes",
     "coerce_existing_indexes",
     "existing_index_covers_candidate",
+    "is_test_index_name",
     "existing_index_metadata_sql",
     "existing_index_response",
     "index_definition_fingerprint",

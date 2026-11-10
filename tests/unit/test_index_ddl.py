@@ -164,7 +164,11 @@ def test_persisted_blockers_and_malformed_coverage_fail_closed() -> None:
 
 def test_rollback_is_exact_and_only_for_removal_candidates() -> None:
     index = _index()
-    expected = render_reverse_index_ddl(index)["reverse_ddl"]
+    # A rollback runs on a live table, so it rebuilds online; nothing else differs.
+    expected = render_reverse_index_ddl(index, online=True)["reverse_ddl"]
+    assert expected == render_reverse_index_ddl(index)["reverse_ddl"].replace(
+        "\nWITH (", "\nWITH (ONLINE = ON, ", 1
+    )
     for state in ("drop_candidate", "consolidate_candidate"):
         subject = _subject(index, state)
         assert render_candidate_rollback(subject) == expected

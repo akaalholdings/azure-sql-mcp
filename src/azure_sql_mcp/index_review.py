@@ -3154,10 +3154,13 @@ class IndexReviewService:
         query_store, references, missing_rows = self._collect_query_store(session, context)
         dmv_rows, dmv_coverage = self._collect_missing_index_dmv(session)
         candidate_rows = self._merge_missing_index_rows(missing_rows, dmv_rows)
+        # Many candidates share a table: read its row count, write ratio and
+        # column widths once inside this transaction.
+        table_memo: dict[tuple[str, ...], Any] = {}
         for row in candidate_rows:
             scoring_blockers = list(row.get("scoring_blockers", []))
             if _as_optional_int(row.get("estimated_size_bytes")) is None:
-                estimated_size = self._estimate_candidate_size(session, row)
+                estimated_size = self._estimate_candidate_size(session, row, memo=table_memo)
                 if estimated_size is not None:
                     row["estimated_size_bytes"] = estimated_size
                     row["estimated_size_mb"] = estimated_size / (1024.0 * 1024.0)
@@ -3167,7 +3170,9 @@ class IndexReviewService:
                 not _as_bool(row.get("dmv_only"))
                 and _as_float(row.get("write_ratio")) is None
             ):
-                row["write_ratio"] = self._collect_candidate_write_ratio(session, row)
+                row["write_ratio"] = self._collect_candidate_write_ratio(
+                    session, row, memo=table_memo
+                )
                 if row["write_ratio"] is None:
                     scoring_blockers.append(
                         "index_candidate_write_ratio_unavailable"
@@ -3757,7 +3762,13 @@ class IndexReviewService:
     def _estimate_candidate_size(
         session: SqlTransactionSession,
         row: Mapping[str, Any],
+        *,
+        memo: dict[tuple[str, ...], Any] | None = None,
     ) -> int | None:
+        """Estimated size in bytes; ``memo`` keeps one row count per table and one width per column."""
+
+        if memo is None:
+            memo = {}
         schema = str(row.get("schema_name") or "")
         table = str(row.get("table_name") or row.get("object_name") or "")
         if not schema or not table:
@@ -3775,38 +3786,45 @@ class IndexReviewService:
         )
         if not columns or len(columns) > _MAX_INDEX_CANDIDATE_COLUMNS:
             return None
-        try:
-            rows = session.fetch_all(
-                INDEX_CANDIDATE_ROW_COUNT_SQL,
-                [1, schema, table],
-            )
-        except Exception:
-            return None
-        if not rows:
-            return None
-        row_count = _as_optional_int(rows[0].get("row_count"))
+        rows_key = ("row_count", schema, table)
+        if rows_key not in memo:
+            try:
+                rows = session.fetch_all(
+                    INDEX_CANDIDATE_ROW_COUNT_SQL,
+                    [1, schema, table],
+                )
+            except Exception:
+                rows = []
+            memo[rows_key] = _as_optional_int(rows[0].get("row_count")) if rows else None
+        row_count = memo[rows_key]
         if row_count is None or row_count < 0:
             return None
         if row_count == 0:
             return 0
-        try:
-            width_rows = session.fetch_all(
-                _build_index_candidate_column_widths_sql(len(columns)),
-                [
-                    _MAX_INDEX_CANDIDATE_COLUMNS + 1,
-                    schema,
-                    table,
-                    *columns,
-                ],
-            )
-        except Exception:
-            return None
-        widths: dict[str, int] = {}
-        for width_row in width_rows:
-            column_name = width_row.get("column_name")
-            width = _as_optional_int(width_row.get("max_length"))
-            if isinstance(column_name, str) and width is not None and width >= 0:
-                widths[column_name] = width
+        unread = [column for column in columns if ("width", schema, table, column) not in memo]
+        if unread:
+            try:
+                width_rows = session.fetch_all(
+                    _build_index_candidate_column_widths_sql(len(unread)),
+                    [
+                        _MAX_INDEX_CANDIDATE_COLUMNS + 1,
+                        schema,
+                        table,
+                        *unread,
+                    ],
+                )
+            except Exception:
+                return None
+            for width_row in width_rows:
+                column_name = width_row.get("column_name")
+                width = _as_optional_int(width_row.get("max_length"))
+                if isinstance(column_name, str) and width is not None and width >= 0:
+                    memo[("width", schema, table, column_name)] = width
+        widths = {
+            column: memo[("width", schema, table, column)]
+            for column in columns
+            if ("width", schema, table, column) in memo
+        }
         if any(column not in widths for column in columns):
             return None
         total_width = (
@@ -3830,20 +3848,28 @@ class IndexReviewService:
     def _collect_candidate_write_ratio(
         session: SqlTransactionSession,
         row: Mapping[str, Any],
+        *,
+        memo: dict[tuple[str, ...], Any] | None = None,
     ) -> float | None:
         schema = str(row.get("schema_name") or "")
         table = str(row.get("table_name") or row.get("object_name") or "")
         if not schema or not table:
             return None
+        key = ("write_ratio", schema, table)
+        if memo is not None and key in memo:
+            return memo[key]
         try:
             rows = session.fetch_all(
                 INDEX_CANDIDATE_WRITE_RATIO_SQL,
                 [1, schema, table],
             )
         except Exception:
-            return None
+            rows = []
         value = _as_float(rows[0].get("write_ratio")) if rows else None
-        return value if value is not None and 0 <= value <= 1 else None
+        result = value if value is not None and 0 <= value <= 1 else None
+        if memo is not None:
+            memo[key] = result
+        return result
 
     @staticmethod
     def _merge_missing_index_rows(
@@ -3935,6 +3961,7 @@ class IndexReviewService:
                 }
                 continue
             source_blockers: list[str] = []
+            names_no_index = False
             capped = len(rows) > MAX_CAPTURE_ROWS
             if capped:
                 source_blockers.append(f"{source}_cap_reached")
@@ -3945,7 +3972,13 @@ class IndexReviewService:
                     source_blockers.append(f"{source}_text_unavailable")
                     continue
                 matches, parse_blockers = _resolve_index_hints(text_value, identities)
-                source_blockers.extend(parse_blockers)
+                # A hint on a temp table, another database or a dropped index
+                # names no index of this capture: no removal here can break it.
+                if "index_hint_names_no_index" in parse_blockers:
+                    names_no_index = True
+                source_blockers.extend(
+                    blocker for blocker in parse_blockers if blocker != "index_hint_names_no_index"
+                )
                 if matches:
                     evidence.append(
                         {
@@ -3963,6 +3996,8 @@ class IndexReviewService:
                 "scanned": min(len(rows), MAX_CAPTURE_ROWS),
                 "capped": capped,
             }
+            if names_no_index:
+                source_coverage[source]["reason"] = "index_hint_names_no_index"
         unique_blockers = list(dict.fromkeys(blockers))
         return (
             {
@@ -4017,7 +4052,26 @@ class IndexReviewService:
             prior_review=prior,
             business_cycle_extension_days=minimum_days - MIN_OBSERVATION_DAYS,
         )
-        return review
+        return self._mark_historical(review, selected[0])
+
+    def _mark_historical(self, review: IndexReviewV1, run: IndexReviewRunV1) -> IndexReviewV1:
+        """Say how old the evidence is when a review is of a capture past the reuse window."""
+
+        age = self.clock().astimezone(timezone.utc) - _parse_time(run.observed_at_utc)
+        if age <= timedelta(hours=SNAPSHOT_REUSE_HOURS):
+            return review
+        return replace(
+            review,
+            observation={
+                **review.observation,
+                "history_status": "historical",
+                "stale_hours": round(age.total_seconds() / 3600.0, 3),
+                "next_action": (
+                    "This review is of an old capture: an index created or dropped since then "
+                    "is not in it. Invoke capture_index_review_snapshot, then review again."
+                ),
+            },
+        )
 
     async def get_review(self, database_name: str, review_id: str) -> IndexReviewV1:
         self._require_read(database_name)
@@ -4047,7 +4101,7 @@ class IndexReviewService:
         )
         if review.review_id != review_id:
             raise IndexReviewIntegrityError("Review selector does not match its deterministic projection.")
-        return review
+        return self._mark_historical(review, selected[0])
 
     def _minimum_days(self, database_name: str) -> int:
         extension = self.database_policy.policy_for(database_name).business_cycle_extension_days if self.database_policy else 0
@@ -4109,6 +4163,7 @@ def _missing_history_review(
         None,
         minimum_days,
         history_fingerprint,
+        history_status=status,
     )
     observation: dict[str, Any] = {
         "snapshot_count": len(history),
@@ -4411,11 +4466,30 @@ def _reference_in_window(reference: Mapping[str, Any], window_start: datetime | 
     return last_seen is None or window_start is None or last_seen >= window_start
 
 
+def subject_lookup(
+    snapshots: Sequence[IndexReviewSnapshotV1],
+) -> dict[int, dict[Any, Mapping[str, Any]]]:
+    """Each capture's subjects by subject id, keyed by the snapshot object.
+
+    Built once per review, so a gate does not search every capture's subject
+    list for every index. Valid only while ``snapshots`` is alive.
+    """
+
+    lookup: dict[int, dict[Any, Mapping[str, Any]]] = {}
+    for snapshot in snapshots:
+        by_id: dict[Any, Mapping[str, Any]] = {}
+        for item in snapshot.subjects:
+            by_id.setdefault(item.get("subject_id"), item)
+        lookup[id(snapshot)] = by_id
+    return lookup
+
+
 def _observation_gate(
     subject: Mapping[str, Any],
     snapshots: Sequence[IndexReviewSnapshotV1],
     *,
     minimum_days: int,
+    lookup: Mapping[int, Mapping[Any, Mapping[str, Any]]] | None = None,
 ) -> tuple[dict[str, Any], list[Mapping[str, Any]], int | None]:
     """Evaluate the trailing minimum_days window of one subject's history.
 
@@ -4426,10 +4500,9 @@ def _observation_gate(
 
     subject_id = subject.get("subject_id")
     ordered = sorted(snapshots, key=lambda item: (item.observed_at_utc, item.run_id))
-    pairs = [
-        (snapshot, next((item for item in snapshot.subjects if item.get("subject_id") == subject_id), None))
-        for snapshot in ordered
-    ]
+    if lookup is None:
+        lookup = subject_lookup(ordered)
+    pairs = [(snapshot, lookup[id(snapshot)].get(subject_id)) for snapshot in ordered]
     usable: list[tuple[IndexReviewSnapshotV1, Mapping[str, Any], dict[str, int]]] = []
     for snapshot, item in pairs:
         counters = _usable_counters(item, snapshot)
@@ -4587,6 +4660,7 @@ def evaluate_removal_gate(
     snapshots: Sequence[IndexReviewSnapshotV1],
     *,
     minimum_days: int = MIN_OBSERVATION_DAYS,
+    lookup: Mapping[int, Mapping[Any, Mapping[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     definition = _mapping_value(subject.get("definition"))
     reversible = _reversible_definition(subject)
@@ -4595,7 +4669,7 @@ def evaluate_removal_gate(
     except (TypeError, ValueError):
         reverse_ddl = {"executable": False}
     observation, history, selected_reads = _observation_gate(
-        subject, snapshots, minimum_days=minimum_days
+        subject, snapshots, minimum_days=minimum_days, lookup=lookup
     )
     window_start = _parse_utc_timestamp(observation["window_start_utc"])
     filter_payload = _mapping_value(reversible.get("filter"))
@@ -4813,13 +4887,83 @@ def _classify_create(
     return ("create_candidate" if not blockers else "observe", blockers, gates)
 
 
+_REMOVAL_STATES = frozenset({"drop_candidate", "consolidate_candidate"})
+
+
+def _definition_width(subject: Mapping[str, Any]) -> tuple[int, int]:
+    definition = _reversible_definition(subject)
+    return (len(definition.get("key_columns") or ()), len(definition.get("include_columns") or ()))
+
+
+def _settle_overlaps(
+    pending: Sequence[tuple[Mapping[str, Any], dict[str, Any], dict[str, Any]]],
+    same_table: Mapping[tuple[Any, Any], Sequence[Mapping[str, Any]]],
+    entries: Sequence[Mapping[str, Any]],
+) -> None:
+    """Decide consolidation between indexes where one covers another.
+
+    Widest first: an index that covers another has more keys, or the same keys
+    and more includes, so its final state is known before the indexes it
+    covers are judged. A survivor is the nearest covering index that is not
+    itself proposed for removal. When every covering index is being removed,
+    the index keeps the state its own removal gate gave it.
+    """
+
+    final_state = {entry.get("subject_id"): str(entry.get("state")) for entry in entries}
+    for subject, entry, removal in sorted(
+        pending, key=lambda item: _definition_width(item[0]), reverse=True
+    ):
+        subject_id = subject.get("subject_id")
+        definition = _reversible_definition(subject)
+        others = [
+            other
+            for other in same_table.get((subject.get("schema_name"), subject.get("table_name")), ())
+            if other.get("subject_id") != subject_id
+        ]
+        covering = [
+            other for other in others if _definition_covers(_reversible_definition(other), definition)
+        ]
+        if covering and not removal["passed"]:
+            entry["state"], entry["reason_codes"] = "observe", ["independent_removal_gate_not_passed"]
+        elif covering:
+            survivors = [
+                other for other in covering if final_state.get(other.get("subject_id")) not in _REMOVAL_STATES
+            ]
+            if survivors:
+                survivor = min(
+                    survivors,
+                    key=lambda other: (
+                        _definition_width(other),
+                        str(other.get("index_name", "")),
+                        str(other.get("subject_id", "")),
+                    ),
+                )
+                entry["state"], entry["reason_codes"] = "consolidate_candidate", ["strict_coverage_overlap"]
+                entry["overlap_relation"] = "strict_coverage"
+                entry["survivor_reference"] = _survivor_reference_for_subject(survivor)
+        elif entry["state"] != "drop_candidate" and any(
+            _definition_covers(definition, _reversible_definition(other)) for other in others
+        ):
+            entry["state"], entry["reason_codes"] = "keep", ["covers_other_index"]
+        final_state[subject_id] = str(entry["state"])
+
+
 def _review_id(
     database_fingerprint_value: str,
     selected_run_id: str,
     prior_base_run_id: str | None,
     minimum_days: int,
     history_fingerprint: str,
+    *,
+    history_status: str | None = None,
 ) -> str:
+    """The deterministic selector of one review.
+
+    ``history_status`` (stale or missing history) gives a selector that names
+    no run: get_review cannot resolve it to the actionable projection of the
+    same capture.
+    """
+
     policy = _digest(
         "index-review-policy-v1",
         {
@@ -4840,6 +4984,12 @@ def _review_id(
         "prior_base_run_id": prior_base_run_id,
         "history_fingerprint": history_fingerprint,
     }
+    as_of = _compact(selected_run_id)
+    if history_status is not None:
+        material["history_status"] = history_status
+        as_of = _compact(
+            _digest("index-review-unresolved-v1", {"status": history_status, "run_id": selected_run_id})
+        )
     signature = _compact(_digest("index-review-selector-signature-v1", material))
     return ".".join(
         (
@@ -4848,7 +4998,7 @@ def _review_id(
             "d=" + str(minimum_days),
             "p=" + _compact(policy),
             "db=" + _compact(database_fingerprint_value),
-            "as=" + _compact(selected_run_id),
+            "as=" + as_of,
             # A 10-character prior prefix keeps a recheck id under the
             # 200-character selector bound; get_review resolves it uniquely.
             "pr=" + (_compact(prior_base_run_id)[:10] if prior_base_run_id else "-"),
@@ -4911,10 +5061,20 @@ def review_index_portfolio(
     # The prior review drives recheck transitions only; the gate always reads
     # the history up to the selected run.
     history = [item for item in ordered if item.observed_at_utc <= selected.observed_at_utc]
-    history_fingerprint = _digest(
-        "index-review-history-v1",
-        [{"run_id": item.run_id, "snapshot_fingerprint": item.snapshot_fingerprint} for item in history],
+    # The gate reads the trailing window and its anchor, the last capture at or
+    # before the window start. An anchor more than 48 hours before the start
+    # closes the gate anyway (the gap rule), so older captures cannot change a
+    # result. Leaving them out of the gate and of the fingerprint keeps a
+    # review id valid after a retention purge.
+    scope_start = _parse_time(selected.observed_at_utc) - timedelta(
+        days=minimum_days, hours=MAX_UNOBSERVED_HOURS
     )
+    scoped = [item for item in history if _parse_time(item.observed_at_utc) >= scope_start]
+    history_fingerprint = _digest(
+        "index-review-history-v2",
+        [{"run_id": item.run_id, "snapshot_fingerprint": item.snapshot_fingerprint} for item in scoped],
+    )
+    lookup = subject_lookup(scoped)
     prior_subjects = {item.get("subject_id"): item for item in (prior_review.subjects if prior_review else ())}
     current_subjects = list(selected.subjects)
     duplicate_groups: dict[str, list[Mapping[str, Any]]] = {}
@@ -4933,12 +5093,22 @@ def review_index_portfolio(
         )
         duplicate_groups.setdefault(group_key, []).append(current)
     result_subjects: list[dict[str, Any]] = []
+    same_table: dict[tuple[Any, Any], list[Mapping[str, Any]]] = {}
+    for current in current_subjects:
+        if current.get("subject_kind") == "existing_index":
+            same_table.setdefault(
+                (current.get("schema_name"), current.get("table_name")), []
+            ).append(current)
+    # Existing indexes with no exact duplicate; their overlap is settled below.
+    overlap_pending: list[tuple[Mapping[str, Any], dict[str, Any], dict[str, Any]]] = []
     for subject in sorted(current_subjects, key=lambda item: str(item.get("subject_id", ""))):
         if subject.get("subject_kind") == "missing_index":
             state, reasons, gates = _classify_create(subject, current_subjects, selected)
             entry = {**dict(subject), "state": state, "reason_codes": reasons, "create_gate": gates}
         else:
-            removal = evaluate_removal_gate(subject, history, minimum_days=minimum_days)
+            removal = evaluate_removal_gate(
+                subject, scoped, minimum_days=minimum_days, lookup=lookup
+            )
             protections = _mapping_value(subject.get("protections"))
             # Any proven read in the window keeps the index, even in a segment
             # whose counters later decreased.
@@ -4963,6 +5133,18 @@ def review_index_portfolio(
             )
             if protected or has_valid_read_delta or has_reference:
                 state, reasons = "keep", ["protected_or_used"]
+                partition_only = _as_bool(protections.get("partition_switch_dependency")) and not any(
+                    _as_bool(protections.get(key))
+                    for key in (
+                        "primary_key", "unique_constraint", "indexed_view", "clustered", "auto_created",
+                        "hinted_or_forced_plan", "referenced_foreign_key_key_index_ids",
+                        "child_foreign_key_support",
+                    )
+                )
+                if partition_only and not has_valid_read_delta and not has_reference:
+                    # Not in use: the partition scheme alone keeps it. Tables that
+                    # switch partitions with this one need matching indexes.
+                    reasons.append("partition_switch_dependency")
             elif removal["passed"] and removal["readable_replica_usage_observed"]:
                 state, reasons = "drop_candidate", []
             elif removal["passed"]:
@@ -5005,51 +5187,11 @@ def review_index_portfolio(
                         "independent_removal_gate_not_passed"
                     ]
             else:
-                covering_index = next(
-                    (
-                        other
-                        for other in current_subjects
-                        if other.get("subject_id") != subject.get("subject_id")
-                        and other.get("subject_kind") == "existing_index"
-                        and other.get("schema_name") == subject.get("schema_name")
-                        and other.get("table_name") == subject.get("table_name")
-                        and _definition_covers(
-                            _reversible_definition(other),
-                            _reversible_definition(subject),
-                        )
-                    ),
-                    None,
-                )
-                if covering_index is not None and removal["passed"]:
-                    entry["state"], entry["reason_codes"] = (
-                        "consolidate_candidate",
-                        ["strict_coverage_overlap"],
-                    )
-                    entry["overlap_relation"] = "strict_coverage"
-                    entry["survivor_reference"] = _survivor_reference_for_subject(
-                        covering_index
-                    )
-                elif covering_index is not None:
-                    entry["state"], entry["reason_codes"] = "observe", [
-                        "independent_removal_gate_not_passed"
-                    ]
-                else:
-                    covers_other = any(
-                        other.get("subject_id") != subject.get("subject_id")
-                        and other.get("subject_kind") == "existing_index"
-                        and other.get("schema_name") == subject.get("schema_name")
-                        and other.get("table_name") == subject.get("table_name")
-                        and _definition_covers(
-                            _reversible_definition(subject),
-                            _reversible_definition(other),
-                        )
-                        for other in current_subjects
-                    )
-                    if covers_other:
-                        entry["state"], entry["reason_codes"] = "keep", [
-                            "covers_other_index"
-                        ]
-        previous = prior_subjects.get(subject.get("subject_id"))
+                overlap_pending.append((subject, entry, removal))
+        result_subjects.append(entry)
+    _settle_overlaps(overlap_pending, same_table, result_subjects)
+    for entry in result_subjects:
+        previous = prior_subjects.get(entry.get("subject_id"))
         entry["recheck"] = {
             "is_recheck": previous is not None,
             "prior_state": previous.get("state") if previous else None,
@@ -5059,7 +5201,6 @@ def review_index_portfolio(
                 else "unchanged" if previous.get("state") == entry["state"] else f"{previous.get('state')}_to_{entry['state']}"
             ),
         }
-        result_subjects.append(entry)
     states = [str(item.get("state")) for item in result_subjects]
     actionable = sum(state in {"create_candidate", "consolidate_candidate", "drop_candidate"} for state in states)
     observed = states.count("observe")
@@ -5174,7 +5315,7 @@ def _create_candidate_ddl(subject: Mapping[str, Any]) -> str | None:
     includes = subject.get("include_columns") or []
     include_sql = " INCLUDE (" + ", ".join(_quote_identifier(column) for column in includes) + ")" if includes else ""
     name = _quote_identifier(_candidate_index_name(subject))
-    return f"CREATE NONCLUSTERED INDEX {name} ON {_quote_identifier(subject.get('schema_name'))}.{_quote_identifier(subject.get('table_name'))} ({', '.join(key_sql)}){include_sql};"
+    return f"CREATE NONCLUSTERED INDEX {name} ON {_quote_identifier(subject.get('schema_name'))}.{_quote_identifier(subject.get('table_name'))} ({', '.join(key_sql)}){include_sql} WITH (ONLINE = ON);"
 
 
 def _candidate_index_name(subject: Mapping[str, Any]) -> str:

@@ -22,7 +22,12 @@ from typing import TypeVar
 from typing import cast
 
 from .azure_tier import dmv_permission_hint
+from .azure_tier import read_dmv
+from .columnstore_health import ROW_GROUP_DMV
+from .columnstore_health import ROW_GROUP_SQL
+from .columnstore_health import summarize_columnstore_indexes
 from .connection import AzureSqlExecutor
+from .index_advisor import COLUMNSTORE_TYPE_CODES
 from .index_advisor import OBJECTIVES
 from .index_advisor import AdvisorInputs
 from .index_advisor import AdvisorSettings
@@ -40,6 +45,7 @@ from .index_review import _reference_is_read
 from .observability import sanitize_error_message
 from .plans import parse_showplan_index_evidence
 from .query_store import QueryStoreService
+from .result_status import RESULT_STATUS_REASON_KEY
 from .result_status import ResultStatus
 from .result_status import status_payload
 from .showplan_access import parse_plan_access
@@ -75,6 +81,8 @@ OPTIONAL_READ_TIMEOUT_SECONDS = 30.0
 _UNRESOLVED_HINT_BLOCKERS = frozenset(
     {"unresolved_or_ambiguous_index_hint", "unresolved_or_ambiguous_numeric_index_hint"}
 )
+# The hint matched no index of the database, so no index here depends on it.
+_HINT_NAMES_NO_INDEX = "index_hint_names_no_index"
 _HINT_SOURCE_NAMES = {
     "query_store_text": "Query Store query text",
     "query_store_query_hints": "Query Store hints",
@@ -264,6 +272,21 @@ FROM sys.dm_db_index_operational_stats(DB_ID(), NULL, NULL, NULL) AS os
 WHERE os.index_id = 0
   AND os.object_id IN ({ids})
 GROUP BY os.object_id
+"""
+
+_LEAF_ACTIVITY_SQL_TEMPLATE = """
+SELECT
+    os.object_id,
+    i.name AS index_name,
+    SUM(os.leaf_insert_count) AS leaf_insert_count,
+    SUM(os.leaf_allocation_count) AS leaf_allocation_count
+FROM sys.dm_db_index_operational_stats(DB_ID(), NULL, NULL, NULL) AS os
+INNER JOIN sys.indexes AS i
+    ON i.object_id = os.object_id
+   AND i.index_id = os.index_id
+WHERE os.index_id > 0
+  AND os.object_id IN ({ids})
+GROUP BY os.object_id, i.name
 """
 
 _SELECTIVITY_SQL_TEMPLATE = """
@@ -653,14 +676,18 @@ class WorkloadIndexAdvisor:
         column_gaps: list[str] = []
         forwarded_gaps: list[str] = []
         selectivity_gaps: list[str] = []
-        columns, _, selectivity = await asyncio.gather(
+        leaf_gaps: list[str] = []
+        columns, _, selectivity, leaf_activity = await asyncio.gather(
             reader._columns(database_name, detail_ids, by_id, column_gaps),
             reader._forwarded_fetches(database_name, heap_ids, tables, by_id, forwarded_gaps),
             reader._selectivity(database_name, detail_ids, by_id, selectivity_gaps),
+            reader._leaf_activity(database_name, detail_ids, by_id, leaf_gaps)
+            if include_existing_index_review
+            else _value(None),
         )
         gaps.extend(column_gaps)
         gaps.extend(_unusable_computed_column_gaps(columns, tables))
-        gaps.extend(forwarded_gaps + selectivity_gaps + foreign_key_gaps)
+        gaps.extend(forwarded_gaps + selectivity_gaps + foreign_key_gaps + leaf_gaps)
 
         # Stage 3: optional dependency reads, each bounded; a timeout or failure
         # becomes a gap. They get a stage of their own so that no read waits
@@ -669,7 +696,9 @@ class WorkloadIndexAdvisor:
         forced_gaps: list[str] = []
         hint_gaps: list[str] = []
         coverage_gaps: list[str] = []
+        columnstore_gaps: list[str] = []
         pin_reads = include_existing_index_review and query_store_readable
+        has_columnstore = any(index.index_type_code in COLUMNSTORE_TYPE_CODES for index in existing)
         # The reference read costs (index names) x (plan bytes), so check only
         # the indexes this review can report. The hint read keeps every index:
         # a hint that names an out-of-scope index must still resolve.
@@ -684,6 +713,7 @@ class WorkloadIndexAdvisor:
             (forced_accesses, forced_coverage),
             (hint_references, hint_coverage),
             coverage,
+            columnstore_health,
         ) = await asyncio.gather(
             self._bounded(
                 reader._index_references(database_name, scoped_existing, start, reference_gaps)
@@ -725,8 +755,18 @@ class WorkloadIndexAdvisor:
                 consequence="per-day rates use the requested window and removals are capped at medium confidence",
                 site="workload_index_advisor.query_store_coverage",
             ),
+            self._bounded(
+                reader._columnstore_health(database_name, columnstore_gaps)
+                if include_existing_index_review and has_columnstore
+                else _value(None),
+                fallback=None,
+                gaps=columnstore_gaps,
+                what="columnstore row-group health",
+                consequence="columnstore maintenance leads are missing",
+                site="workload_index_advisor.columnstore_health",
+            ),
         )
-        gaps.extend(reference_gaps + forced_gaps + hint_gaps + coverage_gaps)
+        gaps.extend(reference_gaps + forced_gaps + hint_gaps + coverage_gaps + columnstore_gaps)
         if include_existing_index_review and not query_store_readable:
             gaps.append(
                 "Query Store plan references could not be checked; unused-index findings stay low confidence"
@@ -764,6 +804,8 @@ class WorkloadIndexAdvisor:
             forced_plan_coverage=forced_coverage,
             hint_coverage=hint_coverage,
             readable_replicas=readable_replicas,
+            columnstore_health=columnstore_health,
+            index_leaf_activity=leaf_activity,
         )
         report = build_index_advice(inputs)
         report.update(self._overall_status(report, query_store, query_store_readable, queries))
@@ -961,6 +1003,42 @@ class WorkloadIndexAdvisor:
             key = _lookup(by_id, row.get("object_id"))
             if key is not None and key in tables:
                 tables[key].forwarded_fetches = _int_or_none(row.get("forwarded_fetches"))
+
+    async def _leaf_activity(
+        self,
+        database_name: str,
+        object_ids: list[int],
+        by_id: dict[int, tuple[str, str]],
+        gaps: list[str],
+    ) -> dict[tuple[str, str, str], dict[str, int]] | None:
+        """Leaf inserts and leaf page allocations per index: the page-split evidence."""
+
+        ids = _id_list(object_ids)
+        if not ids:
+            return {}
+        try:
+            rows = await self.executor.fetch_all(
+                database_name, _LEAF_ACTIVITY_SQL_TEMPLATE.format(ids=ids)
+            )
+        except Exception as exc:
+            note_exception(exc, "workload_index_advisor.leaf_activity")
+            gaps.append(
+                "Leaf page counters could not be read: "
+                + sanitize_error_message(str(exc))
+                + "; fill factor was not reviewed"
+            )
+            return None
+        activity: dict[tuple[str, str, str], dict[str, int]] = {}
+        for row in rows:
+            key = _lookup(by_id, row.get("object_id"))
+            name = row.get("index_name")
+            if key is None or not name:
+                continue
+            activity[(key[0], key[1], _norm(str(name)))] = {
+                "leaf_insert_count": int(_float(row.get("leaf_insert_count"))),
+                "leaf_allocation_count": int(_float(row.get("leaf_allocation_count"))),
+            }
+        return activity
 
     async def _selectivity(
         self,
@@ -1283,11 +1361,20 @@ class WorkloadIndexAdvisor:
             )
         if coverage.get("status") == "complete":
             return references, "complete"
+        all_blockers = [str(blocker) for blocker in coverage.get("blockers") or []]
         blockers = [
-            str(blocker)
-            for blocker in coverage.get("blockers") or []
-            if blocker not in _UNRESOLVED_HINT_BLOCKERS
+            blocker
+            for blocker in all_blockers
+            if blocker not in _UNRESOLVED_HINT_BLOCKERS and blocker != _HINT_NAMES_NO_INDEX
         ]
+        if _HINT_NAMES_NO_INDEX in all_blockers:
+            gaps.append(
+                "Some index hints name no index in this database (a temp table, another database, "
+                "or an index that no longer exists). Removing an index here cannot affect them, "
+                "so they do not limit this review"
+            )
+            if not blockers and not unresolved:
+                return references, "complete"
         if blockers or not unresolved:
             gaps.append(
                 "Index hints in query text, Query Store hints, plan guides and modules were not fully checked"
@@ -1318,6 +1405,27 @@ class WorkloadIndexAdvisor:
             "interval_count": int(_float(row.get("interval_count"))),
             "oldest_interval_start_utc": row.get("oldest_interval_start_utc"),
         }
+
+    async def _columnstore_health(
+        self, database_name: str, gaps: list[str]
+    ) -> list[dict[str, Any]] | None:
+        """Row-group health of every columnstore index, or None with a gap."""
+
+        rows, blocked = await read_dmv(
+            self.executor,
+            database_name,
+            ROW_GROUP_DMV,
+            ROW_GROUP_SQL.format(object_filter=""),
+            site="workload_index_advisor.columnstore_health",
+        )
+        if blocked is not None:
+            gaps.append(
+                "columnstore row-group health could not be read ("
+                + str(blocked.get(RESULT_STATUS_REASON_KEY) or "unavailable")
+                + "); columnstore maintenance leads are missing"
+            )
+            return None
+        return summarize_columnstore_indexes(rows)
 
     @staticmethod
     def _overall_status(

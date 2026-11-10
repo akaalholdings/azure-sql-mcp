@@ -595,20 +595,43 @@ def _render_create_index_statement(
     table_name: str,
     index: IndexDef,
 ) -> str:
+    index_type = " ".join(index.index_type.upper().split())
+    target = quote_qualified_name(schema_name, table_name)
+    if "COLUMNSTORE" in index_type:
+        # A columnstore index has no key and no INCLUDE; the catalog lists its
+        # columns as included columns.
+        columns = index.key_columns + index.included_columns
+        statement = f"CREATE {index_type} INDEX {quote_identifier(index.name)} ON {target}"
+        if index_type.startswith("NONCLUSTERED"):
+            statement += " (" + ", ".join(quote_identifier(column) for column in columns) + ")"
+            if index.filter_definition:
+                statement += f" WHERE {index.filter_definition}"
+        if index.data_compression == "COLUMNSTORE_ARCHIVE":
+            statement += " WITH (DATA_COMPRESSION = COLUMNSTORE_ARCHIVE)"
+        return statement + ";"
+    if index_type not in {"CLUSTERED", "NONCLUSTERED"}:
+        return (
+            f"-- Not scripted: {quote_identifier(index.name)} on {target} is a {index.index_type} "
+            "index. This generator scripts rowstore and columnstore indexes only; script it by hand."
+        )
+    directions = (
+        index.key_directions
+        if len(index.key_directions) == len(index.key_columns)
+        else tuple("ASC" for _ in index.key_columns)
+    )
     parts = ["CREATE"]
     if index.is_unique:
         parts.append("UNIQUE")
-    index_type = index.index_type.upper()
-    if "XML" not in index_type and "SPATIAL" not in index_type:
-        parts.append(index.index_type)
-    else:
-        parts.append(index.index_type)
+    parts.append(index.index_type)
     parts.append("INDEX")
     parts.append(quote_identifier(index.name))
-    parts.append(f"ON {quote_qualified_name(schema_name, table_name)}")
+    parts.append(f"ON {target}")
     parts.append(
         "("
-        + ", ".join(quote_identifier(column) for column in index.key_columns)
+        + ", ".join(
+            quote_identifier(column) + (" DESC" if direction == "DESC" else "")
+            for column, direction in zip(index.key_columns, directions, strict=True)
+        )
         + ")"
     )
     if index.included_columns:

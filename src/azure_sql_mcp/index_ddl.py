@@ -29,8 +29,13 @@ def quote_identifier(identifier: str) -> str:
     return f"[{identifier.replace(']', ']]')}]"
 
 
-def render_reverse_index_ddl(index: ExistingIndex) -> dict[str, Any]:
-    """Render executable recreation SQL only for a complete safe definition."""
+def render_reverse_index_ddl(index: ExistingIndex, *, online: bool = False) -> dict[str, Any]:
+    """Render executable recreation SQL only for a complete safe definition.
+
+    ``online`` adds ONLINE = ON: a rollback run on a live table must not block
+    its writers for the whole build. Rebuild DDL adds its own ONLINE option, so
+    it renders with the default.
+    """
 
     blockers = list(index.reversibility_blockers)
     if not index.name:
@@ -120,6 +125,7 @@ def render_reverse_index_ddl(index: ExistingIndex) -> dict[str, Any]:
     filter_sql = f"\nWHERE {index.filter_definition}" if index.has_filter else ""
     with_sql = ", ".join(
         (
+            *(("ONLINE = ON",) if online else ()),
             f"PAD_INDEX = {_on_off(index.is_padded)}",
             f"FILLFACTOR = {index.fill_factor}",
             f"IGNORE_DUP_KEY = {_on_off(index.ignore_dup_key)}",
@@ -173,7 +179,9 @@ def render_exact_reverse_index_ddl(index: ExistingIndex) -> dict[str, Any]:
     return render_reverse_index_ddl(index)
 
 
-def render_reverse_index_definition(definition: Mapping[str, Any]) -> dict[str, Any]:
+def render_reverse_index_definition(
+    definition: Mapping[str, Any], *, online: bool = False
+) -> dict[str, Any]:
     """Render reverse DDL from the persisted reversible definition only."""
 
     if definition.get("version") != 1:
@@ -288,7 +296,7 @@ def render_reverse_index_definition(definition: Mapping[str, Any]) -> dict[str, 
         parent_object_type_code=definition.get("parent_object_type_code"),
         index_type_code=definition.get("index_type_code"),
     )
-    result = render_reverse_index_ddl(index)
+    result = render_reverse_index_ddl(index, online=online)
     stored_blockers = definition.get("reversibility_blockers")
     if stored_blockers is not None and not isinstance(stored_blockers, (list, tuple)):
         return _malformed_reverse_result("reversibility_blockers_malformed")
@@ -418,7 +426,7 @@ def render_candidate_rollback(subject: Mapping[str, Any]) -> str | None:
     definition = _reversible_definition(subject)
     if definition is None:
         return None
-    rendered = render_reverse_index_definition(definition)
+    rendered = render_reverse_index_definition(definition, online=True)
     reverse_ddl = rendered.get("reverse_ddl")
     if rendered.get("executable") is not True or not isinstance(reverse_ddl, str):
         return None

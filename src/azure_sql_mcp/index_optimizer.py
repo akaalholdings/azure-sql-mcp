@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import hashlib
@@ -11,6 +12,8 @@ from dataclasses import field
 from dataclasses import replace
 from enum import Enum
 from typing import Any
+from typing import Mapping
+from typing import Sequence
 
 from sqlglot import exp
 from sqlglot import parse
@@ -51,6 +54,18 @@ _NON_LEAF_MULTIPLIER = 1.1
 # COLUMNSTORE and COLUMNSTORE_ARCHIVE belong to columnstore index DDL and must
 # not be accepted for this statement shape.
 _SUPPORTED_ROWSTORE_INDEX_COMPRESSIONS = frozenset({"NONE", "ROW", "PAGE"})
+
+# Test-index builds wait for their final schema lock at low priority, so readers
+# and writers do not queue behind them, and give up themselves when it runs out.
+TEST_INDEX_LOW_PRIORITY_WAIT_MINUTES = 1
+TEST_INDEX_DROP_LOCK_TIMEOUT_MS = 5_000
+# The engine accepts MAXDOP 0 to 64; 0 means "use the default", which is the absent option here.
+_MAX_MAXDOP = 64
+REPLACEMENT_HIDE_METHODS = ("table_hint", "disable_in_sandbox")
+# A/B/A: baseline before, with the index, baseline after.
+PROOF_SET_PHASES = 3
+# The advisor's rollback rule: a query that slows more than this fails the proof.
+PROOF_SET_MAX_REGRESSION_PCT = 20.0
 
 INDEX_SCORE_ALPHA = 1.5
 INDEX_SCORE_BETA = 0.5
@@ -1438,8 +1453,19 @@ def build_index_candidate_statement(
     candidate: IndexCandidate,
     *,
     online: bool = False,
+    low_priority_wait_minutes: int | None = None,
+    maxdop: int | None = None,
 ) -> str:
-    """Render a review-only CREATE INDEX statement, including a filter."""
+    """Render a review-only CREATE INDEX statement, including a filter.
+
+    ``low_priority_wait_minutes`` (online builds only) adds WAIT_AT_LOW_PRIORITY
+    with ABORT_AFTER_WAIT = SELF; ``maxdop`` adds MAXDOP.
+    """
+
+    if low_priority_wait_minutes is not None and not 1 <= int(low_priority_wait_minutes) <= 1440:
+        raise ValueError("low_priority_wait_minutes must be between 1 and 1440")
+    if maxdop is not None and not 1 <= int(maxdop) <= _MAX_MAXDOP:
+        raise ValueError(f"maxdop must be between 1 and {_MAX_MAXDOP}")
 
     if not candidate.key_columns:
         raise ValueError("an index candidate requires at least one key column")
@@ -1463,8 +1489,15 @@ def build_index_candidate_statement(
     options: list[str] = []
     if compression:
         options.append(f"DATA_COMPRESSION = {compression}")
-    if online:
+    if online and low_priority_wait_minutes is not None:
+        options.append(
+            "ONLINE = ON (WAIT_AT_LOW_PRIORITY (MAX_DURATION = "
+            f"{int(low_priority_wait_minutes)} MINUTES, ABORT_AFTER_WAIT = SELF))"
+        )
+    elif online:
         options.append("ONLINE = ON")
+    if maxdop is not None:
+        options.append(f"MAXDOP = {int(maxdop)}")
     with_clause = f" WITH ({', '.join(options)})" if options else ""
     on_clause = ""
     if candidate.data_space_name:
@@ -1498,6 +1531,482 @@ def make_temporary_index_candidate(
     ).hexdigest()[:12]
     name = f"IX_Tuning_{workflow}_{digest}"[:128]
     return replace(candidate, index_name=name, workflow_id=workflow_id)
+
+
+def build_test_index_statement(
+    candidate: IndexCandidate,
+    *,
+    online: bool = True,
+    allow_offline: bool = False,
+    maxdop: int | None = None,
+    low_priority_wait_minutes: int = TEST_INDEX_LOW_PRIORITY_WAIT_MINUTES,
+) -> str:
+    """CREATE INDEX for a workflow-managed test index on a sandbox database.
+
+    An online build waits for its last lock at low priority and aborts itself,
+    so it never heads a blocking chain. An offline build blocks every writer of
+    the table for the whole build: refused unless the database policy allows it.
+    ``maxdop`` comes from policy; None leaves the database default.
+    """
+
+    if not online and not allow_offline:
+        raise PermissionError(
+            "An offline test index build blocks all writes to the table while it runs. "
+            "The database policy does not allow it; use online=True."
+        )
+    return build_index_candidate_statement(
+        candidate,
+        online=online,
+        low_priority_wait_minutes=low_priority_wait_minutes if online else None,
+        maxdop=maxdop,
+    )
+
+
+def bounded_table_lock_probe_sql(
+    schema: str, table: str, *, lock_timeout_ms: int = TEST_INDEX_DROP_LOCK_TIMEOUT_MS
+) -> str:
+    """The table lock probe of the guarded test-index drop, with a short lock wait.
+
+    The probe and the DROP INDEX after it then fail fast with error 1222
+    instead of waiting for the whole statement timeout behind a long reader.
+    """
+
+    if not 1 <= int(lock_timeout_ms) <= 60_000:
+        raise ValueError("lock_timeout_ms must be between 1 and 60000")
+    target = f"{_quote_catalog_identifier(schema)}.{_quote_catalog_identifier(table)}"
+    return (
+        f"SET LOCK_TIMEOUT {int(lock_timeout_ms)};\n"
+        f"SELECT TOP (1) @table_lock_probe = 1 FROM {target} WITH (TABLOCK, HOLDLOCK);"
+    )
+
+
+def _quote_catalog_identifier(value: str) -> str:
+    """Quote a name read from the catalog, which may hold any character."""
+
+    if not value or "\r" in value or "\n" in value:
+        raise ValueError(f"invalid SQL identifier: {value!r}")
+    return "[" + value.replace("]", "]]") + "]"
+
+
+# Server errors that end a CREATE INDEX batch with nothing committed (the
+# workflow runs it under XACT_ABORT ON in one transaction).
+_DEFINITE_CREATE_FAILURES: dict[int, str] = {
+    1222: "lock_timeout_or_low_priority_abort",
+    1505: "duplicate_key",
+    102: "compile_error",
+    156: "compile_error",
+    207: "compile_error",
+    208: "compile_error",
+    1088: "compile_error",
+    1911: "compile_error",
+    1913: "compile_error",
+    1919: "compile_error",
+}
+# mssql-python does not always expose the error number; the server text names these.
+_DEFINITE_CREATE_FAILURE_TEXTS: tuple[tuple[re.Pattern[str], int], ...] = (
+    (re.compile(r"Lock request time out period exceeded", re.IGNORECASE), 1222),
+    (re.compile(r"terminated because a duplicate key was found", re.IGNORECASE), 1505),
+    (re.compile(r"does not exist in the target table or view", re.IGNORECASE), 1911),
+    (re.compile(r"Invalid column name", re.IGNORECASE), 207),
+    (re.compile(r"Invalid object name", re.IGNORECASE), 208),
+)
+# 3621 "The statement has been terminated" only accompanies another error.
+_COMPANION_ERROR_NUMBERS = frozenset({3621})
+# The number that ends one diagnostic record; "(5)." inside the text is a row value.
+_RECORD_ERROR_NUMBER = re.compile(r"\((\d{1,6})\)(?=\s*\(SQL\w+\)|\s*;|['\"\s)]*$)")
+_SQLSTATE = re.compile(r"\[(\w{5})\]")
+_TRANSPORT_TEXT = re.compile(
+    r"communication link|tcp provider|timeout expired|connection (?:is |was )?(?:broken|closed|reset)",
+    re.IGNORECASE,
+)
+
+
+def _transport_sqlstate(state: str) -> bool:
+    upper = state.upper()
+    return upper.startswith("08") or upper in {"HYT00", "HYT01", "HY008"}
+
+
+def classify_create_index_failure(error: BaseException) -> dict[str, Any]:
+    """Tell a CREATE INDEX that definitely rolled back from one whose outcome is unknown.
+
+    ``definite_rollback`` needs a listed server error (lock timeout or the
+    low-priority abort 1222, a compile error, a duplicate key) and no sign of a
+    lost connection, client timeout or cancel. Anything else is ``unknown``:
+    the CREATE may still be running or may have committed.
+    """
+
+    texts: list[str] = []
+    transport = False
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (TimeoutError, ConnectionError, asyncio.CancelledError)):
+            transport = True
+        for value in (*getattr(current, "args", ()), getattr(current, "ddbc_error", None), getattr(current, "driver_error", None)):
+            if not isinstance(value, str):
+                continue
+            if len(value) == 5 and value.isalnum() and _transport_sqlstate(value):
+                transport = True
+            texts.append(value)
+        current = current.__cause__ or current.__context__
+    numbers: list[int] = []
+    for text in texts:
+        if _TRANSPORT_TEXT.search(text) or any(_transport_sqlstate(state) for state in _SQLSTATE.findall(text)):
+            transport = True
+        numbers.extend(int(match) for match in _RECORD_ERROR_NUMBER.findall(text))
+        numbers.extend(number for pattern, number in _DEFINITE_CREATE_FAILURE_TEXTS if pattern.search(text))
+    numbers = [number for number in dict.fromkeys(numbers) if number and number not in _COMPANION_ERROR_NUMBERS]
+    definite = next((number for number in numbers if number in _DEFINITE_CREATE_FAILURES), None)
+    if transport or definite is None or any(number not in _DEFINITE_CREATE_FAILURES for number in numbers):
+        return {
+            "outcome": "unknown",
+            "error_number": numbers[0] if numbers else None,
+            "reason": "connection_or_timeout" if transport else "error_not_proven_to_roll_back",
+        }
+    return {
+        "outcome": "definite_rollback",
+        "error_number": definite,
+        "reason": _DEFINITE_CREATE_FAILURES[definite],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Replacement experiment: prove an extend, widen or consolidate recommendation
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ReplacementExperiment:
+    """How to measure a new index definition against the index or indexes it replaces.
+
+    Sandbox only. The workflow creates ``candidate`` as its test index. Then:
+    - ``table_hint``: the candidate arm runs the query with ``candidate_hint`` on
+      the table (``hint_candidate_index``). Nothing else changes. The result is
+      hinted evidence: the index can serve the query; it does not show that the
+      optimizer will choose it.
+    - ``disable_in_sandbox``: run ``setup_sql`` before the candidate arm and
+      ``teardown_sql`` after it. The old index is disabled, so the optimizer
+      chooses freely among what would remain after the change.
+    """
+
+    candidate: IndexCandidate
+    replaces: tuple[str, ...]
+    hide_method: str
+    setup_sql: tuple[str, ...]
+    teardown_sql: tuple[str, ...]
+    candidate_hint: str | None
+    proof_scope: str
+    notes: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "sandbox_only": True,
+            "candidate": self.candidate.as_dict(),
+            "replaces": list(self.replaces),
+            "hide_method": self.hide_method,
+            "setup_sql": list(self.setup_sql),
+            "teardown_sql": list(self.teardown_sql),
+            "candidate_hint": self.candidate_hint,
+            "proof_scope": self.proof_scope,
+            "notes": list(self.notes),
+        }
+
+
+def _disable_blocker(index: ExistingIndex) -> str | None:
+    """Why an index must not be disabled, even on a sandbox copy."""
+
+    evidence = index.protection_evidence or {}
+    if index.index_type_code != 2 or str(index.index_type).strip().upper() != "NONCLUSTERED":
+        return "it is a clustered, columnstore or special index, not a nonclustered rowstore index"
+    if index.is_primary_key or index.is_unique_constraint or index.is_unique:
+        return "it is unique: disabling it stops the constraint and disables the foreign keys that reference it"
+    if evidence.get("coverage") != "complete":
+        return "its protection metadata is incomplete"
+    if evidence.get("child_foreign_key_support") or evidence.get("referenced_foreign_keys"):
+        return "a foreign key depends on it"
+    if evidence.get("indexed_view") or index.is_disabled:
+        return "it is on an indexed view or is already disabled"
+    return None
+
+
+def plan_replacement_experiment(
+    candidate: IndexCandidate,
+    replaced: Sequence[ExistingIndex],
+    *,
+    hide_method: str = "table_hint",
+) -> ReplacementExperiment:
+    """Plan the candidate arm of an experiment in which ``candidate`` replaces ``replaced``.
+
+    ``candidate`` is the new definition under its test-index name (extend and
+    widen: the rebuilt index; consolidate: the surviving definition).
+    ``replaced`` are the existing indexes the recommendation changes or drops.
+    """
+
+    if hide_method not in REPLACEMENT_HIDE_METHODS:
+        raise ValueError(f"hide_method must be one of {', '.join(REPLACEMENT_HIDE_METHODS)}")
+    if not candidate.index_name:
+        raise ValueError("the candidate needs its test index_name")
+    if not replaced:
+        raise ValueError("a replacement experiment needs at least one replaced index")
+    table = (
+        _canonical_catalog_identifier(candidate.schema),
+        _canonical_catalog_identifier(candidate.table),
+    )
+    for index in replaced:
+        if (
+            _canonical_catalog_identifier(index.schema),
+            _canonical_catalog_identifier(index.table),
+        ) != table:
+            raise ValueError(
+                f"{index.name} is not an index of {candidate.schema}.{candidate.table}"
+            )
+    names = tuple(index.name for index in replaced)
+    if hide_method == "table_hint":
+        return ReplacementExperiment(
+            candidate=candidate,
+            replaces=names,
+            hide_method=hide_method,
+            setup_sql=(),
+            teardown_sql=(),
+            candidate_hint=f"INDEX({_quote_catalog_identifier(candidate.index_name)})",
+            proof_scope="hinted_evidence",
+            notes=(
+                "The candidate arm forces the new index with a table hint, so the old index "
+                "cannot be chosen. This shows what the new index costs when it is used; it "
+                "does not show that the optimizer will choose it, and the hinted statement "
+                "is never a rewrite to deploy.",
+            ),
+        )
+    target = f"{_quote_catalog_identifier(candidate.schema)}.{_quote_catalog_identifier(candidate.table)}"
+    for index in replaced:
+        blocker = _disable_blocker(index)
+        if blocker is not None:
+            raise ValueError(
+                f"{index.name} cannot be disabled for the experiment: {blocker}. "
+                "Use hide_method table_hint."
+            )
+    return ReplacementExperiment(
+        candidate=candidate,
+        replaces=names,
+        hide_method=hide_method,
+        setup_sql=tuple(
+            f"ALTER INDEX {_quote_catalog_identifier(name)} ON {target} DISABLE;" for name in names
+        ),
+        teardown_sql=tuple(
+            f"ALTER INDEX {_quote_catalog_identifier(name)} ON {target} REBUILD;" for name in names
+        ),
+        candidate_hint=None,
+        proof_scope="sandbox_replacement",
+        notes=(
+            "DISABLE keeps the definition and drops the index data; statements that name the "
+            "index in a hint fail while it is disabled. REBUILD builds it again and blocks "
+            "writes to the table while it runs. Run both only on the sandbox copy, and run "
+            "teardown_sql even when the measurement fails.",
+        ),
+    )
+
+
+def hint_candidate_index(sql: str, candidate: IndexCandidate) -> str:
+    """Add ``WITH (INDEX([candidate]))`` to every reference of the candidate's table.
+
+    Only the hint text is inserted; the rest of the statement keeps its exact
+    spelling. Raises ValueError when the table is not referenced, when a
+    reference already has a table hint, or when the statement cannot be parsed.
+    """
+
+    if not candidate.index_name:
+        raise ValueError("the candidate needs its test index_name")
+    try:
+        statements = parse(sql, read="tsql")
+    except ParseError as exc:
+        raise ValueError("the statement could not be parsed to place the index hint") from exc
+    if len(statements) != 1 or statements[0] is None:
+        raise ValueError("the index hint needs exactly one statement")
+    tree = statements[0]
+    schema = _canonical_catalog_identifier(candidate.schema)
+    table = _canonical_catalog_identifier(candidate.table)
+    cte_names = {_canonical_catalog_identifier(cte.alias) for cte in tree.find_all(exp.CTE) if cte.alias}
+    positions: list[int] = []
+    for reference in tree.find_all(exp.Table):
+        if _canonical_catalog_identifier(reference.name) != table:
+            continue
+        if reference.db:
+            if _canonical_catalog_identifier(reference.db) != schema:
+                continue
+        elif table in cte_names:
+            continue
+        if reference.args.get("hints"):
+            raise ValueError(
+                f"a reference to {candidate.schema}.{candidate.table} already has a table hint"
+            )
+        alias = reference.args.get("alias")
+        anchor = alias.this if alias is not None and alias.this is not None else reference.this
+        end = getattr(anchor, "meta", {}).get("end")
+        if not isinstance(end, int):
+            raise ValueError("the position of the table reference is not known")
+        positions.append(end + 1)
+    if not positions:
+        raise ValueError(f"the statement does not reference {candidate.schema}.{candidate.table}")
+    hint = f" WITH (INDEX({_quote_catalog_identifier(candidate.index_name)}))"
+    for position in sorted(set(positions), reverse=True):
+        sql = sql[:position] + hint + sql[position:]
+    return sql
+
+
+# ---------------------------------------------------------------------------
+# Multi-query proof set
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ProofQuery:
+    """One Query Store query a recommendation must be measured on.
+
+    role ``proof``: the recommendation claims to serve it, so it must win.
+    role ``regression``: it reads an index the change touches, so it must not slow.
+    """
+
+    query_id: int
+    plan_id: int | None
+    role: str
+    share_pct: float | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "query_id": self.query_id,
+            "plan_id": self.plan_id,
+            "role": self.role,
+            "share_pct": self.share_pct,
+        }
+
+
+@dataclass(frozen=True)
+class ProofQueryResult:
+    query: ProofQuery
+    assessment: ExperimentAssessment
+
+
+def proof_queries_from_recommendation(recommendation: Mapping[str, Any]) -> tuple[ProofQuery, ...]:
+    """The proof and regression queries of one review_workload_indexes recommendation."""
+
+    validation = recommendation.get("validation")
+    validation = validation if isinstance(validation, Mapping) else {}
+    queries: list[ProofQuery] = []
+    seen: set[int] = set()
+    for role, key, share_key in (
+        ("proof", "proof_set", "share_of_recommendation_pct"),
+        ("regression", "regression_set", "workload_share_pct"),
+    ):
+        for item in validation.get(key) or []:
+            if not isinstance(item, Mapping):
+                continue
+            try:
+                query_id = int(item["query_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if query_id in seen:
+                continue
+            seen.add(query_id)
+            plan_id = item.get("plan_id")
+            share = item.get(share_key)
+            queries.append(
+                ProofQuery(
+                    query_id=query_id,
+                    plan_id=int(plan_id) if isinstance(plan_id, (int, float)) else None,
+                    role=role,
+                    share_pct=float(share) if isinstance(share, (int, float)) else None,
+                )
+            )
+    return tuple(queries)
+
+
+def plan_proof_set(
+    queries: Sequence[ProofQuery], *, runs_per_phase: int, max_executions: int
+) -> dict[str, Any]:
+    """Fit a proof set into the session's execution budget.
+
+    Each query costs three phases of ``runs_per_phase`` executions. Regression
+    queries are left out from the end of the list when the budget is short and
+    are reported in ``not_measured``. Proof queries are never left out.
+    """
+
+    if runs_per_phase < 1:
+        raise ValueError("runs_per_phase must be at least 1")
+    per_query = PROOF_SET_PHASES * runs_per_phase
+    proof = [query for query in queries if query.role == "proof"]
+    regression = [query for query in queries if query.role != "proof"]
+    if len(proof) * per_query > max_executions:
+        raise ValueError(
+            f"{len(proof)} proof queries need {len(proof) * per_query} executions and the budget is "
+            f"{max_executions}; lower runs_per_phase or raise the policy budget"
+        )
+    room = (max_executions - len(proof) * per_query) // per_query
+    kept = proof + regression[:room]
+    return {
+        "queries": [query.as_dict() for query in kept],
+        "runs_per_phase": runs_per_phase,
+        "executions_required": len(kept) * per_query,
+        "max_executions": max_executions,
+        "not_measured": [
+            {"query_id": query.query_id, "role": query.role, "reason": "execution_budget"}
+            for query in regression[room:]
+        ],
+    }
+
+
+def assess_proof_set(
+    results: Sequence[ProofQueryResult],
+    *,
+    expected: Sequence[ProofQuery] = (),
+    max_regression_pct: float = PROOF_SET_MAX_REGRESSION_PCT,
+) -> dict[str, Any]:
+    """One verdict for a recommendation from the experiments of its queries.
+
+    ``proven``: every proof query is a winner and no regression query slows
+    more than ``max_regression_pct``. ``rejected``: a measured query fails that
+    rule. ``inconclusive``: a query in ``expected`` has no result, or a result
+    is incomplete or inconclusive.
+    """
+
+    measured = {result.query.query_id for result in results}
+    unmeasured = [query.query_id for query in expected if query.query_id not in measured]
+    failed: list[int] = []
+    unsettled: list[int] = []
+    for result in results:
+        assessment = result.assessment
+        if assessment.status not in {"winner", "loser"} or assessment.improvement_pct is None:
+            unsettled.append(result.query.query_id)
+        elif result.query.role == "proof":
+            if assessment.status != "winner":
+                failed.append(result.query.query_id)
+        elif assessment.improvement_pct < -max_regression_pct:
+            failed.append(result.query.query_id)
+    if failed:
+        status = "rejected"
+        reason = (
+            "A proof query did not beat its baseline, or a regression query slowed more than "
+            f"{max_regression_pct:g}%."
+        )
+    elif unsettled or unmeasured or not results:
+        status = "inconclusive"
+        reason = "Not every query of the proof set has a settled measurement."
+    else:
+        status = "proven"
+        reason = (
+            "Every proof query beat its baseline and no regression query slowed more than "
+            f"{max_regression_pct:g}%."
+        )
+    return {
+        "status": status,
+        "reason": reason,
+        "failed_query_ids": failed,
+        "unsettled_query_ids": unsettled,
+        "unmeasured_query_ids": unmeasured,
+        "queries": [
+            {**result.query.as_dict(), **result.assessment.as_dict()} for result in results
+        ],
+    }
 
 
 def expected_index_definition_matches(

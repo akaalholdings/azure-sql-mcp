@@ -450,12 +450,11 @@ class QueryIndexAnalysisService:
                 key_columns=rec["key_columns"],
                 include_columns=rec.get("include_columns", []),
             )
+            # Seconds of CPU the index could save in the window. Total CPU
+            # already counts every execution.
             rec["impact_score"] = round(
-                (
-                    rec.get("impact_pct", 0.0) / 100.0
-                    * max(rec.get("query_total_cpu_us", 0.0), 0.0)
-                    * max(rec.get("query_executions", 1.0), 1.0)
-                )
+                rec.get("impact_pct", 0.0) / 100.0
+                * max(rec.get("query_total_cpu_us", 0.0), 0.0)
                 / 1_000_000.0,
                 2,
             )
