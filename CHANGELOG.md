@@ -58,6 +58,8 @@ or in an elastic pool. Use it on a non-production copy only.
   leads with the query the caller named.
 - The learning loop expects sql-optimizer 3.0.0, sql-health-triage 1.1.0,
   sql-plan-enforcer 1.1.0 and sql-index-manager 2.1.0.
+- The `mcp` dependency is capped below version 2. The server does not start
+  on `mcp` 2.x, which a plain install would otherwise select.
 
 ### Known limits
 

@@ -35,19 +35,30 @@ install.
 
 In PowerShell, in a folder of your choice:
 
+You need two files from the release: the wheel and
+`requirements-3.0.0rc1.txt`. The requirements file holds the exact dependency
+versions the release was tested with. Install those first, then the wheel
+without its dependencies. A plain `pip install` of the wheel can pull newer
+dependency versions that were not tested.
+
 ```powershell
 py -3.12 -m venv C:\tools\azure-sql-mcp
 C:\tools\azure-sql-mcp\Scripts\python.exe -m pip install --upgrade pip
-C:\tools\azure-sql-mcp\Scripts\python.exe -m pip install .\azure_sql_mcp-3.0.0rc1-py3-none-any.whl
+C:\tools\azure-sql-mcp\Scripts\python.exe -m pip install -r .\requirements-3.0.0rc1.txt
+C:\tools\azure-sql-mcp\Scripts\python.exe -m pip install --no-deps .\azure_sql_mcp-3.0.0rc1-py3-none-any.whl
 ```
+
+Use Python 3.12: the release was tested on 3.12 only.
 
 ## 3. Check the install
 
 ```powershell
-C:\tools\azure-sql-mcp\Scripts\python.exe -c "import azure_sql_mcp, importlib.metadata as m; print(m.version('azure-sql-mcp'))"
+C:\tools\azure-sql-mcp\Scripts\python.exe -c "import azure_sql_mcp.server, importlib.metadata as m; print(m.version('azure-sql-mcp'), m.version('mcp'))"
 ```
 
-Expected output: `3.0.0rc1`.
+Expected output: `3.0.0rc1 1.26.0`. An import error here means the
+dependencies are not the tested ones: repeat step 2 in a new virtual
+environment.
 
 ## 4. Install the skills
 
