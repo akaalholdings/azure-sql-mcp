@@ -6,6 +6,8 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [2.6.4] - 2026-11-10
+
 Smaller tool responses and cheaper reads on the customer database, from the
 2026-11-03 review. No evidence is removed: each trimmed response has an opt-in
 that returns the old form.
@@ -102,6 +104,28 @@ Tools and profiles:
   index metadata read.
 - `optimize_indexes` reads row count, column widths and write ratio once per
   table.
+
+Measured on a 43 GB Azure SQL Database (General Purpose serverless, 4 vCores,
+16 million posts, 112 million votes) against 2.6.3, same script:
+
+- `review_index_portfolio` response: 3.6 MB to 3.3 KB.
+  `capture_index_review_snapshot`: 2.7 MB to 755 bytes.
+  `get_active_sessions` with 40 blocked sessions: 323 KB to 35 KB.
+- `analyze_db_health`: 5.1 s and 28 round trips to 1.4 s and 12.
+  `review_workload_indexes`: 11.5 s and 36 round trips to 5.9 s and 18.
+  `get_object_index_diagnostics` for one table: 20.6 s to 2.7 s.
+- Old and new SQL returned the same rows in all 23 comparisons. The scoped
+  workload read used about 10 times less CPU, the plan reference check 3
+  times less, the index evidence read about 5 times less.
+
+### Known issues
+
+- `get_top_cached_queries` showed no gain at 1,000 cached statements; the
+  top-rows-first change is unproven at that size.
+- The whole-database index metadata read costs slightly more on a database
+  with no partitioned tables. Its gain is on partitioned tables and on the
+  one-table reads.
+- The multi-row snapshot insert was run live with 27 indexes only.
 
 ## [2.6.3] - 2026-11-06
 
