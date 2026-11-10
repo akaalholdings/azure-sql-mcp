@@ -62,7 +62,20 @@ environment.
 
 ## 4. Install the skills
 
-From a checkout or an unpacked copy of the skills repository:
+The release has `sql-skills-3.0.0rc1-installed.zip`. It holds the four skill
+folders in their installed form. Unpack it into the Copilot skills folder. If
+a folder of the same name is already there, rename the old one first.
+
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.copilot\skills" | Out-Null
+Expand-Archive .\sql-skills-3.0.0rc1-installed.zip -DestinationPath "$env:USERPROFILE\.copilot\skills"
+Get-ChildItem "$env:USERPROFILE\.copilot\skills" -Directory | Select-Object Name
+```
+
+Expected folders: `sql_health_triage`, `sql_index_manager`, `sql_optimizer`
+and `sql_plan_enforcer`.
+
+With a checkout of the skills repository you can use its installer instead:
 
 ```powershell
 py -3.12 skills\install_all.py --dest "$env:USERPROFILE\.copilot\skills"
