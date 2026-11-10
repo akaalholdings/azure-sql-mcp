@@ -79,7 +79,7 @@ async def test_stdio_publishes_and_executes_optimizer_contracts(
                     "check_runtime_status", {"include_tool_names": True}
                 )
             )
-            assert runtime["package_version"] == "2.6.4"
+            assert runtime["package_version"] == "3.0.0rc1"
             assert runtime["tool_groups"] == ["core", "performance"]
             assert "check_equivalence_preflight" in runtime["tool_names"]
 

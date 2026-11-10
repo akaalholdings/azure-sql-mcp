@@ -134,7 +134,7 @@ Create a local `.vscode/mcp.json` in the workspace. Do not commit machine paths 
 }
 ```
 
-Reload VS Code, enable the server in Copilot Chat, then call `list_databases` and `check_capabilities`. Full client setup and profile runbooks are in [`docs/09-operations.md`](docs/09-operations.md).
+Reload VS Code, enable the server in Copilot Chat, then call `list_databases` and `check_capabilities`. Full client setup and profile runbooks are in [`docs/09-operations.md`](docs/09-operations.md). To try the 3.0 release candidate on Windows with VS Code Copilot against a copy of a database, follow [`docs/10-run-on-windows-with-vscode-copilot.md`](docs/10-run-on-windows-with-vscode-copilot.md).
 
 ## Named profiles
 

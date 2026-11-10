@@ -6,6 +6,68 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [3.0.0rc1] - 2026-11-10
+
+Release candidate. It has run on one Azure SQL Database (General Purpose
+serverless) in a benchmark of 38 tuning tasks. It has not run on Hyperscale
+or in an elastic pool. Use it on a non-production copy only.
+
+### Added
+
+- `benchmark_indexed_view_candidate`: builds a leased test view with its unique
+  clustered index, measures the statement that reads it, compares the results
+  and drops the view. The result carries the write warning and the base-table
+  restrictions (TRUNCATE TABLE, ALTER COLUMN and partition SWITCH fail while
+  the view exists).
+- `benchmark_index_candidate`: `candidate_sql` measures the original statement
+  against a rewrite with its indexes in one call. It takes several parameter
+  cases, `plan_reuse`, `runs`, `max_call_seconds`, `kind`
+  (`nonclustered_columnstore`) and `partition_aligned` for each index.
+- `keep_for_session` on both benchmark tools: test objects stay in place for
+  later calls in the same tuning session. `finalize_tuning_session` drops them.
+- Test indexes on a table with a clustered columnstore index: built offline when
+  the database policy sets `allow_offline_test_index`, refused before any
+  execution when it does not.
+- Result fields: `time_spent`, `run_rule`, `build_retries`, `test_objects`,
+  `ordered_rows_match`, `multiset_match`, `tested_match`, `caveats`,
+  `decision.by_metric` and `decision.worst_case`.
+- Tool guides `indexed_view_experiment`, `session_held_objects` and
+  `measurement_time_rules`.
+
+### Changed
+
+- A test index call never fails because of its name. A prefix that is not in
+  `test_index_name_prefixes` is replaced by the policy prefix, and
+  `index_name_note` gives the name used. Generated names are readable:
+  `<prefix><Table>_<KeyColumns>_<8 hex>`.
+- Every benchmark compares the two result sets, as ordered rows and as
+  multisets. A tested match is reported with its scope; it is not a proof.
+- A baseline that takes one second or more runs once. A large gain ends the
+  measurement early.
+- A case at zero CPU no longer makes a candidate inconclusive.
+- A failed test index build returns the failed step, the cause class and the
+  redacted engine message.
+- `finalize_tuning_session` can drop objects, so it is no longer marked
+  read-only. A failed drop is retried on a new connection, and a leftover gives
+  `cleanup_required` with the remediation DDL.
+- Every benchmark call and `start_tuning_session` first drops leftover test
+  objects that this server owns in the database, and refuses to run when a drop
+  still fails.
+- `check_capabilities` returns a summary by default (`detail="full"` for all).
+- `review_workload_indexes` orders index keys by equality, ORDER BY, range, and
+  leads with the query the caller named.
+- The learning loop expects sql-optimizer 3.0.0, sql-health-triage 1.1.0,
+  sql-plan-enforcer 1.1.0 and sql-index-manager 2.1.0.
+
+### Known limits
+
+- A final statement with IF / ELSE branches is rated inconclusive when one
+  branch does not use the test object. Compare that branch separately.
+- A one-pass result comparison stops at 10,000 rows.
+- A test view cannot take a columnstore index or a second nonclustered index
+  through the tool.
+- `max_call_seconds` does not hold when a connection stalls.
+
 ## [2.6.4] - 2026-11-10
 
 Smaller tool responses and cheaper reads on the customer database, from the

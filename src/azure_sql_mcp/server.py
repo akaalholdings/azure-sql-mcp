@@ -1043,10 +1043,10 @@ _PLAIN_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _INDEX_OWNER_PROOF = re.compile(r"^[A-Za-z0-9_.:-]{16,200}$")
 _IDEMPOTENCY_DIGEST_PATTERN = re.compile(r"^idempotency-v1:[0-9a-f]{64}$")
 _LEARNING_SKILL_VERSIONS = {
-    "sql-health-triage": "1.0.1",
-    "sql-optimizer": "2.5.0",
-    "sql-plan-enforcer": "1.0.1",
-    "sql-index-manager": "2.0.0",
+    "sql-health-triage": "1.1.0",
+    "sql-optimizer": "3.0.0",
+    "sql-plan-enforcer": "1.1.0",
+    "sql-index-manager": "2.1.0",
 }
 _PENDING_INDEX_OWNERSHIP_SQL = """
 SELECT

@@ -81,7 +81,7 @@ async def test_report_stuck_records_a_redacted_report_and_returns_what_was_kept(
     )
     assert re.fullmatch(r"[0-9a-f]{32}", result["incident_id"])
     assert (result["skill_version_expected"], result["skill_version_mismatch"]) == (
-        "2.5.0",
+        "3.0.0",
         True,
     )
     assert "Sentinel" not in result["summary"] and "`" not in result["summary"]
