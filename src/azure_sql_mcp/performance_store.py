@@ -2714,7 +2714,11 @@ class PerformanceStore:
         owner_reference: str | None = None,
         fencing_token: str | None = None,
         expected_version: int | None = None,
+        expires_at_utc: str | None = None,
     ) -> dict[str, Any]:
+        """Advance a lease. ``expires_at_utc`` moves its expiry: a lease that
+        holds test objects for its session is bounded from the end of each call."""
+
         allowed = {
             "pending_create",
             "active",
@@ -2748,6 +2752,7 @@ class PerformanceStore:
                 metadata=metadata,
                 object_fingerprint=object_fingerprint,
                 expected_version=expected_version,
+                expires_at_utc=expires_at_utc,
             )
 
     def recover_index_lease(
@@ -2785,6 +2790,7 @@ class PerformanceStore:
         metadata: Mapping[str, Any] | None,
         object_fingerprint: str | None,
         expected_version: int | None,
+        expires_at_utc: str | None = None,
     ) -> dict[str, Any]:
         lease_id = str(existing["lease_id"])
         current_version = int(existing["lease_version"])
@@ -2798,10 +2804,15 @@ class PerformanceStore:
             or not object_fingerprint.strip()
         ):
             raise ValueError("object_fingerprint must be a non-empty string.")
+        if expires_at_utc is not None and (
+            not isinstance(expires_at_utc, str) or not expires_at_utc.strip()
+        ):
+            raise ValueError("expires_at_utc must be a non-empty string.")
         if (
             existing["status"] == status
             and metadata is None
             and object_fingerprint is None
+            and expires_at_utc is None
         ):
             return self._index_lease_dict(existing)
         merged = json.loads(existing["metadata"])
@@ -2810,6 +2821,7 @@ class PerformanceStore:
             """
             UPDATE index_leases
             SET status = ?, metadata = ?, object_fingerprint = ?,
+                expires_at_utc = ?,
                 lease_version = lease_version + 1,
                 updated_at_utc = ?
             WHERE lease_id = ? AND lease_version = ?
@@ -2818,6 +2830,7 @@ class PerformanceStore:
                 status,
                 json.dumps(merged, sort_keys=True, separators=(",", ":")),
                 object_fingerprint or str(existing["object_fingerprint"]),
+                expires_at_utc or str(existing["expires_at_utc"]),
                 utc_now(),
                 lease_id,
                 current_version,

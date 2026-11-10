@@ -31,7 +31,9 @@ TOOL_PREFIXES = (
 )
 # Response fields and arguments that share a tool prefix.
 FIELD_NAMES = {"plan_kind", "plan_digest", "plan_findings", "plan_count", "plan_id",
-               "plan_handle", "plan_changes_in_window", "plan_changed", "rollback_ddl"}
+               "plan_handle", "plan_changes_in_window", "plan_changed", "rollback_ddl",
+               # Arguments of the benchmark tools (stream S13d guides name them).
+               "plan_reuse", "compare_order"}
 MARKETING_WORDS = (
     "powerful", "seamless", "robust", "cutting-edge", "world-class", "best-in-class",
     "blazing", "effortless", "leverage", "comprehensive", "revolutionary", "unlock",

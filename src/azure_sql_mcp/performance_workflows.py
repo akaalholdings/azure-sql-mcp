@@ -909,9 +909,11 @@ def preflight_gap_codes(
 ) -> tuple[list[str], list[str]]:
     """The risk codes of a two-sided preflight, and those no comparison can settle.
 
-    A candidate that drops the outer ORDER BY can return the baseline order
-    by accident, so that change blocks. An ORDER BY whose keys differ only as
-    text (another alias, a derived table) is compared.
+    Only a result that is unstable by construction blocks: a clock or a
+    row-volatile function, TABLESAMPLE, a row limit with no ORDER BY, an
+    isolation hint. Inside one snapshot every other statement returns fixed
+    rows, so it is compared: possible ties, a changed ORDER BY, and a removed
+    ORDER BY too (as a multiset; ``order_contract_removed`` adds the caveat).
     """
 
     sides = [side for side in preflight.values() if isinstance(side, Mapping)]
@@ -919,26 +921,55 @@ def preflight_gap_codes(
         dict.fromkeys(str(code) for side in sides for code in side.get("risk_codes") or ())
     )
     blocking = [code for code in gaps if code not in COMPARABLE_PREFLIGHT_GAPS]
-    order_removed = any(
+    return gaps, blocking
+
+
+def order_contract_removed(preflight: Mapping[str, Mapping[str, Any]]) -> bool:
+    """True when the candidate has no outer ORDER BY where the baseline has one."""
+
+    return any(
         isinstance(item, Mapping)
         and item.get("risk") == "order_contract_changed"
         and item.get("change") != "keys_differ"
-        for side in sides
+        for side in preflight.values()
+        if isinstance(side, Mapping)
         for key in ("details", "risks")
         for item in side.get(key) or ()
     )
-    if order_removed and "order_contract_changed" not in blocking:
-        blocking.append("order_contract_changed")
-    return gaps, blocking
+
+
+_TIE_CAVEAT = (
+    "the order is not proven total: rows tied on the ORDER BY keys may be returned "
+    "in another order by another run or plan"
+)
+_ORDER_KEYS_CAVEAT = (
+    "the ORDER BY keys of the two statements could not be shown to be the same, so "
+    "the same order on this data is a test, not a proof"
+)
+_ORDER_REMOVED_CAVEAT = (
+    "the candidate has no outer ORDER BY: its rows matched as a multiset, and the "
+    "order it returns is not promised even where it matched here"
+)
 
 
 def label_comparison(
     result: dict[str, Any],
     gaps: Sequence[str],
     compare_order: bool,
+    *,
+    order_removed: bool = False,
 ) -> None:
-    """Say how the rows were compared, and what a preflight gap leaves open."""
+    """Say how the rows were compared, and what a preflight gap leaves open.
 
+    With an outer ORDER BY the rows are compared in order and as a multiset,
+    and both outcomes are reported (``ordered_rows_match``,
+    ``multiset_match``). Under a gap a match is a ``tested_match``: it holds
+    for the tested values on today's data, with the reason in ``caveats``.
+    """
+
+    status = result.get("status")
+    if status in {"match", "order_only_mismatch", "mismatch"}:
+        result["multiset_match"] = status != "mismatch"
     if compare_order:
         result["ordered_rows_match"] = result.get("rows_match") is True
     result["duplicate_rows"] = {
@@ -962,6 +993,14 @@ def label_comparison(
             "order differs and is not judged, because no total order is proven "
             "for both statements"
         )
+    if result.get("status") == "match":
+        result["tested_match"] = True
+        caveats = []
+        if set(gaps) - {"order_contract_changed"}:
+            caveats.append(_TIE_CAVEAT)
+        if "order_contract_changed" in gaps:
+            caveats.append(_ORDER_REMOVED_CAVEAT if order_removed else _ORDER_KEYS_CAVEAT)
+        result["caveats"] = caveats
     if result.get("status") == "mismatch" and set(gaps) & _TIE_AT_LIMIT_GAPS:
         result["mismatch_may_be_a_tie"] = True
         result["reason"] = (
@@ -971,15 +1010,36 @@ def label_comparison(
         )
 
 
+def _time_spent(call_started: float, phase_seconds: Mapping[str, float]) -> dict[str, float]:
+    """``time_spent`` of a benchmark result: seconds per phase, the rest, and the total."""
+
+    total = time.monotonic() - call_started
+    spent = {
+        phase: round(float(phase_seconds.get(phase, 0.0)), 1)
+        for phase in ("baseline_runs", "build", "candidate_runs", "comparison", "cleanup")
+    }
+    spent["other"] = round(max(0.0, total - sum(phase_seconds.values())), 1)
+    spent["total"] = round(total, 1)
+    return spent
+
+
 def with_order_contract(
     preflight: Mapping[str, Mapping[str, Any]],
     baseline_sql: str,
     candidate_sql: str,
+    *,
+    candidate_relation: tuple[str, str, str] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Add the pairwise outer ORDER BY risk to the candidate preflight."""
+    """Add the pairwise outer ORDER BY risk to the candidate preflight.
+
+    ``candidate_relation`` (schema, name, SELECT body) is a view the
+    candidate reads: its columns are compared as the expressions they store.
+    """
 
     updated = {side: dict(item) for side, item in preflight.items()}
-    risk = order_contract_risk(baseline_sql, candidate_sql)
+    risk = order_contract_risk(
+        baseline_sql, candidate_sql, candidate_relation=candidate_relation
+    )
     if risk is None:
         return updated
     candidate = updated["candidate"]
@@ -3107,6 +3167,9 @@ class PerformanceWorkflowService:
                 )
                 and item.strategy == normalized_strategy
                 and normalized_strategy != "index"
+                # A candidate whose run stopped without a verdict (a failed
+                # build, a time cap) may be measured again as a new candidate.
+                and item.state != "inconclusive"
             ),
             None,
         )
@@ -3177,6 +3240,7 @@ class PerformanceWorkflowService:
             and has_outer_literal_top_zero(candidate)
         )
         gaps, blocking = preflight_gap_codes(preflight)
+        order_removed = order_contract_removed(preflight)
         if blocking and not statically_zero_row:
             return {
                 "status": "proof_contract_required",
@@ -3275,7 +3339,12 @@ class PerformanceWorkflowService:
                 # The caller's cap, not the share that was left for this case.
                 result["max_seconds"] = max_seconds
             if "same_snapshot" in result and "rows_match" in result:
-                label_comparison(result, gaps if tested_under_gap else (), compare_order)
+                label_comparison(
+                    result,
+                    gaps if tested_under_gap else (),
+                    compare_order,
+                    order_removed=order_removed,
+                )
             if tested_under_gap:
                 result["proven_for_parameter_case"] = False
             results.append(result)
@@ -4110,6 +4179,13 @@ class PerformanceWorkflowService:
         ):
             raise ValueError("Finalist validation requires full result equivalence.")
         compare_equivalence = should_prove_equivalence and direct_snapshot_supported
+        # A gap that leaves the rows stable inside one snapshot is tested: the
+        # two statements are compared, and the match is a test on today's
+        # data. The candidate stays performance-only; other rows fail it.
+        gap_codes, blocking_gaps = preflight_gap_codes(equivalence_preflight)
+        test_equivalence = (
+            should_prove_equivalence and not direct_snapshot_supported and not blocking_gaps
+        )
         if phase == "finalist" and set(supplied_case_fingerprints) != (
             registered_case_fingerprints
         ):
@@ -4189,7 +4265,9 @@ class PerformanceWorkflowService:
                 float(kept["sample"].get("client_elapsed_ms") or 0.0) / 1000
                 or SLOW_STATEMENT_SECONDS
             )
-        comparison_executions = len(cases) * 2 if compare_equivalence else 0
+        comparison_executions = (
+            len(cases) * 2 if compare_equivalence or test_equivalence else 0
+        )
         # The worst case is reserved: a reused session baseline needs fewer.
         # A slow baseline is exact: one run, or none when the session has it.
         requested_executions = (
@@ -4227,6 +4305,7 @@ class PerformanceWorkflowService:
                 "cross_case": cross_names,
                 "prove_equivalence": should_prove_equivalence,
                 "compare_equivalence": compare_equivalence,
+                **({"test_equivalence": True} if test_equivalence else {}),
                 "equivalence_preflight": equivalence_preflight,
                 "idempotency_key": idempotency_key or new_id("benchmark-call"),
                 **({"slow_baseline_cases": dict(slow_cases)} if slow_cases else {}),
@@ -4326,6 +4405,11 @@ class PerformanceWorkflowService:
         objective = normalize_tuning_objective(case.metadata.get("objective"))
         objective_metric = OBJECTIVE_METRICS[objective]
 
+        # Seconds per phase of this call, reported as time_spent. A rewrite
+        # benchmark builds and drops nothing.
+        call_started = time.monotonic()
+        phase_seconds = {"baseline_runs": 0.0, "candidate_runs": 0.0, "comparison": 0.0}
+
         async def run_once(contract: ParameterExecutionContract) -> ProfiledPlanResult:
             nonlocal measured_executions
             self.sessions.ensure_dispatch_allowed(session_id)
@@ -4333,7 +4417,13 @@ class PerformanceWorkflowService:
             # SQL Server executed the query, and the hard budget must never
             # under-count uncertain work.
             measured_executions += 1
-            profiled = await self._profile_execution_contract(database_name, contract)
+            run_started = time.monotonic()
+            try:
+                profiled = await self._profile_execution_contract(database_name, contract)
+            finally:
+                phase_seconds[
+                    "candidate_runs" if contract.provenance == "candidate" else "baseline_runs"
+                ] += time.monotonic() - run_started
             if profiled.user_query_executions != 1:
                 raise RuntimeError(
                     "Profiled samples must execute the user query exactly once."
@@ -4558,18 +4648,22 @@ class PerformanceWorkflowService:
                     if baseline_source == "session_pool":
                         parameter_result["baseline_evidence_id"] = pooled["evidence_id"]
                 parameter_results.append(parameter_result)
-                if compare_equivalence:
+                if compare_equivalence or test_equivalence:
                     self.sessions.ensure_dispatch_allowed(session_id)
                     measured_executions += 2
-                    comparison = await self._compare_execution_contracts(
-                        database_name,
-                        case_baseline,
-                        case_rewrite,
-                        compare_order=compare_order,
-                        before_dispatch=lambda: self.sessions.ensure_dispatch_allowed(
-                            session_id
-                        ),
-                    )
+                    compare_started = time.monotonic()
+                    try:
+                        comparison = await self._compare_execution_contracts(
+                            database_name,
+                            case_baseline,
+                            case_rewrite,
+                            compare_order=compare_order,
+                            before_dispatch=lambda: self.sessions.ensure_dispatch_allowed(
+                                session_id
+                            ),
+                        )
+                    finally:
+                        phase_seconds["comparison"] += time.monotonic() - compare_started
                     comparison_executions = int(comparison.get("executions", 0))
                     if comparison_executions not in {0, 1, 2}:
                         raise RuntimeError(
@@ -4580,6 +4674,13 @@ class PerformanceWorkflowService:
                     # reconciled to the synchronous worker-thread dispatch hook.
                     measured_executions -= 2 - comparison_executions
                     comparison["parameter_case"] = parameter_case["name"]
+                    if test_equivalence and "rows_match" in comparison:
+                        label_comparison(
+                            comparison,
+                            gap_codes,
+                            compare_order,
+                            order_removed=order_contract_removed(equivalence_preflight),
+                        )
                     equivalence.append(comparison)
                 completed_parameter_cases += 1
             if cross_names is not None:
@@ -4617,6 +4718,20 @@ class PerformanceWorkflowService:
                 require_equivalence=compare_equivalence,
                 require_snapshot_attestation=compare_equivalence,
             )
+            if (
+                test_equivalence
+                and state in {"improved", "promising", "neutral", "regressed"}
+                and any(
+                    comparison.get("status") == "mismatch"
+                    and not comparison.get("mismatch_may_be_a_tie")
+                    for comparison in equivalence
+                )
+            ):
+                # Different rows on today's data: no proof gap excuses that.
+                state, reason = (
+                    "equivalence_failed",
+                    "at least one parameter case returned different results",
+                )
             if (
                 cross_case_result is not None
                 and state in {"improved", "promising", "neutral"}
@@ -4698,7 +4813,17 @@ class PerformanceWorkflowService:
             candidate_state = "performance_only"
             performance_classification = "improved"
             reason = (
-                "Candidate improved the weighted performance objective, but this "
+                "Candidate improved the weighted performance objective. Its results "
+                "were tested against the baseline in one snapshot per parameter case "
+                + (
+                    "and matched"
+                    if {str(item.get("status")) for item in equivalence} == {"match"}
+                    else "and did not match for every case"
+                )
+                + "; that is a test on today's data, and the static proof still has a "
+                "gap (" + ", ".join(gap_codes) + "), so the result is performance-only."
+                if test_equivalence
+                else "Candidate improved the weighted performance objective, but this "
                 "SQL shape has no deterministic semantic proof input; the result "
                 "is performance-only."
             )
@@ -4815,6 +4940,7 @@ class PerformanceWorkflowService:
             "runs_per_parameter_case": runs,
             "executions": measured_executions,
             "execution_protocol": execution_protocol,
+            "time_spent": _time_spent(call_started, phase_seconds),
             "parameter_results": parameter_results,
             "cross_case_result": cross_case_result,
             # A forced plan or Query Store hint on the application's query does
@@ -5031,10 +5157,25 @@ class PerformanceWorkflowService:
         requirements: list[dict[str, Any]] = []
         verified_count = sum(1 for item in declared if item["verified"])
         for requirement in stored if isinstance(stored, list) else ():
-            checks = [await verify(item) for item in requirement.get("preconditions") or ()]
+            checks = []
+            for item in requirement.get("preconditions") or ():
+                check = await verify(item)
+                if item.get("needed_unless") and not check["verified"]:
+                    # The statement may handle this case itself: named as
+                    # conditional, never counted as verified and never a
+                    # false "the column must be NOT NULL".
+                    check = {
+                        **check,
+                        "conditional": True,
+                        "needed_unless": item["needed_unless"],
+                        "unless_reason": item.get("unless_reason"),
+                    }
+                checks.append(check)
             if requirement.get("resolved"):
                 missing_kinds: list[str] = []
-                satisfied = bool(checks) and all(item["verified"] for item in checks)
+                satisfied = bool(checks) and all(
+                    item["verified"] or item.get("conditional") for item in checks
+                )
                 verified_count += sum(1 for item in checks if item["verified"])
             else:
                 missing_kinds = [
@@ -5051,6 +5192,11 @@ class PerformanceWorkflowService:
                     "satisfied": satisfied,
                     "preconditions": checks,
                     "missing_kinds": missing_kinds,
+                    **(
+                        {"handled_by_statement": requirement["handled_by_statement"]}
+                        if requirement.get("handled_by_statement")
+                        else {}
+                    ),
                 }
             )
         requirements_known = isinstance(stored, list)
@@ -5059,6 +5205,12 @@ class PerformanceWorkflowService:
             and verified_count > 0
             and all(item["satisfied"] for item in requirements)
             and all(item["verified"] for item in declared)
+            # An open conditional precondition is not a verified constraint.
+            and not any(
+                check.get("conditional")
+                for item in requirements
+                for check in item["preconditions"]
+            )
         )
         if constraint_backed:
             basis = "verified_constraints"
@@ -5132,6 +5284,16 @@ class PerformanceWorkflowService:
             basis["declared_preconditions"] = precondition_verification.get("declared", [])
             if precondition_verification.get("constraint_backed") is True:
                 scope = "constraint_backed"
+            conditional = [
+                {"code": str(requirement.get("code")), **check}
+                for requirement in basis["requirements"]
+                for check in requirement.get("preconditions") or ()
+                if check.get("conditional")
+            ]
+            if conditional:
+                # Needed unless the statement handles the case: for a reviewer
+                # to settle, not a refuted precondition.
+                basis["conditional_preconditions"] = conditional
             for requirement in basis["requirements"]:
                 if requirement.get("satisfied"):
                     continue
@@ -5501,6 +5663,28 @@ class PerformanceWorkflowService:
             for name, item in kept.items():
                 if isinstance(item, Mapping) and isinstance(item.get("sample"), Mapping):
                     pool[str(name)] = {**item, "evidence_id": evidence.evidence_id}
+        return pool
+
+    def session_baselines_before_hold(self, session_id: str) -> dict[str, list[dict[str, Any]]]:
+        """Baselines a call measured before it built test objects it kept, by case.
+
+        While a held test object exists the baseline statement cannot run
+        clean, so a later call of the session takes its baseline from here.
+        Each entry holds every sample of that arm, the result digest of its
+        first run, and what it is valid for: the statement (``sql_fingerprint``),
+        ``order_compared``, ``plan_reuse`` and, for a shared plan, the case order.
+        """
+
+        pool: dict[str, list[dict[str, Any]]] = {}
+        for evidence in self.store.list_evidence_for_session(session_id):
+            kept = evidence.metrics.get("baselines_before_hold")
+            if not isinstance(kept, Mapping):
+                continue
+            for name, item in kept.items():
+                if isinstance(item, Mapping) and isinstance(item.get("sample"), Mapping):
+                    pool.setdefault(str(name), []).append(
+                        {**item, "evidence_id": evidence.evidence_id, "before_hold": True}
+                    )
         return pool
 
     @staticmethod

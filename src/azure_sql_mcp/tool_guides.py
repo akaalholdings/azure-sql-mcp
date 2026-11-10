@@ -400,6 +400,8 @@ Read:
 - kind nonclustered_columnstore tests a columnstore index (guide columnstore).
 - proof_scope hinted_evidence (with replaces): what the index costs when
   used. It does not show that the optimizer will choose it.
+- keep_for_session, max_call_seconds, test_objects, time_spent, partial:
+  guides session_held_objects and measurement_time_rules.
 Avoid:
 - Never run this on production. Use a copy with production-like data.
 - Prefer this tool for every test index: its lease guarantees the cleanup.
@@ -562,12 +564,22 @@ Read:
   only the credible ones as finalists.
 - Equivalence: the same columns, types, rows, NULLs and duplicate counts for
   every allowed input, in the same order when the query has an outer ORDER BY.
+- Two statements that return stable rows are always compared, in order and
+  as a multiset: ordered_rows_match and multiset_match. Under a preflight
+  gap (possible ties, a changed or removed ORDER BY) a match is
+  tested_match, proof_scope snapshot_test: true for the tested values on
+  today's data, with the reason in caveats. The candidate is then
+  performance_only. not_compared is left for a clock, NEWID, TABLESAMPLE, a
+  row limit with no ORDER BY, or a run that stopped.
 - A candidate ends as improved, neutral, regressed, equivalence_failed,
   performance_only, inconclusive or cleanup_required.
 - finalize_tuning_session returns deployment_ready. It is true only when a
   constraint or unchanged SQL backs the equality, the candidate adds no
   plan-forcing hint, and no parity check failed. deployment_blockers says why
-  it is false.
+  it is false. A NULL case the statement tests itself (NOT EXISTS ... IS NULL
+  over the rows of the NOT IN subquery) needs no NOT NULL constraint: it is
+  listed under handled_by_statement. conditional_preconditions are needed
+  unless the statement handles NULL; a reviewer settles them.
 Avoid:
 - A sample, a truncated result, different snapshots or a timeout is
   inconclusive, never proven.
@@ -783,9 +795,12 @@ Use when: one statement serves several parameter shapes, for example
 take such a batch as one candidate.
 Read:
 - The admitted form: optional DECLARE and SET of scalar variables, then IF /
-  ELSE over parameters and literals only, with one SELECT per branch, or EXEC
-  sys.sp_executesql of one string literal with a parameter list. At most 16
-  branches. Anything else is refused with the reason.
+  ELSE with one SELECT per branch, or EXEC sys.sp_executesql of one string
+  literal with a parameter list. At most 16 branches. A guard or value holds
+  parameters, literals, operators, LIKE, COLLATE <name> and the functions
+  CAST, CONVERT, TRY_CAST, TRY_CONVERT, PATINDEX, CHARINDEX, LEN, ISNULL,
+  COALESCE, NULLIF: no subquery, no object name, no other function.
+  Anything else is refused with the reason.
 - explain_query with analyze=false: branches, one estimated plan per branch
   with its condition. With analyze=true: one run, and
   summary.batch.executed_branch names the branch the values selected.
@@ -884,8 +899,11 @@ Read:
   proof_scope direct_snapshot is a match on the tested cases and today's
   data. finalize_tuning_session reports it as snapshot_matched; only a
   catalog-verified precondition makes it constraint_backed.
-- performance_only: the SQL shape has no deterministic comparison. The
-  timing stands; the equality is not shown.
+- performance_only with tested_match: the results matched, but the static
+  proof has a gap (caveats names it). The timing stands; the equality is a
+  test on today's data (guide proving_a_rewrite).
+- To measure the index alone and then the rewrite under one build, keep the
+  index: guide session_held_objects.
 - used_in_cases and unused_indexes: an index no case used is not part of
   the design.
 The parent route still exists: a rewrite finalist of the session is a valid
@@ -914,35 +932,37 @@ Steps:
 - check_capabilities: indexed_view_experiment.allowed, its blockers and
   test_view_name_prefixes. It needs allow_test_indexes, allow_view_apply
   and allow_offline_test_index (the first index of a view is built offline:
-  writes to the base tables wait during the build).
+  base-table writes wait).
 - benchmark_indexed_view_candidate with preview set to true and
   view_definition (the SELECT body: two-part names, COUNT_BIG(*), SUM over a
-  NOT NULL column or with ISNULL). It returns the view name, the findings
-  and setup_statements, and runs nothing.
+  NOT NULL column or with ISNULL). It returns the view name, findings and
+  setup_statements; nothing runs.
 - add_tuning_candidate with strategy=rewrite_plus_index, no artifact_ref,
-  and candidate_sql = the statement that reads dbo.<view> WITH (NOEXPAND).
+  and candidate_sql = the statement that reads <schema>.<view> WITH
+  (NOEXPAND) (schema_name; default dbo).
 - benchmark_indexed_view_candidate with sql (the original), candidate_sql,
-  view_definition, view_name and phase=finalist.
+  view_definition, view_name and phase=finalist. plan_reuse, runs,
+  slow_baseline_cases, keep_for_session and max_call_seconds work as in
+  benchmark_index_candidate (guide session_held_objects).
 - read_mode automatic: an index candidate with the unchanged statement; the
   result says whether the optimizer matched the view by itself.
 Read:
-- decision and equivalence as for a rewrite. proof_scope direct_snapshot is
-  a match on the tested cases; finalize reports snapshot_matched.
+- decision and equivalence as for a rewrite: direct_snapshot is a match on
+  the tested cases (finalize: snapshot_matched).
 - view.setup_statements and view.teardown_statements: the exact DDL for the
   report. built.rows and built.size_mb: what the view stores.
 - view.write_overhead_warning, view.write_cost and
-  view.base_table_restrictions: every write to a base table also maintains
-  the view, and TRUNCATE, ALTER COLUMN and partition SWITCH on a base table
-  fail while it exists. Quote them with the recommendation.
+  view.base_table_restrictions: every base-table write also maintains the
+  view; TRUNCATE, ALTER COLUMN and partition SWITCH fail while it exists.
+  Quote them with the recommendation.
 - lease.status cleaned: the view is gone. cleanup_required: give the user
   remediation (DROP VIEW) and stop sandbox work in that database.
 - failure_diagnostic: failed_step, native_error_code and engine_message of
-  a refused build; the lease is then create_failed and nothing is left.
+  a refused build; the lease is create_failed and nothing is left.
 Avoid:
 - Do not recommend an indexed view on a table with heavy writes without the
   write warning and the covering index as the alternative.
-- Do not present read_mode automatic as proof that production will match
-  the view: matching depends on the edition and on the estimated cost.
+- read_mode automatic does not prove that production matches the view.
 - A view over a data property with no constraint (no gaps, no overlaps) is
   not equivalent by proof: name the property as a precondition.
 Next: finalize_tuning_session; hand the DDL, the SET options and the write
@@ -954,44 +974,91 @@ warning to change control.
         "finalize_tuning_session",
     ),
     _guide(
+        "session_held_objects",
+        "workflow",
+        "Build a test index or view once and measure several variants on it",
+        """
+Use when: a build takes minutes and you will measure more than one thing on
+it: the index alone and then a rewrite with it, two rewrites, a view and a
+manual comparison. Without it every benchmark call builds and drops again.
+Steps:
+- First call: benchmark_index_candidate or benchmark_indexed_view_candidate
+  with keep_for_session=true and every parameter case you will need. It
+  measures the baseline, builds, measures, and leaves the objects in place.
+- Later calls of the same session with the same index definitions or the
+  same view definition reuse them without a build; an object that does not
+  match is built and joins the same lease. plan_reuse and compare_order must
+  be those of the first call.
+- compare_query_results and explain_query can read a held object meanwhile.
+  benchmark_tuning_candidate then runs both statements with it in place
+  (held_test_objects_present).
+- finalize_tuning_session drops everything held: held_test_objects_dropped.
+Read:
+- test_objects in every result: reused, built, still_held and
+  hold_expires_at_utc. get_tuning_session lists held_test_objects with
+  their age.
+- baseline_source session_before_hold: the baseline measured before the
+  build. While a held object exists the statement cannot run clean, so it
+  is not run again. A case with no such baseline is refused before any run.
+- A call without keep_for_session drops every object it used when it
+  returns; held objects it did not use stay.
+- The hold lasts lease_minutes from the end of the last call that kept it;
+  after that the next benchmark call or a server start drops it.
+- partial: the call reached max_call_seconds. With keep_for_session the
+  objects stay: add a candidate for the same statement and call again.
+Avoid:
+- Do not hold objects on a database other sessions measure: a held index
+  changes their plans. One lease per database is open at a time.
+- Do not leave a session open with held objects: finalize it.
+- Do not build the same index by hand to compare results: keep it.
+Next: finalize_tuning_session, then read held_test_objects_dropped.
+""",
+        "benchmark_index_candidate",
+        "benchmark_indexed_view_candidate",
+        "compare_query_results",
+        "finalize_tuning_session",
+    ),
+    _guide(
         "measurement_time_rules",
         "topic",
-        "How many times a benchmark runs a statement, and what is reused",
+        "How many times a benchmark runs a statement, and where the time goes",
         """
 Use when: you plan a benchmark of a statement that takes seconds or minutes,
-or you read runs, single-sample flags or baseline_source in a result.
+or you read runs, run_rule, time_spent or baseline_source in a result.
 Read:
-- Both benchmark_tuning_candidate and benchmark_index_candidate time the
-  first run of each arm of each parameter case.
-  under 1 second: every requested run (default 3 screening, 5 finalist;
-  runs lowers it).
+- Both benchmark tools time the first run of each arm of each case.
+  under 1 second: every requested run (3 screening, 5 finalist; runs lowers it).
   1 to 10 seconds: at most 3 runs.
   10 seconds or more: that one run only.
-- The count never exceeds runs, the session execution budget or the policy
-  limit: those are reserved before the first run. In the index benchmark it
-  is also cut to the session time left.
-- A baseline that ran once is kept once in the session, with its plan and
-  result digest, and both benchmark tools reuse it for every later candidate:
-  baseline_source is single_run where it was measured and
-  session_single_run where it was reused. slow_baseline_cases declares such
-  a case before the first run; it is not needed for the rule to apply.
-- A fast baseline is measured again by each index benchmark, before the
-  build and after the drop: those runs are the noise check of that result.
-- One sample has no measured noise. With baseline_single_sample or
+- Index and view benchmarks, baseline of 1 second or more: it runs once
+  before the build. When the first candidate run takes at most one tenth of
+  it, one run of each side decides (run_rule one_run_each_large_gain) and
+  nothing runs after the drop. A smaller gain keeps the repeated runs: the
+  baseline gets its other runs after the drop.
+- A baseline that ran once is kept once in the session, and both benchmark
+  tools reuse it: baseline_source single_run where measured,
+  session_single_run where reused. slow_baseline_cases declares such a case.
+- One sample has no measured noise: with baseline_single_sample or
   candidate_single_sample a gain counts only when the other side is at most
-  half of it; a regression needs no such margin.
-- A case whose baseline is 0 on the objective (under 1 ms or 1 page) is
-  unchanged_at_zero or regressed on the absolute floor; the other cases
-  decide. decision.by_metric gives the verdict on CPU, elapsed time and
-  logical reads from the same runs.
-- compare_query_results: max_seconds caps the comparison (default 120). A
-  capped run returns timed_out with the arm that was running. Pass
-  estimated_seconds when you know the statement time: a comparison that
-  cannot fit is not started, and the result says what to pass.
+  half of it.
+- time_spent: seconds for baseline_runs, build, candidate_runs, comparison,
+  cleanup, other and total. Read it before you plan the next call.
+- max_call_seconds caps an index or view benchmark: no run and no build
+  starts after it, and a build that build_estimate says cannot fit is not
+  started. The result is then partial with no verdict. With
+  keep_for_session what was built stays; add a candidate and call again.
+- A build that lost a deadlock (1205) or a lock wait (1222) is retried once:
+  build_retries. A second loss is create_failure.transient: call again.
+- A case whose baseline is 0 on the objective is unchanged_at_zero or
+  regressed on the absolute floor; decision.by_metric has CPU, elapsed
+  time and reads from the same runs.
+- compare_query_results: max_seconds caps the comparison (default 120);
+  estimated_seconds stops one that cannot fit before it starts.
 Avoid:
 - Do not open a new case to change the objective or to rerun a baseline.
 - Do not read a single-sample verdict as a measured noise margin.
-Next: read parameter_results[].runs and baseline_note for what ran.
+- Do not pay for one build twice: keep it (guide session_held_objects).
+Next: read parameter_results[].runs, run_rule_note and baseline_note.
 """,
         "benchmark_index_candidate",
         "benchmark_tuning_candidate",

@@ -76,7 +76,6 @@ from .database_policy import load_database_policy_or_deny
 from .diagnostics import DiagnosticQueryService
 from .elastic_pool import ElasticPoolService
 from .equivalence_contract import effective_compare_order
-from .equivalence_contract import inline_relation
 from .equivalence_contract import rewrite_requirements
 from .equivalence_contract import statement_hint_profile
 from .equivalence_preflight import EquivalencePreflightService
@@ -113,6 +112,7 @@ from .index_optimizer import IndexOptimizer
 from .index_optimizer import ReplacementExperiment
 from .index_optimizer import bounded_table_lock_probe_sql
 from .index_optimizer import build_test_index_statement
+from .index_optimizer import TRANSIENT_BUILD_ERRORS
 from .index_optimizer import classify_create_index_failure
 from .index_optimizer import columnstore_index_blockers
 from .index_optimizer import expected_index_definition_matches
@@ -174,6 +174,7 @@ from .performance_workflows import fingerprint_json
 from .performance_workflows import fingerprint_text
 from .performance_workflows import fingerprint_text_matches
 from .performance_workflows import label_comparison
+from .performance_workflows import order_contract_removed
 from .performance_workflows import mark_benchmark_sql
 from .performance_workflows import parameter_case_fingerprint
 from .performance_workflows import parameter_case_mismatch
@@ -260,11 +261,13 @@ from .tool_contracts import SelectionScope
 from .tool_contracts import SessionToolOutput
 from .tool_contracts import TuningObjective
 from .tool_contracts import TuningStrategy
+from .tuning_sessions import FAST_STATEMENT_SECONDS
 from .tuning_sessions import INDEX_ABA_PHASES
 from .tuning_sessions import SLOW_STATEMENT_SECONDS
 from .tuning_sessions import InvalidTransitionError
 from .tuning_sessions import TuningSessionStateMachine
 from .tuning_sessions import adaptive_run_count
+from .tuning_sessions import decisive_first_runs
 from .tuning_sessions import session_failure_diagnostic
 from .transport_auth import StaticBearerTokenVerifier
 from .version_store import VersionStoreService
@@ -602,6 +605,163 @@ def _not_compared(blocking_gaps: Sequence[str], failure: Any = None) -> dict[str
     }
 
 
+class _CallTimeCap(Exception):
+    """max_call_seconds was reached before the named step of a benchmark call."""
+
+
+class _CallClock:
+    """Wall time of one benchmark call: the seconds of each phase and the caller's cap."""
+
+    PHASES = ("baseline_runs", "build", "candidate_runs", "comparison", "cleanup")
+
+    def __init__(self, max_call_seconds: float | None) -> None:
+        if max_call_seconds is not None and max_call_seconds <= 0:
+            raise ValueError("max_call_seconds must be greater than zero.")
+        self.max_call_seconds = max_call_seconds
+        self.started = time.monotonic()
+        self.seconds: dict[str, float] = dict.fromkeys(self.PHASES, 0.0)
+
+    def start(self) -> float:
+        return time.monotonic()
+
+    def add(self, phase: str, started: float) -> None:
+        self.seconds[phase] += time.monotonic() - started
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self.started
+
+    def left(self) -> float:
+        """Seconds until the cap; infinite without one."""
+        if self.max_call_seconds is None:
+            return float("inf")
+        return self.max_call_seconds - self.elapsed()
+
+    def require(self, step: str) -> None:
+        """Stop before ``step`` when the cap is reached. A running statement is never cut."""
+        if self.left() <= 0:
+            raise _CallTimeCap(step)
+
+    def cap_diagnostic(self, step: str) -> dict[str, Any]:
+        return {
+            "diagnostic_code": "call_time_cap",
+            "failed_step": step,
+            "max_call_seconds": self.max_call_seconds,
+            "elapsed_seconds": round(self.elapsed(), 1),
+        }
+
+    def report(self) -> dict[str, float]:
+        """``time_spent``: seconds per phase, the rest of the call, and the total."""
+        total = self.elapsed()
+        spent = {phase: round(seconds, 1) for phase, seconds in self.seconds.items()}
+        spent["other"] = round(max(0.0, total - sum(self.seconds.values())), 1)
+        spent["total"] = round(total, 1)
+        return spent
+
+
+def _index_test_objects(
+    members: Sequence[_IndexSetMember],
+    lease: Mapping[str, Any],
+    held_entries: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """``test_objects`` of an index benchmark: what was reused, built and is still held."""
+
+    def report(member: _IndexSetMember) -> dict[str, Any]:
+        return _held_object_report(
+            {
+                "target_schema": member.schema,
+                "target_table": member.table,
+                "index_name": member.index_name,
+            }
+        )
+
+    still_held = [_held_object_report(entry, lease) for entry in held_entries]
+    test_objects: dict[str, Any] = {
+        "reused": [report(member) for member in members if member.reused],
+        "built": [
+            report(member)
+            for member in members
+            if member.ownership_recorded and not member.reused
+        ],
+        "still_held": still_held,
+        "hold_expires_at_utc": lease["expires_at_utc"] if still_held else None,
+    }
+    if still_held:
+        test_objects["note"] = (
+            "These objects stay in place for this session. A later benchmark call "
+            "reuses each one whose definition matches; finalize_tuning_session "
+            "drops them, and so does the lease when it expires."
+        )
+    return test_objects
+
+
+def _build_rate(members: Sequence[_IndexSetMember], build_seconds: float) -> float | None:
+    """Rows per second of the builds of one call: the estimate of the next build in the session."""
+
+    built_rows = sum(
+        int(member.built["row_count"])
+        for member in members
+        if not member.reused
+        and member.ownership_recorded
+        and member.built
+        and member.built.get("row_count")
+    )
+    return round(built_rows / build_seconds, 1) if built_rows and build_seconds > 0 else None
+
+
+_DECISIVE_RUN_RULE = "one_run_each_large_gain"
+
+
+def _decisive_run_note(baseline_seconds: float, candidate_seconds: float) -> str:
+    return (
+        f"the first candidate run took {candidate_seconds:g} s against {baseline_seconds:g} s "
+        "for the baseline: at most one tenth of a statement that takes a second or more, "
+        "so one run of each side decided. A smaller gain gets the repeated runs."
+    )
+
+
+def _call_cap_reason(clock: _CallClock, step: str, still_held: bool) -> str:
+    return (
+        f"the call reached max_call_seconds ({clock.max_call_seconds:g}) before step {step}: "
+        "this is a partial result with no verdict. parameter_results holds what was "
+        "measured and time_spent where the time went."
+        + (
+            " The test objects are still held: add a candidate for the same statement "
+            "and call again; it reuses them and the baselines of this call."
+            if still_held
+            else ""
+        )
+    )
+
+
+# Lease metadata key of a session hold: the test objects of the lease stay in
+# place between the benchmark calls of its tuning session.
+HOLD_FLAG = "held_for_session"
+
+
+def _held_object_report(entry: Mapping[str, Any], lease: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """What a caller is told about one test object of a lease: never the owner token."""
+
+    view = entry.get("object_kind") == LEASE_OBJECT_KIND
+    report: dict[str, Any] = {
+        "kind": LEASE_OBJECT_KIND if view else "index",
+        "name": f"{entry.get('target_schema')}."
+        + str(entry.get("target_view") if view else entry.get("target_table")),
+        "index_name": entry.get("index_name"),
+    }
+    if lease is None:
+        return report
+    held_since = entry.get("held_since_utc")
+    report["held_since_utc"] = held_since
+    try:
+        since = datetime.fromisoformat(str(held_since))
+        report["age_seconds"] = max(0, int((datetime.now(timezone.utc) - since).total_seconds()))
+    except ValueError:
+        report["age_seconds"] = None
+    report["expires_at_utc"] = lease.get("expires_at_utc")
+    report["lease_id"] = lease.get("lease_id")
+    return report
+
+
 def _tested_match_reason(subject: str, statuses: set[str], gaps: Sequence[str]) -> str:
     """Why a candidate whose results were tested under a preflight gap is performance-only."""
 
@@ -761,6 +921,10 @@ class _IndexSetMember:
     # True when the index may exist and this run could not drop it.
     left_behind: bool = False
     built: dict[str, Any] | None = None
+    # True when an earlier call of the session built this index and kept it.
+    reused: bool = False
+    # True once this run dropped the index of a lease that holds objects.
+    released: bool = False
 
     @property
     def index_name(self) -> str:
@@ -769,6 +933,13 @@ class _IndexSetMember:
     @property
     def fingerprint(self) -> str:
         return self.candidate.definition_fingerprint
+# Rows of a table: its heap or clustered index, all partitions.
+_TABLE_ROW_COUNT_SQL = """
+SELECT SUM(ps.row_count) AS row_count
+FROM sys.dm_db_partition_stats AS ps
+WHERE ps.object_id = OBJECT_ID(QUOTENAME(?) + N'.' + QUOTENAME(?))
+  AND ps.index_id IN (0, 1);
+"""
 # One row per table: its catalog spelling, whether its clustered index is
 # columnstore (type 5), and its partition scheme and column.
 _TEST_INDEX_TABLE_SQL = """
@@ -3128,6 +3299,7 @@ class AzureSqlMcpApplication:
                     cross_case=cross_case,
                     slow_baseline_cases=slow_baseline_cases,
                 )
+                payload = self._with_held_objects_present(db, session_id, payload)
                 return payload if detail == "full" else _compact_benchmark_payload(payload)
 
             return cast(
@@ -3309,6 +3481,34 @@ class AzureSqlMcpApplication:
                 ),
             ),
             lease_minutes: int = Field(default=30, ge=5, le=120),
+            keep_for_session: bool = Field(
+                default=False,
+                description=(
+                    "true leaves what this call built in place under the lease of the "
+                    "session when it returns, for at most lease_minutes: a later "
+                    "benchmark call of the session reuses each object whose definition "
+                    "matches and builds only the others, and compare_query_results and "
+                    "explain_query can read them meanwhile. The baseline of a later "
+                    "call is the one measured before the hold, so keep with every "
+                    "parameter case you will need. Default false: every object the "
+                    "call used is dropped before it returns. finalize_tuning_session "
+                    "drops whatever is held; test_objects in the result lists what was "
+                    "reused, built and still held."
+                ),
+            ),
+            max_call_seconds: float | None = Field(
+                default=None,
+                ge=30,
+                description=(
+                    "Cap of this call in seconds. No run and no build starts after it, "
+                    "and a build whose estimate (table rows at the rate of the first "
+                    "build of the session, in build_estimate) does not fit is not "
+                    "started. A running statement is not cut. At the cap the result is "
+                    "partial: true with no verdict, the measurements taken so far and "
+                    "time_spent; with keep_for_session what was built stays held, so "
+                    "the next call continues without a rebuild."
+                ),
+            ),
             idempotency_key: str = Field(
                 description="Caller-generated key used to fence retries and cleanup."
             ),
@@ -3355,6 +3555,8 @@ class AzureSqlMcpApplication:
                     plan_reuse=plan_reuse,
                     index_kind=index_kind,
                     partition_aligned=partition_aligned,
+                    keep_for_session=keep_for_session,
+                    max_call_seconds=max_call_seconds,
                 )
                 return payload if detail == "full" else _compact_benchmark_payload(payload)
 
@@ -3466,8 +3668,49 @@ class AzureSqlMcpApplication:
                 ge=1,
                 description="Runs per arm and case, 1 to the session limit; lowered for a slow statement.",
             ),
+            plan_reuse: Literal["per_case", "first_case"] = Field(
+                default="per_case",
+                description=(
+                    "As for benchmark_index_candidate. per_case: each parameter case "
+                    "compiles its own plan. first_case: all cases share one statement "
+                    "text, so the first case compiles and the later cases run on its "
+                    "plan, in the order given."
+                ),
+            ),
+            slow_baseline_cases: dict[str, float] | None = Field(
+                default=None,
+                description=_SLOW_BASELINE_DESCRIPTION,
+            ),
             compare_order: bool | None = Field(default=None),
             lease_minutes: int = Field(default=30, ge=5, le=120),
+            keep_for_session: bool = Field(
+                default=False,
+                description=(
+                    "true leaves what this call built in place under the lease of the "
+                    "session when it returns, for at most lease_minutes: a later "
+                    "benchmark call of the session reuses each object whose definition "
+                    "matches and builds only the others, and compare_query_results and "
+                    "explain_query can read them meanwhile. The baseline of a later "
+                    "call is the one measured before the hold, so keep with every "
+                    "parameter case you will need. Default false: every object the "
+                    "call used is dropped before it returns. finalize_tuning_session "
+                    "drops whatever is held; test_objects in the result lists what was "
+                    "reused, built and still held."
+                ),
+            ),
+            max_call_seconds: float | None = Field(
+                default=None,
+                ge=30,
+                description=(
+                    "Cap of this call in seconds. No run and no build starts after it, "
+                    "and a build whose estimate (table rows at the rate of the first "
+                    "build of the session, in build_estimate) does not fit is not "
+                    "started. A running statement is not cut. At the cap the result is "
+                    "partial: true with no verdict, the measurements taken so far and "
+                    "time_spent; with keep_for_session what was built stays held, so "
+                    "the next call continues without a rebuild."
+                ),
+            ),
             idempotency_key: str | None = Field(
                 default=None,
                 description="Caller-generated key that fences retries and cleanup. Not needed for preview.",
@@ -3505,6 +3748,10 @@ class AzureSqlMcpApplication:
                     lease_minutes=lease_minutes,
                     idempotency_key=idempotency_key,
                     preview=preview,
+                    keep_for_session=keep_for_session,
+                    max_call_seconds=max_call_seconds,
+                    plan_reuse=plan_reuse,
+                    slow_baseline_cases=slow_baseline_cases,
                 )
                 if preview or detail == "full":
                     return payload
@@ -3528,11 +3775,14 @@ class AzureSqlMcpApplication:
         @self.mcp.tool(
             description=(
                 "Finalize a tuning session with the winning candidate, complete leaderboard, "
-                "rejected experiments, and explicit stopping reason."
+                "rejected experiments, and explicit stopping reason. Test objects a "
+                "benchmark call kept for the session (keep_for_session) are dropped "
+                "and listed in held_test_objects_dropped."
             ),
             annotations=ToolAnnotations(
                 title="Finalize Tuning Session",
-                readOnlyHint=True,
+                # It drops the session's own leased test objects when any are held.
+                readOnlyHint=False,
                 destructiveHint=False,
                 idempotentHint=True,
                 openWorldHint=False,
@@ -3598,11 +3848,13 @@ class AzureSqlMcpApplication:
                 "only when the complete bounded results, duplicates, shape, and required order "
                 "match. Statements with a proven total order are compared as ordered rows, the "
                 "others as multisets with duplicate counts; comparison_basis says which. A "
-                "preflight gap that a comparison can settle (possible ORDER BY ties, a row "
-                "limit with ties, a UNION ALL rewrite, a changed ORDER BY) no longer stops "
-                "the run: the result is then proof_scope snapshot_test, a test on today's "
-                "data that lists what is not settled. A volatile statement (clock, NEWID, "
-                "TABLESAMPLE, unordered row limit) is refused. max_seconds caps the run."
+                "preflight gap that leaves the rows stable (possible ORDER BY ties, a row "
+                "limit with ties, a UNION ALL rewrite, a changed or removed ORDER BY) does "
+                "not stop the run: the result is then a tested_match, proof_scope "
+                "snapshot_test, a test on today's data with ordered_rows_match, "
+                "multiset_match and the caveats. A volatile statement (clock, NEWID, "
+                "TABLESAMPLE, unordered row limit) is refused. max_seconds caps the run. "
+                "It can read test objects a benchmark call kept for the session."
             ),
             annotations=ToolAnnotations(
                 title="Compare Query Results",
@@ -8559,6 +8811,12 @@ class AzureSqlMcpApplication:
             allow_legacy=bool(self.config.legacy_state_server_binding),
         ):
             raise PermissionError("Tuning session belongs to another database.")
+        held = self._held_test_objects(
+            str(session.get("metadata", {}).get("database_fingerprint") or ""), session_id
+        )
+        if held:
+            # Test objects a benchmark call kept for this session, with their age.
+            payload = {**payload, "held_test_objects": held}
         return payload
 
     async def _add_tuning_candidate(
@@ -8618,7 +8876,7 @@ class AzureSqlMcpApplication:
             if selected_candidate_id is not None
             else None
         )
-        return self.performance_workflows.finalize_session(
+        result = self.performance_workflows.finalize_session(
             session_id,
             selected_candidate_id=selected_candidate_id,
             selection_scope=selection_scope,
@@ -8626,6 +8884,17 @@ class AzureSqlMcpApplication:
             idempotency_key=idempotency_key,
             precondition_verification=verification,
         )
+        # A finished session keeps no test object in the database.
+        released = await self._release_session_hold(database_name, session_id)
+        if released:
+            result = {**result, "held_test_objects_dropped": released}
+            if not all(item["dropped"] for item in released):
+                result["held_test_objects_note"] = (
+                    "A held test object could not be dropped. Its lease is "
+                    "cleanup_required: the next benchmark call in this database "
+                    "retries the drop before it runs."
+                )
+        return result
 
     async def _compare_plan_summaries(
         self,
@@ -9482,6 +9751,249 @@ class AzureSqlMcpApplication:
             )
         return views
 
+    def _session_hold(self, database_fingerprint: str, session_id: str) -> dict[str, Any] | None:
+        """The lease that keeps test objects in place for this session, or None."""
+
+        for lease in self.performance_store.list_open_index_leases(
+            database_fingerprint=database_fingerprint
+        ):
+            metadata = lease.get("metadata") or {}
+            if (
+                lease["session_id"] == session_id
+                and lease["status"] == "active"
+                and metadata.get(HOLD_FLAG) is True
+                and isinstance(metadata.get("members"), list)
+            ):
+                return lease
+        return None
+
+    def _held_test_objects(self, database_fingerprint: str, session_id: str) -> list[dict[str, Any]]:
+        """The test objects this session holds, each with its age and the expiry of the hold."""
+
+        hold = self._session_hold(database_fingerprint, session_id)
+        if hold is None:
+            return []
+        return [
+            _held_object_report(entry, hold)
+            for entry in hold["metadata"]["members"]
+            if isinstance(entry, Mapping)
+        ]
+
+    async def _table_row_count(self, database_name: str, schema: str, table: str) -> int | None:
+        """Rows of a table from the partition statistics; None when it cannot be read."""
+
+        try:
+            rows = await self.executor.fetch_all(
+                database_name,
+                _TABLE_ROW_COUNT_SQL,
+                params=[schema, table],
+                max_rows=1,
+                sql_origin="server_built",
+            )
+        except Exception as exc:
+            note_exception(exc, "server.table_row_count")
+            return None
+        value = rows[0].get("row_count") if rows else None
+        return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+    async def _build_time_estimate(
+        self,
+        database_name: str,
+        session_id: str,
+        members: Sequence[_IndexSetMember],
+    ) -> dict[str, Any]:
+        """Seconds the builds of ``members`` should take, from the first build of the session.
+
+        Each index reads its whole table once, so the estimate is the rows
+        of the tables at the rows per second that the first build of this
+        session reached. No build yet, or a row count that cannot be read:
+        no estimate, and the cap of the call then applies between steps only.
+        """
+
+        rate = next(
+            (
+                float(evidence.metadata["build_rate_rows_per_second"])
+                for evidence in self.performance_store.list_evidence_for_session(session_id)
+                if isinstance(evidence.metadata.get("build_rate_rows_per_second"), (int, float))
+            ),
+            None,
+        )
+        counts = [
+            await self._table_row_count(database_name, member.schema, member.table)
+            for member in members
+        ]
+        rows = sum(count for count in counts if count is not None) if None not in counts else None
+        return {
+            "table_rows": rows,
+            "rate_rows_per_second": rate,
+            "estimated_seconds": round(rows / rate, 1) if rows is not None and rate else None,
+            "basis": (
+                "table rows at the rate of the first test index build of this session"
+                if rows is not None and rate
+                else "no estimate: no test index build was measured in this session yet"
+                if rate is None
+                else "no estimate: the row count of the table could not be read"
+            ),
+        }
+
+    def _with_held_objects_present(
+        self,
+        database_name: str,
+        session_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Say in a rewrite benchmark that held test objects existed while it ran."""
+
+        held = self._held_test_objects(
+            database_fingerprint(database_name, self.config.server), session_id
+        )
+        if not held:
+            return payload
+        return {
+            **payload,
+            "held_test_objects_present": {
+                "objects": held,
+                "note": (
+                    "Both statements ran while these test objects of the session "
+                    "existed, so this compares the two statements with them in place. "
+                    "A baseline taken from the session (baseline_source "
+                    "session_single_run) ran before they were built."
+                ),
+            },
+        }
+
+    def _baselines_before_hold(
+        self,
+        session_id: str,
+        baseline_sql: str,
+        compare_order: bool,
+        plan_reuse: str,
+        case_names: Sequence[str],
+    ) -> dict[str, dict[str, Any]]:
+        """The baselines of ``baseline_sql`` this session measured with no held object in place."""
+
+        sql_fingerprint = fingerprint_json({"baseline_sql": baseline_sql})
+        pool: dict[str, dict[str, Any]] = {}
+        for name, items in self.performance_workflows.session_baselines_before_hold(
+            session_id
+        ).items():
+            for item in items:
+                if (
+                    item.get("sql_fingerprint") == sql_fingerprint
+                    and item.get("order_compared") is compare_order
+                    and item.get("plan_reuse") == plan_reuse
+                    and isinstance(item.get("result"), Mapping)
+                    # On a shared plan the first case compiles: the same cases, the same order.
+                    and (plan_reuse == "per_case" or item.get("case_order") == list(case_names))
+                ):
+                    pool[name] = item
+        return pool
+
+    def _return_hold_to_idle(self, lease_id: str, owner: str, lease_minutes: int) -> None:
+        """Give a hold back its own bounded expiry when a call that took it did not start.
+
+        While a call uses a hold, the open session protects the lease past its
+        expiry. A call that stops before its first statement must not leave
+        that protection behind.
+        """
+
+        try:
+            current = self.performance_store.get_index_lease(lease_id)
+            if current["status"] != "active" or (current.get("metadata") or {}).get(
+                "hold_state"
+            ) != "in_call":
+                return
+            self.performance_store.update_index_lease(
+                lease_id,
+                status="active",
+                metadata={"hold_state": "idle"},
+                owner_reference=owner,
+                expected_version=current["version"],
+                expires_at_utc=(
+                    datetime.now(timezone.utc) + timedelta(minutes=lease_minutes)
+                ).isoformat(),
+            )
+        except Exception as exc:
+            note_exception(exc, "server.return_hold_to_idle")
+
+    def _require_baselines_before_hold(
+        self,
+        session_id: str,
+        baseline_sql: str,
+        compare_order: bool,
+        plan_reuse: str,
+        case_names: Sequence[str],
+        held_entries: Sequence[Mapping[str, Any]],
+        session_pool: Mapping[str, dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        """The baseline of every case of a call that starts with held objects in place.
+
+        A held object is in place, so the baseline statement cannot run clean
+        now: each case takes the baseline this session measured before the
+        hold, or its one-run baseline (``session_pool``). A case with neither
+        is refused before any run.
+        """
+
+        pool = {
+            **self._baselines_before_hold(
+                session_id, baseline_sql, compare_order, plan_reuse, case_names
+            ),
+            **session_pool,
+        }
+        missing = [name for name in case_names if name not in pool]
+        if missing:
+            raise ValueError(
+                "This session holds test objects ("
+                + ", ".join(
+                    str(_held_object_report(entry)["index_name"]) for entry in held_entries
+                )
+                + "), and parameter case(s) "
+                + ", ".join(missing)
+                + " have no baseline measured before they were built for this "
+                "statement, plan_reuse and compare_order. The statement cannot give "
+                "a clean baseline while they exist. Name only the cases that were "
+                "measured in the call that kept the objects, with the same plan_reuse "
+                "and compare_order, or call finalize_tuning_session to drop them. "
+                "No query and no DDL was run."
+            )
+        return pool
+
+    async def _release_session_hold(self, database_name: str, session_id: str) -> list[dict[str, Any]]:
+        """Drop every test object the session holds and close its lease.
+
+        Returns what was held, each with ``dropped``. A drop that fails
+        leaves the lease as cleanup_required, as an expired lease does.
+        """
+
+        hold = self._session_hold(
+            database_fingerprint(database_name, self.config.server), session_id
+        ) or next(
+            (
+                lease
+                for lease in self.performance_store.list_open_index_leases()
+                if lease["session_id"] == session_id
+                and lease["status"] == "active"
+                and (lease.get("metadata") or {}).get(HOLD_FLAG) is True
+            ),
+            None,
+        )
+        if hold is None:
+            return []
+        held = [
+            _held_object_report(entry, hold)
+            for entry in hold["metadata"].get("members") or ()
+            if isinstance(entry, Mapping)
+        ]
+        now = datetime.now(timezone.utc)
+        try:
+            await self._drop_lease_objects(hold, now, closed_by="released_by_finalize")
+            dropped = True
+        except Exception as exc:
+            note_exception(exc, "server.release_session_hold")
+            self._record_lease_cleanup_failure(hold, exc, now)
+            dropped = False
+        return [{**item, "dropped": dropped} for item in held]
+
     def _recover_index_benchmark_result(
         self,
         *,
@@ -9644,6 +10156,10 @@ class AzureSqlMcpApplication:
         }
         if isinstance(metadata.get("indexes"), list):
             result["indexes"] = metadata["indexes"]
+        if isinstance(metadata.get("test_objects"), Mapping):
+            result["test_objects"] = dict(metadata["test_objects"])
+        if isinstance(metadata.get("time_spent"), Mapping):
+            result["time_spent"] = dict(metadata["time_spent"])
         if isinstance(metadata.get("replacement_experiment"), Mapping):
             result["replacement_experiment"] = dict(metadata["replacement_experiment"])
             result["deployment_ready"] = False
@@ -9681,11 +10197,28 @@ class AzureSqlMcpApplication:
         plan_reuse: str = "per_case",
         index_kind: str | None = None,
         partition_aligned: bool | None = None,
+        keep_for_session: bool = False,
+        max_call_seconds: float | None = None,
     ) -> dict[str, Any]:
         """Measure a query before, with and after a leased set of 1 to 4 test indexes.
 
         One lease covers the whole set: every index is created or none is
         left, and every created index is dropped on every path.
+
+        ``keep_for_session`` leaves the set in place under the lease when the
+        call returns, for at most ``lease_minutes``. A later call of the same
+        session reuses each held index whose definition matches and builds
+        only the others; its baseline is the one the session measured before
+        the hold, because the statement cannot run clean while a held object
+        exists. Without ``keep_for_session`` a call drops every index it
+        used. finalize_tuning_session drops everything the session holds.
+
+        ``max_call_seconds`` caps the call: no run and no build starts after
+        it, and a build whose estimate (table rows at the rate of the first
+        build of the session) does not fit is not started. The result is then
+        ``partial`` with no verdict; with ``keep_for_session`` what was built
+        stays held. A build that lost a deadlock or a lock wait is retried
+        once. ``time_spent`` in the result is the seconds per phase.
 
         ``candidate_sql`` is the one-call path for a rewrite that needs its
         indexes: ``sql`` is the statement of the performance case and runs in
@@ -9709,6 +10242,7 @@ class AzureSqlMcpApplication:
 
         if self.config.profile != McpProfile.SANDBOX:
             raise PermissionError("Index benchmarking requires the sandbox MCP profile.")
+        clock = _CallClock(max_call_seconds)
         policy = self.database_policy.require(database_name)
         if not policy.is_non_production:
             raise PermissionError(
@@ -9770,6 +10304,13 @@ class AzureSqlMcpApplication:
             }
         if candidate.session_id != session_id:
             raise ValueError("Candidate does not belong to the tuning session.")
+        # Test objects an earlier call of this session left in place.
+        hold = self._session_hold(case.database_fingerprint or "", session_id)
+        held_entries: list[dict[str, Any]] = (
+            [dict(entry) for entry in hold["metadata"]["members"]] if hold is not None else []
+        )
+        # A lease that holds objects lists each of them, also when it is one.
+        hold_mode = keep_for_session or hold is not None
         legacy_combined_lineage = bool(
             candidate.strategy == "combined"
             and candidate.rewrite_artifact_ref
@@ -10026,9 +10567,21 @@ class AzureSqlMcpApplication:
             if pool_allowed
             else {}
         )
+        if held_entries:
+            slow_pool = self._require_baselines_before_hold(
+                session_id,
+                normalized_sql,
+                compare_order,
+                plan_reuse,
+                [str(parameter_case["name"]) for parameter_case in cases],
+                held_entries,
+                slow_pool,
+            )
         requested_executions = sum(
             runs + (0 if str(parameter_case["name"]) in slow_pool else 1)
             if str(parameter_case["name"]) in slow_cases
+            else runs
+            if held_entries
             else runs * 3
             for parameter_case in cases
         ) + (2 * len(cases) if compare_results else 0)
@@ -10124,6 +10677,8 @@ class AzureSqlMcpApplication:
             request_identity["candidate_sql"] = normalized_rewrite
         if plan_reuse != "per_case":
             request_identity["plan_reuse"] = plan_reuse
+        if keep_for_session:
+            request_identity["keep_for_session"] = True
         request_fingerprint = fingerprint_json(request_identity)
 
         def plan_identity(parameter_case: Mapping[str, Any]) -> str:
@@ -10162,6 +10717,11 @@ class AzureSqlMcpApplication:
         canonical_tables: dict[tuple[str, str], _TestIndexTable] = {}
         not_partitioned: list[str] = []
         members: list[_IndexSetMember] = []
+        held_indexes = {
+            str(entry["object_fingerprint"]): entry
+            for entry in held_entries
+            if entry.get("object_kind") != LEASE_OBJECT_KIND
+        }
         for ordinal, spec in enumerate(index_specs):
             spelled = (spec["schema"], spec["table"])
             if spelled not in canonical_tables:
@@ -10206,7 +10766,8 @@ class AzureSqlMcpApplication:
                 **table_facts.placement(),
                 index_kind=spec["kind"],
             )
-            if spec["kind"] == INDEX_KIND_NONCLUSTERED_COLUMNSTORE:
+            held_index = held_indexes.get(provisional_index.definition_fingerprint)
+            if spec["kind"] == INDEX_KIND_NONCLUSTERED_COLUMNSTORE and held_index is None:
                 # Refused here, before the request binds and before any run: one
                 # columnstore index per table, and only columns it can hold.
                 blockers = columnstore_index_blockers(
@@ -10230,7 +10791,10 @@ class AzureSqlMcpApplication:
             # definition, so two requests can never fight over one name.
             member_candidate = replace(
                 provisional_index,
-                index_name=generated_test_index_name(name_prefix, provisional_index, name_tag),
+                # A held index keeps the name it was built with.
+                index_name=str(held_index["index_name"])
+                if held_index is not None
+                else generated_test_index_name(name_prefix, provisional_index, name_tag),
             )
             members.append(
                 _IndexSetMember(
@@ -10256,6 +10820,7 @@ class AzureSqlMcpApplication:
                     cleanup_key=member_operation_key("index-benchmark-cleanup-key", ordinal),
                     table_facts=table_facts,
                     online=member_online,
+                    reused=held_index is not None,
                 )
             )
         if len({member.index_name for member in members}) != len(members):
@@ -10279,6 +10844,16 @@ class AzureSqlMcpApplication:
                 + "."
             )
         is_set = len(members) > 1
+        lease_as_set = is_set or hold_mode
+        reused_fingerprints = {member.fingerprint for member in members if member.reused}
+        # Held objects this call does not use: they stay under the lease.
+        carried_entries = [
+            entry
+            for entry in held_entries
+            if entry.get("object_kind") == LEASE_OBJECT_KIND
+            or entry["object_fingerprint"] not in reused_fingerprints
+        ]
+        held_index_names = {str(entry.get("index_name")) for entry in held_entries}
         tables = list(dict.fromkeys((member.schema, member.table) for member in members))
         # A one-index lease keeps the identity it always had.
         object_fingerprint = (
@@ -10475,7 +11050,8 @@ class AzureSqlMcpApplication:
             (
                 existing
                 for member in members
-                if (existing := member_index(existing_indexes, member)) is not None
+                if not member.reused
+                and (existing := member_index(existing_indexes, member)) is not None
             ),
             None,
         )
@@ -10515,6 +11091,7 @@ class AzureSqlMcpApplication:
             for existing in existing_indexes
             if (existing.schema, existing.table) in tables
             and existing.name not in member_names
+            and existing.name not in held_index_names
             and _is_generated_test_index_name(existing.name, generated_prefixes)
         )
         leftover_test_indexes = [name for name, _schema, _table in leftovers]
@@ -10659,6 +11236,10 @@ class AzureSqlMcpApplication:
             f"lease-{fingerprint_json({'session': session_id, 'candidate': candidate_id, 'key': idempotency_key})[:32]}"
         )
         lease_owner = f"index-lease-{owner_fingerprint[:32]}"
+        if hold is not None:
+            # The session has one lease; this call works under it and its owner token.
+            lease_id = str(hold["lease_id"])
+            lease_owner = str(hold["metadata"]["lease_owner_fence"])
         lease: dict[str, Any] | None = None
         pre_dispatch_reservation_finalized = False
 
@@ -10685,6 +11266,11 @@ class AzureSqlMcpApplication:
                 minutes=effective_lease_minutes
             )
             for member in members:
+                if member.reused:
+                    member.state = dict(held_indexes[member.fingerprint])
+                    member.ownership_recorded = True
+                    member.create_outcome_settled = True
+                    continue
                 member.state = {
                     "target_schema": member.schema,
                     "target_table": member.table,
@@ -10713,10 +11299,23 @@ class AzureSqlMcpApplication:
                     member.state["partition_scheme"] = member.table_facts.partition_scheme
                     member.state["partition_function"] = member.table_facts.partition_function
                     member.state["partition_column"] = member.table_facts.partition_column
-                if is_set:
+                if lease_as_set:
                     member.state["index_name"] = member.index_name
                     member.state["object_fingerprint"] = member.fingerprint
-            lease = self.performance_store.create_index_lease(
+            if hold is not None:
+                lease = self.performance_store.update_index_lease(
+                    lease_id,
+                    status="active",
+                    metadata={
+                        "hold_state": "in_call",
+                        "members": [*carried_entries, *(dict(member.state) for member in members)],
+                    },
+                    owner_reference=lease_owner,
+                    expected_version=hold["version"],
+                    # As for a new lease: the call is covered to the end of the session.
+                    expires_at_utc=expires_at.isoformat(),
+                )
+            lease = lease or self.performance_store.create_index_lease(
                 lease_id=lease_id,
                 database_fingerprint=case.database_fingerprint or "",
                 session_id=session_id,
@@ -10734,7 +11333,7 @@ class AzureSqlMcpApplication:
                     # its fields at the top level; a set lists them per index.
                     **(
                         {"members": [dict(member.state) for member in members]}
-                        if is_set
+                        if lease_as_set
                         else members[0].state
                     ),
                     "equivalence_preflight": equivalence_preflight,
@@ -10749,7 +11348,7 @@ class AzureSqlMcpApplication:
                     }
                 ),
             )
-            if lease["status"] != "pending_create":
+            if hold is None and lease["status"] != "pending_create":
                 finalize_pre_dispatch_reservation()
                 return {
                     "session_id": session_id,
@@ -10776,7 +11375,7 @@ class AzureSqlMcpApplication:
             begin_candidate_phase()
         except BaseException:
             finalize_pre_dispatch_reservation()
-            if lease is not None:
+            if lease is not None and hold is None:
                 self.performance_store.update_index_lease(
                     lease_id,
                     status="create_failed",
@@ -10784,6 +11383,8 @@ class AzureSqlMcpApplication:
                     owner_reference=lease_owner,
                     expected_version=lease["version"],
                 )
+            elif hold is not None:
+                self._return_hold_to_idle(lease_id, lease_owner, lease_minutes)
             raise
 
         measured_executions = 0
@@ -10804,6 +11405,10 @@ class AzureSqlMcpApplication:
                 ),
                 "slow_auto": False,
                 "pooled_baseline": slow_pool.get(str(bound_case["name"])),
+                # Runs of a baseline of seconds that wait for the first candidate run.
+                "baseline_runs_after": None,
+                # True when one run of each side decided (decisive_first_runs).
+                "decisive": False,
                 "runs": {"baseline_before": 0, "candidate": 0, "baseline_after": 0},
                 "baseline_before_samples": [],
                 "baseline_after_samples": [],
@@ -10833,11 +11438,21 @@ class AzureSqlMcpApplication:
         terminal_error: InvalidTransitionError | None = None
         cancelled = False
         equivalence: list[dict[str, Any]] = []
+        build_estimate: dict[str, Any] | None = None
+        build_retries: list[dict[str, Any]] = []
+
+        def lease_entries() -> list[dict[str, Any]]:
+            """What the lease lists: the carried objects, then the indexes of this call."""
+            return [
+                *carried_entries,
+                *(dict(item.state) for item in members if not item.released),
+            ]
 
         def update_lease(
             status: str,
             metadata: Mapping[str, Any] | None = None,
             member: _IndexSetMember | None = None,
+            expires_at_utc: str | None = None,
         ) -> None:
             """Advance the one lease of the set; a fact about one index goes to its entry."""
             nonlocal lease
@@ -10846,16 +11461,38 @@ class AzureSqlMcpApplication:
             payload: dict[str, Any] | None = dict(metadata) if metadata is not None else None
             if member is not None and metadata is not None:
                 member.state.update(metadata)
-            if is_set:
+            if lease_as_set:
                 if member is not None:
                     payload = None
-                payload = {**(payload or {}), "members": [dict(item.state) for item in members]}
+                payload = {**(payload or {}), "members": lease_entries()}
             lease = self.performance_store.update_index_lease(
                 lease_id,
                 status=status,
                 metadata=payload,
                 owner_reference=lease_owner,
                 expected_version=lease["version"],
+                expires_at_utc=expires_at_utc,
+            )
+
+        def objects_in_place() -> bool:
+            """True when the lease would still hold an object that exists."""
+            return bool(carried_entries) or any(
+                item.ownership_recorded and not item.released for item in members
+            )
+
+        def hold_lease() -> None:
+            """Leave the lease open with the objects that exist, bounded from now."""
+            held_at = datetime.now(timezone.utc)
+            for item in members:
+                if item.ownership_recorded and not item.released:
+                    item.state.setdefault("held_since_utc", held_at.isoformat())
+                else:
+                    # Never built, or settled as not there: the hold does not list it.
+                    item.released = True
+            update_lease(
+                "active",
+                {HOLD_FLAG: True, "hold_state": "idle", "hold_minutes": lease_minutes},
+                expires_at_utc=(held_at + timedelta(minutes=lease_minutes)).isoformat(),
             )
 
         async def record_observed_index(
@@ -10873,7 +11510,11 @@ class AzureSqlMcpApplication:
                 raise RuntimeError("Temporary index lease was not created.")
             await self._verify_pending_index_ownership(
                 database_name,
-                self._index_lease_members(lease)[members.index(member)],
+                next(
+                    view
+                    for view in self._index_lease_members(lease)
+                    if view["index_name"] == member.index_name
+                ),
                 observed_index,
                 lease_owner,
             )
@@ -10944,7 +11585,7 @@ class AzureSqlMcpApplication:
                 # cleanup below; the lease closes there.
                 update_lease(
                     str(lease["status"])
-                    if any(other.ownership_recorded for other in members)
+                    if carried_entries or any(other.ownership_recorded for other in members)
                     else "cleaned",
                     {
                         "cleaned_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -11101,21 +11742,31 @@ class AzureSqlMcpApplication:
                 member,
             ) is not None:
                 raise RuntimeError("Temporary index removal was not verified.")
-            if is_set:
+            if lease_as_set:
                 member.state["cleaned_at_utc"] = datetime.now(timezone.utc).isoformat()
+            # A lease that holds objects lists only what still exists.
+            member.released = hold_mode
 
         async def measure(measurement: dict[str, Any], phase_name: str) -> Any:
             """One charged execution of a case, kept under ``phase_name``."""
             nonlocal measured_executions
             self._require_tuning_session_time(session_id)
+            clock.require("candidate_measure" if phase_name == "candidate" else phase_name)
             measured_executions += 1
-            profiled = await self.performance_workflows._profile_execution_contract(
-                database_name,
-                measurement[
-                    "candidate_contract" if phase_name == "candidate" else "execution_contract"
-                ],
-                max_result_rows=self.config.comparison_row_limit,
-            )
+            run_started = clock.start()
+            try:
+                profiled = await self.performance_workflows._profile_execution_contract(
+                    database_name,
+                    measurement[
+                        "candidate_contract" if phase_name == "candidate" else "execution_contract"
+                    ],
+                    max_result_rows=self.config.comparison_row_limit,
+                )
+            finally:
+                clock.add(
+                    "candidate_runs" if phase_name == "candidate" else "baseline_runs",
+                    run_started,
+                )
             if profiled.user_query_executions != 1:
                 raise RuntimeError(
                     "Profiled samples must execute the user query exactly once."
@@ -11143,9 +11794,11 @@ class AzureSqlMcpApplication:
             """Measure one arm of one case; its first run sets how many runs it gets."""
             nonlocal arms_left
             await measure(measurement, phase_name)
-            remaining_seconds = self._require_tuning_session_time(session_id)
+            first_seconds = _sample_seconds(measurement[f"{phase_name}_samples"][0])
+            # The session time and the cap of the call both bound the arm.
+            remaining_seconds = min(self._require_tuning_session_time(session_id), clock.left())
             count = adaptive_run_count(
-                _sample_seconds(measurement[f"{phase_name}_samples"][0]),
+                first_seconds,
                 runs,
                 seconds_available=(
                     remaining_seconds / max(1, arms_left)
@@ -11153,10 +11806,190 @@ class AzureSqlMcpApplication:
                     else None
                 ),
             )
+            if (
+                phase_name == "baseline_before"
+                and count > 1
+                and first_seconds >= FAST_STATEMENT_SECONDS
+            ):
+                # A statement of seconds runs once before the build. The first
+                # candidate run decides whether its other runs are needed;
+                # they then follow the drop.
+                measurement["baseline_runs_after"] = count
+                count = 1
+            if phase_name == "candidate":
+                baseline_seconds = (
+                    _sample_seconds(measurement["baseline_before_samples"][0])
+                    if measurement["baseline_before_samples"]
+                    else measurement["slow_seconds"]
+                )
+                if baseline_seconds is not None and decisive_first_runs(
+                    baseline_seconds, first_seconds
+                ):
+                    measurement["decisive"] = True
+                    measurement["decisive_seconds"] = (baseline_seconds, first_seconds)
+                    count = 1
             for _ in range(count - 1):
                 await measure(measurement, phase_name)
             measurement["runs"][phase_name] = count
             arms_left -= 1
+
+        async def build_member(member: _IndexSetMember, create_options: dict[str, Any]) -> None:
+            """Build one index. A build that lost a deadlock or a lock wait gets one more try."""
+            nonlocal create_failure
+            build_started = clock.start()
+            try:
+                for attempt in (0, 1):
+                    try:
+                        await self._create_test_index(
+                            database_name,
+                            member.schema,
+                            member.table,
+                            member.index_name,
+                            member.key_columns,
+                            member.include_columns,
+                            member.online,
+                            dry_run=False,
+                            workflow_managed=True,
+                            filter_definition=member.filter_definition,
+                            is_unique=member.is_unique,
+                            idempotency_key=(
+                                member_operation_key(
+                                    "index-benchmark-create-retry-key", members.index(member)
+                                )
+                                if attempt
+                                else member.create_key
+                            ),
+                            ownership_proof=lease_owner,
+                            **create_options,
+                        )
+                        if attempt:
+                            build_retries[-1]["succeeded"] = True
+                        break
+                    except Exception as create_error:
+                        create_failure = classify_create_index_failure(create_error)
+                        transient = (
+                            create_failure["outcome"] == "definite_rollback"
+                            and create_failure["error_number"] in TRANSIENT_BUILD_ERRORS
+                        )
+                        if transient:
+                            create_failure["transient"] = True
+                        if (
+                            transient
+                            and attempt == 0
+                            and member_index(
+                                await collect_existing_indexes(
+                                    self.executor,
+                                    database_name,
+                                    schema_name=member.schema,
+                                    table_name=member.table,
+                                ),
+                                member,
+                            )
+                            is None
+                        ):
+                            # The build lost a deadlock or a lock wait to
+                            # another session and rolled back: one more try.
+                            build_retries.append(
+                                {
+                                    "index_name": member.index_name,
+                                    "error_number": create_failure["error_number"],
+                                    "reason": create_failure["reason"],
+                                    "retried": True,
+                                    "succeeded": False,
+                                }
+                            )
+                            create_failure = None
+                            continue
+                        if create_failure["outcome"] == "definite_rollback":
+                            # The engine reported the error and XACT_ABORT rolled the
+                            # CREATE transaction back: no index exists, nothing to clean.
+                            member.create_outcome_settled = True
+                        if is_set:
+                            create_failure["index_name"] = member.index_name
+                        raise
+            finally:
+                clock.add("build", build_started)
+
+        def lease_status() -> str:
+            if lease is None:
+                raise RuntimeError("Temporary index lease was not created.")
+            return str(lease["status"])
+
+        async def settle_test_objects() -> None:
+            """Drop what this call must not leave, or hold it, and record the lease state."""
+            nonlocal cancelled, cleanup_error, cleanup_failure
+            owned_members = [member for member in members if member.ownership_recorded]
+            # An index whose create outcome is unknown keeps the lease open even
+            # when every other index of the set was dropped.
+            left_behind = any(member.left_behind for member in members)
+            # keep_for_session leaves the whole set in place. A set that was not
+            # built in full is not kept: what this call built of it is dropped.
+            if not keep_for_session:
+                drop_members = owned_members
+            elif len(owned_members) == len(members) and not left_behind:
+                drop_members = []
+            else:
+                drop_members = [member for member in owned_members if not member.reused]
+            if drop_members:
+                try:
+                    if not left_behind:
+                        update_lease("cleanup_pending")
+                    drop_errors: list[Exception] = []
+                    cleanup_started = clock.start()
+                    try:
+                        for member in reversed(drop_members):
+                            try:
+                                await drop_owned_member(member)
+                            except Exception as drop_error:
+                                # The other indexes of the set are still dropped.
+                                drop_errors.append(drop_error)
+                    finally:
+                        clock.add("cleanup", cleanup_started)
+                    if drop_errors:
+                        raise drop_errors[0]
+                    if left_behind:
+                        update_lease("cleanup_required")
+                    elif hold_mode and objects_in_place():
+                        hold_lease()
+                    else:
+                        update_lease(
+                            "cleaned",
+                            {"cleaned_at_utc": datetime.now(timezone.utc).isoformat()},
+                        )
+                except asyncio.CancelledError:
+                    cancelled = True
+                    cleanup_error = "cancelled"
+                    try:
+                        update_lease(
+                            "cleanup_required",
+                            {
+                                "cleanup_error_type": "cancelled",
+                                "cleanup_policy": "retry_only_with_observed_ownership",
+                            },
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Unable to persist cancellation during temporary-index cleanup",
+                            extra={"lease_id": lease_id},
+                        )
+                except Exception as exc:
+                    cleanup_error = type(exc).__name__
+                    cleanup_failure = _index_experiment_failure(
+                        exc,
+                        step="drop_index",
+                        query_timeout_seconds=self.config.query_timeout_seconds,
+                    )
+                    update_lease("cleanup_required", {"cleanup_error_type": cleanup_error})
+            elif hold_mode and objects_in_place() and lease_status() != "cleanup_required":
+                try:
+                    hold_lease()
+                except Exception as exc:
+                    # The lease stays open as it is; its expiry still bounds it.
+                    note_exception(exc, "server.index_benchmark_hold")
+                    cleanup_error = type(exc).__name__
+            elif benchmark_error:
+                if lease_status() not in {"cleanup_required", "cleaned"}:
+                    update_lease("create_failed", {"failure_type": benchmark_error})
 
         try:
             for measurement in measurements:
@@ -11176,7 +12009,19 @@ class AzureSqlMcpApplication:
             self._require_tuning_session_time(session_id)
             if lease is None:
                 raise RuntimeError("Temporary index lease was not created.")
+            to_build = [member for member in members if not member.reused]
+            if to_build:
+                clock.require("create_index")
+            if to_build and max_call_seconds is not None:
+                build_estimate = await self._build_time_estimate(
+                    database_name, session_id, to_build
+                )
+                if (build_estimate["estimated_seconds"] or 0.0) > clock.left():
+                    # Not started: a build cannot be stopped half way for free.
+                    raise _CallTimeCap("create_index")
             for member in members:
+                if member.reused:
+                    continue
                 if member is not members[0]:
                     self._require_tuning_session_time(session_id)
                 update_lease(
@@ -11199,32 +12044,7 @@ class AzureSqlMcpApplication:
                     create_options["index_kind"] = member.candidate.index_kind
                 if member.table_facts.has_clustered_columnstore_index or member.table_facts.placement():
                     create_options["table_facts"] = member.table_facts
-                try:
-                    await self._create_test_index(
-                        database_name,
-                        member.schema,
-                        member.table,
-                        member.index_name,
-                        member.key_columns,
-                        member.include_columns,
-                        member.online,
-                        dry_run=False,
-                        workflow_managed=True,
-                        filter_definition=member.filter_definition,
-                        is_unique=member.is_unique,
-                        idempotency_key=member.create_key,
-                        ownership_proof=lease_owner,
-                        **create_options,
-                    )
-                except Exception as create_error:
-                    create_failure = classify_create_index_failure(create_error)
-                    if create_failure["outcome"] == "definite_rollback":
-                        # The engine reported the error and XACT_ABORT rolled the
-                        # CREATE transaction back: no index exists, nothing to clean.
-                        member.create_outcome_settled = True
-                    if is_set:
-                        create_failure["index_name"] = member.index_name
-                    raise
+                await build_member(member, create_options)
                 step = "verify_created_index"
                 observed_index = member_index(
                     await collect_existing_indexes(
@@ -11254,24 +12074,39 @@ class AzureSqlMcpApplication:
             if compare_results:
                 step = "compare_results"
                 for measurement in measurements:
-                    remaining_seconds = self._require_tuning_session_time(session_id)
+                    clock.require("compare_results")
+                    remaining_seconds = min(
+                        self._require_tuning_session_time(session_id), clock.left()
+                    )
                     # Charged before the await: a timeout can follow an execution.
                     measured_executions += 2
-                    comparison = await self.performance_workflows._compare_execution_contracts(
-                        database_name,
-                        measurement["execution_contract"],
-                        measurement["candidate_contract"],
-                        compare_order=compare_order,
-                        before_dispatch=lambda: self._require_tuning_session_time(session_id),
-                        # The session time left is the cap of the comparison.
-                        max_seconds=(
-                            remaining_seconds if math.isfinite(remaining_seconds) else None
-                        ),
-                    )
+                    compare_started = clock.start()
+                    try:
+                        comparison = await self.performance_workflows._compare_execution_contracts(
+                            database_name,
+                            measurement["execution_contract"],
+                            measurement["candidate_contract"],
+                            compare_order=compare_order,
+                            before_dispatch=lambda: self._require_tuning_session_time(session_id),
+                            # The session time left, or the cap of the call, caps it.
+                            max_seconds=(
+                                remaining_seconds if math.isfinite(remaining_seconds) else None
+                            ),
+                        )
+                    finally:
+                        clock.add("comparison", compare_started)
                     measured_executions -= 2 - int(comparison.get("executions", 0))
                     if "rows_match" in comparison:
-                        label_comparison(comparison, tested_gaps, compare_order)
+                        label_comparison(
+                            comparison,
+                            tested_gaps,
+                            compare_order,
+                            order_removed=order_contract_removed(equivalence_preflight),
+                        )
                     measurement["snapshot_comparison"] = comparison
+        except _CallTimeCap as cap:
+            benchmark_error = "call_time_cap"
+            benchmark_failure_diagnostic = clock.cap_diagnostic(str(cap))
         except asyncio.CancelledError:
             benchmark_error = "timeout"
             benchmark_failure_diagnostic = {
@@ -11329,67 +12164,29 @@ class AzureSqlMcpApplication:
                     extra={"lease_id": lease_id},
                 )
         finally:
-            owned_members = [member for member in members if member.ownership_recorded]
-            # An index whose create outcome is unknown keeps the lease open even
-            # when every other index of the set was dropped.
-            left_behind = any(member.left_behind for member in members)
-            if owned_members:
-                try:
-                    if not left_behind:
-                        update_lease("cleanup_pending")
-                    drop_errors: list[Exception] = []
-                    for member in reversed(owned_members):
-                        try:
-                            await drop_owned_member(member)
-                        except Exception as drop_error:
-                            # The other indexes of the set are still dropped.
-                            drop_errors.append(drop_error)
-                    if drop_errors:
-                        raise drop_errors[0]
-                    if left_behind:
-                        update_lease("cleanup_required")
-                    else:
-                        update_lease(
-                            "cleaned",
-                            {"cleaned_at_utc": datetime.now(timezone.utc).isoformat()},
-                        )
-                except asyncio.CancelledError:
-                    cancelled = True
-                    cleanup_error = "cancelled"
-                    try:
-                        update_lease(
-                            "cleanup_required",
-                            {
-                                "cleanup_error_type": "cancelled",
-                                "cleanup_policy": "retry_only_with_observed_ownership",
-                            },
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Unable to persist cancellation during temporary-index cleanup",
-                            extra={"lease_id": lease_id},
-                        )
-                except Exception as exc:
-                    cleanup_error = type(exc).__name__
-                    cleanup_failure = _index_experiment_failure(
-                        exc,
-                        step="drop_index",
-                        query_timeout_seconds=self.config.query_timeout_seconds,
-                    )
-                    update_lease("cleanup_required", {"cleanup_error_type": cleanup_error})
-            elif benchmark_error:
-                if lease["status"] not in {"cleanup_required", "cleaned"}:
-                    update_lease("create_failed", {"failure_type": benchmark_error})
+            await settle_test_objects()
+        # True when test objects of the session are still in place: no
+        # statement can then run as a clean baseline.
+        objects_remain = hold_mode and lease["status"] == "active"
 
         if not cleanup_error and not benchmark_error and lease["status"] == "cleaned":
             try:
                 for measurement in measurements:
-                    if measurement["slow_seconds"] is not None:
+                    if measurement["slow_seconds"] is not None or measurement["decisive"]:
                         continue
-                    # As many runs as before the build: both halves of the baseline.
-                    for _ in range(measurement["runs"]["baseline_before"]):
+                    # As many runs as before the build: both halves of the
+                    # baseline. A baseline of seconds ran once before it; the
+                    # runs it still needs follow here.
+                    after_runs = (
+                        measurement["baseline_runs_after"]
+                        or measurement["runs"]["baseline_before"]
+                    )
+                    for _ in range(after_runs):
                         await measure(measurement, "baseline_after")
-                    measurement["runs"]["baseline_after"] = measurement["runs"]["baseline_before"]
+                    measurement["runs"]["baseline_after"] = after_runs
+            except _CallTimeCap as cap:
+                benchmark_error = "call_time_cap"
+                benchmark_failure_diagnostic = clock.cap_diagnostic(str(cap))
             except asyncio.CancelledError:
                 benchmark_error = "timeout"
                 benchmark_failure_diagnostic = {
@@ -11436,14 +12233,20 @@ class AzureSqlMcpApplication:
                 *measurement["baseline_after_results"],
             ]
             # A slow baseline has one result, and none after the index is dropped.
+            # While held objects remain, no run follows a drop either.
             expected_counts = (
                 (len(baseline_results) == 1, len(measurement["baseline_after_results"]) == 0)
                 if slow
                 else (
                     0 < len(baseline_results) == measurement["runs"]["baseline_before"],
-                    len(measurement["baseline_after_results"])
-                    == measurement["runs"]["baseline_after"]
-                    == measurement["runs"]["baseline_before"],
+                    len(measurement["baseline_after_results"]) == 0,
+                )
+                if objects_remain or measurement["decisive"]
+                else (
+                    0 < len(baseline_results) == measurement["runs"]["baseline_before"],
+                    0
+                    < len(measurement["baseline_after_results"])
+                    == measurement["runs"]["baseline_after"],
                 )
             )
             complete_results = (
@@ -11488,8 +12291,17 @@ class AzureSqlMcpApplication:
                     "basis": (
                         ("the SQL with only an index hint added" if hinted else "unchanged SQL")
                         + (
-                            " plus result stability against the one baseline run of the session"
+                            " plus result stability against the baseline this session "
+                            "measured before the held test objects were built"
+                            if pooled is not None and pooled.get("before_hold")
+                            else " plus result stability against the one baseline run of the session"
                             if slow
+                            else " plus result stability against the baseline runs before "
+                            "the build (the test objects are kept, so no run follows a drop)"
+                            if objects_remain
+                            else " plus result stability against the one baseline run before "
+                            "the build (a large gain is decided by one run of each side)"
+                            if measurement["decisive"]
                             else " plus complete A-B-A result stability"
                         )
                     ),
@@ -11500,10 +12312,11 @@ class AzureSqlMcpApplication:
 
         parameter_results: list[dict[str, Any]] = []
         slow_baselines_kept: dict[str, Any] = {}
+        baselines_before_hold_kept: dict[str, Any] = {}
         for measurement in measurements:
             pooled = measurement["pooled_baseline"]
             baseline_samples = (
-                [dict(pooled["sample"])]
+                [dict(sample) for sample in pooled.get("samples") or [pooled["sample"]]]
                 if pooled is not None
                 else [
                     *measurement["baseline_before_samples"],
@@ -11534,7 +12347,54 @@ class AzureSqlMcpApplication:
             if measurement["runs"]["candidate"] == 1:
                 # Ran once by rule (slow, runs=1 or the time left): the 2x rule applies.
                 parameter_result["candidate_single_sample"] = True
-            if measurement["slow_seconds"] is not None:
+            if len(baseline_samples) == 1 and (measurement["decisive"] or objects_remain):
+                # One baseline run by rule: the 2x rule applies to it too.
+                parameter_result["baseline_single_sample"] = True
+            if measurement["decisive"]:
+                parameter_result["run_rule"] = _DECISIVE_RUN_RULE
+                parameter_result["run_rule_note"] = _decisive_run_note(
+                    *measurement["decisive_seconds"]
+                )
+            if (
+                keep_for_session
+                and pooled is None
+                and measurement["baseline_before_samples"]
+                and all(
+                    item.get("complete") is True
+                    for item in measurement["baseline_before_results"]
+                )
+            ):
+                # Measured with no test object in place: the baseline of every
+                # later call of the session while the objects of this one are held.
+                baselines_before_hold_kept[str(measurement["parameter_case"])] = {
+                    "sample": measurement["baseline_before_samples"][0],
+                    "samples": list(measurement["baseline_before_samples"]),
+                    "result": measurement["baseline_before_results"][0],
+                    "plan": parameter_result["plan_delta"]["baseline"],
+                    "order_compared": compare_order,
+                    "plan_reuse": plan_reuse,
+                    "case_order": [str(item["parameter_case"]) for item in measurements],
+                    "sql_fingerprint": fingerprint_json({"baseline_sql": normalized_sql}),
+                }
+            if pooled is not None and pooled.get("before_hold"):
+                parameter_result["baseline_single_sample"] = len(baseline_samples) == 1
+                parameter_result["baseline_source"] = "session_before_hold"
+                parameter_result["baseline_evidence_id"] = pooled["evidence_id"]
+                parameter_result["baseline_note"] = (
+                    "baseline measured earlier in this session, before the held test "
+                    "objects were built. It was not run again: the statement cannot "
+                    "run clean while they exist."
+                )
+                delta = parameter_result["plan_delta"]
+                if delta["baseline"] is None and isinstance(pooled.get("plan"), Mapping):
+                    delta["baseline"] = dict(pooled["plan"])
+                    delta["plan_changed"] = (
+                        delta["baseline"].get("plan_fingerprint")
+                        != delta["candidate"]["plan_fingerprint"]
+                        if delta["candidate"] is not None
+                        else None
+                    )
+            elif measurement["slow_seconds"] is not None:
                 parameter_result["baseline_single_sample"] = len(baseline_samples) == 1
                 parameter_result["baseline_source"] = (
                     "session_single_run" if pooled is not None else "single_run"
@@ -11579,6 +12439,13 @@ class AzureSqlMcpApplication:
             state, reason = (
                 "cleanup_required",
                 "benchmark completed but the temporary index could not be removed",
+            )
+        elif benchmark_error == "call_time_cap" and benchmark_failure_diagnostic is not None:
+            state, reason = (
+                "inconclusive",
+                _call_cap_reason(
+                    clock, str(benchmark_failure_diagnostic["failed_step"]), objects_remain
+                ),
             )
         elif benchmark_error or not all(
             measurement["candidate_samples"] for measurement in measurements
@@ -11708,6 +12575,11 @@ class AzureSqlMcpApplication:
             for measurement in measurements
             if measurement["candidate_plan"]
         ]
+        test_objects = _index_test_objects(
+            members, lease, lease_entries() if objects_remain else []
+        )
+        time_spent = clock.report()
+        build_rate = None if build_retries else _build_rate(members, clock.seconds["build"])
         # What finalize_tuning_session needs to state how far the rewrite is proven.
         rewrite_evidence: dict[str, Any] = {}
         if normalized_rewrite is not None:
@@ -11752,6 +12624,11 @@ class AzureSqlMcpApplication:
                     "decision_basis": COMPARISON_DECISION_BASIS,
                     "parameter_results": parameter_results,
                     **({"slow_baselines": slow_baselines_kept} if slow_baselines_kept else {}),
+                    **(
+                        {"baselines_before_hold": baselines_before_hold_kept}
+                        if baselines_before_hold_kept
+                        else {}
+                    ),
                 },
                 metadata={
                     "session_id": session_id,
@@ -11760,6 +12637,13 @@ class AzureSqlMcpApplication:
                         parameter_case_receipt(parameter_case)
                         for parameter_case in cases
                     ],
+                    "test_objects": test_objects,
+                    "time_spent": time_spent,
+                    **(
+                        {"build_rate_rows_per_second": build_rate}
+                        if build_rate is not None
+                        else {}
+                    ),
                     "lease_id": lease_id,
                     "lease_status": lease["status"],
                     "index_definition_fingerprint": object_fingerprint,
@@ -11871,8 +12755,18 @@ class AzureSqlMcpApplication:
             "index_ddl": index_ddl,
             "rollback_ddl": rollback_ddl,
             "plan_reuse": plan_reuse,
+            "test_objects": test_objects,
+            "time_spent": time_spent,
             "session_continues": True,
         }
+        if benchmark_error == "call_time_cap":
+            result["partial"] = True
+        if build_estimate is not None:
+            result["build_estimate"] = build_estimate
+        if build_rate is not None:
+            result["build_rate_rows_per_second"] = build_rate
+        if build_retries:
+            result["build_retries"] = build_retries
         if any(member.table_facts.data_space is not None for member in members):
             result["non_aligned_index_warning"] = NON_ALIGNED_INDEX_WARNING
         if normalized_rewrite is not None:
@@ -11942,8 +12836,30 @@ class AzureSqlMcpApplication:
         lease_minutes: int = 30,
         idempotency_key: str | None = None,
         preview: bool = False,
+        keep_for_session: bool = False,
+        max_call_seconds: float | None = None,
+        plan_reuse: str = "per_case",
+        slow_baseline_cases: Mapping[str, float] | None = None,
     ) -> dict[str, Any]:
         """Measure a statement against a leased indexed view built for it.
+
+        ``plan_reuse`` and ``slow_baseline_cases`` are those of
+        benchmark_index_candidate: ``first_case`` gives all parameter cases
+        one statement text, so the later cases run on the plan of the first;
+        a baseline declared slow runs once in the session, whichever
+        benchmark tool measures it first. A replayed idempotency key returns
+        the stored result and runs nothing.
+
+        ``max_call_seconds`` caps the call: no run and no build starts after
+        it, and the result is then ``partial`` with no verdict. A build that
+        lost a deadlock or a lock wait is retried once. ``time_spent`` in
+        the result is the seconds per phase.
+
+        ``keep_for_session`` leaves the view in place under the lease of the
+        session when the call returns, for at most ``lease_minutes``: a later
+        call with the same view definition reuses it without a build, and
+        compare_query_results and explain_query can read it meanwhile.
+        finalize_tuning_session drops it.
 
         The original statement (``sql``, the statement of the performance
         case) runs before the build and after the drop. One lease then builds
@@ -11960,12 +12876,15 @@ class AzureSqlMcpApplication:
         """
 
         self._require_test_index_database(database_name)
+        clock = _CallClock(max_call_seconds)
         policy = self.database_policy.require(database_name)
         require_view_experiment_policy(policy)
         if phase not in {"screening", "finalist"}:
             raise ValueError("phase must be screening or finalist.")
         if read_mode not in {READ_MODE_NOEXPAND, READ_MODE_AUTOMATIC}:
             raise ValueError("read_mode must be noexpand or automatic.")
+        if plan_reuse not in {"per_case", "first_case"}:
+            raise ValueError("plan_reuse must be per_case or first_case.")
         name_prefix, name_tag = self._resolve_test_index_prefix(policy, index_name_prefix)
         allowed_prefixes = self._allowed_test_index_prefixes(policy)
         if len(extra_indexes or ()) > MAX_VIEW_EXTRA_INDEXES:
@@ -12071,14 +12990,48 @@ class AzureSqlMcpApplication:
         findings = view_candidate_findings(measured, plan, read_mode=read_mode)
         if any(finding.severity == "error" for finding in findings) or (not noexpand and findings):
             raise refuse(findings)
-        blocker = name_in_use_blocker(
-            plan,
-            await read_view_catalog_state(
-                self.executor, database_name, schema_name=plan.schema, view_name=plan.view_name
-            ),
+        # Before the hold is read: an expired hold is dropped here, not reused.
+        cleanup = await self._cleanup_expired_index_leases(
+            database_fingerprint=case.database_fingerprint
         )
-        if blocker is not None:
-            raise ValueError(blocker)
+        if cleanup["cleanup_required"]:
+            return {
+                "session_id": session_id,
+                "candidate_id": candidate_id,
+                "classification": "cleanup_required",
+                "reason": (
+                    "Expired test object cleanup is unresolved in this database; "
+                    "no DDL or benchmark query was dispatched."
+                ),
+                "failure_code": "expired_index_cleanup_required",
+                "executions": 0,
+                "cleanup": cleanup,
+                "session_continues": False,
+            }
+        # Test objects an earlier call of this session left in place.
+        hold = self._session_hold(case.database_fingerprint or "", session_id)
+        held_entries: list[dict[str, Any]] = (
+            [dict(entry) for entry in hold["metadata"]["members"]] if hold is not None else []
+        )
+        held_view = next(
+            (
+                entry
+                for entry in held_entries
+                if entry.get("object_kind") == LEASE_OBJECT_KIND
+                and entry.get("object_fingerprint") == plan.definition_fingerprint
+            ),
+            None,
+        )
+        hold_mode = keep_for_session or hold is not None
+        if held_view is None:
+            blocker = name_in_use_blocker(
+                plan,
+                await read_view_catalog_state(
+                    self.executor, database_name, schema_name=plan.schema, view_name=plan.view_name
+                ),
+            )
+            if blocker is not None:
+                raise ValueError(blocker)
         option_rows = await self.executor.fetch_all(
             database_name, SESSION_SET_OPTIONS_SQL, sql_origin="server_built"
         )
@@ -12126,17 +13079,15 @@ class AzureSqlMcpApplication:
             ).as_dict()
             # For the ORDER BY contract the view is read as its definition, so
             # a column of the view is the base column it copies.
-            contract_sql = (
-                None
-                if plan.definition.column_list
-                else inline_relation(
-                    measured, plan.schema, plan.view_name, plan.definition.body
-                )
-            ) or measured
             equivalence_preflight = with_order_contract(
                 {"baseline": equivalence_preflight, "candidate": candidate_preflight},
                 original,
-                contract_sql,
+                measured,
+                candidate_relation=(
+                    None
+                    if plan.definition.column_list
+                    else (plan.schema, plan.view_name, plan.definition.body)
+                ),
             )
             direct_snapshot_supported = all(
                 bool(side["direct_snapshot_supported"]) for side in equivalence_preflight.values()
@@ -12177,28 +13128,35 @@ class AzureSqlMcpApplication:
             runs = default_runs
         elif not 1 <= runs <= default_runs:
             raise ValueError(f"runs must be between 1 and the {phase} limit of {default_runs}.")
-        requested_executions = len(cases) * runs * INDEX_ABA_PHASES + (
-            2 * len(cases) if compare_results else 0
+        case_names = [str(item["name"]) for item in cases]
+        slow_cases = self._slow_baseline_seconds(slow_baseline_cases, cases)
+        # A baseline too slow to repeat runs once in the session, whichever
+        # benchmark tool ran it. Only a statement on its own plan is pooled.
+        pooled_baselines = (
+            self._session_slow_index_baselines(session_id, compare_order)
+            if plan_reuse == "per_case"
+            else {}
         )
+        if held_entries:
+            pooled_baselines = self._require_baselines_before_hold(
+                session_id,
+                original,
+                compare_order,
+                plan_reuse,
+                case_names,
+                held_entries,
+                pooled_baselines,
+            )
+        requested_executions = sum(
+            runs
+            if name in pooled_baselines
+            else runs + 1
+            if name in slow_cases
+            else runs * INDEX_ABA_PHASES
+            for name in case_names
+        ) + (2 * len(cases) if compare_results else 0)
         if not policy.can_benchmark(requested_executions):
             raise PermissionError("Database policy does not permit this benchmark count.")
-        cleanup = await self._cleanup_expired_index_leases(
-            database_fingerprint=case.database_fingerprint
-        )
-        if cleanup["cleanup_required"]:
-            return {
-                "session_id": session_id,
-                "candidate_id": candidate_id,
-                "classification": "cleanup_required",
-                "reason": (
-                    "Expired test object cleanup is unresolved in this database; "
-                    "no DDL or benchmark query was dispatched."
-                ),
-                "failure_code": "expired_index_cleanup_required",
-                "executions": 0,
-                "cleanup": cleanup,
-                "session_continues": False,
-            }
         owner_fingerprint = fingerprint_json(
             {
                 "session_id": session_id,
@@ -12210,6 +13168,26 @@ class AzureSqlMcpApplication:
         execution_owner = f"view-execution-{owner_fingerprint[:32]}"
         lease_owner = f"index-lease-{owner_fingerprint[:32]}"
         lease_id = f"lease-{fingerprint_json({'view': owner_fingerprint})[:32]}"
+        if hold is not None:
+            # The session has one lease; this call works under it and its owner token.
+            lease_id = str(hold["lease_id"])
+            lease_owner = str(hold["metadata"]["lease_owner_fence"])
+        # What the lease lists for the view, and the held objects this call leaves alone.
+        view_entry: dict[str, Any] = (
+            held_view
+            if held_view is not None
+            else {
+                **plan.lease_metadata(),
+                "index_name": str(plan.clustered_index.index_name),
+                "object_fingerprint": plan.definition_fingerprint,
+            }
+        )
+        carried_entries = [entry for entry in held_entries if entry is not held_view]
+        view_listed = True
+
+        def lease_entries() -> list[dict[str, Any]]:
+            return [*carried_entries, *([dict(view_entry)] if view_listed else [])]
+
         request_fingerprint = fingerprint_json(
             {
                 "operation": "indexed-view-benchmark-v1",
@@ -12224,9 +13202,20 @@ class AzureSqlMcpApplication:
                 "parameter_cases": supplied,
                 "runs": runs,
                 "compare_order": compare_order,
+                **({"keep_for_session": True} if keep_for_session else {}),
+                **({"plan_reuse": plan_reuse} if plan_reuse != "per_case" else {}),
+                **({"slow_baseline_cases": dict(slow_cases)} if slow_cases else {}),
             }
         )
         operation_key = fingerprint_json({"operation": "indexed-view-result", "key": idempotency_key})
+        evidence_key = fingerprint_json(
+            {"operation": "indexed-view-evidence", "key": idempotency_key}
+        )
+
+        def plan_identity(name: Any) -> str:
+            # One text for all cases: the first case compiles, the others reuse.
+            return str(name) if plan_reuse == "per_case" else "shared-plan"
+
         replay = {
             "session_id": session_id,
             "candidate_id": candidate_id,
@@ -12240,6 +13229,54 @@ class AzureSqlMcpApplication:
             "replayed": True,
             "session_continues": True,
         }
+
+        def stored_result() -> dict[str, Any]:
+            """The committed result of this key; the notice when none was committed."""
+            evidence = self.performance_store.get_idempotent_evidence(
+                evidence_key, request_fingerprint=request_fingerprint
+            )
+            if evidence is None:
+                return replay
+            stored = dict(evidence.metadata)
+            metrics = dict(evidence.metrics)
+            stored_lease = self.performance_store.get_index_lease(str(stored.get("lease_id")))
+            result: dict[str, Any] = {
+                "session_id": session_id,
+                "candidate_id": candidate_id,
+                "experiment": "indexed_view",
+                "read_mode": read_mode,
+                "plan_reuse": plan_reuse,
+                "classification": metrics.get("classification"),
+                "performance_classification": metrics.get("performance_classification"),
+                "objective": metrics.get("objective"),
+                "decision_basis": metrics.get("decision_basis"),
+                "durable_state": candidate.state,
+                "reason": stored.get("reason"),
+                "phase": phase,
+                "executions": int(evidence.observed_execution_count),
+                "parameter_results": metrics.get("parameter_results") or [],
+                "equivalence": stored.get("equivalence") or [],
+                "equivalence_preflight": stored.get("equivalence_preflight"),
+                "equivalence_deferred": stored.get("equivalence_deferred"),
+                "proof_scope": stored.get("proof_scope"),
+                "evidence_id": evidence.evidence_id,
+                "lease": self._public_index_lease(stored_lease),
+                "view": {
+                    key: value for key, value in plan.as_dict().items() if key != "findings" or value
+                },
+                "built": (stored.get("view") or {}).get("built"),
+                "verification": stored.get("verification"),
+                "test_objects": stored.get("test_objects"),
+                "time_spent": stored.get("time_spent"),
+                "session_continues": stored_lease["status"] != "cleanup_required",
+                "plan_controls_not_applied": True,
+                "replayed": True,
+                "recovered_from_durable_evidence": True,
+            }
+            if isinstance(stored.get("failure_diagnostic"), Mapping):
+                result["failure_diagnostic"] = dict(stored["failure_diagnostic"])
+            return result
+
         if (
             self.performance_store.get_idempotent_execution_reservation(
                 session_id,
@@ -12250,7 +13287,7 @@ class AzureSqlMcpApplication:
             )
             is not None
         ):
-            return replay
+            return stored_result()
         if candidate.is_terminal or (candidate.screen_runs if phase == "screening" else candidate.finalist_runs):
             raise ValueError(f"This candidate already has a {phase} result; add a new candidate.")
         bound_cases = [
@@ -12260,13 +13297,19 @@ class AzureSqlMcpApplication:
                 "fingerprint": parameter_case_fingerprint(item),
                 "execution_contract": await self.performance_workflows._bind_case(
                     database_name,
-                    mark_benchmark_sql(original, session_id, "view", candidate_id, str(item["name"])),
+                    mark_benchmark_sql(
+                        original, session_id, "view", candidate_id, plan_identity(item["name"])
+                    ),
                     item,
                 ),
                 "candidate_contract": await self.performance_workflows._bind_case(
                     database_name,
                     mark_benchmark_sql(
-                        measured, session_id, "view-candidate", candidate_id, str(item["name"])
+                        measured,
+                        session_id,
+                        "view-candidate",
+                        candidate_id,
+                        plan_identity(item["name"]),
                     ),
                     item,
                 ),
@@ -12283,7 +13326,7 @@ class AzureSqlMcpApplication:
             owner_reference=execution_owner,
         )
         if reservation["status"] != "reserved" or reservation.get("replayed") is True:
-            return replay
+            return stored_result()
         create_sql = build_view_experiment_create_batch(plan)
         drop_sql = build_test_view_drop_batch(
             plan.schema, plan.view_name, test_index_name_prefixes=allowed_prefixes
@@ -12291,29 +13334,44 @@ class AzureSqlMcpApplication:
         create_params, _drop_params = view_experiment_batch_params(plan, lease_owner)
         try:
             remaining = self._require_tuning_session_time(session_id)
-            lease: dict[str, Any] = self.performance_store.create_index_lease(
-                lease_id=lease_id,
-                database_fingerprint=case.database_fingerprint or "",
-                session_id=session_id,
-                candidate_id=candidate_id,
-                index_name=str(plan.clustered_index.index_name),
-                object_fingerprint=plan.definition_fingerprint,
-                expires_at_utc=(
-                    datetime.now(timezone.utc)
-                    + timedelta(
-                        minutes=max(lease_minutes, int(remaining / 60) + 2)
-                        if math.isfinite(remaining)
-                        else lease_minutes
-                    )
-                ).isoformat(),
-                metadata={
-                    **plan.lease_metadata(),
-                    "phase": phase,
-                    "lease_owner_fence": lease_owner,
-                    "sql_persisted": False,
-                },
-                owner_reference=lease_owner,
-                request_fingerprint=fingerprint_json({"lease_id": lease_id, "key": idempotency_key}),
+            lease_expires_at = (
+                datetime.now(timezone.utc)
+                + timedelta(
+                    minutes=max(lease_minutes, int(remaining / 60) + 2)
+                    if math.isfinite(remaining)
+                    else lease_minutes
+                )
+            ).isoformat()
+            lease: dict[str, Any] = (
+                self.performance_store.update_index_lease(
+                    lease_id,
+                    status="active",
+                    metadata={"hold_state": "in_call", "members": lease_entries()},
+                    owner_reference=lease_owner,
+                    expected_version=hold["version"],
+                    expires_at_utc=lease_expires_at,
+                )
+                if hold is not None
+                else self.performance_store.create_index_lease(
+                    lease_id=lease_id,
+                    database_fingerprint=case.database_fingerprint or "",
+                    session_id=session_id,
+                    candidate_id=candidate_id,
+                    index_name=str(plan.clustered_index.index_name),
+                    object_fingerprint=plan.definition_fingerprint,
+                    expires_at_utc=lease_expires_at,
+                    metadata={
+                        # A lease that keeps objects lists each of them.
+                        **({"members": lease_entries()} if hold_mode else plan.lease_metadata()),
+                        "phase": phase,
+                        "lease_owner_fence": lease_owner,
+                        "sql_persisted": False,
+                    },
+                    owner_reference=lease_owner,
+                    request_fingerprint=fingerprint_json(
+                        {"lease_id": lease_id, "key": idempotency_key}
+                    ),
+                )
             )
             if phase == "finalist":
                 if self.tuning_sessions.get_session(session_id).status == "created":
@@ -12327,22 +13385,59 @@ class AzureSqlMcpApplication:
                 owner_reference=execution_owner,
                 expected_version=reservation["version"],
             )
+            if hold is not None:
+                self._return_hold_to_idle(lease_id, lease_owner, lease_minutes)
             raise
 
-        def update_lease(status: str, metadata: Mapping[str, Any] | None = None) -> None:
+        def update_lease(
+            status: str,
+            metadata: Mapping[str, Any] | None = None,
+            expires_at_utc: str | None = None,
+        ) -> None:
             nonlocal lease
+            payload: dict[str, Any] | None = dict(metadata) if metadata is not None else None
+            if hold_mode:
+                # A fact about the view goes to its entry; the lease lists what exists.
+                facts = payload or {}
+                payload = {
+                    key: facts.pop(key)
+                    for key in (HOLD_FLAG, "hold_state", "hold_minutes", "cleaned_at_utc")
+                    if key in facts
+                }
+                view_entry.update(facts)
+                payload["members"] = lease_entries()
             lease = self.performance_store.update_index_lease(
                 lease_id,
                 status=status,
-                metadata=dict(metadata) if metadata is not None else None,
+                metadata=payload,
                 owner_reference=lease_owner,
                 expected_version=lease["version"],
+                expires_at_utc=expires_at_utc,
+            )
+
+        def hold_lease() -> None:
+            """Leave the lease open with the objects it lists, bounded from now."""
+            held_at = datetime.now(timezone.utc)
+            if view_listed:
+                view_entry.setdefault("held_since_utc", held_at.isoformat())
+            update_lease(
+                "active",
+                {HOLD_FLAG: True, "hold_state": "idle", "hold_minutes": lease_minutes},
+                expires_at_utc=(held_at + timedelta(minutes=lease_minutes)).isoformat(),
             )
 
         view_index_names = [str(index.index_name) for index in plan.indexes]
         measurements: list[dict[str, Any]] = [
             {
                 **bound,
+                "pooled_baseline": pooled_baselines.get(str(bound["parameter_case"])),
+                # True when the baseline is declared slow, or its first run
+                # takes 10 seconds or more: it runs once in the session.
+                "slow": str(bound["parameter_case"]) in slow_cases,
+                # Runs of a baseline of seconds that wait for the first candidate run.
+                "baseline_runs_after": None,
+                # True when one run of each side decided (decisive_first_runs).
+                "decisive": False,
                 "runs": {"baseline_before": 0, "candidate": 0, "baseline_after": 0},
                 "baseline_before_samples": [],
                 "candidate_samples": [],
@@ -12365,13 +13460,24 @@ class AzureSqlMcpApplication:
             target = count
             run = 0
             while target is None or run < target:
-                remaining_seconds = self._require_tuning_session_time(session_id)
-                measured_executions += 1
-                profiled = await self.performance_workflows._profile_execution_contract(
-                    database_name,
-                    measurement["candidate_contract" if arm == "candidate" else "execution_contract"],
-                    max_result_rows=self.config.comparison_row_limit,
+                remaining_seconds = min(
+                    self._require_tuning_session_time(session_id), clock.left()
                 )
+                clock.require("candidate_measure" if arm == "candidate" else arm)
+                measured_executions += 1
+                run_started = clock.start()
+                try:
+                    profiled = await self.performance_workflows._profile_execution_contract(
+                        database_name,
+                        measurement[
+                            "candidate_contract" if arm == "candidate" else "execution_contract"
+                        ],
+                        max_result_rows=self.config.comparison_row_limit,
+                    )
+                finally:
+                    clock.add(
+                        "candidate_runs" if arm == "candidate" else "baseline_runs", run_started
+                    )
                 sample = extract_profile_metrics(profiled)
                 measurement[f"{arm}_samples"].append(sample)
                 measurement[f"{arm}_results"].append(
@@ -12388,8 +13494,9 @@ class AzureSqlMcpApplication:
                     )
                 run += 1
                 if target is None:
+                    first_seconds = _sample_seconds(sample)
                     target = adaptive_run_count(
-                        _sample_seconds(sample),
+                        first_seconds,
                         runs,
                         seconds_available=(
                             remaining_seconds / max(1, arms_left)
@@ -12397,6 +13504,31 @@ class AzureSqlMcpApplication:
                             else None
                         ),
                     )
+                    if (
+                        arm == "baseline_before"
+                        and target > 1
+                        and first_seconds >= FAST_STATEMENT_SECONDS
+                    ):
+                        # A statement of seconds runs once before the build. The
+                        # first candidate run decides whether its other runs are
+                        # needed; they then follow the drop.
+                        measurement["baseline_runs_after"] = target
+                        target = 1
+                    if arm == "candidate":
+                        pooled_sample = (measurement["pooled_baseline"] or {}).get("sample")
+                        baseline_seconds = (
+                            _sample_seconds(measurement["baseline_before_samples"][0])
+                            if measurement["baseline_before_samples"]
+                            else _sample_seconds(pooled_sample)
+                            if isinstance(pooled_sample, Mapping)
+                            else None
+                        )
+                        if baseline_seconds is not None and decisive_first_runs(
+                            baseline_seconds, first_seconds
+                        ):
+                            measurement["decisive"] = True
+                            measurement["decisive_seconds"] = (baseline_seconds, first_seconds)
+                            target = 1
             measurement["runs"][arm] = run
             arms_left -= 1
 
@@ -12438,34 +13570,83 @@ class AzureSqlMcpApplication:
         built: dict[str, Any] | None = None
         verification: dict[str, Any] | None = None
         view_exists = False
+        view_verified = False
         cancelled = False
+        build_retries: list[dict[str, Any]] = []
         comparisons: dict[str, dict[str, Any]] = {}
         try:
             for measurement in measurements:
-                await measure_arm(measurement, "baseline_before")
+                if measurement["pooled_baseline"] is not None:
+                    # Measured earlier in the session with no test object in place.
+                    arms_left -= 1
+                    continue
+                await measure_arm(
+                    measurement, "baseline_before", 1 if measurement["slow"] else None
+                )
+                measurement["slow"] = measurement["slow"] or (
+                    _sample_seconds(measurement["baseline_before_samples"][0])
+                    >= SLOW_STATEMENT_SECONDS
+                )
             self._require_tuning_session_time(session_id)
-            step = "build_view"
-            update_lease("pending_create", {"create_dispatch_state": "dispatched"})
-            await self.admin_policy.execute(
-                AdminAction(
-                    tool_name="benchmark_indexed_view_candidate",
-                    database_name=database_name,
-                    action_type="test_view",
-                    sql=create_sql,
-                    params=create_params,
-                    rollback_sql=drop_sql,
-                    rollback_params=(lease_owner, plan.definition_fingerprint, None),
-                    trusted_generated=True,
-                    reviewed_intent=True,
-                    idempotency_key=fingerprint_json({"view-build": owner_fingerprint}),
-                    exactly_once=True,
-                    policy_verified=True,
-                    non_production=True,
-                    verification_required=True,
-                ),
-                self.executor,
-                dry_run=False,
-            )
+            if held_view is None:
+                step = "build_view"
+                clock.require(step)
+                update_lease("pending_create", {"create_dispatch_state": "dispatched"})
+                build_started = clock.start()
+                try:
+                    for attempt in (0, 1):
+                        try:
+                            await self.admin_policy.execute(
+                                AdminAction(
+                                    tool_name="benchmark_indexed_view_candidate",
+                                    database_name=database_name,
+                                    action_type="test_view",
+                                    sql=create_sql,
+                                    params=create_params,
+                                    rollback_sql=drop_sql,
+                                    rollback_params=(lease_owner, plan.definition_fingerprint, None),
+                                    trusted_generated=True,
+                                    reviewed_intent=True,
+                                    idempotency_key=fingerprint_json(
+                                        {
+                                            "view-build-retry" if attempt else "view-build": (
+                                                owner_fingerprint
+                                            )
+                                        }
+                                    ),
+                                    exactly_once=True,
+                                    policy_verified=True,
+                                    non_production=True,
+                                    verification_required=True,
+                                ),
+                                self.executor,
+                                dry_run=False,
+                            )
+                            if attempt:
+                                build_retries[-1]["succeeded"] = True
+                            break
+                        except Exception as build_error:
+                            lost = view_build_failure(build_error)
+                            if (
+                                attempt
+                                or lost["outcome"] != "definite_rollback"
+                                or lost["engine_error_number"] not in TRANSIENT_BUILD_ERRORS
+                            ):
+                                raise
+                            # The build lost a deadlock or a lock wait to another
+                            # session and its batch rolled back: one more try.
+                            build_retries.append(
+                                {
+                                    "view": f"{plan.schema}.{plan.view_name}",
+                                    "error_number": lost["engine_error_number"],
+                                    "retried": True,
+                                    "succeeded": False,
+                                }
+                            )
+                finally:
+                    clock.add("build", build_started)
+            # A held view is proven again before it is measured: the catalog,
+            # not the lease, says what exists.
             step = "verify_built_view"
             state = await read_view_catalog_state(
                 self.executor, database_name, schema_name=plan.schema, view_name=plan.view_name
@@ -12474,7 +13655,12 @@ class AzureSqlMcpApplication:
             check = verify_view_experiment(plan, state, owner_token=lease_owner)
             verification = check.as_dict()
             if not check.matches:
-                raise RuntimeError("The built view does not match the request.")
+                raise RuntimeError(
+                    "The held view no longer matches the request."
+                    if held_view is not None
+                    else "The built view does not match the request."
+                )
+            view_verified = True
             update_lease("active", {"view_object_id": state.object_id})
             built = view_index_size(plan, state)
             step = "candidate_measure"
@@ -12483,23 +13669,37 @@ class AzureSqlMcpApplication:
             if compare_results:
                 step = "compare_results"
                 for measurement in measurements:
-                    remaining_seconds = self._require_tuning_session_time(session_id)
-                    measured_executions += 2
-                    comparison = await self.performance_workflows._compare_execution_contracts(
-                        database_name,
-                        measurement["execution_contract"],
-                        measurement["candidate_contract"],
-                        compare_order=compare_order,
-                        before_dispatch=lambda: self._require_tuning_session_time(session_id),
-                        # The session time left is the cap of the comparison.
-                        max_seconds=(
-                            remaining_seconds if math.isfinite(remaining_seconds) else None
-                        ),
+                    clock.require(step)
+                    remaining_seconds = min(
+                        self._require_tuning_session_time(session_id), clock.left()
                     )
+                    measured_executions += 2
+                    compare_started = clock.start()
+                    try:
+                        comparison = await self.performance_workflows._compare_execution_contracts(
+                            database_name,
+                            measurement["execution_contract"],
+                            measurement["candidate_contract"],
+                            compare_order=compare_order,
+                            before_dispatch=lambda: self._require_tuning_session_time(session_id),
+                            # The session time left, or the cap of the call, caps it.
+                            max_seconds=(
+                                remaining_seconds if math.isfinite(remaining_seconds) else None
+                            ),
+                        )
+                    finally:
+                        clock.add("comparison", compare_started)
                     measured_executions -= 2 - int(comparison.get("executions", 0))
                     if "rows_match" in comparison:
-                        label_comparison(comparison, tested_gaps, compare_order)
+                        label_comparison(
+                            comparison,
+                            tested_gaps,
+                            compare_order,
+                            order_removed=order_contract_removed(equivalence_preflight),
+                        )
                     comparisons[str(measurement["parameter_case"])] = comparison
+        except _CallTimeCap as cap:
+            failure = clock.cap_diagnostic(str(cap))
         except asyncio.CancelledError:
             cancelled = True
             failure = {"diagnostic_code": "benchmark_cancelled", "failed_step": step}
@@ -12520,8 +13720,13 @@ class AzureSqlMcpApplication:
             # The view is dropped on every path; the lease closes only when
             # the catalog shows that nothing of it is left.
             try:
-                if step == "baseline_before":
-                    update_lease("create_failed", {"failure_type": "not_built"})
+                if step == "baseline_before" and held_view is None:
+                    # This call built nothing; held objects it did not use stay.
+                    view_listed = False
+                    if carried_entries:
+                        hold_lease()
+                    else:
+                        update_lease("create_failed", {"failure_type": "not_built"})
                 else:
                     try:
                         state = await read_view_catalog_state(
@@ -12547,15 +13752,29 @@ class AzureSqlMcpApplication:
                         ),
                     )
                     status = outcome.lease_status
-                    if outcome.drop_view and state is not None:
-                        update_lease("cleanup_pending")
-                        status = await drop_view(state)
-                    update_lease(
-                        status,
-                        {"cleaned_at_utc": datetime.now(timezone.utc).isoformat()}
-                        if status == "cleaned"
-                        else {"cleanup_reason": outcome.reason},
-                    )
+                    if keep_for_session and view_verified and outcome.drop_view:
+                        # Built and proven: kept for the session, also when a
+                        # later step of this call failed.
+                        hold_lease()
+                    else:
+                        if outcome.drop_view and state is not None:
+                            update_lease("cleanup_pending")
+                            cleanup_started = clock.start()
+                            try:
+                                status = await drop_view(state)
+                            finally:
+                                clock.add("cleanup", cleanup_started)
+                        if status in {"cleaned", "create_failed"}:
+                            view_listed = False
+                        if carried_entries and status in {"cleaned", "create_failed"}:
+                            hold_lease()
+                        else:
+                            update_lease(
+                                status,
+                                {"cleaned_at_utc": datetime.now(timezone.utc).isoformat()}
+                                if status == "cleaned"
+                                else {"cleanup_reason": outcome.reason},
+                            )
             except asyncio.CancelledError:
                 cancelled = True
                 update_lease("cleanup_required", {"cleanup_error_type": "cancelled"})
@@ -12563,13 +13782,27 @@ class AzureSqlMcpApplication:
                 note_exception(cleanup_error, "server.indexed_view_cleanup")
                 update_lease("cleanup_required", {"cleanup_error_type": type(cleanup_error).__name__})
 
+        # True when test objects of the session are still in place: no
+        # statement can then run as a clean baseline.
+        objects_remain = hold_mode and lease["status"] == "active"
         if failure is None and lease["status"] == "cleaned":
             try:
                 step = "baseline_after"
                 for measurement in measurements:
+                    if (
+                        measurement["pooled_baseline"] is not None
+                        or measurement["slow"]
+                        or measurement["decisive"]
+                    ):
+                        # One baseline run in the session; none after the drop.
+                        continue
                     await measure_arm(
-                        measurement, "baseline_after", measurement["runs"]["baseline_before"]
+                        measurement,
+                        "baseline_after",
+                        measurement["baseline_runs_after"] or measurement["runs"]["baseline_before"],
                     )
+            except _CallTimeCap as cap:
+                failure = clock.cap_diagnostic(str(cap))
             except asyncio.CancelledError:
                 cancelled = True
                 failure = {"diagnostic_code": "benchmark_cancelled", "failed_step": step}
@@ -12579,9 +13812,18 @@ class AzureSqlMcpApplication:
 
         equivalence: list[dict[str, Any]] = []
         parameter_results: list[dict[str, Any]] = []
+        slow_baselines_kept: dict[str, Any] = {}
+        baselines_before_hold_kept: dict[str, Any] = {}
         for measurement in measurements:
             name = str(measurement["parameter_case"])
             used = bool(measurement["plan_use"]) and all(measurement["plan_use"])
+            pooled = measurement["pooled_baseline"]
+            no_after_arm = (
+                pooled is not None
+                or measurement["slow"]
+                or measurement["decisive"]
+                or objects_remain
+            )
             if noexpand:
                 comparison = comparisons.get(name) or _not_compared(blocking_gaps, failure)
                 equivalence.append(
@@ -12597,13 +13839,15 @@ class AzureSqlMcpApplication:
                 )
             else:
                 evidence = [
+                    *([dict(pooled["result"])] if pooled is not None else ()),
                     *measurement["baseline_before_results"],
                     *measurement["candidate_results"],
                     *measurement["baseline_after_results"],
                 ]
                 complete = (
                     failure is None
-                    and len(measurement["baseline_after_results"]) > 0
+                    and (no_after_arm or len(measurement["baseline_after_results"]) > 0)
+                    and len(evidence) > len(measurement["candidate_results"]) > 0
                     and all(item.get("complete") is True for item in evidence)
                 )
                 status = aba_result_status(evidence, complete=complete)
@@ -12615,14 +13859,24 @@ class AzureSqlMcpApplication:
                         "proven_for_parameter_case": status == "match",
                         "same_sql": True,
                         "same_snapshot": False,
-                        "basis": "unchanged SQL plus complete A-B-A result stability",
+                        "basis": "unchanged SQL plus "
+                        + (
+                            "result stability against the baseline of the session "
+                            "(no run followed a drop)"
+                            if no_after_arm
+                            else "complete A-B-A result stability"
+                        ),
                         "plan_used_expected_index": used,
                     }
                 )
-            baseline_samples = [
-                *measurement["baseline_before_samples"],
-                *measurement["baseline_after_samples"],
-            ]
+            baseline_samples = (
+                [dict(sample) for sample in pooled.get("samples") or [pooled["sample"]]]
+                if pooled is not None
+                else [
+                    *measurement["baseline_before_samples"],
+                    *measurement["baseline_after_samples"],
+                ]
+            )
             result_row: dict[str, Any] = {
                 "parameter_case": name,
                 "weight": measurement["weight"],
@@ -12633,11 +13887,68 @@ class AzureSqlMcpApplication:
                 ),
                 "runs": dict(measurement["runs"]),
                 "view_index_used": used,
+                "plan_compiled_for": (
+                    name if plan_reuse == "per_case" else str(measurements[0]["parameter_case"])
+                ),
             }
             if measurement["runs"]["candidate"] == 1:
                 result_row["candidate_single_sample"] = True
             if len(baseline_samples) == 1:
                 result_row["baseline_single_sample"] = True
+            if measurement["decisive"]:
+                result_row["run_rule"] = _DECISIVE_RUN_RULE
+                result_row["run_rule_note"] = _decisive_run_note(*measurement["decisive_seconds"])
+            delta = result_row["plan_delta"]
+            if pooled is not None:
+                before_hold = bool(pooled.get("before_hold"))
+                result_row["baseline_source"] = (
+                    "session_before_hold" if before_hold else "session_single_run"
+                )
+                result_row["baseline_evidence_id"] = pooled["evidence_id"]
+                result_row["baseline_note"] = (
+                    "baseline measured earlier in this session, before the held test "
+                    "objects were built. It was not run again: the statement cannot "
+                    "run clean while they exist."
+                    if before_hold
+                    else "baseline too slow to repeat: it ran once in this session and "
+                    "was not run again."
+                )
+                if delta["baseline"] is None and isinstance(pooled.get("plan"), Mapping):
+                    delta["baseline"] = dict(pooled["plan"])
+                    delta["plan_changed"] = (
+                        delta["baseline"].get("plan_fingerprint")
+                        != delta["candidate"]["plan_fingerprint"]
+                        if delta["candidate"] is not None
+                        else None
+                    )
+            elif measurement["baseline_before_samples"] and all(
+                item.get("complete") is True for item in measurement["baseline_before_results"]
+            ):
+                kept_baseline = {
+                    "sample": measurement["baseline_before_samples"][0],
+                    "result": measurement["baseline_before_results"][0],
+                    "plan": delta["baseline"],
+                    "order_compared": compare_order,
+                }
+                if measurement["slow"]:
+                    result_row["baseline_source"] = "single_run"
+                    result_row["baseline_note"] = (
+                        "baseline too slow to repeat (declared, or 10 seconds or more on "
+                        "its first run): it ran once in the session and was not run "
+                        "again after the drop."
+                    )
+                    if plan_reuse == "per_case":
+                        slow_baselines_kept[name] = kept_baseline
+                if keep_for_session:
+                    # Measured with no test object in place: the baseline of every
+                    # later call of the session while the view is held.
+                    baselines_before_hold_kept[name] = {
+                        **kept_baseline,
+                        "samples": list(measurement["baseline_before_samples"]),
+                        "plan_reuse": plan_reuse,
+                        "case_order": case_names,
+                        "sql_fingerprint": fingerprint_json({"baseline_sql": original}),
+                    }
             parameter_results.append(result_row)
 
         objective = str(case.metadata.get("objective") or "elapsed_time")
@@ -12646,6 +13957,11 @@ class AzureSqlMcpApplication:
             state_name, reason = (
                 "cleanup_required",
                 "the test view could not be removed or its removal could not be verified",
+            )
+        elif failure is not None and failure.get("diagnostic_code") == "call_time_cap":
+            state_name, reason = (
+                "inconclusive",
+                _call_cap_reason(clock, str(failure.get("failed_step")), objects_remain),
             )
         elif failure is not None:
             state_name, reason = (
@@ -12719,6 +14035,26 @@ class AzureSqlMcpApplication:
         view_report = {
             key: value for key, value in plan.as_dict().items() if key != "findings" or value
         }
+        still_held = (
+            [_held_object_report(entry, lease) for entry in lease_entries()]
+            if objects_remain
+            else []
+        )
+        view_object = _held_object_report(view_entry)
+        time_spent = clock.report()
+        test_objects: dict[str, Any] = {
+            "reused": [view_object] if held_view is not None and view_verified else [],
+            "built": [view_object] if held_view is None and view_verified else [],
+            "still_held": still_held,
+            "hold_expires_at_utc": lease["expires_at_utc"] if still_held else None,
+        }
+        if still_held:
+            test_objects["note"] = (
+                "These objects stay in place for this session. A later benchmark call "
+                "reuses each one whose definition matches; compare_query_results and "
+                "explain_query can read them; finalize_tuning_session drops them, and "
+                "so does the lease when it expires."
+            )
         evidence_envelope = self.performance_store.create_evidence(
             EvidenceEnvelopeV1(
                 source="azure-sql-mcp",
@@ -12738,11 +14074,20 @@ class AzureSqlMcpApplication:
                     "objective": objective,
                     "decision_basis": COMPARISON_DECISION_BASIS,
                     "parameter_results": parameter_results,
+                    **({"slow_baselines": slow_baselines_kept} if slow_baselines_kept else {}),
+                    **(
+                        {"baselines_before_hold": baselines_before_hold_kept}
+                        if baselines_before_hold_kept
+                        else {}
+                    ),
                 },
                 metadata={
                     "session_id": session_id,
                     "candidate_id": candidate_id,
                     "experiment": "indexed_view",
+                    "test_objects": test_objects,
+                    "time_spent": time_spent,
+                    "verification": verification,
                     "read_mode": read_mode,
                     "lease_id": lease_id,
                     "lease_status": lease["status"],
@@ -12769,7 +14114,7 @@ class AzureSqlMcpApplication:
                     "failure_diagnostic": failure,
                 },
             ),
-            idempotency_key=fingerprint_json({"operation": "indexed-view-evidence", "key": idempotency_key}),
+            idempotency_key=evidence_key,
             request_fingerprint=request_fingerprint,
         )
         screening_passed = phase == "screening" and state_name in {"promising", "improved"}
@@ -12804,6 +14149,7 @@ class AzureSqlMcpApplication:
             "candidate_id": candidate_id,
             "experiment": "indexed_view",
             "read_mode": read_mode,
+            "plan_reuse": plan_reuse,
             "classification": state_name,
             "performance_classification": performance_classification,
             "objective": objective,
@@ -12822,9 +14168,15 @@ class AzureSqlMcpApplication:
             "view": view_report,
             "built": built,
             "verification": verification,
+            "test_objects": test_objects,
+            "time_spent": time_spent,
             "session_continues": lease["status"] != "cleanup_required",
             "plan_controls_not_applied": True,
         }
+        if build_retries:
+            result["build_retries"] = build_retries
+        if failure is not None and failure.get("diagnostic_code") == "call_time_cap":
+            result["partial"] = True
         if failure is not None:
             result["failure_diagnostic"] = failure
         if lease["status"] == "cleanup_required":
@@ -15175,137 +16527,160 @@ class AzureSqlMcpApplication:
                 expires_at = now
             if expires_at.astimezone(timezone.utc) > now:
                 continue
-            if self._index_lease_has_live_session(lease, now):
+            lease_metadata = lease.get("metadata") or {}
+            # A hold between calls is bounded by its expiry alone: no call is
+            # using the objects, so an open session does not extend it.
+            idle_hold = (
+                lease_metadata.get(HOLD_FLAG) is True
+                and lease_metadata.get("hold_state") == "idle"
+            )
+            if not idle_hold and self._index_lease_has_live_session(lease, now):
                 # A short/legacy lease must not let another MCP process drop an
                 # index while its durable tuning session can still dispatch work.
                 continue
             summary["examined"] += 1
-            database_name = next(
-                (
-                    name
-                    for name in self.config.allowed_databases
-                    if database_fingerprint_matches(
-                        str(lease["database_fingerprint"]),
-                        name,
-                        self.config.server,
-                        allow_legacy=bool(self.config.legacy_state_server_binding),
-                    )
-                ),
-                None,
-            )
-            metadata = lease.get("metadata") or {}
-            ownership_proof = metadata.get("lease_owner_fence")
             try:
-                if metadata.get("object_kind") == LEASE_OBJECT_KIND:
-                    # A leased test view: it has no target_table on purpose.
-                    await self._recover_expired_view_lease(
-                        database_name, lease, ownership_proof, now
-                    )
-                    summary["cleaned"] += 1
-                    continue
-                # A set is one lease: every index of it is proven and dropped
-                # here, and the lease closes only when none is left.
-                views = self._index_lease_members(lease)
-                if not database_name or any(
-                    not isinstance(view["metadata"].get("target_schema"), str)
-                    or not isinstance(view["metadata"].get("target_table"), str)
-                    for view in views
-                ):
-                    raise ValueError("expired lease has no resolvable cleanup target")
-                if not isinstance(ownership_proof, str) or not _INDEX_OWNER_PROOF.fullmatch(
-                    ownership_proof
-                ):
-                    raise ValueError(
-                        "expired lease has no private ownership marker token"
-                    )
-                self._require_test_index_database(database_name)
-                updated_lease = self.performance_store.recover_index_lease(
-                    lease["lease_id"],
-                    status="cleanup_pending",
-                    metadata={"recovery_attempted_at_utc": now.isoformat()},
-                    expected_version=lease["version"],
-                )
-                member_failure: Exception | None = None
-                for ordinal, view in enumerate(views):
-                    drop_key = f"lease-recovery:{lease['lease_id']}:{updated_lease['version']}"
-                    try:
-                        await self._recover_expired_lease_index(
-                            database_name,
-                            view,
-                            ownership_proof,
-                            drop_key=f"{drop_key}:{ordinal}" if len(views) > 1 else drop_key,
-                        )
-                    except Exception as member_error:
-                        if len(views) == 1:
-                            raise
-                        # The other indexes of the set are still dropped.
-                        member_failure = member_failure or member_error
-                if member_failure is not None:
-                    raise member_failure
-                self.performance_store.recover_index_lease(
-                    lease["lease_id"],
-                    status="cleaned",
-                    metadata={
-                        "recovered_at_startup": True,
-                        "cleaned_at_utc": datetime.now(timezone.utc).isoformat(),
-                    },
-                    expected_version=updated_lease["version"],
-                )
+                await self._drop_lease_objects(lease, now, closed_by="recovered_at_startup")
                 summary["cleaned"] += 1
             except Exception as exc:
-                try:
-                    current_lease = self.performance_store.get_index_lease(
-                        lease["lease_id"]
-                    )
-                    self.performance_store.recover_index_lease(
-                        lease["lease_id"],
-                        status="cleanup_required",
-                        metadata={
-                            "recovery_error_type": type(exc).__name__,
-                            "recovery_attempted_at_utc": now.isoformat(),
-                        },
-                        expected_version=current_lease["version"],
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed to record expired temporary-index cleanup failure",
-                        extra={"lease_id": lease["lease_id"]},
-                    )
+                self._record_lease_cleanup_failure(lease, exc, now)
                 summary["cleanup_required"] += 1
         return summary
 
-    async def _recover_expired_view_lease(
+    def _record_lease_cleanup_failure(
         self,
-        database_name: str | None,
         lease: Mapping[str, Any],
-        ownership_proof: Any,
+        exc: Exception,
         now: datetime,
     ) -> None:
-        """Drop the view of an expired indexed-view lease and close the lease.
+        try:
+            current_lease = self.performance_store.get_index_lease(lease["lease_id"])
+            self.performance_store.recover_index_lease(
+                lease["lease_id"],
+                status="cleanup_required",
+                metadata={
+                    "recovery_error_type": type(exc).__name__,
+                    "recovery_attempted_at_utc": now.isoformat(),
+                },
+                expected_version=current_lease["version"],
+            )
+        except Exception:
+            logger.exception(
+                "Failed to record expired temporary-index cleanup failure",
+                extra={"lease_id": lease["lease_id"]},
+            )
 
-        Only a view that carries both markers of this lease is dropped. Any
-        other outcome than a proven clean catalog raises, and the caller
-        records the lease as cleanup_required.
+    async def _drop_lease_objects(
+        self,
+        lease: Mapping[str, Any],
+        now: datetime,
+        *,
+        closed_by: str,
+    ) -> None:
+        """Prove and drop every test object of a lease, then close the lease.
+
+        A lease holds one index, a set of indexes, one indexed view, or the
+        mixed objects a session kept. Each object is dropped only when its
+        ownership is proven; the lease closes only when none is left. Any
+        other outcome raises, and the caller records cleanup_required.
         """
 
+        database_name = next(
+            (
+                name
+                for name in self.config.allowed_databases
+                if database_fingerprint_matches(
+                    str(lease["database_fingerprint"]),
+                    name,
+                    self.config.server,
+                    allow_legacy=bool(self.config.legacy_state_server_binding),
+                )
+            ),
+            None,
+        )
         metadata = lease.get("metadata") or {}
-        schema, view = metadata.get("target_schema"), metadata.get("target_view")
-        if not database_name or not isinstance(schema, str) or not isinstance(view, str):
-            raise ValueError("expired view lease has no resolvable cleanup target")
+        ownership_proof = metadata.get("lease_owner_fence")
+        views = self._index_lease_members(lease)
+        for view in views:
+            target = view["metadata"]
+            if target.get("object_kind") == LEASE_OBJECT_KIND:
+                # A leased test view: it has no target_table on purpose.
+                if (
+                    not database_name
+                    or not isinstance(target.get("target_schema"), str)
+                    or not isinstance(target.get("target_view"), str)
+                ):
+                    raise ValueError("expired view lease has no resolvable cleanup target")
+            elif (
+                not database_name
+                or not isinstance(target.get("target_schema"), str)
+                or not isinstance(target.get("target_table"), str)
+            ):
+                raise ValueError("expired lease has no resolvable cleanup target")
+        if not database_name:
+            raise ValueError("expired lease has no resolvable cleanup target")
         if not isinstance(ownership_proof, str) or not _INDEX_OWNER_PROOF.fullmatch(
             ownership_proof
         ):
-            raise ValueError("expired view lease has no private ownership marker token")
+            raise ValueError("expired lease has no private ownership marker token")
         self._require_test_index_database(database_name)
-        policy = self.database_policy.require(database_name)
-        require_view_experiment_policy(policy)
-        fingerprint = str(lease["object_fingerprint"])
-        updated = self.performance_store.recover_index_lease(
+        updated_lease = self.performance_store.recover_index_lease(
             lease["lease_id"],
             status="cleanup_pending",
             metadata={"recovery_attempted_at_utc": now.isoformat()},
             expected_version=lease["version"],
         )
+        member_failure: Exception | None = None
+        for ordinal, view in enumerate(views):
+            drop_key = f"lease-recovery:{lease['lease_id']}:{updated_lease['version']}"
+            if len(views) > 1:
+                drop_key = f"{drop_key}:{ordinal}"
+            try:
+                if view["metadata"].get("object_kind") == LEASE_OBJECT_KIND:
+                    await self._drop_expired_lease_view(
+                        database_name, view, ownership_proof, drop_key=drop_key
+                    )
+                else:
+                    await self._recover_expired_lease_index(
+                        database_name, view, ownership_proof, drop_key=drop_key
+                    )
+            except Exception as member_error:
+                if len(views) == 1:
+                    raise
+                # The other objects of the lease are still dropped.
+                member_failure = member_failure or member_error
+        if member_failure is not None:
+            raise member_failure
+        self.performance_store.recover_index_lease(
+            lease["lease_id"],
+            status="cleaned",
+            metadata={
+                closed_by: True,
+                "cleaned_at_utc": datetime.now(timezone.utc).isoformat(),
+            },
+            expected_version=updated_lease["version"],
+        )
+
+    async def _drop_expired_lease_view(
+        self,
+        database_name: str,
+        lease: Mapping[str, Any],
+        ownership_proof: str,
+        *,
+        drop_key: str,
+    ) -> None:
+        """Drop the view of an indexed-view lease, or raise when it is not proven gone.
+
+        ``lease`` is a view lease, or the entry of a view in a lease that
+        holds several objects. Only a view that carries both markers of the
+        lease is dropped.
+        """
+
+        metadata = lease.get("metadata") or {}
+        schema, view = str(metadata.get("target_schema")), str(metadata.get("target_view"))
+        policy = self.database_policy.require(database_name)
+        require_view_experiment_policy(policy)
+        fingerprint = str(lease["object_fingerprint"])
         state = await read_view_catalog_state(
             self.executor, database_name, schema_name=schema, view_name=view
         )
@@ -15326,7 +16701,7 @@ class AzureSqlMcpApplication:
                     rollback_sql=_view_recreate_sql(state),
                     trusted_generated=True,
                     reviewed_intent=True,
-                    idempotency_key=f"lease-recovery:{lease['lease_id']}:{updated['version']}",
+                    idempotency_key=drop_key,
                     exactly_once=True,
                     policy_verified=True,
                     non_production=True,
@@ -15346,15 +16721,6 @@ class AzureSqlMcpApplication:
         )
         if outcome.lease_status != "cleaned":
             raise RuntimeError(f"expired view lease was not cleaned: {outcome.reason}")
-        self.performance_store.recover_index_lease(
-            lease["lease_id"],
-            status="cleaned",
-            metadata={
-                "recovered_at_startup": True,
-                "cleaned_at_utc": datetime.now(timezone.utc).isoformat(),
-            },
-            expected_version=updated["version"],
-        )
 
     async def _recover_expired_lease_index(
         self,

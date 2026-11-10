@@ -307,9 +307,9 @@ async def test_a_two_index_set_on_two_tables_is_one_candidate_under_one_lease(
     badges, users = _names(TEST_INDEX_PREFIX, BADGES, USERS)
     app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
         side_effect=[
-            *[_profile(4000) for _ in range(3)],
+            *[_profile(400) for _ in range(3)],
             *[_plan(badges, users) for _ in range(3)],
-            *[_profile(4000) for _ in range(3)],
+            *[_profile(400) for _ in range(3)],
         ]
     )
 
@@ -349,9 +349,9 @@ async def test_an_index_of_the_set_that_no_plan_used_is_named(
     badges, users = _names(TEST_INDEX_PREFIX, BADGES, USERS)
     app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
         side_effect=[
-            *[_profile(4000) for _ in range(3)],
+            *[_profile(400) for _ in range(3)],
             *[_plan(badges) for _ in range(3)],
-            *[_profile(4000) for _ in range(3)],
+            *[_profile(400) for _ in range(3)],
         ]
     )
 
@@ -370,15 +370,16 @@ async def test_a_definite_create_failure_on_the_second_index_leaves_no_index(
     # could not be built, or it changes every later baseline on the table.
     app = _app(server_config_factory)
     sandbox = _Sandbox(app, monkeypatch)
+    # Not a lock timeout or a deadlock: those are retried once (S13d).
     sandbox.fail[1] = RuntimeError(
-        "[42000] [Microsoft][ODBC Driver 18 for SQL Server][SQL Server]Lock request "
-        "time out period exceeded. (1222) (SQLExecDirectW)"
+        "[23000] [Microsoft][ODBC Driver 18 for SQL Server][SQL Server]The CREATE UNIQUE "
+        "INDEX statement terminated because a duplicate key was found. (1505) (SQLExecDirectW)"
     )
     sandbox.commit_before_failure = False
     session_id, candidate_id = _session(app)
     badges, users = _names(TEST_INDEX_PREFIX, BADGES, USERS)
     app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
-        side_effect=[_profile(4000) for _ in range(3)]
+        side_effect=[_profile(400) for _ in range(3)]
     )
 
     result = await _benchmark(app, session_id, candidate_id, indexes=[BADGES, USERS])
@@ -406,7 +407,7 @@ async def test_a_lost_reply_on_the_second_create_is_proven_by_its_marker_and_bot
     session_id, candidate_id = _session(app)
     names = _names(TEST_INDEX_PREFIX, BADGES, USERS)
     app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
-        side_effect=[_profile(4000) for _ in range(3)]
+        side_effect=[_profile(400) for _ in range(3)]
     )
 
     result = await _benchmark(app, session_id, candidate_id, indexes=[BADGES, USERS])
@@ -432,7 +433,7 @@ async def test_an_unprovable_second_create_keeps_the_lease_open_and_still_drops_
     session_id, candidate_id = _session(app)
     badges, users = _names(TEST_INDEX_PREFIX, BADGES, USERS)
     app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
-        side_effect=[_profile(4000) for _ in range(3)]
+        side_effect=[_profile(400) for _ in range(3)]
     )
 
     result = await _benchmark(app, session_id, candidate_id, indexes=[BADGES, USERS])
@@ -467,7 +468,7 @@ async def test_a_cancel_between_the_creates_drops_the_created_index_and_is_re_ra
     session_id, candidate_id = _session(app)
     badges, users = _names(TEST_INDEX_PREFIX, BADGES, USERS)
     app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
-        side_effect=[_profile(4000) for _ in range(3)]
+        side_effect=[_profile(400) for _ in range(3)]
     )
     real_catalog = sandbox._catalog
     reads = 0
@@ -506,7 +507,7 @@ async def test_a_cancel_during_the_second_create_drops_the_first_and_keeps_the_l
     session_id, candidate_id = _session(app)
     badges, users = _names(TEST_INDEX_PREFIX, BADGES, USERS)
     app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
-        side_effect=[_profile(4000) for _ in range(3)]
+        side_effect=[_profile(400) for _ in range(3)]
     )
 
     with pytest.raises(asyncio.CancelledError):
@@ -544,7 +545,7 @@ async def _crash_during_second_create(
     session_id, candidate_id = _session(app)
     names = _names(TEST_INDEX_PREFIX, BADGES, USERS)
     app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
-        side_effect=[_profile(4000) for _ in range(3)]
+        side_effect=[_profile(400) for _ in range(3)]
     )
     real_update = app.performance_store.update_index_lease
 
@@ -662,9 +663,9 @@ async def test_a_name_prefix_the_database_policy_lists_is_used(
     [badges] = _names("IX_Bench_", BADGES)
     app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
         side_effect=[
-            *[_profile(4000) for _ in range(3)],
+            *[_profile(400) for _ in range(3)],
             *[_plan(badges) for _ in range(3)],
-            *[_profile(4000) for _ in range(3)],
+            *[_profile(400) for _ in range(3)],
         ]
     )
 
@@ -916,7 +917,9 @@ async def test_a_slow_baseline_case_runs_once_and_later_index_candidates_reuse_i
     assert scan["baseline_source"] == "single_run"
     assert scan["baseline_single_sample"] is True
     assert "150 seconds" in scan["baseline_note"]
-    assert first["executions"] == 3 * 3 + 1 + 3
+    # 150 s against 2 ms: one candidate run decides the slow case (S13d).
+    assert scan["run_rule"] == "one_run_each_large_gain"
+    assert first["executions"] == 3 * 3 + 1 + 1
     assert first["equivalence"][1]["status"] == "match"
 
     second = app.performance_workflows.add_candidate(
@@ -945,7 +948,7 @@ async def test_a_slow_baseline_case_runs_once_and_later_index_candidates_reuse_i
     assert scan["baseline_evidence_id"] == first["evidence_id"]
     assert scan["baseline"]["elapsed_ms"] == 150_000
     assert result["classification"] == "improved"
-    assert result["executions"] == 3 * 3 + 3
+    assert result["executions"] == 3 * 3 + 1
 
 
 async def _call(app: AzureSqlMcpApplication, name: str, arguments: dict[str, Any]) -> Any:
@@ -962,9 +965,9 @@ async def test_the_tool_takes_a_set_and_refuses_a_mixed_or_oversized_request(
     badges, users = _names(TEST_INDEX_PREFIX, BADGES, USERS)
     app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
         side_effect=[
-            *[_profile(4000) for _ in range(3)],
+            *[_profile(400) for _ in range(3)],
             *[_plan(badges, users) for _ in range(3)],
-            *[_profile(4000) for _ in range(3)],
+            *[_profile(400) for _ in range(3)],
         ]
     )
     base = {
@@ -1101,9 +1104,9 @@ async def test_a_set_that_repeats_an_existing_index_is_refused_before_any_ddl(
     [compressed] = _names(TEST_INDEX_PREFIX, {**BADGES, "data_compression": "ROW"})
     app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
         side_effect=[
-            *[_profile(4000) for _ in range(3)],
+            *[_profile(400) for _ in range(3)],
             *[_plan(compressed) for _ in range(3)],
-            *[_profile(4000) for _ in range(3)],
+            *[_profile(400) for _ in range(3)],
         ]
     )
 

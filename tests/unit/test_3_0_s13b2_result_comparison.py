@@ -328,8 +328,9 @@ async def test_the_tool_applies_a_default_cap_and_passes_the_new_arguments(
 
 
 @pytest.mark.asyncio
-async def test_a_candidate_that_drops_the_order_by_is_still_refused_before_any_execution() -> None:
-    """A run can return the baseline order by accident: no comparison shows an order."""
+async def test_a_candidate_that_drops_the_order_by_is_compared_but_its_order_is_never_proven() -> None:
+    """A run can return the baseline order by accident: the rows are compared as a
+    multiset, and the result says that the order is not promised."""
 
     service, _store, _plans, executor = _service()
 
@@ -337,6 +338,8 @@ async def test_a_candidate_that_drops_the_order_by_is_still_refused_before_any_e
         "appdb", ORIGINAL, UNION_ALL.rsplit(" ORDER BY", 1)[0]
     )
 
-    assert result["status"] == "proof_contract_required"
-    assert result["blocking_gaps"] == ["order_contract_changed"]
-    assert executor.sessions == []
+    assert len(executor.sessions) == 1
+    assert result["status"] == "match"
+    assert result["comparison_basis"] == "multiset_with_duplicate_counts"
+    assert result["proven_for_parameter_case"] is False
+    assert any("no outer ORDER BY" in caveat for caveat in result["caveats"])

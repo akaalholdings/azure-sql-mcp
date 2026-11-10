@@ -156,12 +156,14 @@ async def test_a_baseline_that_takes_minutes_runs_once_without_being_told(
     )
 
     assert runs.count(False) == 1  # the baseline: once, and not again after the drop
-    assert runs.count(True) == 3
-    assert result["executions"] == 4
+    # 150 s against 2 ms: one candidate run decides (S13d, decisive_first_runs).
+    assert runs.count(True) == 1
+    assert result["executions"] == 2
     case = result["parameter_results"][0]
     assert case["baseline_single_sample"] is True
     assert case["baseline_source"] == "single_run"
-    assert case["runs"] == {"baseline_before": 1, "candidate": 3, "baseline_after": 0}
+    assert case["runs"] == {"baseline_before": 1, "candidate": 1, "baseline_after": 0}
+    assert case["run_rule"] == "one_run_each_large_gain"
     assert "150 seconds" in case["baseline_note"]
     assert result["classification"] == "improved", result["reason"]
     assert result["equivalence"][0]["status"] == "match"
@@ -204,20 +206,21 @@ async def test_a_statement_that_takes_seconds_gets_three_runs_per_arm_not_five(
     app = _app(server_config_factory)
     sandbox = _Sandbox(app, monkeypatch)
     session_id, candidate_id = _session(app, SQL, parameter_cases=CASES)
-    runs = _scripted(app, sandbox, OWNER, baseline_ms=4_000, with_index_ms=20)
+    runs = _scripted(app, sandbox, OWNER, baseline_ms=4_000, with_index_ms=3_000)
 
     result = await _benchmark(
         app, session_id, candidate_id, sql=SQL, phase="finalist",
         parameter_cases=CASES, indexes=[OWNER],
     )
 
-    # Finalist default is 5 runs: the 4 s baseline gets 3, the 20 ms candidate all 5.
+    # Finalist default is 5 runs: each arm of a statement of seconds gets 3.
+    # The baseline runs once before the build and three times after the drop
+    # (S13d): a gain of 10x or more would have needed no more runs at all.
     assert result["parameter_results"][0]["runs"] == {
-        "baseline_before": 3, "candidate": 5, "baseline_after": 3,
+        "baseline_before": 1, "candidate": 3, "baseline_after": 3,
     }
-    assert (runs.count(False), runs.count(True)) == (6, 5)
-    assert result["executions"] == 11
-    assert result["classification"] == "improved", result["reason"]
+    assert (runs.count(False), runs.count(True)) == (4, 3)
+    assert result["executions"] == 7
 
 
 @pytest.mark.asyncio

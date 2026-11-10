@@ -172,6 +172,27 @@ def adaptive_run_count(
     return runs
 
 
+# One run of each side decides when the candidate takes at most one tenth of
+# a baseline that takes a second or more.
+DECISIVE_GAIN_RATIO = 10.0
+
+
+def decisive_first_runs(baseline_seconds: float, candidate_seconds: float) -> bool:
+    """True when the first run of each side is enough for a decision.
+
+    The baseline run takes ``FAST_STATEMENT_SECONDS`` or more, so a tenth of
+    it is far above timer resolution, and the first candidate run takes at
+    most that tenth. No more runs of either side are needed then: the verdict
+    counts a gain from single samples only at 2x or more, and this is 10x.
+    A smaller gain keeps the repeated runs of ``adaptive_run_count``.
+    """
+
+    return (
+        baseline_seconds >= FAST_STATEMENT_SECONDS
+        and candidate_seconds * DECISIVE_GAIN_RATIO <= baseline_seconds
+    )
+
+
 Clock = Callable[[], datetime]
 
 

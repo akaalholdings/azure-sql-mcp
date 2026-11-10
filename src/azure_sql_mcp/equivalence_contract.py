@@ -976,6 +976,27 @@ def inline_relation(sql: str, schema: str, name: str, body: str) -> str | None:
     return inlined.sql(dialect="tsql") if replaced else None
 
 
+def _expression_identity(expression: exp.Expr, *, ignore_qualifiers: bool) -> str:
+    """One text for an expression, so two spellings of it compare equal.
+
+    Identifier case and quoting do not change T-SQL name resolution.
+    ``ignore_qualifiers`` drops table qualifiers: valid only where every
+    column can come from one source.
+    """
+
+    node = expression.copy()
+    while isinstance(node, exp.Paren):
+        node = node.this
+    for column in list(node.find_all(exp.Column)):
+        if ignore_qualifiers:
+            for part in ("table", "db", "catalog"):
+                column.set(part, None)
+    for identifier in node.find_all(exp.Identifier):
+        identifier.set("this", identifier.name.casefold())
+        identifier.set("quoted", False)
+    return node.sql(dialect="tsql")
+
+
 def _total_order_requirement(
     select: exp.Select,
     keys: list[exp.Expr],
@@ -1028,12 +1049,16 @@ def _total_order_requirement(
     group = select.args.get("group")
     if group is not None:
         grouped = list(group.expressions)
+        # One row per distinct value of the GROUP BY expressions: keys that
+        # cover each of them, as the expression itself or through its alias,
+        # leave no two rows tied. With one source, a qualifier adds nothing.
+        one_source = not select.args.get("joins")
         ordered = {
-            (item.table.casefold(), item.name.casefold()) for item in (*key_columns, *pinned)
+            _expression_identity(item, ignore_qualifiers=one_source)
+            for item in (*resolved, *pinned)
         }
         if grouped and all(
-            isinstance(item, exp.Column)
-            and (item.table.casefold(), item.name.casefold()) in ordered
+            _expression_identity(item, ignore_qualifiers=one_source) in ordered
             for item in grouped
         ):
             return None
@@ -1131,10 +1156,183 @@ def _not_null_precondition(
     }
 
 
+def _conjuncts(condition: exp.Expr | None) -> list[exp.Expr]:
+    """The terms of a top-level AND chain."""
+
+    pending = [condition] if condition is not None else []
+    terms: list[exp.Expr] = []
+    while pending:
+        node = pending.pop()
+        if isinstance(node, exp.Paren):
+            pending.append(node.this)
+        elif isinstance(node, exp.And):
+            pending.extend((node.expression, node.this))
+        else:
+            terms.append(node)
+    return terms
+
+
+def _single_table_rows(select: exp.Expr | None) -> tuple[tuple[str, str], list[exp.Expr]] | None:
+    """The table and the filter terms of a subquery that reads one table, plainly.
+
+    None for a join, a derived table, GROUP BY, HAVING, DISTINCT or a row
+    limit, and for a filter that names a column of another query (a
+    correlation): two such subqueries cannot be compared term by term.
+    """
+
+    if not isinstance(select, exp.Select) or select.args.get("joins"):
+        return None
+    if any(select.args.get(name) for name in ("group", "having", "distinct", "limit", "offset")):
+        return None
+    from_clause = select.args.get("from") or select.args.get("from_")
+    table = from_clause.this if from_clause is not None else None
+    if not isinstance(table, exp.Table) or table.catalog:
+        return None
+    where = select.args.get("where")
+    terms = _conjuncts(where.this if where is not None else None)
+    own = {table.name.casefold(), (table.alias_or_name or table.name).casefold()}
+    if any(
+        column.table and column.table.casefold() not in own
+        for term in terms
+        for column in term.find_all(exp.Column)
+    ):
+        return None
+    return ((table.db or "dbo").casefold(), table.name.casefold()), terms
+
+
+def _null_existence_tests(statement: exp.Expr) -> list[dict[str, Any]]:
+    """Each ``NOT EXISTS (SELECT ... WHERE ... column IS NULL)`` of the statement.
+
+    ``filter`` is the other filter terms of the subquery, as comparable text;
+    None when the test is not a term of its WHERE clause's AND chain or its
+    subquery is not a plain read of one table.
+    """
+
+    tests: list[dict[str, Any]] = []
+    for node in statement.find_all(exp.Exists):
+        if not isinstance(node.parent, exp.Not) or not isinstance(node.this, exp.Select):
+            continue
+        null_columns = [
+            term.this
+            for term in _conjuncts((node.this.args.get("where") or exp.Where()).args.get("this"))
+            if isinstance(term, exp.Is)
+            and isinstance(term.this, exp.Column)
+            and isinstance(term.expression, exp.Null)
+        ]
+        if not null_columns:
+            continue
+        from_clause = node.this.args.get("from") or node.this.args.get("from_")
+        table = from_clause.this if from_clause is not None else None
+        if not isinstance(table, exp.Table):
+            continue
+        ancestor = node.parent.parent
+        while isinstance(ancestor, (exp.And, exp.Paren)):
+            ancestor = ancestor.parent
+        rows = _single_table_rows(node.this) if isinstance(ancestor, exp.Where) else None
+        for column in null_columns:
+            tests.append(
+                {
+                    "table": ((table.db or "dbo").casefold(), table.name.casefold()),
+                    "column": column.name.casefold(),
+                    "filter": (
+                        frozenset(
+                            _expression_identity(term, ignore_qualifiers=True)
+                            for term in rows[1]
+                            if not (isinstance(term, exp.Is) and term.this is column)
+                        )
+                        if rows is not None
+                        else None
+                    ),
+                }
+            )
+    return tests
+
+
+def _not_in_subquery_rows(subquery: exp.Expr | None) -> dict[str, Any] | None:
+    """The table, the column and the filter of a NOT IN subquery that reads one table."""
+
+    rows = _single_table_rows(subquery)
+    if rows is None or not isinstance(subquery, exp.Select) or len(subquery.expressions) != 1:
+        return None
+    column = subquery.expressions[0]
+    if not isinstance(column, exp.Column):
+        return None
+    return {
+        "table": rows[0],
+        "column": column.name.casefold(),
+        "filter": frozenset(
+            _expression_identity(term, ignore_qualifiers=True) for term in rows[1]
+        ),
+    }
+
+
+_NEEDED_UNLESS_NULL_HANDLED = "the statement handles NULL"
+
+
+def _not_in_preconditions(
+    removed: Sequence[Mapping[str, Any]],
+    null_tests: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any] | None], list[dict[str, Any]]]:
+    """NOT NULL preconditions of removed NOT IN predicates, less what the rewrite tests itself.
+
+    NOT IN returns no row when its subquery yields a NULL. A rewrite that
+    keeps ``AND NOT EXISTS (the same rows WHERE column IS NULL)`` returns no
+    row then either, so it does not need the subquery column to be NOT NULL.
+    A NULL test that cannot be matched to the subquery leaves the
+    precondition in place, marked as needed unless the statement handles NULL.
+    The tested value on the outer side stays a precondition.
+    """
+
+    preconditions: list[dict[str, Any] | None] = []
+    handled: list[dict[str, Any]] = []
+    for item in removed:
+        subquery_column, tested_value = item["preconditions"]
+        rows = item["rows"]
+        subquery_filter = rows["filter"] if rows is not None else None
+        tests = (
+            [
+                test
+                for test in null_tests
+                if test["table"] == rows["table"] and test["column"] == rows["column"]
+            ]
+            if rows is not None and subquery_column is not None
+            else []
+        )
+        if subquery_column is not None and any(
+            test["filter"] is not None and test["filter"] == subquery_filter for test in tests
+        ):
+            handled.append(
+                {
+                    **subquery_column,
+                    "how": (
+                        "the statement returns no row when this column IS NULL in the "
+                        "rows the NOT IN subquery read: NOT EXISTS (... IS NULL) over "
+                        "the same table and filter"
+                    ),
+                }
+            )
+        elif subquery_column is not None and tests:
+            preconditions.append(
+                {
+                    **subquery_column,
+                    "needed_unless": _NEEDED_UNLESS_NULL_HANDLED,
+                    "unless_reason": (
+                        "the statement tests this column for NULL, but the filter of that "
+                        "test could not be matched to the filter of the NOT IN subquery, "
+                        "so it is not shown to cover the same rows"
+                    ),
+                }
+            )
+        else:
+            preconditions.append(subquery_column)
+        preconditions.append(tested_value)
+    return preconditions, handled
+
+
 def _shape(statements: list[exp.Expr]) -> dict[str, Any]:
     """Count the constructs whose meaning depends on NULLs, duplicates or missing rows."""
 
-    not_in: list[list[dict[str, Any] | None]] = []
+    not_in: list[dict[str, Any]] = []
     counted: dict[str, dict[str, Any] | None] = {}
     shape: dict[str, Any] = {
         "distinct": 0,
@@ -1155,16 +1353,19 @@ def _shape(statements: list[exp.Expr]) -> dict[str, Any]:
                     subquery = node.args["query"].this
                     projections = subquery.expressions if isinstance(subquery, exp.Select) else []
                     not_in.append(
-                        [
-                            _not_null_precondition(
-                                statement,
-                                projections[0] if len(projections) == 1 else None,
-                                subquery if isinstance(subquery, exp.Select) else None,
-                            ),
-                            _not_null_precondition(
-                                statement, node.this, node.find_ancestor(exp.Select)
-                            ),
-                        ]
+                        {
+                            "preconditions": [
+                                _not_null_precondition(
+                                    statement,
+                                    projections[0] if len(projections) == 1 else None,
+                                    subquery if isinstance(subquery, exp.Select) else None,
+                                ),
+                                _not_null_precondition(
+                                    statement, node.this, node.find_ancestor(exp.Select)
+                                ),
+                            ],
+                            "rows": _not_in_subquery_rows(subquery),
+                        }
                     )
             elif isinstance(node, exp.Join) and not isinstance(node.this, exp.Lateral):
                 shape["joins"] += 1
@@ -1181,6 +1382,9 @@ def _shape(statements: list[exp.Expr]) -> dict[str, Any]:
                 elif not isinstance(argument, exp.Distinct):
                     shape["count_star"] += 1  # COUNT(*) and COUNT(<constant>) count rows
     shape["not_in"] = not_in
+    shape["null_tests"] = [
+        test for statement in statements for test in _null_existence_tests(statement)
+    ]
     shape["counted_columns"] = counted
     return shape
 
@@ -1233,17 +1437,26 @@ def rewrite_requirements(baseline_sql: str, candidate_sql: str) -> list[dict[str
 
     requirements: list[dict[str, Any]] = []
     if len(baseline["not_in"]) != len(candidate["not_in"]):
-        longer = max(baseline["not_in"], candidate["not_in"], key=len)
-        requirements.append(
-            _requirement(
-                "not_in_null_semantics",
-                "NOT IN returns no row when the subquery yields a NULL and drops a row whose "
-                "tested value is NULL; NOT EXISTS and an anti-join keep those rows. The two are "
-                "equal only when both compared columns are NOT NULL.",
-                ["not_null"],
-                [item for pair in longer for item in pair],
-            )
+        with_not_in, without = (
+            (baseline, candidate)
+            if len(baseline["not_in"]) > len(candidate["not_in"])
+            else (candidate, baseline)
         )
+        preconditions, handled = _not_in_preconditions(
+            with_not_in["not_in"], without["null_tests"]
+        )
+        requirement = _requirement(
+            "not_in_null_semantics",
+            "NOT IN returns no row when the subquery yields a NULL and drops a row whose "
+            "tested value is NULL; NOT EXISTS and an anti-join keep those rows. The two are "
+            "equal only when both compared columns are NOT NULL, or when the statement "
+            "tests the NULL case itself.",
+            ["not_null"],
+            preconditions,
+        )
+        if handled:
+            requirement["handled_by_statement"] = handled
+        requirements.append(requirement)
     changed_counts = set(baseline["counted_columns"]) ^ set(candidate["counted_columns"])
     if changed_counts and baseline["count_star"] != candidate["count_star"]:
         both = {**candidate["counted_columns"], **baseline["counted_columns"]}
@@ -1319,18 +1532,27 @@ def has_outer_literal_top_zero(sql: str) -> bool:
 OrderKeys = tuple[tuple[str, bool], ...]
 
 
-def outer_order_by_keys(sql: str) -> tuple[OrderKeys | None, ...]:
+def outer_order_by_keys(
+    sql: str,
+    relation: tuple[str, str, str] | None = None,
+) -> tuple[OrderKeys | None, ...]:
     """Return the outer ORDER BY keys of each result-returning statement.
 
     Each entry is ``None`` when that statement has no outer ORDER BY. An
     ORDER BY inside a derived table, CTE, TOP, or window does not count:
     only the outermost one promises an order to the caller. A read-only
-    branching batch has one entry per branch.
+    branching batch has one entry per branch. ``relation`` (schema, name,
+    SELECT body) is a view the statement reads: it is read as its definition
+    (``inline_relation``), in every branch of a batch.
     """
 
     selects = _batch_selects(sql)
     if selects is not None:
-        return tuple(keys for select in selects for keys in outer_order_by_keys(select))
+        return tuple(
+            keys for select in selects for keys in outer_order_by_keys(select, relation)
+        )
+    if relation is not None:
+        sql = inline_relation(sql, *relation) or sql
     statements = _parse_statements(sql)
     orders: list[OrderKeys | None] = []
     for statement in statements:
@@ -1376,15 +1598,19 @@ def effective_compare_order(sql: str, requested: bool | None) -> bool:
 def order_contract_risk(
     baseline_sql: str,
     candidate_sql: str,
+    *,
+    candidate_relation: tuple[str, str, str] | None = None,
 ) -> dict[str, Any] | None:
     """Return a blocking risk when the candidate weakens the baseline order.
 
     A sandbox run can return key order by accident, so result comparison
     cannot detect a dropped or changed outer ORDER BY. The candidate must keep
     the baseline keys, in order and direction, as a prefix of its own keys.
+    ``candidate_relation`` is a view the candidate reads, as (schema, name,
+    SELECT body): its columns are then the expressions they store.
     """
 
-    candidate_orders = outer_order_by_keys(candidate_sql)
+    candidate_orders = outer_order_by_keys(candidate_sql, candidate_relation)
     baseline_orders = outer_order_by_keys(baseline_sql)
     if _batch_selects(candidate_sql) is not None or _batch_selects(baseline_sql) is not None:
         # Any branch can be the one that runs, so every candidate branch must
@@ -1394,11 +1620,16 @@ def order_contract_risk(
             return None
         reason = None
         branch = None
+        # removed: a branch returns rows in no promised order, which no
+        # comparison can show. keys_differ: every branch still orders its rows.
+        change = "keys_differ"
         if len(required) > 1:
             reason = (
                 "baseline branches have different outer ORDER BY keys, so the order "
                 "contract of the batch cannot be compared"
             )
+        if any(candidate_keys is None for candidate_keys in candidate_orders):
+            change = "removed"
         for ordinal, candidate_keys in enumerate(candidate_orders, start=1):
             if reason is not None:
                 break
@@ -1417,6 +1648,7 @@ def order_contract_risk(
             "source": "baseline_vs_candidate",
             "result_set_ordinal": 1,
             **({"branch": branch} if branch is not None else {}),
+            "change": change,
             "reason": reason,
             "proof_requirement": (
                 "keep the baseline outer ORDER BY keys and directions as a "
@@ -1479,6 +1711,35 @@ def _order_sources(select: exp.Select) -> dict[str, str] | None:
     return sources
 
 
+def _order_relations(
+    select: exp.Select,
+    ctes: Mapping[str, exp.CTE | None],
+) -> dict[str, exp.Select]:
+    """The plain SELECT behind each derived table or CTE in the FROM clause, by alias."""
+
+    relations: dict[str, exp.Select] = {}
+    from_clause = select.args.get("from") or select.args.get("from_")
+    items = [from_clause.this] if from_clause is not None else []
+    items += [join.this for join in select.args.get("joins") or []]
+    for item in items:
+        inner: exp.Expr | None = None
+        if isinstance(item, exp.Subquery):
+            inner = item.this
+        elif isinstance(item, exp.Table) and not item.db:
+            cte = ctes.get(item.name.casefold())
+            inner = cte.this if cte is not None else None
+        if (
+            isinstance(inner, exp.Select)
+            and item.alias_or_name
+            and not any(
+                isinstance(projection, exp.Star) or isinstance(projection.this, exp.Star)
+                for projection in inner.expressions
+            )
+        ):
+            relations[item.alias_or_name.casefold()] = inner
+    return relations
+
+
 def _resolve_order_expression(
     expression: exp.Expr,
     select: exp.Select,
@@ -1521,6 +1782,7 @@ def _resolve_order_expression(
         identity: _RowIdentity | None = _row_identity(select, ctes)
     except _NoRowKey:
         identity = None
+    relations = _order_relations(select, ctes)
 
     def qualify(node: exp.Expr) -> exp.Expr:
         if not isinstance(node, exp.Column) or isinstance(node.this, exp.Star):
@@ -1531,6 +1793,30 @@ def _resolve_order_expression(
                 this=exp.to_identifier(base["column"]),
                 table=exp.to_identifier(f"{base['schema']}.{base['table']}".casefold()),
             )
+        # A column of a derived table, CTE or inlined view that is an
+        # expression there (the alias of a GROUP BY expression) is that
+        # expression: ordering by the column orders by its values.
+        inner = (
+            relations.get(node.table.casefold())
+            if node.table
+            else next(iter(relations.values()))
+            if len(sources) == len(relations) == 1
+            else None
+        )
+        if inner is not None:
+            named = [
+                item
+                for item in inner.expressions
+                if isinstance(item, (exp.Alias, exp.Column))
+                and item.alias_or_name.casefold() == node.name.casefold()
+            ]
+            if len(named) == 1 and not any(
+                isinstance(part, (exp.AggFunc, exp.Window, exp.Subquery))
+                for part in named[0].walk()
+            ):
+                return exp.Paren(
+                    this=_resolve_order_expression(named[0].unalias().copy(), inner, ctes)
+                )
         qualifier = ".".join(
             part.casefold() for part in (node.catalog, node.db, node.table) if part
         )
@@ -1554,6 +1840,13 @@ def _order_key(
     expression = ordered.this.copy() if isinstance(ordered, exp.Ordered) else ordered.copy()
     if select is not None:
         expression = _resolve_order_expression(expression, select, ctes or {})
+    # Parentheses around a whole key or a whole operand change nothing.
+    expression = expression.transform(
+        lambda node: node.this
+        if isinstance(node, exp.Paren)
+        and isinstance(node.this, (exp.Column, exp.Func, exp.Cast, exp.Paren))
+        else node
+    )
     # Identifier case and quoting do not change T-SQL name resolution.
     for identifier in expression.find_all(exp.Identifier):
         identifier.set("this", identifier.name.casefold())

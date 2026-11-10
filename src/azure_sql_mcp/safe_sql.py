@@ -674,7 +674,20 @@ MAX_BATCH_DEPTH = 8
 MAX_BATCH_BRANCHES = 16
 _BATCH_STATEMENT_WORDS = frozenset({"IF", "SELECT", "WITH", "EXEC", "EXECUTE", "BEGIN"})
 _BATCH_PREFIX_WORDS = frozenset({"DECLARE", "SET"})
-_BATCH_CONDITION_WORDS = frozenset({"AND", "OR", "NOT", "IS", "NULL", "IN", "BETWEEN", "LIKE"})
+_BATCH_CONDITION_WORDS = frozenset(
+    {"AND", "OR", "NOT", "IS", "NULL", "IN", "BETWEEN", "LIKE", "ESCAPE"}
+)
+# Deterministic scalar functions a guard or a value may call on @variables and
+# literals: conversions and pattern tests. None reads data, the catalog, a
+# clock or user code, so the batch stays a closed read-only form.
+_BATCH_SCALAR_FUNCTIONS = frozenset(
+    {
+        "CAST", "CONVERT", "TRY_CAST", "TRY_CONVERT", "PATINDEX", "CHARINDEX",
+        "LEN", "ISNULL", "COALESCE", "NULLIF",
+    }
+)
+# The one word COLLATE takes: Latin1_General_BIN2, SQL_Latin1_General_CP1_CI_AS.
+_BATCH_COLLATION_NAME = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+")
 _BATCH_CONDITION_PUNCT = frozenset("()=<>!+-*/%,.")
 _BATCH_VALUE_PUNCT = frozenset("()+-*/%.")
 _BATCH_SCALAR_TYPES = frozenset(
@@ -706,13 +719,19 @@ class _BranchingBatchParser:
                 | select [;]
                 | EXEC[UTE] [sys.]sp_executesql 'select' [ , 'declarations' { , argument } ] [;]
     condition  := @variables, literals, comparison and arithmetic operators,
-                  AND OR NOT IS NULL IN BETWEEN LIKE, parentheses
-    value      := @variables, literals, arithmetic operators, parentheses
+                  AND OR NOT IS NULL IN BETWEEN LIKE [ESCAPE], parentheses, scalar
+    value      := @variables, literals, arithmetic operators, parentheses, scalar
+    scalar     := COLLATE collation_name
+                | ( CAST | TRY_CAST ) ( value AS type )
+                | ( CONVERT | TRY_CONVERT ) ( type , value [ , style ] )
+                | ( PATINDEX | CHARINDEX | LEN | ISNULL | COALESCE | NULLIF ) ( value { , value } )
     argument   := [ @name = ] ( @variable | literal )
     select     := text that validate_read_only admits as exactly one SELECT
 
     The top statement is IF, BEGIN or EXEC: one SELECT alone is the ordinary
-    form. No function call, subquery or object name can occur outside a select.
+    form. Outside a select there is no subquery, no object name and no
+    function other than the deterministic scalar functions above, which take
+    @variables and literals only.
     """
 
     def __init__(self, sql: str, validator: SafeSqlValidator) -> None:
@@ -790,22 +809,48 @@ class _BranchingBatchParser:
             ):
                 break
             word = self._word()
+            following = (
+                self.tokens[self.position + 1] if self.position + 1 < len(self.tokens) else None
+            )
             allowed = (
                 token.kind == "string"
                 or (token.kind == "punct" and token.text in punct)
+                # The argument separator of a scalar function call.
+                or (depth > 0 and _is_punct(token, ","))
                 or (
                     word is not None
                     and (
                         word in words
                         or _OPTIMIZE_FOR_VARIABLE.fullmatch(word) is not None
                         or _BATCH_NUMBER.fullmatch(word) is not None
+                        # A function name only as a call; a type, MAX and AS
+                        # only inside the parentheses of one.
+                        or (
+                            word in _BATCH_SCALAR_FUNCTIONS
+                            and following is not None
+                            and _is_punct(following, "(")
+                        )
+                        or (depth > 0 and (word in _BATCH_SCALAR_TYPES or word in {"AS", "MAX"}))
                     )
                 )
             )
+            if word == "COLLATE":
+                # COLLATE takes exactly one collation name, and nothing else.
+                if (
+                    following is None
+                    or following.kind != "word"
+                    or not self.sql[following.start : following.end].isascii()
+                    or _BATCH_COLLATION_NAME.fullmatch(following.text) is None
+                ):
+                    raise _BatchGrammarError(f"{what}: COLLATE needs one collation name")
+                self.position += 2
+                continue
             if not allowed:
                 raise _BatchGrammarError(
-                    f"{what} may hold only @variables, literals and operators; "
-                    "no function, subquery or object name"
+                    f"{what} may hold only @variables, literals, operators, COLLATE and "
+                    "the scalar functions "
+                    + ", ".join(sorted(_BATCH_SCALAR_FUNCTIONS))
+                    + "; no other function, subquery or object name"
                 )
             depth += _is_punct(token, "(") - _is_punct(token, ")")
             if depth < 0:
@@ -1178,6 +1223,26 @@ class UnsupportedSqlError(ValueError):
         self.submitted_sql = submitted_sql
 
 
+def _parse_stop_hint(error: ParseError) -> str:
+    """Where the parser stopped, for a refusal the caller can act on.
+
+    Only the place and the one token: the statement is the caller's own text.
+    The usual cause is a string literal that lost or doubled its quotes in a
+    shell or JSON layer on the way in.
+    """
+
+    first = error.errors[0] if getattr(error, "errors", None) else None
+    if not isinstance(first, dict) or not first.get("line"):
+        return ""
+    token = str(first.get("highlight") or "")[:40]
+    return (
+        f" The parser stopped at line {first['line']}, column {first.get('col')}"
+        + (f", at {token!r}" if token else "")
+        + ". Check that every string literal kept its single quotes: a shell or JSON "
+        "layer can strip or double them."
+    )
+
+
 class SafeSqlValidator:
     def validate_read_only(self, sql: str) -> ValidatedQuery:
         """Validate a read-only batch: optional DECLARE / SET @variable statements
@@ -1202,7 +1267,8 @@ class SafeSqlValidator:
             if under_option is None:
                 if _READ_ONLY_PREFIX_PATTERN.match(candidate):
                     raise UnsupportedSqlError(
-                        "T-SQL could not be statically analyzed; admission is not allowed.",
+                        "T-SQL could not be statically analyzed; admission is not allowed."
+                        + _parse_stop_hint(exc),
                         submitted_sql=sql,
                     ) from exc
                 raise ValueError(f"Invalid T-SQL: {exc}") from exc

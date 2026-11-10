@@ -1813,6 +1813,8 @@ def _quote_catalog_identifier(value: str) -> str:
 # Server errors that end a CREATE INDEX batch with nothing committed (the
 # workflow runs it under XACT_ABORT ON in one transaction).
 _DEFINITE_CREATE_FAILURES: dict[int, str] = {
+    # The engine rolls the victim's transaction back before it reports 1205.
+    1205: "deadlock_victim",
     1222: "lock_timeout_or_low_priority_abort",
     1505: "duplicate_key",
     102: "compile_error",
@@ -1826,12 +1828,16 @@ _DEFINITE_CREATE_FAILURES: dict[int, str] = {
 }
 # mssql-python does not always expose the error number; the server text names these.
 _DEFINITE_CREATE_FAILURE_TEXTS: tuple[tuple[re.Pattern[str], int], ...] = (
+    (re.compile(r"chosen as the deadlock victim", re.IGNORECASE), 1205),
     (re.compile(r"Lock request time out period exceeded", re.IGNORECASE), 1222),
     (re.compile(r"terminated because a duplicate key was found", re.IGNORECASE), 1505),
     (re.compile(r"does not exist in the target table or view", re.IGNORECASE), 1911),
     (re.compile(r"Invalid column name", re.IGNORECASE), 207),
     (re.compile(r"Invalid object name", re.IGNORECASE), 208),
 )
+# A build that lost to another session, not to its own definition: the same
+# statement can succeed on the next try.
+TRANSIENT_BUILD_ERRORS = frozenset({1205, 1222})
 # 3621 "The statement has been terminated" only accompanies another error.
 _COMPANION_ERROR_NUMBERS = frozenset({3621})
 # The number that ends one diagnostic record; "(5)." inside the text is a row value.

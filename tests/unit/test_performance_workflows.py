@@ -3629,7 +3629,7 @@ async def test_outer_order_by_cannot_be_waived_by_compare_order_false() -> None:
 
 
 @pytest.mark.asyncio
-async def test_comparison_that_drops_outer_order_by_needs_a_proof_contract() -> None:
+async def test_comparison_that_drops_outer_order_by_is_a_test_and_never_a_proof() -> None:
     service, _store, _plans, executor = _service()
 
     result = await service.compare_query_results(
@@ -3638,11 +3638,13 @@ async def test_comparison_that_drops_outer_order_by_needs_a_proof_contract() -> 
         "SELECT id FROM dbo.Items AS candidate",
     )
 
-    assert result["status"] == "proof_contract_required"
-    assert "order_contract_changed" in (
-        result["equivalence_preflight"]["candidate"]["risk_codes"]
-    )
-    assert executor.sessions == []
+    # The rows are compared as a multiset; the missing ORDER BY stays a gap.
+    assert len(executor.sessions) == 1
+    assert result["status"] == "match"
+    assert result["proven_for_parameter_case"] is False
+    assert result["proof_scope"] == "snapshot_test"
+    assert result["not_settled"][0]["code"] == "order_contract_changed"
+    assert any("no outer ORDER BY" in caveat for caveat in result["caveats"])
 
 
 @pytest.mark.asyncio

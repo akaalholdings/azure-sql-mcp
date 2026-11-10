@@ -462,7 +462,10 @@ async def test_a_branching_batch_is_compared_and_benchmarked_in_a_session() -> N
 
 
 @pytest.mark.asyncio
-async def test_a_batch_branch_that_drops_the_order_is_stopped_before_any_execution() -> None:
+async def test_a_batch_branch_that_drops_the_order_is_compared_and_never_proven() -> None:
+    """The rows are fixed inside one snapshot, so they are compared; an order
+    nobody asks for cannot be shown, so the match is a test with that caveat."""
+
     plans = ScriptedPlans(lambda side, _case, _call: 400 if side == "baseline" else 100)
     service, _store, _plans, executor = _service(plans=plans, binder=_typed_binder())
     unordered = OPTIONAL_FIX.replace("WHERE owner = @p ORDER BY id", "WHERE owner = @p")
@@ -471,7 +474,8 @@ async def test_a_batch_branch_that_drops_the_order_is_stopped_before_any_executi
         "appdb", OPTIONAL_BASELINE, unordered, parameter_case=OPTIONAL_CASES[0]
     )
 
-    assert comparison["status"] == "proof_contract_required"
-    assert comparison["executions"] == 0
-    assert "order_contract_changed" in comparison["equivalence_preflight"]["candidate"]["risk_codes"]
-    assert executor.sessions == []
+    assert len(executor.sessions) == 1
+    assert comparison["proven_for_parameter_case"] is False
+    assert comparison["proof_scope"] == "snapshot_test"
+    assert comparison["preflight_gaps"] == ["order_contract_changed"]
+    assert any("no outer ORDER BY" in caveat for caveat in comparison["caveats"])
