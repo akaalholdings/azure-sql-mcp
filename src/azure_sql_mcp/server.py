@@ -78,6 +78,7 @@ from .elastic_pool import ElasticPoolService
 from .equivalence_contract import effective_compare_order
 from .equivalence_contract import rewrite_requirements
 from .equivalence_contract import statement_hint_profile
+from .equivalence_contract import tables_read
 from .equivalence_preflight import EquivalencePreflightService
 from .health import HealthService
 from .history_azure_monitor import ARM_SCOPE
@@ -736,6 +737,70 @@ def _call_cap_reason(clock: _CallClock, step: str, still_held: bool) -> str:
 # Lease metadata key of a session hold: the test objects of the lease stay in
 # place between the benchmark calls of its tuning session.
 HOLD_FLAG = "held_for_session"
+# Seconds to wait before the second and the third attempt to drop the objects
+# of a lease; idle pooled connections are closed before each of them.
+_LEASE_DROP_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 3.0)
+# Attempts to drop the objects of a lease: when a session ends, and before a
+# call that must not run on a database with a leftover.
+_FINALIZE_DROP_ATTEMPTS = 3
+_PRE_CALL_DROP_ATTEMPTS = 2
+# A drop that failed for one of these causes can succeed on a new connection.
+_RETRYABLE_DROP_CAUSES = frozenset({"connection_lost", "timeout", "lock_wait_abort", "engine_error"})
+# A lease whose create outcome is unknown: the build may still commit, so its
+# object is dropped only after the lease has expired.
+_OUTCOME_UNKNOWN_MARKS = frozenset(
+    {"uncertain_after_create_dispatch", "outcome_unknown_after_transport_failure"}
+)
+_MAX_WARNED_TABLES = 8
+
+
+class _LeaseDropError(Exception):
+    """Some objects of a lease could not be dropped; ``failures`` is by index name."""
+
+    def __init__(self, failures: Mapping[str, Exception]) -> None:
+        super().__init__(f"{len(failures)} test object(s) of the lease were not dropped")
+        self.failures = dict(failures)
+
+    @property
+    def first(self) -> Exception:
+        return next(iter(self.failures.values()))
+
+
+def _object_drop_statement(entry: Mapping[str, Any]) -> str:
+    """The DDL a person runs to remove one leased test object."""
+
+    schema = entry.get("target_schema")
+    if entry.get("object_kind") == LEASE_OBJECT_KIND:
+        return f"DROP VIEW [{schema}].[{entry.get('target_view')}];"
+    return f"DROP INDEX [{entry.get('index_name')}] ON [{schema}].[{entry.get('target_table')}];"
+
+
+def _drop_failure_diagnostic(
+    exc: Exception,
+    *,
+    view: bool,
+    query_timeout_seconds: int,
+) -> dict[str, Any]:
+    """Why the drop of one test object failed: the step, the class of the cause, the engine text.
+
+    The DDL is built by the server, so the engine or driver message is
+    returned through the same redaction as a failed test index build.
+    """
+
+    diagnostic = _index_experiment_failure(
+        exc, step="drop_index", query_timeout_seconds=query_timeout_seconds
+    )
+    if view:
+        diagnostic["failed_step"] = "drop_view"
+    if (
+        diagnostic.get("cause_class") in {"engine_error", "internal_error"}
+        and classify_create_index_failure(exc)["reason"] == "connection_or_timeout"
+    ):
+        diagnostic["cause_class"] = "connection_lost"
+    if diagnostic.get("cause_class") == "internal_error":
+        # A refusal of the server itself (ownership not proven): its own words.
+        diagnostic["detail"] = sanitize_error_message(str(exc))[:300]
+    return diagnostic
 
 
 def _held_object_report(entry: Mapping[str, Any], lease: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -3256,8 +3321,9 @@ class AzureSqlMcpApplication:
                 ge=2,
                 le=5,
                 description=(
-                    "Optional paired runs per parameter case. Screening is capped by "
-                    "the session screening limit; finalists by the finalist limit."
+                    "Optional paired runs per parameter case, 2 to 5 (a pair of runs "
+                    "is the least that shows noise). Screening is capped by the "
+                    "session screening limit; finalists by the finalist limit."
                 ),
             ),
             prove_equivalence: bool | None = Field(
@@ -3284,10 +3350,10 @@ class AzureSqlMcpApplication:
             database_name: str | None = Field(default=None),
         ) -> BenchmarkToolOutput:
             async def benchmark(db: str) -> Any:
-                payload = await self.performance_workflows.benchmark_candidate(
+                payload = await self._benchmark_tuning_candidate(
+                    db,
                     session_id,
                     candidate_id,
-                    db,
                     baseline_sql,
                     candidate_sql,
                     phase=phase,
@@ -3299,7 +3365,6 @@ class AzureSqlMcpApplication:
                     cross_case=cross_case,
                     slow_baseline_cases=slow_baseline_cases,
                 )
-                payload = self._with_held_objects_present(db, session_id, payload)
                 return payload if detail == "full" else _compact_benchmark_payload(payload)
 
             return cast(
@@ -3777,7 +3842,12 @@ class AzureSqlMcpApplication:
                 "Finalize a tuning session with the winning candidate, complete leaderboard, "
                 "rejected experiments, and explicit stopping reason. Test objects a "
                 "benchmark call kept for the session (keep_for_session) are dropped "
-                "and listed in held_test_objects_dropped."
+                "and listed in held_test_objects_dropped, each with dropped true or "
+                "false. A drop that fails is retried on a new connection; when an "
+                "object is still in place the result has cleanup_required true, "
+                "result_status precondition, the failure per object and the DDL in "
+                "remediation: that is not a clean finish. Call this tool again on the "
+                "finalized session to retry the drop."
             ),
             annotations=ToolAnnotations(
                 title="Finalize Tuning Session",
@@ -3940,6 +4010,11 @@ class AzureSqlMcpApplication:
                         f"is {self.config.tool_timeout_seconds} seconds "
                         "(AZURE_SQL_TOOL_TIMEOUT_SECONDS)."
                     )
+                # A comparison has no session: every test index on a table it
+                # reads is named, with the session that holds it when one does.
+                foreign = await self._test_objects_on_read_tables(db, [baseline_sql, candidate_sql])
+                if foreign is not None and isinstance(result, dict):
+                    result["test_objects_on_read_tables"] = foreign
                 return result
 
             return await self._run_tool("compare_query_results", database_name, compare)
@@ -8783,7 +8858,16 @@ class AzureSqlMcpApplication:
             allow_legacy=bool(self.config.legacy_state_server_binding),
         ):
             raise PermissionError("Performance case belongs to another database.")
-        return self.performance_workflows.start_session(
+        # A session must not start on a database that holds a leftover of an
+        # earlier lease: its drop is retried here, and the start is refused
+        # while the object is still in place.
+        cleanup = await self._reconcile_leases(
+            database_fingerprint=case.database_fingerprint,
+            attempts=_PRE_CALL_DROP_ATTEMPTS,
+        )
+        if cleanup["cleanup_required"]:
+            return self._leftover_refusal(cleanup, case_id=case_id)
+        started = self.performance_workflows.start_session(
             case_id,
             database_name,
             max_candidates=max_candidates,
@@ -8791,6 +8875,9 @@ class AzureSqlMcpApplication:
             time_limit_minutes=time_limit_minutes,
             idempotency_key=idempotency_key,
         )
+        if cleanup["dropped"]:
+            started = {**started, "cleanup_before_run": {"dropped": cleanup["dropped"]}}
+        return started
 
     async def _get_tuning_session(
         self,
@@ -8864,36 +8951,73 @@ class AzureSqlMcpApplication:
             allow_legacy=bool(self.config.legacy_state_server_binding),
         ):
             raise PermissionError("Tuning session belongs to another database.")
-        # Read the catalog before the session completes: a refuted
-        # precondition raises here and leaves the session open.
-        verification = (
-            await self.performance_workflows.verify_logical_preconditions(
-                database_name,
-                session_id,
-                selected_candidate_id,
-                logical_preconditions,
-            )
-            if selected_candidate_id is not None
-            else None
-        )
-        result = self.performance_workflows.finalize_session(
-            session_id,
-            selected_candidate_id=selected_candidate_id,
-            selection_scope=selection_scope,
-            stopping_reason=stopping_reason,
-            idempotency_key=idempotency_key,
-            precondition_verification=verification,
-        )
-        # A finished session keeps no test object in the database.
-        released = await self._release_session_hold(database_name, session_id)
-        if released:
-            result = {**result, "held_test_objects_dropped": released}
-            if not all(item["dropped"] for item in released):
-                result["held_test_objects_note"] = (
-                    "A held test object could not be dropped. Its lease is "
-                    "cleanup_required: the next benchmark call in this database "
-                    "retries the drop before it runs."
+        already_finalized = session.status not in {"created", "screening", "finalist_validation"}
+        if already_finalized:
+            # The session is closed and stays as it was finalized. The call is
+            # the explicit retry of the drop of what it still has in place.
+            result: dict[str, Any] = {
+                **self.performance_workflows.get_session(session_id),
+                "already_finalized": True,
+                "already_finalized_note": (
+                    "The session was finalized before; its selection and stopping "
+                    "reason are unchanged. This call only retried the drop of test "
+                    "objects the session still had in place."
+                ),
+            }
+        else:
+            # Read the catalog before the session completes: a refuted
+            # precondition raises here and leaves the session open.
+            verification = (
+                await self.performance_workflows.verify_logical_preconditions(
+                    database_name,
+                    session_id,
+                    selected_candidate_id,
+                    logical_preconditions,
                 )
+                if selected_candidate_id is not None
+                else None
+            )
+            result = self.performance_workflows.finalize_session(
+                session_id,
+                selected_candidate_id=selected_candidate_id,
+                selection_scope=selection_scope,
+                stopping_reason=stopping_reason,
+                idempotency_key=idempotency_key,
+                precondition_verification=verification,
+            )
+        # A finished session keeps no test object in the database.
+        cleanup = await self._reconcile_leases(
+            session_id=session_id,
+            closed_by="released_by_finalize",
+            attempts=_FINALIZE_DROP_ATTEMPTS,
+        )
+        objects = [*cleanup["dropped"], *cleanup["remaining"]]
+        if objects or already_finalized:
+            result = {**result, "held_test_objects_dropped": objects}
+        if cleanup["remaining"]:
+            names = ", ".join(
+                str(item.get("index_name") or item.get("lease_id")) for item in cleanup["remaining"]
+            )
+            remediation = "\n".join(
+                str(item["remediation"]) for item in cleanup["remaining"] if item.get("remediation")
+            )
+            reason = (
+                f"The session is finalized, but a test object it held is still in place: {names}. "
+                "This is not a clean finish: the object changes the plans of other sessions "
+                "on its table until it is dropped."
+            )
+            result = {
+                **result,
+                "cleanup_required": True,
+                **status_payload(ResultStatus.PRECONDITION, reason, remediation=remediation or None),
+                "held_test_objects_note": (
+                    f"Not dropped after {_FINALIZE_DROP_ATTEMPTS} attempts; failure says why "
+                    "per object. Call finalize_tuning_session again with this session_id to "
+                    "retry the drop. Every benchmark call and start_tuning_session in this "
+                    "database also retries it first and is refused while the object is "
+                    "still in place. If it stays, give the user remediation."
+                ),
+            }
         return result
 
     async def _compare_plan_summaries(
@@ -9958,42 +10082,6 @@ class AzureSqlMcpApplication:
             )
         return pool
 
-    async def _release_session_hold(self, database_name: str, session_id: str) -> list[dict[str, Any]]:
-        """Drop every test object the session holds and close its lease.
-
-        Returns what was held, each with ``dropped``. A drop that fails
-        leaves the lease as cleanup_required, as an expired lease does.
-        """
-
-        hold = self._session_hold(
-            database_fingerprint(database_name, self.config.server), session_id
-        ) or next(
-            (
-                lease
-                for lease in self.performance_store.list_open_index_leases()
-                if lease["session_id"] == session_id
-                and lease["status"] == "active"
-                and (lease.get("metadata") or {}).get(HOLD_FLAG) is True
-            ),
-            None,
-        )
-        if hold is None:
-            return []
-        held = [
-            _held_object_report(entry, hold)
-            for entry in hold["metadata"].get("members") or ()
-            if isinstance(entry, Mapping)
-        ]
-        now = datetime.now(timezone.utc)
-        try:
-            await self._drop_lease_objects(hold, now, closed_by="released_by_finalize")
-            dropped = True
-        except Exception as exc:
-            note_exception(exc, "server.release_session_hold")
-            self._record_lease_cleanup_failure(hold, exc, now)
-            dropped = False
-        return [{**item, "dropped": dropped} for item in held]
-
     def _recover_index_benchmark_result(
         self,
         *,
@@ -10285,23 +10373,12 @@ class AzureSqlMcpApplication:
         case = self.performance_store.get_performance_case(session.performance_case_id)
         # Only this database's leases gate its work: an unresolved cleanup in
         # another database must not stop index tests here.
-        cleanup = await self._cleanup_expired_index_leases(
-            database_fingerprint=case.database_fingerprint
+        cleanup = await self._reconcile_leases(
+            database_fingerprint=case.database_fingerprint,
+            attempts=_PRE_CALL_DROP_ATTEMPTS,
         )
         if cleanup["cleanup_required"]:
-            return {
-                "session_id": session_id,
-                "candidate_id": candidate_id,
-                "classification": "cleanup_required",
-                "reason": (
-                    "Expired temporary-index cleanup is unresolved in this database; "
-                    "no new DDL or benchmark query was dispatched."
-                ),
-                "failure_code": "expired_index_cleanup_required",
-                "executions": 0,
-                "cleanup": cleanup,
-                "session_continues": False,
-            }
+            return self._leftover_refusal(cleanup, session_id=session_id, candidate_id=candidate_id)
         if candidate.session_id != session_id:
             raise ValueError("Candidate does not belong to the tuning session.")
         # Test objects an earlier call of this session left in place.
@@ -10963,7 +11040,14 @@ class AzureSqlMcpApplication:
                     "session_continues": candidate.state != "cleanup_required",
                     "replayed_zero_execution_result": True,
                 }
-            raise ValueError("Index candidate already has a terminal benchmark result.")
+            raise ValueError(
+                f"Index candidate already has a terminal benchmark result ({candidate.state}); "
+                "a candidate is measured once. For a further run (plan_reuse='first_case', "
+                "other parameter cases), register it again with add_tuning_candidate (the "
+                f"same SQL, strategy='{candidate.strategy}') and call benchmark_index_candidate "
+                "on the new candidate_id. With keep_for_session=true on the first call the "
+                "held index is reused, so nothing is built twice."
+            )
         if (
             existing_reservation is None
             and not candidate.is_terminal
@@ -11046,6 +11130,24 @@ class AzureSqlMcpApplication:
                     table_name=table_only,
                 )
             )
+        # A test index that a closed lease of this server built and that is
+        # still in the catalog is ours by its owner marker: it is dropped, not
+        # reported as an index nobody owns.
+        leftovers_dropped = await self._drop_owned_leftover_indexes(
+            database_name,
+            case.database_fingerprint or "",
+            [
+                existing
+                for existing in existing_indexes
+                if existing.name not in held_index_names
+                and _is_generated_test_index_name(
+                    existing.name, self._allowed_test_index_prefixes(policy)
+                )
+            ],
+        )
+        if leftovers_dropped:
+            gone = {str(item["index_name"]) for item in leftovers_dropped}
+            existing_indexes = [item for item in existing_indexes if item.name not in gone]
         name_conflict = next(
             (
                 existing
@@ -12759,6 +12861,15 @@ class AzureSqlMcpApplication:
             "time_spent": time_spent,
             "session_continues": True,
         }
+        if objects_remain and proof_scope_label == "aba_result_stability":
+            result["proof_scope_note"] = (
+                "The results matched before the build and with the index. No run followed "
+                "a drop, because the index is held for the session."
+            )
+        if cleanup["dropped"]:
+            result["cleanup_before_run"] = {"dropped": cleanup["dropped"]}
+        if leftovers_dropped:
+            result["leftovers_dropped"] = leftovers_dropped
         if benchmark_error == "call_time_cap":
             result["partial"] = True
         if build_estimate is not None:
@@ -12991,23 +13102,12 @@ class AzureSqlMcpApplication:
         if any(finding.severity == "error" for finding in findings) or (not noexpand and findings):
             raise refuse(findings)
         # Before the hold is read: an expired hold is dropped here, not reused.
-        cleanup = await self._cleanup_expired_index_leases(
-            database_fingerprint=case.database_fingerprint
+        cleanup = await self._reconcile_leases(
+            database_fingerprint=case.database_fingerprint,
+            attempts=_PRE_CALL_DROP_ATTEMPTS,
         )
         if cleanup["cleanup_required"]:
-            return {
-                "session_id": session_id,
-                "candidate_id": candidate_id,
-                "classification": "cleanup_required",
-                "reason": (
-                    "Expired test object cleanup is unresolved in this database; "
-                    "no DDL or benchmark query was dispatched."
-                ),
-                "failure_code": "expired_index_cleanup_required",
-                "executions": 0,
-                "cleanup": cleanup,
-                "session_continues": False,
-            }
+            return self._leftover_refusal(cleanup, session_id=session_id, candidate_id=candidate_id)
         # Test objects an earlier call of this session left in place.
         hold = self._session_hold(case.database_fingerprint or "", session_id)
         held_entries: list[dict[str, Any]] = (
@@ -14173,6 +14273,8 @@ class AzureSqlMcpApplication:
             "session_continues": lease["status"] != "cleanup_required",
             "plan_controls_not_applied": True,
         }
+        if cleanup["dropped"]:
+            result["cleanup_before_run"] = {"dropped": cleanup["dropped"]}
         if build_retries:
             result["build_retries"] = build_retries
         if failure is not None and failure.get("diagnostic_code") == "call_time_cap":
@@ -16505,47 +16607,225 @@ class AzureSqlMcpApplication:
         *,
         database_fingerprint: str | None = None,
     ) -> dict[str, int]:
-        """Retry expired temporary-index cleanup before a sandbox accepts work.
+        """Retry the cleanup of expired and cleanup_required leases; the counts only.
 
         ``database_fingerprint`` limits the pass to one database's leases.
         """
 
-        summary = {"examined": 0, "cleaned": 0, "cleanup_required": 0}
+        report = await self._reconcile_leases(database_fingerprint=database_fingerprint)
+        return {key: int(report[key]) for key in ("examined", "cleaned", "cleanup_required")}
+
+    def _lease_database_name(self, lease: Mapping[str, Any]) -> str | None:
+        return next(
+            (
+                name
+                for name in self.config.allowed_databases
+                if database_fingerprint_matches(
+                    str(lease["database_fingerprint"]),
+                    name,
+                    self.config.server,
+                    allow_legacy=bool(self.config.legacy_state_server_binding),
+                )
+            ),
+            None,
+        )
+
+    def _lease_object_entries(self, lease: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """One entry per test object of a lease; empty when the lease cannot be read."""
+
+        try:
+            views = self._index_lease_members(lease)
+        except ValueError:
+            return []
+        return [{**view["metadata"], "index_name": view["index_name"]} for view in views]
+
+    def _lease_is_due(
+        self,
+        lease: Mapping[str, Any],
+        now: datetime,
+        session_id: str | None,
+    ) -> bool:
+        """True when the objects of a lease must be dropped now.
+
+        Ending a session: every lease of it that still has objects. Otherwise:
+        a lease whose cleanup already failed (cleanup_required) or was cut off
+        (cleanup_pending), at once, and any lease that has expired. A lease
+        whose create outcome is unknown waits for its expiry, because its
+        build may still commit.
+        """
+
+        metadata = lease.get("metadata") or {}
+        status = str(lease.get("status"))
+        if session_id is not None:
+            return lease.get("session_id") == session_id and (
+                status in {"cleanup_required", "cleanup_pending"}
+                or (status == "active" and metadata.get(HOLD_FLAG) is True)
+            )
+        try:
+            expires_at = datetime.fromisoformat(str(lease["expires_at_utc"]).replace("Z", "+00:00"))
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            expires_at = now
+        if expires_at.astimezone(timezone.utc) > now:
+            if status not in {"cleanup_required", "cleanup_pending"}:
+                return False
+            marks = {
+                str(entry.get(key))
+                for entry in (metadata, *self._lease_object_entries(lease))
+                for key in ("ownership_status", "cleanup_reason")
+            }
+            return not marks & _OUTCOME_UNKNOWN_MARKS
+        # A hold between calls is bounded by its expiry alone: no call is
+        # using the objects, so an open session does not extend it.
+        idle_hold = metadata.get(HOLD_FLAG) is True and metadata.get("hold_state") == "idle"
+        # A short/legacy lease must not let another MCP process drop an index
+        # while its durable tuning session can still dispatch work.
+        return idle_hold or not self._index_lease_has_live_session(lease, now)
+
+    async def _reconcile_leases(
+        self,
+        *,
+        database_fingerprint: str | None = None,
+        database_name: str | None = None,
+        session_id: str | None = None,
+        closed_by: str = "recovered_at_startup",
+        attempts: int = 1,
+    ) -> dict[str, Any]:
+        """Drop the test objects of every lease that is due, and say what happened.
+
+        ``dropped`` lists the objects that are gone; ``remaining`` those still
+        in place, each with ``failure`` (failed_step, cause_class, engine
+        message) and ``remediation`` (the DDL that removes it). A drop that
+        failed on the connection, a timeout or a lock wait is tried again, up
+        to ``attempts`` times, after the idle pooled connections were closed.
+        ``session_id`` limits the pass to the leases of one session and takes
+        its held objects too (the session is ending). ``database_fingerprint``
+        or ``database_name`` limits it to one database.
+        """
+
+        report: dict[str, Any] = {
+            "examined": 0,
+            "cleaned": 0,
+            "cleanup_required": 0,
+            "dropped": [],
+            "remaining": [],
+        }
         if self.config.profile != McpProfile.SANDBOX:
-            return summary
+            return report
         now = datetime.now(timezone.utc)
         for lease in self.performance_store.list_open_index_leases(
             database_fingerprint=database_fingerprint
         ):
-            try:
-                expires_at = datetime.fromisoformat(
-                    str(lease["expires_at_utc"]).replace("Z", "+00:00")
-                )
-                if expires_at.tzinfo is None:
-                    expires_at = expires_at.replace(tzinfo=timezone.utc)
-            except (TypeError, ValueError):
-                expires_at = now
-            if expires_at.astimezone(timezone.utc) > now:
+            if database_name is not None and self._lease_database_name(lease) != database_name:
                 continue
-            lease_metadata = lease.get("metadata") or {}
-            # A hold between calls is bounded by its expiry alone: no call is
-            # using the objects, so an open session does not extend it.
-            idle_hold = (
-                lease_metadata.get(HOLD_FLAG) is True
-                and lease_metadata.get("hold_state") == "idle"
+            if not self._lease_is_due(lease, now, session_id):
+                continue
+            report["examined"] += 1
+            entries = self._lease_object_entries(lease)
+            error: Exception | None = None
+            attempt = 0
+            while True:
+                attempt += 1
+                current = self.performance_store.get_index_lease(lease["lease_id"])
+                try:
+                    await self._drop_lease_objects(current, now, closed_by=closed_by)
+                    error = None
+                    break
+                except Exception as exc:
+                    error = exc
+                    note_exception(exc, "server.lease_cleanup")
+                    self._record_lease_cleanup_failure(current, exc, now)
+                    cause = exc.first if isinstance(exc, _LeaseDropError) else exc
+                    retryable = (
+                        _drop_failure_diagnostic(
+                            cause,
+                            view=False,
+                            query_timeout_seconds=self.config.query_timeout_seconds,
+                        ).get("cause_class")
+                        in _RETRYABLE_DROP_CAUSES
+                    )
+                    if attempt >= attempts or not retryable:
+                        break
+                    # The next attempt must not reuse a connection that died
+                    # with the one that just failed.
+                    database_name = self._lease_database_name(current)
+                    if database_name:
+                        await self.pool.discard_idle(database_name)
+                    await asyncio.sleep(
+                        _LEASE_DROP_BACKOFF_SECONDS[
+                            min(attempt - 1, len(_LEASE_DROP_BACKOFF_SECONDS) - 1)
+                        ]
+                    )
+            failures = (
+                error.failures
+                if isinstance(error, _LeaseDropError)
+                else {str(entry.get("index_name")): error for entry in entries}
+                if error is not None
+                else {}
             )
-            if not idle_hold and self._index_lease_has_live_session(lease, now):
-                # A short/legacy lease must not let another MCP process drop an
-                # index while its durable tuning session can still dispatch work.
-                continue
-            summary["examined"] += 1
-            try:
-                await self._drop_lease_objects(lease, now, closed_by="recovered_at_startup")
-                summary["cleaned"] += 1
-            except Exception as exc:
-                self._record_lease_cleanup_failure(lease, exc, now)
-                summary["cleanup_required"] += 1
-        return summary
+            report["cleaned" if error is None else "cleanup_required"] += 1
+            for entry in entries:
+                item = {**_held_object_report(entry), "lease_id": lease["lease_id"], "attempts": attempt}
+                failure = failures.get(str(entry.get("index_name")))
+                if failure is None:
+                    report["dropped"].append({**item, "dropped": True})
+                    continue
+                report["remaining"].append(
+                    {
+                        **item,
+                        "dropped": False,
+                        "failure": _drop_failure_diagnostic(
+                            failure,
+                            view=entry.get("object_kind") == LEASE_OBJECT_KIND,
+                            query_timeout_seconds=self.config.query_timeout_seconds,
+                        ),
+                        "remediation": _object_drop_statement(entry),
+                    }
+                )
+            if error is not None and not entries:
+                # A lease that cannot be read has no object to name; it still blocks.
+                report["remaining"].append(
+                    {
+                        "lease_id": lease["lease_id"],
+                        "dropped": False,
+                        "failure": _drop_failure_diagnostic(
+                            error,
+                            view=False,
+                            query_timeout_seconds=self.config.query_timeout_seconds,
+                        ),
+                    }
+                )
+        return report
+
+    def _leftover_refusal(self, cleanup: Mapping[str, Any], **identity: Any) -> dict[str, Any]:
+        """The result of a call that was not run because a leased test object is still in place."""
+
+        remaining = [item for item in cleanup["remaining"] if isinstance(item, Mapping)]
+        names = ", ".join(
+            str(item.get("index_name") or item.get("lease_id")) for item in remaining
+        )
+        remediation = "\n".join(
+            str(item["remediation"]) for item in remaining if item.get("remediation")
+        )
+        reason = (
+            f"A test object of an earlier lease is still in place in this database ({names}) "
+            "and its drop failed again. No DDL and no benchmark query was dispatched: a "
+            "measurement on a database that holds a leftover is not valid. Show the user "
+            "remediation, or call finalize_tuning_session on the session that held it to "
+            "retry the drop."
+        )
+        return {
+            **identity,
+            "classification": "cleanup_required",
+            "reason": reason,
+            "failure_code": "expired_index_cleanup_required",
+            "executions": 0,
+            "cleanup": dict(cleanup),
+            "cleanup_required": True,
+            **status_payload(ResultStatus.PRECONDITION, reason, remediation=remediation or None),
+            "session_continues": False,
+        }
 
     def _record_lease_cleanup_failure(
         self,
@@ -16553,14 +16833,20 @@ class AzureSqlMcpApplication:
         exc: Exception,
         now: datetime,
     ) -> None:
+        cause = exc.first if isinstance(exc, _LeaseDropError) else exc
         try:
             current_lease = self.performance_store.get_index_lease(lease["lease_id"])
             self.performance_store.recover_index_lease(
                 lease["lease_id"],
                 status="cleanup_required",
                 metadata={
-                    "recovery_error_type": type(exc).__name__,
+                    "recovery_error_type": type(cause).__name__,
                     "recovery_attempted_at_utc": now.isoformat(),
+                    "recovery_failure": _drop_failure_diagnostic(
+                        cause,
+                        view=False,
+                        query_timeout_seconds=self.config.query_timeout_seconds,
+                    ),
                 },
                 expected_version=current_lease["version"],
             )
@@ -16569,6 +16855,178 @@ class AzureSqlMcpApplication:
                 "Failed to record expired temporary-index cleanup failure",
                 extra={"lease_id": lease["lease_id"]},
             )
+
+    async def _drop_owned_leftover_indexes(
+        self,
+        database_name: str,
+        database_fingerprint: str,
+        candidates: Sequence[Any],
+    ) -> list[dict[str, Any]]:
+        """Drop test indexes that a closed lease of this server built and that still exist.
+
+        The store says such a lease left nothing; the catalog disagrees. The
+        owner marker the CREATE batch wrote proves which lease built the
+        index, exactly as the drop guard checks it. An index whose markers do
+        not match a lease of this store is not touched.
+        """
+
+        if not candidates:
+            return []
+        owners: dict[tuple[str, str, str], tuple[dict[str, Any], str]] = {}
+        for lease in self.performance_store.list_closed_index_leases(
+            database_fingerprint=database_fingerprint
+        ):
+            fence = (lease.get("metadata") or {}).get("lease_owner_fence")
+            if not isinstance(fence, str) or not _INDEX_OWNER_PROOF.fullmatch(fence):
+                continue
+            for entry in self._lease_object_entries(lease):
+                if entry.get("object_kind") == LEASE_OBJECT_KIND:
+                    continue
+                key = (
+                    str(entry.get("target_schema")),
+                    str(entry.get("target_table")),
+                    str(entry.get("index_name")),
+                )
+                owners.setdefault(key, ({**entry, "lease_id": lease["lease_id"]}, fence))
+        dropped: list[dict[str, Any]] = []
+        for existing in candidates:
+            owner = owners.get((existing.schema, existing.table, existing.name))
+            if owner is None:
+                continue
+            entry, fence = owner
+            fingerprint = str(entry.get("object_fingerprint") or "")
+            try:
+                if not await self._index_owner_marker_matches(
+                    database_name,
+                    existing.schema,
+                    existing.table,
+                    existing.name,
+                    ownership_proof=fence,
+                    definition_fingerprint=fingerprint,
+                    index_id=existing.index_id,
+                ):
+                    continue
+                # The guarded DROP checks both markers and the index_id again
+                # inside its own transaction.
+                await self._drop_test_index(
+                    database_name,
+                    existing.schema,
+                    existing.table,
+                    existing.name,
+                    dry_run=False,
+                    workflow_managed=True,
+                    idempotency_key=(
+                        f"leftover-recovery:{entry['lease_id']}:{existing.name}:"
+                        f"{datetime.now(timezone.utc).isoformat()}"
+                    ),
+                    ownership_proof=fence,
+                    expected_definition_fingerprint=fingerprint,
+                    expected_index_id=existing.index_id,
+                )
+            except Exception as exc:
+                # Still in place: the caller then reports the leftover as before.
+                note_exception(exc, "server.owned_leftover_drop")
+                continue
+            dropped.append({**_held_object_report(entry), "lease_id": entry["lease_id"], "dropped": True})
+        return dropped
+
+    async def _test_objects_on_read_tables(
+        self,
+        database_name: str,
+        statements: Sequence[str],
+        *,
+        own_session_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Test indexes on the tables the statements read that the caller's session does not hold.
+
+        Such an index (held by another session, or left behind) can change the
+        plan of both statements, so a measurement or a comparison made with it
+        in place is not a measurement of the database as deployed. None when
+        there is none, or when the check does not apply to this database.
+        """
+
+        try:
+            policy = self.database_policy.require(database_name)
+            if self.config.profile != McpProfile.SANDBOX and not policy.allow_test_indexes:
+                return None
+            prefixes = self._allowed_test_index_prefixes(policy)
+            tables = list(
+                dict.fromkeys(table for statement in statements for table in tables_read(statement))
+            )[:_MAX_WARNED_TABLES]
+            holders: dict[str, dict[str, Any]] = {}
+            for lease in self.performance_store.list_open_index_leases():
+                for entry in self._lease_object_entries(lease):
+                    holders.setdefault(str(entry.get("index_name")), lease)
+            objects: list[dict[str, Any]] = []
+            for schema, table in tables:
+                for existing in await collect_existing_indexes(
+                    self.executor, database_name, schema_name=schema, table_name=table
+                ):
+                    if not _is_generated_test_index_name(existing.name, prefixes):
+                        continue
+                    holder = holders.get(existing.name)
+                    if holder is not None and own_session_id and holder["session_id"] == own_session_id:
+                        continue
+                    objects.append(
+                        {
+                            "kind": "index",
+                            "name": f"{existing.schema}.{existing.table}",
+                            "index_name": existing.name,
+                            "held_by_session": holder["session_id"] if holder else None,
+                            "lease_status": holder["status"] if holder else None,
+                        }
+                    )
+        except Exception as exc:
+            # A warning that cannot be computed must not fail the call it annotates.
+            note_exception(exc, "server.test_objects_on_read_tables")
+            return None
+        if not objects:
+            return None
+        return {
+            "objects": objects,
+            "warning": (
+                "A test index that this call's session does not hold exists on a table "
+                "the statements read. It can change the plans of both statements, so "
+                "these numbers are not those of the database without it. An index with "
+                "no lease (held_by_session null) is a leftover: its owner drops it with "
+                "finalize_tuning_session, or a DBA with DROP INDEX."
+            ),
+        }
+
+    async def _benchmark_tuning_candidate(
+        self,
+        database_name: str,
+        session_id: str,
+        candidate_id: str,
+        baseline_sql: str,
+        candidate_sql: str,
+        **options: Any,
+    ) -> dict[str, Any]:
+        """Measure a rewrite, on a database with no leased leftover in place.
+
+        A lease of this database whose cleanup failed or expired is retried
+        first; when its object is still there the benchmark is refused. The
+        result says what was dropped, which held objects were in place, and
+        which test indexes of other sessions sit on the tables it read.
+        """
+
+        cleanup = await self._reconcile_leases(
+            database_name=database_name, attempts=_PRE_CALL_DROP_ATTEMPTS
+        )
+        if cleanup["cleanup_required"]:
+            return self._leftover_refusal(cleanup, session_id=session_id, candidate_id=candidate_id)
+        payload = await self.performance_workflows.benchmark_candidate(
+            session_id, candidate_id, database_name, baseline_sql, candidate_sql, **options
+        )
+        if cleanup["dropped"]:
+            payload = {**payload, "cleanup_before_run": {"dropped": cleanup["dropped"]}}
+        payload = self._with_held_objects_present(database_name, session_id, payload)
+        foreign = await self._test_objects_on_read_tables(
+            database_name, [baseline_sql, candidate_sql], own_session_id=session_id
+        )
+        if foreign is not None:
+            payload = {**payload, "test_objects_on_read_tables": foreign}
+        return payload
 
     async def _drop_lease_objects(
         self,
@@ -16585,19 +17043,7 @@ class AzureSqlMcpApplication:
         other outcome raises, and the caller records cleanup_required.
         """
 
-        database_name = next(
-            (
-                name
-                for name in self.config.allowed_databases
-                if database_fingerprint_matches(
-                    str(lease["database_fingerprint"]),
-                    name,
-                    self.config.server,
-                    allow_legacy=bool(self.config.legacy_state_server_binding),
-                )
-            ),
-            None,
-        )
+        database_name = self._lease_database_name(lease)
         metadata = lease.get("metadata") or {}
         ownership_proof = metadata.get("lease_owner_fence")
         views = self._index_lease_members(lease)
@@ -16630,7 +17076,7 @@ class AzureSqlMcpApplication:
             metadata={"recovery_attempted_at_utc": now.isoformat()},
             expected_version=lease["version"],
         )
-        member_failure: Exception | None = None
+        member_failures: dict[str, Exception] = {}
         for ordinal, view in enumerate(views):
             drop_key = f"lease-recovery:{lease['lease_id']}:{updated_lease['version']}"
             if len(views) > 1:
@@ -16648,9 +17094,9 @@ class AzureSqlMcpApplication:
                 if len(views) == 1:
                     raise
                 # The other objects of the lease are still dropped.
-                member_failure = member_failure or member_error
-        if member_failure is not None:
-            raise member_failure
+                member_failures[str(view["index_name"])] = member_error
+        if member_failures:
+            raise _LeaseDropError(member_failures) from next(iter(member_failures.values()))
         self.performance_store.recover_index_lease(
             lease["lease_id"],
             status="cleaned",

@@ -289,8 +289,14 @@ UNRECOGNIZED_TABLE_HINT = "UNRECOGNIZED TABLE HINT"
 # USE HINT names a statement may carry through the read-only gate. Each one
 # changes an optimizer choice only. This list is the statement-admission list;
 # the Query Store hint list in query_hints.py is separate and may be narrower.
+# It holds the names Microsoft documents for Azure SQL Database (Query Hints,
+# USE HINT; read 2026-11-10). Left out on purpose: ABORT_QUERY_EXECUTION (it
+# blocks the statement), DISABLE_RESULT_SET_CACHE (Fabric only) and names the
+# engine accepts but the documentation does not list.
 STATEMENT_USE_HINT_NAMES = frozenset(
     {
+        "ASSUME_FIXED_MAX_SELECTIVITY_FOR_REGEXP",
+        "ASSUME_FIXED_MIN_SELECTIVITY_FOR_REGEXP",
         "ASSUME_JOIN_PREDICATE_DEPENDS_ON_FILTERS",
         "ASSUME_MIN_SELECTIVITY_FOR_FILTER_ESTIMATES",
         "ASSUME_FULL_INDEPENDENCE_FOR_FILTER_ESTIMATES",
@@ -1223,14 +1229,65 @@ class UnsupportedSqlError(ValueError):
         self.submitted_sql = submitted_sql
 
 
-def _parse_stop_hint(error: ParseError) -> str:
+def _refused_option_hint(sql: str) -> str | None:
+    """The words of the first hint of a trailing OPTION clause that the gate does not admit."""
+
+    tokens = _tokenize(_lex(sql))
+    trailing = _trailing_option(tokens)
+    if trailing is None:
+        return None
+    option_index, close_index = trailing
+    for item in _split_items(tokens[option_index + 2 : close_index]):
+        if item and not _is_admitted_query_hint(sql, item):
+            words: list[str] = []
+            for token in item:
+                if token.kind != "word":
+                    break
+                words.append(token.text)
+            if words[:2] == ["USE", "HINT"]:
+                # The name is echoed only when it is one plain word.
+                names = [
+                    _string_literal_value(sql, token)
+                    for token in item
+                    if token.kind == "string"
+                ]
+                unlisted = next(
+                    (
+                        name
+                        for name in names
+                        if _USE_HINT_NAME.fullmatch(name)
+                        and name.upper() not in STATEMENT_USE_HINT_NAMES
+                        and not _COMPATIBILITY_LEVEL_HINT.fullmatch(name.upper())
+                    ),
+                    None,
+                )
+                return (
+                    f"USE HINT name '{unlisted[:80]}', which is not one of the documented "
+                    "hint names on the admitted list"
+                    if unlisted
+                    else "USE HINT with an argument that is not one hint name in quotes"
+                )
+            return " ".join(words[:3]) or "a hint that is not a keyword"
+    return None
+
+
+def _parse_stop_hint(error: ParseError, sql: str = "") -> str:
     """Where the parser stopped, for a refusal the caller can act on.
 
     Only the place and the one token: the statement is the caller's own text.
-    The usual cause is a string literal that lost or doubled its quotes in a
-    shell or JSON layer on the way in.
+    A trailing OPTION clause with a hint outside the admitted list is named
+    as that. Otherwise the usual cause is a string literal that lost or
+    doubled its quotes in a shell or JSON layer on the way in.
     """
 
+    refused = _refused_option_hint(sql) if sql else None
+    if refused is not None:
+        return (
+            f" The OPTION clause holds a query hint this gate does not admit: {refused}. "
+            "Admitted: RECOMPILE, OPTIMIZE FOR, MAXDOP, FORCE ORDER, LOOP / MERGE / HASH "
+            "JOIN, and USE HINT with a documented hint name. The quotes of the statement "
+            "are not the cause."
+        )
     first = error.errors[0] if getattr(error, "errors", None) else None
     if not isinstance(first, dict) or not first.get("line"):
         return ""
@@ -1268,7 +1325,7 @@ class SafeSqlValidator:
                 if _READ_ONLY_PREFIX_PATTERN.match(candidate):
                     raise UnsupportedSqlError(
                         "T-SQL could not be statically analyzed; admission is not allowed."
-                        + _parse_stop_hint(exc),
+                        + _parse_stop_hint(exc, candidate),
                         submitted_sql=sql,
                     ) from exc
                 raise ValueError(f"Invalid T-SQL: {exc}") from exc

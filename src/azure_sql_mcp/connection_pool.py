@@ -399,6 +399,28 @@ class ConnectionPool:
             if self._pool_sizes[key] > 0:
                 self._pool_sizes[key] -= 1
 
+    async def discard_idle(self, database_name: str) -> int:
+        """Close the idle connections of one database; the next acquire opens a new one.
+
+        For a retry after a transport failure: an idle connection that was
+        released a moment ago is reused without a check, and it can be as
+        dead as the one that just failed. Connections in use are not touched.
+        """
+
+        closed = 0
+        for key, pool in list(self._pools.items()):
+            name = key if isinstance(key, str) else cast(tuple[str, str], key)[0]
+            if name != database_name:
+                continue
+            while True:
+                try:
+                    connection = pool.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                await self.discard(database_name, connection)
+                closed += 1
+        return closed
+
     async def close_all(self) -> None:
         """Drain all pools and close all connections."""
         self._closed = True

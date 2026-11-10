@@ -611,11 +611,13 @@ async def test_volatile_index_finalist_runs_complete_performance_workload(
     app = _app(server_config_factory)
     sql = "SELECT TOP (1) id, NEWID() AS token FROM dbo.Items"
     session_id, candidate_id = _candidate(app, sql)
-    app._cleanup_expired_index_leases = AsyncMock(  # type: ignore[method-assign]
+    app._reconcile_leases = AsyncMock(  # type: ignore[method-assign]
         return_value={
-            "expired": 1,
+            "examined": 1,
             "cleaned": 1,
             "cleanup_required": 0,
+            "dropped": [],
+            "remaining": [],
         }
     )
     app._create_test_index = AsyncMock(return_value={"status": "completed"})  # type: ignore[method-assign]
@@ -655,7 +657,7 @@ async def test_volatile_index_finalist_runs_complete_performance_workload(
     assert result["durable_state"] == "performance_only"
     assert result["proof_scope"] == "performance_only"
     assert result["executions"] == 15
-    app._cleanup_expired_index_leases.assert_awaited_once()
+    app._reconcile_leases.assert_awaited_once()
     app._create_test_index.assert_awaited_once()
     app._drop_test_index.assert_awaited_once()
 
@@ -1040,8 +1042,8 @@ async def test_covering_index_result_is_idempotent_without_ddl_or_queries(
         session_id,
         stopping_reason="terminal replay regression",
     )
-    app._cleanup_expired_index_leases = AsyncMock(  # type: ignore[method-assign]
-        return_value={"examined": 0, "cleaned": 0, "cleanup_required": 0}
+    app._reconcile_leases = AsyncMock(  # type: ignore[method-assign]
+        return_value={"examined": 0, "cleaned": 0, "cleanup_required": 0, "dropped": [], "remaining": []}
     )
     with pytest.raises(
         InvalidTransitionError,
@@ -1064,7 +1066,7 @@ async def test_covering_index_result_is_idempotent_without_ddl_or_queries(
             30,
             "covering-index",
         )
-    app._cleanup_expired_index_leases.assert_not_awaited()
+    app._reconcile_leases.assert_not_awaited()
     assert catalog.await_count == 1
     app._create_test_index.assert_not_awaited()
     app.plans.profile_query.assert_not_awaited()
@@ -1091,8 +1093,8 @@ async def test_terminal_session_rejects_index_benchmark_before_any_work(
             stopping_reason="terminal session regression",
         )
 
-    app._cleanup_expired_index_leases = AsyncMock(  # type: ignore[method-assign]
-        return_value={"examined": 0, "cleaned": 0, "cleanup_required": 0}
+    app._reconcile_leases = AsyncMock(  # type: ignore[method-assign]
+        return_value={"examined": 0, "cleaned": 0, "cleanup_required": 0, "dropped": [], "remaining": []}
     )
     app._check_equivalence_preflight = AsyncMock()  # type: ignore[method-assign]
     app.performance_workflows._bind_case = AsyncMock()  # type: ignore[method-assign]
@@ -1131,7 +1133,7 @@ async def test_terminal_session_rejects_index_benchmark_before_any_work(
             f"{terminal_status}-session",
         )
 
-    app._cleanup_expired_index_leases.assert_not_awaited()
+    app._reconcile_leases.assert_not_awaited()
     app._check_equivalence_preflight.assert_not_awaited()
     app.performance_workflows._bind_case.assert_not_awaited()
     app._resolve_canonical_table_identity.assert_not_awaited()
@@ -1583,7 +1585,7 @@ async def test_index_cleanup_failure_is_durable_and_blocks_silent_success(
     index_name, _ = _install_catalog(
         monkeypatch,
         key_columns=["status"],
-        sequence=("empty", "present", "present"),
+        sequence=("empty", "present", "present", "present"),
     )
     app.plans.profile_query = AsyncMock(  # type: ignore[method-assign]
         side_effect=[
@@ -1631,9 +1633,39 @@ async def test_index_cleanup_failure_is_durable_and_blocks_silent_success(
         30,
         "cleanup-failure",
     )
+    # S13e: before any benchmark call the drop of the leftover is tried again.
+    # While the index stays, nothing runs and the result cannot be missed.
+    assert replay["classification"] == "cleanup_required"
+    assert replay["cleanup_required"] is True
+    assert replay["result_status"] == "precondition"
+    assert replay["remediation"] == f"DROP INDEX [{index_name}] ON [dbo].[Items];"
+    app._create_test_index.assert_awaited_once()
+    assert app._drop_test_index.await_count == 2
+
+    # Once the drop works, the committed result is returned without new work.
+    app._drop_test_index = AsyncMock(return_value={"status": "completed"})  # type: ignore[method-assign]
+    _install_catalog(monkeypatch, key_columns=["status"], sequence=("present",) * 4)
+    replay = await app._benchmark_index_candidate(
+        "appdb",
+        session_id,
+        candidate_id,
+        sql,
+        "dbo",
+        "Items",
+        ["status"],
+        None,
+        None,
+        False,
+        "screening",
+        True,
+        True,
+        30,
+        "cleanup-failure",
+    )
     assert replay["recovered_from_durable_evidence"] is True
     assert replay["classification"] == "cleanup_required"
     assert replay["reservation_status"] == "completed"
+    assert replay["lease"]["status"] == "cleaned"
     app._create_test_index.assert_awaited_once()
     app._drop_test_index.assert_awaited_once()
 

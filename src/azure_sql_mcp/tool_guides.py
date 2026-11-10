@@ -985,33 +985,35 @@ Steps:
 - First call: benchmark_index_candidate or benchmark_indexed_view_candidate
   with keep_for_session=true and every parameter case you will need. It
   measures the baseline, builds, measures, and leaves the objects in place.
-- Later calls of the same session with the same index definitions or the
-  same view definition reuse them without a build; an object that does not
-  match is built and joins the same lease. plan_reuse and compare_order must
-  be those of the first call.
+- Later calls of the session with the same index or view definition reuse
+  them without a build; another object is built and joins the same lease.
+  plan_reuse and compare_order must be those of the first call.
 - compare_query_results and explain_query can read a held object meanwhile.
-  benchmark_tuning_candidate then runs both statements with it in place
-  (held_test_objects_present).
-- finalize_tuning_session drops everything held: held_test_objects_dropped.
+- finalize_tuning_session before you deliver the answer: it drops everything
+  held. Read held_test_objects_dropped and check dropped for each object.
 Read:
 - test_objects in every result: reused, built, still_held and
-  hold_expires_at_utc. get_tuning_session lists held_test_objects with
-  their age.
+  hold_expires_at_utc. get_tuning_session lists held_test_objects.
 - baseline_source session_before_hold: the baseline measured before the
-  build. While a held object exists the statement cannot run clean, so it
-  is not run again. A case with no such baseline is refused before any run.
-- A call without keep_for_session drops every object it used when it
-  returns; held objects it did not use stay.
-- The hold lasts lease_minutes from the end of the last call that kept it;
-  after that the next benchmark call or a server start drops it.
-- partial: the call reached max_call_seconds. With keep_for_session the
-  objects stay: add a candidate for the same statement and call again.
+  build; it is not run again while a held object exists. A case with no
+  such baseline is refused before any run.
+- A call without keep_for_session drops every object it used on return.
+- The hold lasts lease_minutes from the end of the last call that kept it.
+- cleanup_required true (result_status precondition): an object is still in
+  place. failure says why per object; remediation is the DDL. Call
+  finalize_tuning_session again on the same session to retry. Every
+  benchmark call and start_tuning_session in that database retries the drop
+  first and is refused while the object stays.
+- test_objects_on_read_tables in a rewrite benchmark or a comparison: a test
+  index your session does not hold is on a table you read; the numbers are
+  not those of the database without it.
 Avoid:
 - Do not hold objects on a database other sessions measure: a held index
   changes their plans. One lease per database is open at a time.
-- Do not leave a session open with held objects: finalize it.
+- Do not deliver an answer while an object is held or cleanup_required: on
+  cleanup_required give the user remediation and say the index is in place.
 - Do not build the same index by hand to compare results: keep it.
-Next: finalize_tuning_session, then read held_test_objects_dropped.
+Next: finalize_tuning_session, then check dropped per object.
 """,
         "benchmark_index_candidate",
         "benchmark_indexed_view_candidate",

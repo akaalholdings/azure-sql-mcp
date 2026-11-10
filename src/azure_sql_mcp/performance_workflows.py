@@ -3167,9 +3167,11 @@ class PerformanceWorkflowService:
                 )
                 and item.strategy == normalized_strategy
                 and normalized_strategy != "index"
-                # A candidate whose run stopped without a verdict (a failed
-                # build, a time cap) may be measured again as a new candidate.
-                and item.state != "inconclusive"
+                # Refused only while the first one is open. A candidate with a
+                # terminal result may be registered again for a run that one
+                # benchmark call did not make (a cross case, a shared plan, a
+                # retry after a failed build): both results stay in the session.
+                and not item.is_terminal
             ),
             None,
         )
@@ -4349,7 +4351,15 @@ class PerformanceWorkflowService:
                 benchmark_operation_key=benchmark_operation_key,
             )
         if candidate.is_terminal:
-            raise ValueError("Candidate already has a terminal benchmark result.")
+            raise ValueError(
+                f"Candidate already has a terminal benchmark result ({candidate.state}); a "
+                "candidate is measured once. A cross_case run, or any other further run, is "
+                "part of one benchmark call: register the same statement again with "
+                f"add_tuning_candidate(session_id, candidate_sql=<the same SQL>, strategy="
+                f"'{candidate.strategy}') and call benchmark_tuning_candidate on the new "
+                "candidate_id with the phase and cross_case={'compile_case': <case>, "
+                "'run_case': <case>} you need. Both results stay in the session."
+            )
         if phase == "screening" and candidate.screen_runs:
             raise ValueError("Candidate screening has already been measured.")
         if phase == "finalist" and candidate.finalist_runs:

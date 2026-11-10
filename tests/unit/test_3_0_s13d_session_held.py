@@ -58,6 +58,8 @@ class IndexSandbox:
         self.events: list[str] = []
         self.profiled: list[str] = []
         self.create_errors: list[BaseException] = []
+        # Each DROP raises the next of these before it removes anything.
+        self.drop_errors: list[BaseException] = []
         app._create_test_index = AsyncMock(side_effect=self._create)  # type: ignore[method-assign]
         app._drop_test_index = AsyncMock(side_effect=self._drop)  # type: ignore[method-assign]
         app.executor.fetch_all = AsyncMock(side_effect=self._fetch)  # type: ignore[method-assign]
@@ -109,9 +111,12 @@ class IndexSandbox:
         return {"status": "completed"}
 
     async def _drop(self, _database: str, _schema: str, _table: str, index_name: str, **options: Any) -> dict[str, Any]:
-        # The guarded DROP checks the owner marker before it drops.
-        assert options["ownership_proof"] == self.markers[index_name][0]
         self.events.append(f"drop:{index_name}")
+        if self.drop_errors:
+            raise self.drop_errors.pop(0)
+        # The guarded DROP checks the owner marker before it drops.
+        if options["ownership_proof"] != self.markers[index_name][0]:
+            raise RuntimeError("Temporary index ownership marker mismatch. (50001)")
         del self.indexes[index_name]
         del self.markers[index_name]
         return {"status": "completed"}

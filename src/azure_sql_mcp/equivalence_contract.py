@@ -161,6 +161,32 @@ def _batch_selects(sql: str) -> list[str] | None:
     return [branch.select_sql for branch in branches] if branches else None
 
 
+def tables_read(sql: str) -> tuple[tuple[str, str], ...]:
+    """The (schema, table) pairs a statement or a read-only batch reads, in order.
+
+    Names only, from the text: a CTE name is left out, a name without a schema
+    is taken as dbo. Text that cannot be parsed gives no table.
+    """
+
+    found: dict[tuple[str, str], None] = {}
+    for select in _batch_selects(sql) or [sql]:
+        try:
+            statements = _parse_statements(select)
+        except (ParseError, ValueError):
+            continue
+        for statement in statements:
+            ctes = {
+                cte.alias_or_name.casefold()
+                for cte in statement.find_all(exp.CTE)
+                if cte.alias_or_name
+            }
+            for table in statement.find_all(exp.Table):
+                if not table.name or (not table.db and table.name.casefold() in ctes):
+                    continue
+                found.setdefault((table.db or "dbo", table.name), None)
+    return tuple(found)
+
+
 def _merged_branch_preflights(selects: list[str]) -> EquivalencePreflight:
     """One preflight for a branching batch: a risk in any branch is a risk of the batch."""
 

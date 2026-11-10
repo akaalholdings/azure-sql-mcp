@@ -2875,6 +2875,30 @@ class PerformanceStore:
             rows = self._connection.execute(query, params).fetchall()
         return [self._index_lease_dict(row) for row in rows]
 
+    def list_closed_index_leases(
+        self,
+        *,
+        database_fingerprint: str,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """The closed leases (cleaned or create_failed) of a database, newest first.
+
+        A closed lease should have no object left. Its owner token still
+        proves which object it created, when one is found in the catalog.
+        """
+
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM index_leases
+                WHERE status IN ('cleaned', 'create_failed') AND database_fingerprint = ?
+                ORDER BY updated_at_utc DESC
+                LIMIT ?
+                """,
+                (database_fingerprint, int(limit)),
+            ).fetchall()
+        return [self._index_lease_dict(row) for row in rows]
+
     @staticmethod
     def _index_lease_dict(row: sqlite3.Row) -> dict[str, Any]:
         return {

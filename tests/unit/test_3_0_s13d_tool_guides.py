@@ -23,7 +23,7 @@ def test_a_workflow_guide_says_how_to_keep_and_reuse_test_objects() -> None:
         "reuse them without a build",
         "test_objects",
         "session_before_hold",
-        "finalize_tuning_session drops everything held",
+        "finalize_tuning_session before you deliver the answer",
         "lease_minutes",
         "compare_query_results and explain_query",
     ):

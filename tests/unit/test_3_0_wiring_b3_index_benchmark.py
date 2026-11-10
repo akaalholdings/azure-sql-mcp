@@ -171,11 +171,12 @@ async def test_a_stuck_lease_in_another_database_does_not_block_this_one(
     session_id, candidate_id = _candidate(app, SQL)
     seen: list[str | None] = []
 
-    async def cleanup(*, database_fingerprint: str | None = None) -> dict[str, int]:
+    async def cleanup(*, database_fingerprint: str | None = None, **_options: object) -> dict[str, object]:
         seen.append(database_fingerprint)
-        return {"examined": 0, "cleaned": 0, "cleanup_required": 0}
+        return {"examined": 0, "cleaned": 0, "cleanup_required": 0, "dropped": [], "remaining": []}
 
-    app._cleanup_expired_index_leases = cleanup  # type: ignore[method-assign]
+    # The benchmark reconciles the leases of its own database only (S13e seam).
+    app._reconcile_leases = cleanup  # type: ignore[method-assign]
     app._create_test_index = AsyncMock(return_value={"status": "completed"})  # type: ignore[method-assign]
     app._drop_test_index = AsyncMock(return_value={"status": "completed"})  # type: ignore[method-assign]
     index_name, _ = _install_catalog(monkeypatch, key_columns=["id"])

@@ -44,7 +44,7 @@ Every tool result has result_status:
 - Index design and review: review_workload_indexes. It reads Query Store workload and
   stored plans, finds the queries that hit each table, and returns create, extend,
   widen, consolidate, drop, and heap recommendations with inert DDL and rollback;
-  include_change_plan=true orders them into steps. get_columnstore_health and
+  include_change_plan=true orders them into steps. get_object_index_diagnostics and
   get_object_details (included columns, filters, declared types) give the detail.
   Prove a candidate with benchmark_index_candidate (sandbox profile, non-production
   policy) before any production change.

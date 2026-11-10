@@ -78,6 +78,8 @@ class SessionHeadline(BaseModel):
     deadline_exceeded: bool | None = None
     accepts_new_work: bool | None = None
     accepts_finalization: bool | None = None
+    # True when a test object of the session is still in place in the database.
+    cleanup_required: bool | None = None
 
 
 class BenchmarkHeadline(BaseModel):
@@ -304,6 +306,8 @@ def _session_headline(payload: Mapping[str, Any]) -> dict[str, Any]:
             if value is not None
         }
     )
+    if payload.get("cleanup_required") is True:
+        result["cleanup_required"] = True
     return result
 
 
