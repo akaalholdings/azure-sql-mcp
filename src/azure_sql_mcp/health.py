@@ -75,6 +75,17 @@ PEAK_METRICS = (
     "max_session_percent",
 )
 
+# ``state`` is JSON {currentValue, reason}. Only Active rows wait for a decision:
+# Verifying, Success, Reverted and Expired are the engine's own history.
+TUNING_RECOMMENDATION_STATES_SQL = """
+SELECT
+    JSON_VALUE(state, '$.currentValue') AS current_state,
+    COUNT(*) AS recommendation_count
+FROM sys.dm_db_tuning_recommendations
+GROUP BY JSON_VALUE(state, '$.currentValue')
+"""
+PENDING_TUNING_STATE = "active"
+
 GEO_LINK_SQL = """
 SELECT
     link_guid,
@@ -100,6 +111,35 @@ FROM sys.dm_database_replica_states
 WHERE database_id = DB_ID()
   AND is_local = 0
 """
+
+
+def summarize_checks(checks: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """The verdict of a sweep, read before the checks: what failed and what could not be read."""
+
+    def named(status: str) -> list[str]:
+        return [name for name, check in checks.items() if check.get("status") == status]
+
+    critical, warning = named("critical"), named("warning")
+    not_assessed = [
+        name for name, check in checks.items() if (check.get("details") or {}).get("available") is False
+    ]
+    parts = [
+        f"{len(names)} check(s) {status}: {', '.join(names)}."
+        for status, names in (("critical", critical), ("warning", warning))
+        if names
+    ]
+    if not_assessed:
+        parts.append(
+            f"{len(not_assessed)} could not be read and is not a pass: {', '.join(not_assessed)}."
+        )
+    return {
+        "status": "critical" if critical else "warning" if warning else "pass",
+        "critical": critical,
+        "warning": warning,
+        "not_assessed": not_assessed,
+        "passed": named("pass"),
+        "headline": " ".join(parts) or f"All {len(checks)} checks passed.",
+    }
 
 
 class _SharedRead:
@@ -173,7 +213,8 @@ class HealthService:
 
         check_names = [name for name in CHECK_NAMES if name in requested]
         results = await asyncio.gather(*(run(name) for name in check_names))
-        return {"database_name": database_name, "checks": dict(zip(check_names, results))}
+        checks = dict(zip(check_names, results))
+        return {"database_name": database_name, "summary": summarize_checks(checks), "checks": checks}
 
     def _parse_requested_checks(self, health_type: str) -> set[str]:
         normalized = health_type.lower()
@@ -992,20 +1033,19 @@ class HealthService:
         FROM sys.database_automatic_tuning_options
         ORDER BY name
         """
-        recommendations_query = """
-        SELECT COUNT(*) AS recommendation_count
-        FROM sys.dm_db_tuning_recommendations
-        """
         options = await self.executor.fetch_all(database_name, options_query)
         recommendation_rows = await self.executor.fetch_all(
             database_name,
-            recommendations_query,
+            TUNING_RECOMMENDATION_STATES_SQL,
         )
-        recommendation_count = (
-            self._to_int(recommendation_rows[0].get("recommendation_count"))
-            if recommendation_rows
-            else 0
-        ) or 0
+        by_state: dict[str, int] = {}
+        for row in recommendation_rows:
+            state = str(row.get("current_state") or "unknown")
+            by_state[state] = by_state.get(state, 0) + (self._to_int(row.get("recommendation_count")) or 0)
+        recommendation_count = sum(by_state.values())
+        pending_count = sum(
+            count for state, count in by_state.items() if state.casefold() == PENDING_TUNING_STATE
+        )
 
         mismatched_options = [
             row
@@ -1039,12 +1079,12 @@ class HealthService:
                 ),
             )
 
-        if recommendation_count > 0:
+        if pending_count > 0:
             status = self._escalate(
                 status,
                 "warning",
                 findings,
-                f"{recommendation_count} automatic tuning recommendations are pending review.",
+                f"{pending_count} automatic tuning recommendations are pending review (state Active).",
             )
 
         return self._build_check(
@@ -1052,6 +1092,8 @@ class HealthService:
             details={
                 "options": options,
                 "recommendation_count": recommendation_count,
+                "pending_recommendation_count": pending_count,
+                "recommendations_by_state": by_state,
             },
             thresholds={
                 "recommendation_warning_count": 1,

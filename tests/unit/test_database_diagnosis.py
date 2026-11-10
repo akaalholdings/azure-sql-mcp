@@ -72,16 +72,18 @@ def test_blocking_regressions_and_dominant_queries_become_findings() -> None:
             {
                 "sessions": {
                     "blocking_chains": [
-                        {"head_blocker_session_id": 61, "blocked_session_ids": [62, 63, 64, 65, 66, 67]}
+                        {"head_blocker_session_id": 61, "blocked_session_ids": list(range(62, 88))}
                     ]
                 },
                 "top_queries": [
                     {"query_id": 9, "plan_id": 90, "total_cpu_us": 8_000_000},
                     {"query_id": 10, "plan_id": 100, "total_cpu_us": 1_000_000},
                 ],
+                # A busy database: the regression adds 900 s of run time in the hour.
                 "regressions": {
+                    "window": {"recent_minutes": 60},
                     "regressions": [
-                        {"query_id": 9, "regression_pct": 340.0, "plan_changed": True, "new_plan_ids": [91], "extra_cost": 5000.0},
+                        {"query_id": 9, "regression_pct": 340.0, "plan_changed": True, "new_plan_ids": [91], "extra_cost": 900_000.0},
                         {"query_id": 11, "regression_pct": 30.0, "plan_changed": False},
                     ]
                 },
@@ -90,7 +92,7 @@ def test_blocking_regressions_and_dominant_queries_become_findings() -> None:
     )
 
     assert findings["active_blocking"]["severity"] == "high"
-    assert findings["active_blocking"]["evidence"]["blocked_sessions"] == 6
+    assert findings["active_blocking"]["evidence"]["blocked_sessions"] == 26
     assert "head blocker session 61" in findings["active_blocking"]["message"]
     assert findings["dominant_query"]["next_tools"][0] == {"tool": "analyze_query_plan", "arguments": {"query_id": 9}}
     assert findings["query_regression"]["severity"] == "high"
@@ -127,6 +129,7 @@ def _service(**overrides: Any) -> DatabaseDiagnosisService:
     defaults["sessions"].get_active_sessions = AsyncMock(return_value={"blocking_chains": [], "active_session_count": 3})
     defaults["query_store"].get_top_queries = AsyncMock(return_value=[])
     defaults["query_store_trends"].regressions = AsyncMock(return_value={"regressions": []})
+    defaults["query_store_trends"].failed_executions = AsyncMock(return_value={"rising": [], "summary": {}})
     defaults["version_store"].get_version_store_stats = AsyncMock(return_value={"findings": [], "persistent_version_store": {"size_mb": 12.0}})
     defaults.update(overrides)
     return DatabaseDiagnosisService(**defaults)
@@ -141,12 +144,15 @@ async def test_diagnose_reports_findings_facts_and_passes_the_window() -> None:
     assert result["result_status"] == "ok"
     assert result["verdict"] == "findings"
     assert result["findings"][0]["code"] == "cpu_pressure"
-    assert result["facts"]["service_objective"] == {"service_objective": "GP_S_Gen5_2"}
+    assert result["facts"][0]["code"] == "cpu_pressure"
+    assert result["context"]["service_objective"] == {"service_objective": "GP_S_Gen5_2"}
     service.resource_governance.get_resource_stats_history.assert_awaited_once_with(
         "appdb", 120, master_available=True
     )
-    service.wait_stats.get_wait_stats.assert_awaited_once_with("appdb", 10, sample_seconds=10)
-    service.query_store.get_top_queries.assert_awaited_once_with("appdb", "cpu", 120, 5)
+    # 25 waits, not 10: the poison waits have bars of 0.01 and seldom lead the list.
+    service.wait_stats.get_wait_stats.assert_awaited_once_with("appdb", 25, sample_seconds=10)
+    service.query_store.get_top_queries.assert_awaited_once_with("appdb", "cpu", 120, 5, group_by="query_hash")
+    service.query_store_trends.failed_executions.assert_awaited_once_with("appdb", recent_minutes=120, top=5)
 
 
 @pytest.mark.asyncio
@@ -181,6 +187,7 @@ async def test_every_source_failing_is_unavailable() -> None:
     store.get_top_queries = failing()
     trends = AsyncMock()
     trends.regressions = failing()
+    trends.failed_executions = failing()
     pvs = AsyncMock()
     pvs.get_version_store_stats = failing()
     service = DatabaseDiagnosisService(
@@ -195,7 +202,8 @@ async def test_every_source_failing_is_unavailable() -> None:
     result = await service.diagnose("appdb")
 
     assert result["result_status"] == "unavailable"
-    assert len(result["gaps"]) == 7
+    assert len(result["gaps"]) == 8
+    assert {fact["state"] for fact in result["facts"]} == {"not_observed"}
 
 
 def test_resource_peak_comes_from_the_sample_maximum_on_long_windows() -> None:
