@@ -14,7 +14,6 @@ from azure_sql_mcp.param_binding import (
     TypedParameter,
     TypedParameterBucket,
     detect_parameters,
-    get_type_fallback,
 )
 
 
@@ -34,6 +33,40 @@ class FakeExecutor:
             if needle in query:
                 return rows
         return []
+
+
+class ColumnExecutor:
+    """Returns one catalog row per column name and an empty histogram."""
+
+    def __init__(self, columns: dict[str, dict[str, Any]]):
+        self.columns = {name.casefold(): row for name, row in columns.items()}
+        self.calls: list[list[Any]] = []
+
+    async def fetch_all(
+        self,
+        database_name: str,
+        query: str,
+        params: list[Any] | tuple[Any, ...] | None = None,
+    ) -> list[dict[str, Any]]:
+        arguments = list(params or [])
+        self.calls.append(arguments)
+        if "sys.dm_db_stats_histogram" in query:
+            return []
+        row = self.columns.get(str(arguments[0]).casefold())
+        return [row] if row else []
+
+
+def _column(data_type: str, max_length: int = 4, **extra: Any) -> dict[str, Any]:
+    return {
+        "table_name": "Orders",
+        "schema_name": "dbo",
+        "data_type": data_type,
+        "max_length": max_length,
+        "precision": 0,
+        "scale": 0,
+        "stats_id": None,
+        **extra,
+    }
 
 
 # --- 18.1: Parameter detection tests ---
@@ -161,35 +194,16 @@ def test_column_mapping_supports_brackets_and_reverse_comparison() -> None:
     }
 
 
-# --- 18.3: Type fallback tests ---
-
-def test_type_fallback_int() -> None:
-    assert get_type_fallback("int") == "1"
-    assert get_type_fallback("bigint") == "1"
-
-
-def test_type_fallback_string_types() -> None:
-    assert get_type_fallback("varchar") == "'test'"
-    assert get_type_fallback("nvarchar") == "N'test'"
-    assert get_type_fallback("varchar(50)") == "'test'"
-
-
-def test_type_fallback_date_types() -> None:
-    assert get_type_fallback("datetime") == "GETDATE()"
-    assert get_type_fallback("date") == "CAST(GETDATE() AS DATE)"
-    assert get_type_fallback("datetime2(7)") == "SYSDATETIME()"
-
-
-def test_type_fallback_unknown_returns_null() -> None:
-    assert get_type_fallback("geometry") == "NULL"
-
+# --- Column type formatting ---
 
 def test_format_data_type_rejects_hostile_type_names() -> None:
     """Catalog type names are embedded in DECLARE statements; a hostile UDT name
     must fall back to a safe type instead of being interpolated verbatim."""
     service = ParameterBindingService(executor=FakeExecutor())
     row = {"data_type": "int; DROP TABLE dbo.Users --", "max_length": 4}
-    assert service._format_data_type(row) == "nvarchar(256)"
+    # A type that cannot be a parameter type leaves the parameter unbound; it
+    # is never swapped for an nvarchar guess.
+    assert service._format_data_type(row) is None
 
 
 def test_format_data_type_allows_plain_types() -> None:
@@ -253,7 +267,10 @@ async def test_bind_parameters_no_params_returns_original() -> None:
 
 @pytest.mark.asyncio
 async def test_bind_parameters_uses_explicit_values() -> None:
-    service = ParameterBindingService(FakeExecutor())
+    # The types come from the compared columns; a value alone has no type.
+    service = ParameterBindingService(
+        ColumnExecutor({"Name": _column("nvarchar", 100), "IsActive": _column("bit", 1)})
+    )
     result = await service.bind_parameters(
         "testdb",
         "SELECT * FROM Orders WHERE Name = @Name AND IsActive = @IsActive",
@@ -270,7 +287,7 @@ async def test_bind_parameters_uses_explicit_values() -> None:
 
 @pytest.mark.asyncio
 async def test_bind_parameters_matches_explicit_names_case_insensitively() -> None:
-    service = ParameterBindingService(FakeExecutor())
+    service = ParameterBindingService(ColumnExecutor({"Name": _column("nvarchar", 100)}))
     result = await service.bind_parameters(
         "testdb",
         "SELECT * FROM Orders WHERE Name = @Name",
@@ -350,13 +367,13 @@ async def test_bind_parameters_with_histogram_value() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bind_parameters_falls_back_to_type_default() -> None:
+async def test_bind_parameters_reports_no_value_when_the_histogram_is_empty() -> None:
     executor = FakeExecutor(responses=[
         (
             "sys.stats_columns",
             [
                 {
-                    "table_name": "Orders",
+                    "table_name": "Customers",
                     "schema_name": "dbo",
                     "data_type": "nvarchar",
                     "max_length": 100,
@@ -366,7 +383,7 @@ async def test_bind_parameters_falls_back_to_type_default() -> None:
                 }
             ],
         ),
-        # No histogram rows — force fallback
+        # No histogram rows: the type is known, a representative value is not.
         ("sys.dm_db_stats_histogram", []),
     ])
     service = ParameterBindingService(executor)
@@ -376,49 +393,49 @@ async def test_bind_parameters_falls_back_to_type_default() -> None:
         "SELECT * FROM Customers WHERE Name = @Name",
     )
 
-    assert len(result["parameters"]) == 1
-    param = result["parameters"][0]
-    assert param["name"] == "@Name"
-    assert param["source"] == "type_fallback"
-    assert "DECLARE @Name nvarchar(50);" in result["bound_sql"]
+    # The column type is reported; no 'test' value is made up to go with it.
+    assert result["parameters"] == []
+    assert result["bound_sql"] is None
+    assert result["unbound_parameters"] == [
+        {
+            "name": "@Name",
+            "reason_code": "empty_histogram",
+            "reason": (
+                "The statistics object that leads with this column has no "
+                "histogram step with rows."
+            ),
+            "data_type": "nvarchar(50)",
+        }
+    ]
 
 
 @pytest.mark.asyncio
-async def test_bind_parameters_no_column_match_uses_defaults() -> None:
+async def test_bind_parameters_no_column_match_is_unbound() -> None:
     executor = FakeExecutor()
     service = ParameterBindingService(executor)
 
-    # No column = @param pattern — just a bare @param in VALUES
+    # No column = @param pattern: a bare @param in the select list has no type.
     result = await service.bind_parameters(
         "testdb",
         "SELECT @SomeValue AS Val",
     )
 
-    assert len(result["parameters"]) == 1
-    param = result["parameters"][0]
-    assert param["source"] == "type_fallback"
-    assert param["data_type"] == "nvarchar(256)"
+    assert result["parameters"] == []
+    assert [
+        (item["name"], item["reason_code"], item["data_type"])
+        for item in result["unbound_parameters"]
+    ] == [("@SomeValue", "no_column_mapping", None)]
+    assert executor.calls == []
 
 
 @pytest.mark.asyncio
 async def test_bind_parameters_multiple_params() -> None:
-    executor = FakeExecutor(responses=[
-        (
-            "sys.stats_columns",
-            [
-                {
-                    "table_name": "Events",
-                    "schema_name": "dbo",
-                    "data_type": "datetime2",
-                    "max_length": 8,
-                    "precision": 27,
-                    "scale": 7,
-                    "stats_id": 2,
-                }
-            ],
-        ),
-        ("sys.dm_db_stats_histogram", []),
-    ])
+    executor = ColumnExecutor(
+        {
+            "EventDate": _column("datetime2", 8, precision=27, scale=7, table_name="Events"),
+            "Category": _column("int", table_name="Events"),
+        }
+    )
     service = ParameterBindingService(executor)
 
     result = await service.bind_parameters(
@@ -426,39 +443,25 @@ async def test_bind_parameters_multiple_params() -> None:
         "SELECT * FROM Events WHERE EventDate > @StartDate AND Category = @Cat",
     )
 
-    assert len(result["parameters"]) == 2
-    names = [p["name"] for p in result["parameters"]]
-    assert "@StartDate" in names
-    assert "@Cat" in names
+    # Each parameter takes the type of its own column.
+    assert [
+        (item["name"], item["data_type"], item["reason_code"])
+        for item in result["unbound_parameters"]
+    ] == [
+        ("@StartDate", "datetime2(7)", "no_leading_statistics"),
+        ("@Cat", "int", "no_leading_statistics"),
+    ]
 
 
 @pytest.mark.asyncio
-async def test_alias_table_hint_retries_without_hint() -> None:
+async def test_alias_table_hint_resolves_to_the_aliased_table() -> None:
     """`o.CustomerId = @p` yields table hint 'o' (an alias, not a table). The
-    resolver must retry across all tables instead of silently falling back to
-    an nvarchar guess that breaks execution with a conversion error."""
+    alias is resolved from the FROM clause, so the column is read from its own
+    table in one lookup instead of from whichever table has the lowest stats id."""
 
-    class AliasAwareExecutor:
-        def __init__(self) -> None:
-            self.calls: list[list[Any]] = []
-
-        async def fetch_all(self, database_name, query, params=None):
-            self.calls.append(list(params or []))
-            if "AND t.name = ?" in query:
-                return []  # alias never matches a real table
-            if "sys.dm_db_stats_histogram" in query:
-                return []
-            return [{
-                "table_name": "Orders",
-                "schema_name": "Sales",
-                "data_type": "int",
-                "max_length": 4,
-                "precision": 10,
-                "scale": 0,
-                "stats_id": 1,
-            }]
-
-    executor = AliasAwareExecutor()
+    executor = ColumnExecutor(
+        {"CustomerID": _column("int", schema_name="Sales")}
+    )
     service = ParameterBindingService(executor)
 
     result = await service.bind_parameters(
@@ -466,11 +469,8 @@ async def test_alias_table_hint_retries_without_hint() -> None:
         "SELECT o.OrderID FROM Sales.Orders AS o WHERE o.CustomerID = @CustomerId",
     )
 
-    parameter = result["parameters"][0]
-    assert parameter["data_type"] == "int"
-    assert parameter["value"] == "1"  # int type fallback, not N'test'
-    assert ["CustomerID", "o"] in executor.calls  # hinted attempt happened
-    assert ["CustomerID"] in executor.calls  # unhinted retry happened
+    assert result["unbound_parameters"][0]["data_type"] == "int"  # not an nvarchar guess
+    assert executor.calls == [["CustomerID", "Orders"]]
 
 
 def test_typed_bucket_binds_baseline_and_candidate_without_local_variables() -> None:
@@ -872,7 +872,9 @@ def test_parameter_execution_contract_rejects_missing_or_extra_parameters() -> N
 
 @pytest.mark.asyncio
 async def test_bind_parameters_exposes_typed_driver_contract_and_provenance() -> None:
-    result = await ParameterBindingService(FakeExecutor()).bind_parameters(
+    result = await ParameterBindingService(
+        ColumnExecutor({"CustomerId": _column("int")})
+    ).bind_parameters(
         "testdb",
         "SELECT * FROM Orders WHERE CustomerId = @CustomerId",
         parameter_values={"CustomerId": None},

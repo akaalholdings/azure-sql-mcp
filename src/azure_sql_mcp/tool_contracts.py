@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from collections.abc import Mapping
 from typing import Any
 from typing import Literal
@@ -8,6 +9,8 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import field_validator
+
+from .config import PROFILE_TOOL_ALLOWLISTS
 
 
 TuningObjective = Literal[
@@ -173,6 +176,47 @@ def add_tool_headline(tool_name: str, payload: Any) -> Any:
         result["headline"] = _plan_headline(result)
     elif tool_name == "check_equivalence_preflight":
         result["headline"] = _preflight_headline(result)
+    return result
+
+
+def profiles_exposing(tool_name: str) -> list[str]:
+    """Names of the profiles that register ``tool_name``, sorted."""
+
+    return sorted(
+        profile.value
+        for profile, allowlist in PROFILE_TOOL_ALLOWLISTS.items()
+        if tool_name in allowlist
+    )
+
+
+def annotate_next_tools(payload: Any, is_enabled: Callable[[str], bool]) -> Any:
+    """Keep only the next_tools entries the running server can call.
+
+    Walks a response for every ``next_tools`` list. An entry is a tool name or
+    a ``{"tool": ...}`` mapping; its shape is kept. Entries for tools that are
+    not enabled move to a sibling ``unavailable_next_tools`` list that names
+    the profiles which expose each one. The input is not modified.
+    """
+
+    if isinstance(payload, list):
+        return [annotate_next_tools(item, is_enabled) for item in payload]
+    if not isinstance(payload, dict):
+        return payload
+    result = {key: annotate_next_tools(value, is_enabled) for key, value in payload.items()}
+    entries = payload.get("next_tools")
+    if not isinstance(entries, list):
+        return result
+    kept: list[Any] = []
+    unavailable: list[dict[str, Any]] = []
+    for entry in entries:
+        name = entry.get("tool") if isinstance(entry, Mapping) else entry
+        if isinstance(name, str) and not is_enabled(name):
+            unavailable.append({"tool": name, "available_in_profiles": profiles_exposing(name)})
+        else:
+            kept.append(entry)
+    result["next_tools"] = kept
+    if unavailable:
+        result["unavailable_next_tools"] = unavailable
     return result
 
 

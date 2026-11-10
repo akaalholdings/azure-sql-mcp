@@ -249,7 +249,8 @@ async def test_analyze_workload_binds_query_store_parameterized_sql() -> None:
     # (sqlglot normalizes the type spelling, e.g. int -> INTEGER).
     session_batch = executor.execute_session.await_args.args[1]
     assert session_batch[1].upper().startswith("DECLARE @P1 INT")
-    assert "SET @P1 = 1" in session_batch[1]
+    # No invented value: a typed local variable compiles the same estimated plan.
+    assert "SET @P1" not in session_batch[1]
     assert "(@P1 int)SELECT" not in session_batch[1]
 
 

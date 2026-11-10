@@ -13,6 +13,39 @@ OBJECT_TYPE_MAP = {
 }
 
 
+def _scalar_udf_inlining(row: dict[str, Any]) -> dict[str, str]:
+    """Say whether the engine can inline a T-SQL scalar function into a query.
+
+    A function that is not inlined runs once per row, forces a serial plan,
+    and its time appears in no plan operator.
+    """
+
+    if not row.get("is_inlineable"):
+        return {
+            "status": "not_inlineable",
+            "note": (
+                "The function body uses a construct that blocks inlining. Every "
+                "calling query runs it once per row on a serial plan. Rewrite it "
+                "as an inline table-valued function or move the logic into the query."
+            ),
+        }
+    if not row.get("inline_type"):
+        return {
+            "status": "inlining_off",
+            "note": (
+                "The body can be inlined, but inlining is turned off for this "
+                "function (WITH INLINE = OFF). It runs once per row on a serial plan."
+            ),
+        }
+    return {
+        "status": "inlineable",
+        "note": (
+            "The engine inlines this function when the database compatibility "
+            "level is 150 or higher and TSQL_SCALAR_UDF_INLINING is ON."
+        ),
+    }
+
+
 class IntrospectionService:
     def __init__(self, executor: AzureSqlExecutor):
         self.executor = executor
@@ -431,7 +464,9 @@ class IntrospectionService:
             o.type_desc AS object_type,
             o.create_date,
             o.modify_date,
-            m.definition
+            m.definition,
+            m.is_inlineable,
+            m.inline_type
         FROM sys.objects AS o
         INNER JOIN sys.schemas AS s
             ON o.schema_id = s.schema_id
@@ -445,6 +480,8 @@ class IntrospectionService:
             raise ValueError(f"Object '{schema_name}.{object_name}' was not found.")
         row = rows[0]
         row["requested_type"] = object_type
+        if row.get("object_type") == "SQL_SCALAR_FUNCTION":
+            row["scalar_udf_inlining"] = _scalar_udf_inlining(row)
         return row
 
     async def _get_index_details(
