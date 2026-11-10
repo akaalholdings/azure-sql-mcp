@@ -105,49 +105,87 @@ SORT_BY_EXPRESSIONS = {
 }
 
 
+# One row per plan. A row per plan x runtime interval, each with the plan XML,
+# filled the caller's row cap with about 12 hourly plans over 35 days. The
+# interval ids travel as lists: CAST to varchar(max) because STRING_AGG over
+# plain varchar fails (error 9829) once the list passes 8,000 bytes. The plan
+# text is joined after TOP so it is read once per returned plan and is never a
+# GROUP BY key.
 INDEX_EVIDENCE_QUERY = """
-SELECT TOP (?)
-    q.query_id,
-    p.plan_id,
-    p.query_plan_hash,
-    p.is_forced_plan,
-    CAST(p.query_plan AS nvarchar(max)) AS query_plan_xml,
-    rs.runtime_stats_interval_id,
-    COALESCE(SUM(rs.count_executions), 0) AS execution_count,
-    COALESCE(SUM(rs.avg_cpu_time * rs.count_executions), 0) AS total_cpu_us,
-    CAST(MAX(rs.end_time) AS datetime2(7)) AS last_seen_utc
-FROM sys.query_store_query AS q
-INNER JOIN sys.query_store_plan AS p
-    ON p.query_id = q.query_id
-LEFT JOIN
+SELECT
+    ranked.query_id,
+    ranked.plan_id,
+    ranked.query_plan_hash,
+    ranked.is_forced_plan,
+    plan_text.query_plan AS query_plan_xml,
+    ranked.positive_runtime_interval_ids,
+    ranked.zero_execution_runtime_interval_ids,
+    ranked.execution_count,
+    ranked.total_cpu_us,
+    ranked.last_seen_utc
+FROM
 (
-    SELECT
-        runtime.plan_id,
-        runtime.runtime_stats_interval_id,
-        runtime.count_executions,
-        runtime.avg_cpu_time,
-        intervals.end_time
-    FROM sys.query_store_runtime_stats AS runtime
-    INNER JOIN sys.query_store_runtime_stats_interval AS intervals
-        ON intervals.runtime_stats_interval_id = runtime.runtime_stats_interval_id
-    WHERE intervals.end_time >= DATEADD(MINUTE, -?, SYSUTCDATETIME())
-) AS rs
-    ON rs.plan_id = p.plan_id
--- Index maintenance (ALTER INDEX REBUILD, UPDATE STATISTICS) runs as internal
--- queries whose plans scan the index; that is not use of the index.
-WHERE q.is_internal_query = 0
-GROUP BY
-    q.query_id,
-    p.plan_id,
-    p.query_plan_hash,
-    p.is_forced_plan,
-    CAST(p.query_plan AS nvarchar(max)),
-    rs.runtime_stats_interval_id
+    SELECT TOP (?)
+        q.query_id,
+        p.plan_id,
+        p.query_plan_hash,
+        p.is_forced_plan,
+        rs.positive_runtime_interval_ids,
+        rs.zero_execution_runtime_interval_ids,
+        COALESCE(rs.execution_count, 0) AS execution_count,
+        COALESCE(rs.total_cpu_us, 0) AS total_cpu_us,
+        CAST(rs.last_end_time AS datetime2(7)) AS last_seen_utc
+    FROM sys.query_store_query AS q
+    INNER JOIN sys.query_store_plan AS p
+        ON p.query_id = q.query_id
+    LEFT JOIN
+    (
+        SELECT
+            per_interval.plan_id,
+            SUM(per_interval.execution_count) AS execution_count,
+            SUM(per_interval.total_cpu_us) AS total_cpu_us,
+            MAX(per_interval.end_time) AS last_end_time,
+            STRING_AGG(
+                CASE WHEN per_interval.execution_count > 0
+                    THEN CAST(per_interval.runtime_stats_interval_id AS varchar(max)) END,
+                ',') AS positive_runtime_interval_ids,
+            STRING_AGG(
+                CASE WHEN per_interval.execution_count > 0 THEN NULL
+                    ELSE CAST(per_interval.runtime_stats_interval_id AS varchar(max)) END,
+                ',') AS zero_execution_runtime_interval_ids
+        FROM
+        (
+            SELECT
+                runtime.plan_id,
+                runtime.runtime_stats_interval_id,
+                SUM(runtime.count_executions) AS execution_count,
+                SUM(runtime.avg_cpu_time * runtime.count_executions) AS total_cpu_us,
+                MAX(intervals.end_time) AS end_time
+            FROM sys.query_store_runtime_stats AS runtime
+            INNER JOIN sys.query_store_runtime_stats_interval AS intervals
+                ON intervals.runtime_stats_interval_id = runtime.runtime_stats_interval_id
+            WHERE intervals.end_time >= DATEADD(MINUTE, -?, SYSUTCDATETIME())
+            GROUP BY
+                runtime.plan_id,
+                runtime.runtime_stats_interval_id
+        ) AS per_interval
+        GROUP BY per_interval.plan_id
+    ) AS rs
+        ON rs.plan_id = p.plan_id
+    -- Index maintenance (ALTER INDEX REBUILD, UPDATE STATISTICS) runs as internal
+    -- queries whose plans scan the index; that is not use of the index.
+    WHERE q.is_internal_query = 0
+    ORDER BY
+        CASE WHEN p.is_forced_plan = 1 THEN 0 ELSE 1 END,
+        rs.execution_count DESC,
+        p.plan_id
+) AS ranked
+INNER JOIN sys.query_store_plan AS plan_text
+    ON plan_text.plan_id = ranked.plan_id
 ORDER BY
-    CASE WHEN p.is_forced_plan = 1 THEN 0 ELSE 1 END,
-    SUM(rs.count_executions) DESC,
-    p.plan_id,
-    rs.runtime_stats_interval_id
+    CASE WHEN ranked.is_forced_plan = 1 THEN 0 ELSE 1 END,
+    ranked.execution_count DESC,
+    ranked.plan_id
 """
 
 
@@ -252,6 +290,30 @@ def _strict_int(value: Any) -> int | None:
     if isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
         return int(value.strip())
     return None
+
+
+def _split_interval_ids(value: Any) -> list[str]:
+    if not isinstance(value, str):
+        return []
+    return [token.strip() for token in value.split(",") if token.strip()]
+
+
+def index_evidence_row_intervals(row: Mapping[str, Any]) -> tuple[list[Any], list[Any]]:
+    """Return (runtime interval ids, ids with executions) for one evidence row.
+
+    INDEX_EVIDENCE_QUERY returns one row per plan with the ids as lists. A row
+    that carries ``runtime_stats_interval_id`` is one plan x interval (the
+    grain read before 2.6.4) and gives the same evidence one interval at a
+    time. The ids are returned raw; the caller validates them.
+    """
+
+    if "runtime_stats_interval_id" in row or "runtime_interval_id" in row:
+        interval_id = row.get("runtime_stats_interval_id", row.get("runtime_interval_id"))
+        interval_ids = [] if interval_id is None else [interval_id]
+        executions = _optional_float(row.get("execution_count", row.get("executions")))
+        return interval_ids, interval_ids if executions is not None and executions > 0 else []
+    positive = _split_interval_ids(row.get("positive_runtime_interval_ids"))
+    return positive + _split_interval_ids(row.get("zero_execution_runtime_interval_ids")), positive
 
 
 def _optional_float(
@@ -1005,7 +1067,7 @@ class QueryStoreService:
         limit: int = 100,
         max_plan_xml_chars: int = 4_000_000,
     ) -> dict[str, Any]:
-        """Collect index references at Query Store plan/interval grain."""
+        """Collect index references per Query Store plan, with its runtime interval ids."""
 
         self._validate_index_evidence_window_and_limit(window_minutes, limit)
         rows, coverage = await self._fetch_index_evidence_rows(
@@ -1137,7 +1199,10 @@ class QueryStoreService:
                 item["execution_count"] = (item.get("execution_count") or 0) + (
                     candidate.get("execution_count") or 0
                 )
-                item["request_count"] = item.get("request_count", 0) + 1
+                # One request per plan x interval, as before the plan-grain read.
+                item["request_count"] = item.get("request_count", 0) + max(
+                    1, len(candidate.get("runtime_interval_ids", []))
+                )
                 item["is_forced_plan"] = bool(
                     item.get("is_forced_plan") or candidate.get("is_forced_plan")
                 )
@@ -1569,9 +1634,12 @@ class QueryStoreService:
     ) -> dict[str, Any]:
         query_id = _strict_int(row.get("query_id"))
         plan_id = _strict_int(row.get("plan_id"))
-        interval_id = _strict_int(
-            row.get("runtime_stats_interval_id", row.get("runtime_interval_id"))
-        )
+        raw_interval_ids, _positive = index_evidence_row_intervals(row)
+        interval_ids = [
+            interval_id
+            for interval_id in map(_strict_int, raw_interval_ids)
+            if interval_id is not None
+        ]
         raw_execution_count = row.get("execution_count", row.get("executions"))
         execution_count = _strict_int(
             raw_execution_count
@@ -1582,8 +1650,10 @@ class QueryStoreService:
         elif execution_count is None:
             malformed_facts.append("execution_count_malformed")
         forced = _as_bool(row.get("is_forced_plan"))
+        # Executions need an interval, and every interval id must be readable.
         if query_id is None or plan_id is None or (
-            interval_id is None and execution_count != 0
+            (not interval_ids or len(interval_ids) != len(raw_interval_ids))
+            and execution_count != 0
         ):
             malformed_facts.append("query_store_identity_or_interval_malformed")
         if malformed_facts:
@@ -1604,7 +1674,6 @@ class QueryStoreService:
         plan_xml = row.get("query_plan_xml") or row.get("plan_xml") or ""
         if not isinstance(plan_xml, str):
             plan_xml = ""
-        interval_ids = [interval_id] if interval_id is not None else []
         parsed = parse_showplan_index_evidence(
             plan_xml,
             query_id=query_id,

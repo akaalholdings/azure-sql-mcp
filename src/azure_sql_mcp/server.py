@@ -74,6 +74,8 @@ from .index_review import IndexReviewSetupError
 from .index_review import index_history_setup_precondition
 from .index_review import CONTRACT_SCHEMA_FINGERPRINT
 from .index_review import SqlIndexHistoryRepository
+from .index_review import compact_index_review
+from .index_review import index_review_subjects
 from .index_review import render_index_review_artifacts
 from .introspection import IntrospectionService
 from .lock_diagnostics import LockDiagnosticsService
@@ -124,6 +126,7 @@ from .plan_sources import PlanSource
 from .plan_sources import PlanSourceService
 from .plan_tree import PlanParseError
 from .plans import PlansService
+from .plans import compact_plan_summary
 from .platform_capabilities import PlatformCapabilitiesService
 from .prompts import register_prompts
 from .query_index_analysis import QueryIndexAnalysisService
@@ -1044,7 +1047,13 @@ class AzureSqlMcpApplication:
             )
 
         @self.mcp.tool(
-            description="List active sessions and running queries, including blocking information.",
+            description=(
+                "List active sessions and running queries with blocking chains "
+                "(head blocker, blocked session ids, wait summary). Each request "
+                "returns plan_handle and query_hash; the plan XML is returned only "
+                "with include_plans=true. For one in-flight plan use "
+                "analyze_query_plan(session_id=...)."
+            ),
             annotations=ToolAnnotations(
                 title="Get Active Sessions",
                 readOnlyHint=True,
@@ -1058,6 +1067,13 @@ class AzureSqlMcpApplication:
                 default=200,
                 description="Maximum sessions to return (longest-running first, max 1000).",
             ),
+            include_plans: bool = Field(
+                default=False,
+                description=(
+                    "When true, returns the cached plan XML of every request. This "
+                    "builds each plan on the database and can return megabytes."
+                ),
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -1066,7 +1082,9 @@ class AzureSqlMcpApplication:
             return await self._run_tool(
                 "get_active_sessions",
                 database_name,
-                lambda db: self.sessions.get_active_sessions(db, limit),
+                lambda db: self.sessions.get_active_sessions(
+                    db, limit, include_plans=include_plans
+                ),
             )
 
         @self.mcp.tool(
@@ -1149,6 +1167,14 @@ class AzureSqlMcpApplication:
                     "use raw_xml_resource_uri for token-safe retrieval."
                 ),
             ),
+            include_operator_summary: bool = Field(
+                default=False,
+                description=(
+                    "When true, adds summary.operators (every operator, about 1 KB "
+                    "each) and summary.top_operators_by_estimated_cost. The default "
+                    "response has plan_digest, which ranks operators by self time."
+                ),
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -1168,6 +1194,7 @@ class AzureSqlMcpApplication:
                         include_raw_xml,
                         parameter_values,
                         parameter_types,
+                        include_operator_summary,
                     ),
                 ),
             )
@@ -2287,6 +2314,13 @@ class AzureSqlMcpApplication:
                     "across the supplied queries."
                 ),
             ),
+            include_all_existing_indexes: bool = Field(
+                default=False,
+                description=(
+                    "When true, returns the full metadata of every index in the "
+                    "database. The default lists the indexes of the analysed tables."
+                ),
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -2301,6 +2335,7 @@ class AzureSqlMcpApplication:
                     auto_bind_params,
                     parameter_values,
                     parameter_types,
+                    include_all_existing_indexes=include_all_existing_indexes,
                 ),
             )
 
@@ -2323,6 +2358,13 @@ class AzureSqlMcpApplication:
                 default=20,
                 description="Number of top queries to analyze.",
             ),
+            include_all_existing_indexes: bool = Field(
+                default=False,
+                description=(
+                    "When true, returns the full metadata of every index in the "
+                    "database. The default lists the indexes of the analysed tables."
+                ),
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -2335,6 +2377,7 @@ class AzureSqlMcpApplication:
                     resolved_database,
                     window_minutes,
                     top_n,
+                    include_all_existing_indexes=include_all_existing_indexes,
                 ),
             )
 
@@ -2400,6 +2443,13 @@ class AzureSqlMcpApplication:
                 default=5.0,
                 description="Minimum impact percentage to include a candidate.",
             ),
+            include_all_existing_indexes: bool = Field(
+                default=False,
+                description=(
+                    "When true, returns the full metadata of every index in the "
+                    "database. The default lists the indexes of the analysed tables."
+                ),
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -2409,7 +2459,14 @@ class AzureSqlMcpApplication:
                 "optimize_indexes",
                 database_name,
                 lambda db: self.index_optimizer.optimize(
-                    db, window_minutes, top_n, budget_mb, alpha, beta, min_improvement_pct,
+                    db,
+                    window_minutes,
+                    top_n,
+                    budget_mb,
+                    alpha,
+                    beta,
+                    min_improvement_pct,
+                    include_all_existing_indexes=include_all_existing_indexes,
                 ),
             )
 
@@ -2490,6 +2547,15 @@ class AzureSqlMcpApplication:
                     "unused indexes, heaps, and unindexed foreign keys."
                 ),
             ),
+            query_ids: list[int] | None = Field(
+                default=None,
+                max_length=50,
+                description=(
+                    "Query Store query ids that must be analysed whatever their rank "
+                    "or table scope. Pass the query being tuned so its access paths "
+                    "shape the advice."
+                ),
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -2510,6 +2576,7 @@ class AzureSqlMcpApplication:
                     min_table_rows=min_table_rows,
                     max_recommendations_per_table=max_recommendations_per_table,
                     include_existing_index_review=include_existing_index_review,
+                    query_ids=query_ids,
                 ),
             )
 
@@ -3158,8 +3225,9 @@ class AzureSqlMcpApplication:
         @self.mcp.tool(
             description=(
                 "Get object and index diagnostics: write-heavy nonclustered indexes, "
-                "read/write usage, buffer footprint, volatile stats, columnstore row groups, "
-                "index lock waits, and resumable index rebuilds."
+                "read/write usage, volatile stats, columnstore row groups, "
+                "index lock waits, and resumable index rebuilds. The buffer footprint "
+                "is read only with include_buffer_usage=true."
             ),
             annotations=ToolAnnotations(
                 title="Get Object Index Diagnostics",
@@ -3179,6 +3247,13 @@ class AzureSqlMcpApplication:
                 description="Optional table filter.",
             ),
             limit: int = Field(default=25, description="Maximum rows per detail section."),
+            include_buffer_usage: bool = Field(
+                default=False,
+                description=(
+                    "When true, reads sys.dm_os_buffer_descriptors. That walks the "
+                    "whole buffer pool, also for one table; avoid it during an incident."
+                ),
+            ),
             database_name: str | None = Field(
                 default=None,
                 description="Optional database name. Defaults to AZURE_SQL_DEFAULT_DATABASE.",
@@ -3192,6 +3267,7 @@ class AzureSqlMcpApplication:
                     schema_name=schema_name,
                     table_name=table_name,
                     limit=limit,
+                    include_buffer_usage=include_buffer_usage,
                 ),
             )
 
@@ -4206,7 +4282,9 @@ class AzureSqlMcpApplication:
         @self.mcp.tool(
             description=(
                 "Capture a redacted index portfolio snapshot into the installed, "
-                "append-only history contract. No index DDL is executed."
+                "append-only history contract. No index DDL is executed. Returns the "
+                "run id, subject count and coverage; the stored snapshot is returned "
+                "only with include_snapshot=true."
             ),
             annotations=ToolAnnotations(
                 title="Capture Index Review Snapshot",
@@ -4229,17 +4307,25 @@ class AzureSqlMcpApplication:
                 max_length=512,
                 description="Optional caller key. Omitted calls use the UTC-day key.",
             ),
+            include_snapshot: bool = Field(
+                default=False,
+                description="When true, returns every stored subject (about 2.5 KB each).",
+            ),
         ) -> ResponseType:
             return await self._run_tool(
                 "capture_index_review_snapshot",
                 database_name,
-                lambda db: self._capture_index_review_snapshot(db, idempotency_key),
+                lambda db: self._capture_index_review_snapshot(
+                    db, idempotency_key, include_snapshot=include_snapshot
+                ),
             )
 
         @self.mcp.tool(
             description=(
                 "Review captured index history using deterministic safety gates and "
-                "recommend-only artifacts."
+                "recommend-only artifacts. Returns state counts, the create, consolidate "
+                "and drop candidates with inert DDL and rollback, and blockers by code. "
+                "For the full gate of a subject call get_index_review with subject_ids."
             ),
             annotations=ToolAnnotations(
                 title="Review Index Portfolio",
@@ -4268,15 +4354,29 @@ class AzureSqlMcpApplication:
                 max_length=200,
                 description="Optional prior review for deterministic recheck transitions.",
             ),
+            include_full_review: bool = Field(
+                default=False,
+                description=(
+                    "When true, returns every subject with its gate plus the JSON "
+                    "artifact (about 14 KB per index)."
+                ),
+            ),
         ) -> ResponseType:
             return await self._run_tool(
                 "review_index_portfolio",
                 database_name,
-                lambda db: self._review_index_portfolio(db, as_of_run_id, prior_review_id),
+                lambda db: self._review_index_portfolio(
+                    db, as_of_run_id, prior_review_id, include_full_review=include_full_review
+                ),
             )
 
         @self.mcp.tool(
-            description="Reconstruct one scoped index portfolio review from validated history.",
+            description=(
+                "Reconstruct one scoped index portfolio review from validated history. "
+                "Returns the compact review by default. Pass subject_ids, or "
+                "subject_offset to page, for the full gate, definition and protections "
+                "of subjects."
+            ),
             annotations=ToolAnnotations(
                 title="Get Index Review",
                 readOnlyHint=True,
@@ -4293,11 +4393,41 @@ class AzureSqlMcpApplication:
                 description="Target database name.",
             ),
             review_id: str = Field(min_length=1, max_length=200),
+            subject_ids: list[str] | None = Field(
+                default=None,
+                max_length=100,
+                description="Return the full entries of these subjects.",
+            ),
+            subject_offset: int | None = Field(
+                default=None,
+                ge=0,
+                description="Return a page of full subject entries from this offset.",
+            ),
+            subject_limit: int = Field(
+                default=10,
+                ge=1,
+                le=100,
+                description="Page size for subject_ids or subject_offset.",
+            ),
+            include_full_review: bool = Field(
+                default=False,
+                description=(
+                    "When true, returns every subject with its gate plus the JSON "
+                    "artifact (about 14 KB per index)."
+                ),
+            ),
         ) -> ResponseType:
             return await self._run_tool(
                 "get_index_review",
                 database_name,
-                lambda db: self._get_index_review(db, review_id),
+                lambda db: self._get_index_review(
+                    db,
+                    review_id,
+                    subject_ids=subject_ids,
+                    subject_offset=subject_offset,
+                    subject_limit=subject_limit,
+                    include_full_review=include_full_review,
+                ),
             )
 
     def _register_incident_tools(self) -> None:
@@ -5412,7 +5542,7 @@ class AzureSqlMcpApplication:
             **checks,
             "azure_sql_database": platform,
             "mcp_contract": {
-                "contract_version": "2.6.3",
+                "contract_version": "2.6.4",
                 "performance_tuning": 1,
                 "durable_view_change": 1,
                 "prepared_plan_action": 1,
@@ -5449,21 +5579,26 @@ class AzureSqlMcpApplication:
         self,
         database_name: str,
         idempotency_key: str | None,
+        *,
+        include_snapshot: bool = False,
     ) -> dict[str, Any]:
         try:
             result = await self.index_review.capture_snapshot(
                 database_name,
                 idempotency_key=idempotency_key,
+                include_snapshot=include_snapshot,
             )
         except IndexReviewSetupError as exc:
             return index_history_setup_precondition(exc, for_write=True)
-        return result.as_dict()
+        return result.as_dict() if include_snapshot else result.as_summary()
 
     async def _review_index_portfolio(
         self,
         database_name: str,
         as_of_run_id: str | None,
         prior_review_id: str | None,
+        *,
+        include_full_review: bool = False,
     ) -> dict[str, Any]:
         try:
             review = await self.index_review.review_portfolio(
@@ -5473,21 +5608,43 @@ class AzureSqlMcpApplication:
             )
         except IndexReviewSetupError as exc:
             return index_history_setup_precondition(exc)
-        payload = review.as_dict()
-        payload["artifacts"] = render_index_review_artifacts(review)
-        return payload
+        return self._index_review_response(review, include_full_review=include_full_review)
 
     async def _get_index_review(
         self,
         database_name: str,
         review_id: str,
+        *,
+        subject_ids: list[str] | None = None,
+        subject_offset: int | None = None,
+        subject_limit: int = 10,
+        include_full_review: bool = False,
     ) -> dict[str, Any]:
         try:
             review = await self.index_review.get_review(database_name, review_id)
         except IndexReviewSetupError as exc:
             return index_history_setup_precondition(exc)
-        payload = review.as_dict()
-        payload["artifacts"] = render_index_review_artifacts(review)
+        if subject_ids is not None or subject_offset is not None:
+            return index_review_subjects(
+                review,
+                subject_ids=subject_ids,
+                offset=subject_offset or 0,
+                limit=subject_limit,
+            )
+        return self._index_review_response(review, include_full_review=include_full_review)
+
+    @staticmethod
+    def _index_review_response(review: Any, *, include_full_review: bool) -> dict[str, Any]:
+        """Return the compact review, or the whole review with every artifact."""
+
+        if include_full_review:
+            payload = review.as_dict()
+            payload["artifacts"] = render_index_review_artifacts(review)
+            return payload
+        payload = compact_index_review(review)
+        payload["artifacts"] = render_index_review_artifacts(
+            review, include_json=False, actionable_only=True
+        )
         return payload
 
     async def _start_performance_case(
@@ -6973,7 +7130,9 @@ class AzureSqlMcpApplication:
             )
 
         self._require_tuning_session_time(session_id)
-        existing_indexes = await collect_existing_indexes(self.executor, database_name)
+        existing_indexes = await collect_existing_indexes(
+            self.executor, database_name, schema_name=schema, table_name=table
+        )
         name_conflict = next(
             (
                 existing
@@ -7305,7 +7464,9 @@ class AzureSqlMcpApplication:
                     expected_index_id=observed_index.index_id,
                 )
                 if find_created_index(
-                    await collect_existing_indexes(self.executor, database_name)
+                    await collect_existing_indexes(
+                        self.executor, database_name, schema_name=schema, table_name=table
+                    )
                 ) is not None:
                     raise RuntimeError("Temporary index removal was not verified.")
                 lease = self.performance_store.update_index_lease(
@@ -7363,7 +7524,9 @@ class AzureSqlMcpApplication:
             cancelled_during_probe = False
             try:
                 observed_index = find_created_index(
-                    await collect_existing_indexes(self.executor, database_name)
+                    await collect_existing_indexes(
+                        self.executor, database_name, schema_name=schema, table_name=table
+                    )
                 )
                 if await record_observed_index(
                     observed_index,
@@ -7451,6 +7614,8 @@ class AzureSqlMcpApplication:
             observed_indexes = await collect_existing_indexes(
                 self.executor,
                 database_name,
+                schema_name=schema,
+                table_name=table,
             )
             observed_index = next(
                 (
@@ -7561,6 +7726,8 @@ class AzureSqlMcpApplication:
                     current_indexes = await collect_existing_indexes(
                         self.executor,
                         database_name,
+                        schema_name=schema,
+                        table_name=table,
                     )
                     current_index = next(
                         (
@@ -7613,6 +7780,8 @@ class AzureSqlMcpApplication:
                     remaining_indexes = await collect_existing_indexes(
                         self.executor,
                         database_name,
+                        schema_name=schema,
+                        table_name=table,
                     )
                     if any(
                         existing.schema == schema
@@ -8236,6 +8405,13 @@ class AzureSqlMcpApplication:
             return max(
                 float(self.config.tool_timeout_seconds),
                 self.config.query_timeout_seconds * 2 + 45.0,
+            )
+        if tool_name == "capture_index_review_snapshot":
+            # Catalog, Query Store and DMV reads, per-candidate sizing, then the
+            # chunked insert, all inside one history transaction.
+            return max(
+                float(self.config.tool_timeout_seconds),
+                self.config.query_timeout_seconds * 6 + 60.0,
             )
         if tool_name == "review_workload_indexes":
             # About eight bounded catalog and Query Store reads run in sequence.
@@ -9450,6 +9626,7 @@ class AzureSqlMcpApplication:
         include_raw_xml: bool = False,
         parameter_values: dict[str, Any] | None = None,
         parameter_types: dict[str, str] | None = None,
+        include_operator_summary: bool = False,
     ) -> dict[str, Any]:
         if hypothetical_indexes:
             raise ValueError(
@@ -9486,6 +9663,10 @@ class AzureSqlMcpApplication:
                 hypothetical_indexes=hypothetical_indexes,
             )
         result = self._artifact_to_dict(artifact, include_raw_xml=include_raw_xml)
+        # The response only: in-process readers use artifact.summary in full.
+        result["summary"] = compact_plan_summary(
+            result["summary"], include_operator_summary=include_operator_summary
+        )
         if binding_info is not None:
             result["parameter_binding"] = binding_info
         if artifact.raw_xml:
@@ -9510,6 +9691,8 @@ class AzureSqlMcpApplication:
         auto_bind_params: bool = False,
         parameter_values: dict[str, Any] | None = None,
         parameter_types: dict[str, str] | None = None,
+        *,
+        include_all_existing_indexes: bool = False,
     ) -> dict[str, Any]:
         normalized_values: dict[str, Any] = {}
         for raw_name, value in (parameter_values or {}).items():
@@ -9610,6 +9793,7 @@ class AzureSqlMcpApplication:
             database_name,
             queries,
             execution_contracts=contracts,
+            include_all_existing_indexes=include_all_existing_indexes,
         )
         result["parameter_binding"] = binding_summaries
         return result
@@ -9912,6 +10096,8 @@ class AzureSqlMcpApplication:
                 current_indexes = await collect_existing_indexes(
                     self.executor,
                     database_name,
+                    schema_name=schema_name,
+                    table_name=table_name,
                 )
                 current_index = next(
                     (

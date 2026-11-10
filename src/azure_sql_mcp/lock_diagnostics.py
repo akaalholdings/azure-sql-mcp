@@ -31,19 +31,68 @@ class LockDiagnosticsService:
         """Current locks from sys.dm_tran_locks with owning session and SQL text.
 
         sys.dm_tran_locks can hold hundreds of thousands of rows on a busy
-        system; results are bounded with waiting locks sorted first.
+        system; the rows are bounded with waiting locks sorted first, and the
+        totals come from a separate aggregate so truncation cannot hide a storm.
+        The two reads are not one snapshot, so the totals can differ slightly
+        from the rows.
         """
         bounded_limit = _clamp_limit(limit, default=200)
-        query = """
-        SELECT TOP (?)
+        totals = await self.executor.fetch_all(
+            database_name,
+            """
+        SELECT
             tl.resource_type,
-            tl.resource_subtype,
-            tl.request_mode,
-            tl.request_status,
-            tl.request_session_id AS session_id,
-            tl.resource_description,
-            CASE tl.resource_type
-                WHEN 'OBJECT' THEN OBJECT_NAME(tl.resource_associated_entity_id)
+            COUNT_BIG(*) AS lock_count,
+            SUM(CASE WHEN tl.request_status = 'WAIT' THEN 1 ELSE 0 END) AS waiting_count
+        FROM sys.dm_tran_locks AS tl
+        WHERE tl.resource_database_id = DB_ID()
+          AND EXISTS (
+                SELECT 1
+                FROM sys.dm_exec_sessions AS us
+                WHERE us.session_id = tl.request_session_id
+                  AND us.is_user_process = 1
+          )
+        GROUP BY tl.resource_type
+        """,
+        )
+        # TOP is taken in the CTE so the joins and dm_exec_sql_text run for the
+        # returned rows only, not once per lock. KEY, PAGE, RID and HOBT locks
+        # carry a hobt_id, which sys.partitions maps to the object.
+        query = """
+        WITH l AS (
+            SELECT TOP (?)
+                tl.resource_type,
+                tl.resource_subtype,
+                tl.request_mode,
+                tl.request_status,
+                tl.request_session_id,
+                tl.resource_description,
+                tl.resource_associated_entity_id
+            FROM sys.dm_tran_locks AS tl
+            WHERE tl.resource_database_id = DB_ID()
+              AND EXISTS (
+                    SELECT 1
+                    FROM sys.dm_exec_sessions AS us
+                    WHERE us.session_id = tl.request_session_id
+                      AND us.is_user_process = 1
+              )
+            ORDER BY
+                CASE WHEN tl.request_status = 'WAIT' THEN 0 ELSE 1 END,
+                tl.resource_type,
+                tl.request_mode
+        )
+        SELECT
+            l.resource_type,
+            l.resource_subtype,
+            l.request_mode,
+            l.request_status,
+            l.request_session_id AS session_id,
+            l.resource_description,
+            CASE
+                WHEN l.resource_type = 'OBJECT'
+                    THEN OBJECT_NAME(l.resource_associated_entity_id)
+                WHEN l.resource_type IN ('KEY', 'PAGE', 'RID', 'HOBT')
+                    THEN OBJECT_NAME(p.object_id)
                 ELSE NULL
             END AS object_name,
             s.login_name,
@@ -62,18 +111,19 @@ class LockDiagnosticsService:
                     END - r.statement_start_offset
                 ) / 2 + 1
             ) AS current_statement
-        FROM sys.dm_tran_locks AS tl
+        FROM l
         INNER JOIN sys.dm_exec_sessions AS s
-            ON tl.request_session_id = s.session_id
+            ON l.request_session_id = s.session_id
         LEFT JOIN sys.dm_exec_requests AS r
-            ON tl.request_session_id = r.session_id
+            ON l.request_session_id = r.session_id
+        LEFT JOIN sys.partitions AS p
+            ON p.hobt_id = l.resource_associated_entity_id
+           AND l.resource_type IN ('KEY', 'PAGE', 'RID', 'HOBT')
         OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) AS st
-        WHERE tl.resource_database_id = DB_ID()
-          AND s.is_user_process = 1
         ORDER BY
-            CASE WHEN tl.request_status = 'WAIT' THEN 0 ELSE 1 END,
-            tl.resource_type,
-            tl.request_mode
+            CASE WHEN l.request_status = 'WAIT' THEN 0 ELSE 1 END,
+            l.resource_type,
+            l.request_mode
         """
         rows = await self.executor.fetch_all(
             database_name, query, params=[bounded_limit + 1],
@@ -81,19 +131,16 @@ class LockDiagnosticsService:
         truncated = len(rows) > bounded_limit
         rows = rows[:bounded_limit]
 
-        # Summarize by resource type
-        by_type: dict[str, int] = {}
-        for row in rows:
-            rt = row.get("resource_type", "UNKNOWN")
-            by_type[rt] = by_type.get(rt, 0) + 1
-
-        waiting = [r for r in rows if r.get("request_status") == "WAIT"]
+        by_type = {
+            row["resource_type"]: int(row.get("lock_count") or 0) for row in totals
+        }
 
         return {
             "database_name": database_name,
-            "total_locks": len(rows),
-            "waiting_locks": len(waiting),
+            "total_locks": sum(by_type.values()),
+            "waiting_locks": sum(int(row.get("waiting_count") or 0) for row in totals),
             "locks_by_resource_type": by_type,
+            "returned_locks": len(rows),
             "limit": bounded_limit,
             "truncated": truncated,
             "locks": rows,

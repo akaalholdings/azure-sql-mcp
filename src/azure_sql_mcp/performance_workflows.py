@@ -323,6 +323,22 @@ def normalize_tuning_objective(value: Any) -> str:
     return objective
 
 
+def _evidence_for_response(evidence: EvidenceEnvelopeV1) -> dict[str, Any]:
+    """The envelope without the sections and the profile summary.
+
+    The response returns both beside the envelope. The stored envelope keeps
+    them: get_performance_case reads the full record.
+    """
+
+    payload = evidence.to_dict()
+    payload["metadata"] = {
+        key: value
+        for key, value in payload["metadata"].items()
+        if key not in {"sections", "profile_summary"}
+    }
+    return payload
+
+
 def _evidence_gaps(value: Any, path: str = "data") -> list[dict[str, str]]:
     """Find explicit availability/completeness gaps without copying source values."""
 
@@ -1452,7 +1468,7 @@ class PerformanceWorkflowService:
             return {
                 "performance_case_id": case_id,
                 "outcome": committed_outcome,
-                "evidence": committed_evidence.to_dict(),
+                "evidence": _evidence_for_response(committed_evidence),
                 "sections": (
                     committed_sections
                     if isinstance(committed_sections, Mapping)
@@ -1622,7 +1638,7 @@ class PerformanceWorkflowService:
         return {
             "performance_case_id": case_id,
             "outcome": outcome,
-            "evidence": evidence.to_dict(),
+            "evidence": _evidence_for_response(evidence),
             "sections": (
                 dict(persisted_sections)
                 if isinstance(persisted_sections, Mapping)

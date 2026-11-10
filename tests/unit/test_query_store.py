@@ -33,10 +33,18 @@ INDEX_EVIDENCE_XML = """\
 """
 
 
+def sqlite_index_evidence_query() -> str:
+    """INDEX_EVIDENCE_QUERY with the T-SQL that QueryStoreSqlite does not translate."""
+
+    query = re.sub(r"(?i)\bvarchar\s*\(\s*max\s*\)|\bdatetime2\(7\)", "TEXT", INDEX_EVIDENCE_QUERY)
+    return query.replace("STRING_AGG(", "group_concat(")
+
+
 def test_index_evidence_query_retains_stored_plans_without_window_runtime() -> None:
     normalized = " ".join(INDEX_EVIDENCE_QUERY.split()).casefold()
 
-    assert "left join ( select runtime.plan_id" in normalized
+    assert "left join ( select per_interval.plan_id" in normalized
+    assert ") as rs on rs.plan_id = p.plan_id" in normalized
     assert "where intervals.end_time >= dateadd" in normalized
     assert "where rsi.runtime_stats_interval_id is not null" not in normalized
     assert "or (p.is_forced_plan = 1" not in normalized
@@ -427,7 +435,7 @@ async def test_index_evidence_skips_query_store_internal_queries() -> None:
     store.add_runtime(600, 1, 5, 100)
     store.add_runtime(601, 2, 1, 900_000)
 
-    rows = await store.fetch_all("db", INDEX_EVIDENCE_QUERY, params=[100, 1440])
+    rows = await store.fetch_all("db", sqlite_index_evidence_query(), params=[100, 1440])
 
     assert [(row["query_id"], row["plan_id"]) for row in rows] == [(500, 600)]
 

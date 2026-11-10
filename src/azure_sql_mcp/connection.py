@@ -127,6 +127,75 @@ class ProfiledExecution:
 class BatchExecutionMode(str, Enum):
     DEFAULT = "default"
     ADMIN = "admin"
+    # fetch_all only. Gated writes use DEFAULT or ADMIN and keep their batch
+    # text and their discard-on-error behaviour.
+    READ = "read"
+
+
+# A batch that starts with SELECT or WITH holds no statement that must be
+# first in its batch, so SET LOCK_TIMEOUT can go in front of it.
+_PLAIN_READ_START = re.compile(r"\s*(?:SELECT|WITH)\b", re.IGNORECASE)
+
+# Statement errors with a fixed severity below 20: invalid column or object,
+# permission denied, unbound identifier, divide by zero.
+_REUSABLE_ERROR_NUMBERS = frozenset({207, 208, 229, 297, 300, 4104, 8134})
+# The ODBC driver gives each of these SQLSTATE classes to one kind of statement
+# error (208, 207, 8134). 42000 is its catch-all for server errors.
+_SPECIFIC_STATEMENT_SQLSTATES = ("42S02", "42S22", "22012")
+_GENERIC_STATEMENT_SQLSTATE = "42000"
+_ERROR_NUMBER_SUFFIX = re.compile(r"\((\d{1,6})\)\s*$")
+# mssql-python 1.10 returns permission errors (229, 297, 300) in the catch-all
+# class with no number, so the server text is the only thing that names them.
+_PERMISSION_DENIED_TEXT = re.compile(
+    r"permission was denied|does not have permission to perform this action", re.IGNORECASE
+)
+_statement_error_texts: dict[str, str] | None = None
+
+
+def _statement_error_sqlstate(exc: BaseException) -> str | None:
+    """Return the statement-error SQLSTATE of a mssql-python exception.
+
+    The driver puts one fixed text per SQLSTATE in ``driver_error``.
+    """
+
+    global _statement_error_texts
+    if _statement_error_texts is None:
+        texts: dict[str, str] = {}
+        try:
+            from mssql_python.exceptions import sqlstate_to_exception
+
+            for state in (*_SPECIFIC_STATEMENT_SQLSTATES, _GENERIC_STATEMENT_SQLSTATE):
+                text = getattr(sqlstate_to_exception(state, ""), "driver_error", None)
+                if isinstance(text, str):
+                    texts[text] = state
+        except Exception:
+            texts = {}
+        _statement_error_texts = texts
+    driver_error = getattr(exc, "driver_error", None)
+    if not isinstance(driver_error, str):
+        return None
+    return _statement_error_texts.get(driver_error)
+
+
+def _is_reusable_statement_error(exc: BaseException) -> bool:
+    """True when the error proves the session is still usable.
+
+    mssql-python 1.10 exposes no error number and no severity. So the SQLSTATE
+    class must be one that only a harmless statement error gets, the server
+    text must end with a listed error number, or it must be a permission
+    error. All else is unknown.
+    """
+
+    sqlstate = _statement_error_sqlstate(exc)
+    if sqlstate is None:
+        return False
+    ddbc_error = getattr(exc, "ddbc_error", None)
+    number = _ERROR_NUMBER_SUFFIX.search(ddbc_error) if isinstance(ddbc_error, str) else None
+    if number is not None:
+        return int(number.group(1)) in _REUSABLE_ERROR_NUMBERS
+    if sqlstate in _SPECIFIC_STATEMENT_SQLSTATES:
+        return True
+    return isinstance(ddbc_error, str) and _PERMISSION_DENIED_TEXT.search(ddbc_error) is not None
 
 
 class AdminBatchOutcomeUnknownError(RuntimeError):
@@ -223,7 +292,11 @@ class AzureSqlExecutor:
         max_rows: int | None = None,
     ) -> list[dict[str, Any]]:
         results = await self.execute_batches(
-            database_name, query, params=params, max_rows=max_rows,
+            database_name,
+            query,
+            params=params,
+            max_rows=max_rows,
+            execution_mode=BatchExecutionMode.READ,
         )
         for result in results:
             if result.columns:
@@ -242,10 +315,12 @@ class AzureSqlExecutor:
         validated_database = self.config.validate_database_name(database_name)
         execution_mode = BatchExecutionMode(execution_mode)
         is_admin_batch = execution_mode is BatchExecutionMode.ADMIN
+        is_read = execution_mode is BatchExecutionMode.READ
 
         async def _attempt() -> list[QueryResult]:
             connection = await self.pool.acquire(validated_database)
             succeeded = False
+            keep_after_error = False
             deferred_cleanup = False
             execution_task: asyncio.Task[list[QueryResult]] | None = None
             cancel_event = threading.Event()
@@ -261,6 +336,7 @@ class AzureSqlExecutor:
                         drain_all_result_sets=is_admin_batch,
                         outcome_unknown_after_dispatch=is_admin_batch,
                         cancel_event=cancel_event,
+                        lock_timeout_in_batch=is_read,
                     )
                 )
                 result = await asyncio.shield(execution_task)
@@ -279,9 +355,22 @@ class AzureSqlExecutor:
                         )
                     )
                 raise
+            except Exception as exc:
+                keep_after_error = is_read and self._connection_survives_error(
+                    connection, query, exc
+                )
+                raise
             finally:
                 if succeeded and not is_admin_batch:
                     await self.pool.release(validated_database, connection)
+                elif keep_after_error:
+                    # A new login costs far more than the SELECT 1 that proves
+                    # this connection on its next acquire.
+                    await self.pool.release(
+                        validated_database,
+                        connection,
+                        validate_before_reuse=True,
+                    )
                 elif not deferred_cleanup:
                     # Failed and arbitrary admin batches may leave transaction,
                     # database, or SET state behind. Never return them to a pool.
@@ -681,6 +770,7 @@ class AzureSqlExecutor:
         drain_all_result_sets: bool = False,
         outcome_unknown_after_dispatch: bool = False,
         cancel_event: threading.Event | None = None,
+        lock_timeout_in_batch: bool = False,
     ) -> list[QueryResult]:
         logger.debug(
             "Executing query",
@@ -691,7 +781,18 @@ class AzureSqlExecutor:
         )
         cursor = self._open_cursor(connection, cancel_event)
         try:
-            self._set_lock_timeout(cursor)
+            if (
+                lock_timeout_in_batch
+                and _PLAIN_READ_START.match(query)
+                # The driver describes a NULL parameter from the batch text;
+                # that path is not proven with a prefixed batch.
+                and not any(value is None for value in params)
+            ):
+                # One round trip, not two. SET returns no result set, so the
+                # first result set is still the query's.
+                query = f"{self._lock_timeout_statement()}; {query}"
+            else:
+                self._set_lock_timeout(cursor)
             try:
                 cursor.execute(query, params)
                 return self._consume_batches(
@@ -807,9 +908,13 @@ class AzureSqlExecutor:
 
         setup_cursor = self._open_cursor(connection, cancel_event)
         try:
-            self._set_lock_timeout(setup_cursor)
-            setup_cursor.execute("SET STATISTICS XML ON", ())
-            setup_cursor.execute("SET STATISTICS IO ON", ())
+            # One batch. STATISTICS XML goes on last (and off first below) so
+            # that no setup or teardown statement runs with it on.
+            setup_cursor.execute(
+                f"{self._lock_timeout_statement()}; "
+                "SET STATISTICS IO ON; SET STATISTICS XML ON;",
+                (),
+            )
         finally:
             with contextlib.suppress(Exception):
                 setup_cursor.close()
@@ -848,8 +953,9 @@ class AzureSqlExecutor:
             teardown_cursor = connection.cursor()
             try:
                 self._configure_cursor(teardown_cursor)
-                teardown_cursor.execute("SET STATISTICS IO OFF", ())
-                teardown_cursor.execute("SET STATISTICS XML OFF", ())
+                teardown_cursor.execute(
+                    "SET STATISTICS XML OFF; SET STATISTICS IO OFF;", ()
+                )
             except Exception:
                 if not active_error:
                     raise
@@ -941,9 +1047,29 @@ class AzureSqlExecutor:
                 return cursor.execute(statement, bound_params)
         return cursor.execute(statement, bound_params)
 
-    def _set_lock_timeout(self, cursor) -> None:
+    def _lock_timeout_statement(self) -> str:
         lock_timeout_ms = max(1, int(self.config.query_timeout_seconds)) * 1000
-        cursor.execute(f"SET LOCK_TIMEOUT {lock_timeout_ms}", ())
+        return f"SET LOCK_TIMEOUT {lock_timeout_ms}"
+
+    def _set_lock_timeout(self, cursor) -> None:
+        cursor.execute(self._lock_timeout_statement(), ())
+
+    @staticmethod
+    def _connection_survives_error(connection, query: str, exc: Exception) -> bool:
+        """True when a failed plain read left an open autocommit connection.
+
+        In autocommit mode a failed SELECT leaves no transaction open. Any
+        doubt (another batch shape, a closed or manual-commit connection, an
+        error that is not a known statement error) means discard.
+        """
+
+        if _PLAIN_READ_START.match(query) is None:
+            return False
+        try:
+            usable = connection.closed is False and bool(connection.autocommit)
+        except Exception:
+            return False
+        return usable and _is_reusable_statement_error(exc)
 
     def _request_cancel(self, connection) -> None:
         for method_name in ("cancel", "interrupt"):

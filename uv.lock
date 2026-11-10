@@ -73,7 +73,7 @@ wheels = [
 
 [[package]]
 name = "azure-sql-mcp"
-version = "2.6.3"
+version = "2.6.4"
 source = { editable = "." }
 dependencies = [
     { name = "azure-identity" },

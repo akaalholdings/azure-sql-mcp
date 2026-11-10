@@ -121,10 +121,16 @@ class RoutingExecutor:
             "hint_modules": [],
             "edition": [{"edition": "GeneralPurpose"}],
             "geo_links": [{"geo_replication_link_count": 0}],
+            # Read only when a test leaves collect_existing_indexes unpatched.
+            "index_metadata": [],
+            "engine_start": [{"engine_start_time_utc": "2026-08-01T00:00:00", "engine_identity": "srv"}],
+            "protection": [],
         }
         self.responses.update(overrides)
         self.delays: dict[str, float] = {}
         self.calls: list[tuple[str, str, list[Any] | None]] = []
+        # (key, started, ended) per read, to assert which reads overlap.
+        self.spans: list[tuple[str, float, float]] = []
         self.in_flight = 0
         self.peak_in_flight = 0
 
@@ -164,15 +170,23 @@ class RoutingExecutor:
         elif "sys.geo_replication_links" in query:
             # A master catalog view: absent from the user database MCP reads.
             raise RuntimeError("Invalid object name 'sys.geo_replication_links'. (208)")
+        elif "FROM sys.dm_os_sys_info" in query:
+            key = "engine_start"
+        elif "child_foreign_key_ids" in query:
+            key = "protection"
+        elif "FROM sys.indexes AS i" in query:
+            key = "index_metadata"
         else:
             raise AssertionError(f"unexpected query: {query[:80]}")
         self.calls.append((key, query, list(params) if params is not None else None))
         self.in_flight += 1
         self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
+        started = time.perf_counter()
         try:
             await asyncio.sleep(self.delays.get(key, 0.001))
         finally:
             self.in_flight -= 1
+            self.spans.append((key, started, time.perf_counter()))
         result = self.responses[key]
         if callable(result):
             result = result(params)
@@ -211,8 +225,10 @@ def test_window_resolution_rejects_the_future_and_accepts_dates() -> None:
 
 
 def test_workload_sql_orders_by_a_whitelisted_objective_column() -> None:
-    assert "ORDER BY qs.total_cpu_us DESC" in workload_sql("cpu")
-    assert "ORDER BY qs.total_logical_reads DESC" in workload_sql("logical_reads")
+    assert "SUM(ps.total_cpu_us) OVER (PARTITION BY ps.query_id) AS query_objective" in workload_sql("cpu")
+    assert "SUM(ps.total_logical_reads) OVER (PARTITION BY ps.query_id) AS query_objective" in workload_sql(
+        "logical_reads"
+    )
     with pytest.raises(KeyError):
         workload_sql("drop table")
 
@@ -1123,13 +1139,17 @@ async def test_scoped_review_ranks_the_scope_before_the_top_query_cap(existing) 
     )
 
     sql, params = next((query, params) for _db, query, params in executor.calls if "WITH plan_stats AS" in query)
-    ranked = sql[sql.index("ranked AS (") : sql.index("dominant AS (")]
-    assert ranked.index("CHARINDEX(?, CAST(sp.query_plan AS nvarchar(max)))") < ranked.rindex("ORDER BY qs.")
-    assert params[3:5] == ['Schema="[sales]" Table="[Orders]"', 'Schema="[sales]" Table="[Order]]Lines]"']
-    assert params[-1] == 1  # plans_per_query stays last
-    # Workload totals stay database-wide: the scope filter is not in totals.
-    totals = sql[sql.index("totals AS (") : sql.index("ranked AS (")]
-    assert "CHARINDEX" not in totals
+    # in_scope is decided per query before the rank, and the rank puts the
+    # scope's queries first, so the cap counts only them.
+    windowed = sql[sql.index("windowed AS (") : sql.index("ranked AS (")]
+    assert "CHARINDEX(?, CAST(sp.query_plan AS nvarchar(max)))" in windowed
+    assert "OVER (PARTITION BY ps.query_id) AS in_scope" in windowed
+    assert "ORDER BY w.in_scope DESC, w.query_objective DESC, w.query_id" in sql
+    assert "r.in_scope = 1 AND r.workload_rank <= ?" in sql
+    assert params[2:4] == ['Schema="[sales]" Table="[Orders]"', 'Schema="[sales]" Table="[Order]]Lines]"']
+    assert params[4:] == [100, 1]  # top_queries, then plans_per_query last
+    # Workload totals stay database-wide: they are windows over every plan row.
+    assert "SUM(ps.total_cpu_us) OVER () AS workload_cpu_us" in windowed
 
 
 @pytest.mark.asyncio

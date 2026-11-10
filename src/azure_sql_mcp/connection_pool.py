@@ -314,10 +314,23 @@ class ConnectionPool:
             return True
         return await asyncio.to_thread(self._validate_connection, connection)
 
-    async def release(self, database_name: str, connection) -> None:
-        """Return a connection to the pool."""
+    async def release(
+        self,
+        database_name: str,
+        connection,
+        *,
+        validate_before_reuse: bool = False,
+    ) -> None:
+        """Return a connection to the pool.
+
+        ``validate_before_reuse`` makes the next acquire run the SELECT 1
+        check even when the connection was released a moment ago.
+        """
         self._release_lease(connection)
-        self._idle_since[id(connection)] = time.monotonic()
+        if validate_before_reuse:
+            self._idle_since.pop(id(connection), None)
+        else:
+            self._idle_since[id(connection)] = time.monotonic()
         metrics = self._metrics[database_name]
         metrics.release_count += 1
         metrics.active_connections = max(0, metrics.active_connections - 1)

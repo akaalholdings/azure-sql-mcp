@@ -121,5 +121,10 @@ def test_troubleshoot_performance_prompt_uses_performance_workflow_tools(
     assert "analyze_db_health" in text
     assert "get_top_queries" in text
     assert "explain_query" in text
-    assert "analyze_workload_indexes" in text
+    # The legacy tool recompiles each top query through SHOWPLAN and is in no
+    # profile; the prompt must name the tool the profiles and skills use, with
+    # arguments that tool accepts.
+    assert "review_workload_indexes" in text
+    assert "analyze_workload_indexes" not in text
+    assert "top_n" not in text and "top_queries=20" in text
     assert "get_active_sessions" in text

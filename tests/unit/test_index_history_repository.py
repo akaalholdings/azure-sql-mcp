@@ -12,6 +12,7 @@ import pytest
 from azure_sql_mcp.connection import AzureSqlExecutor
 from azure_sql_mcp.database_policy import DatabasePolicySet
 from azure_sql_mcp.index_review import CAPTURE_READ_SQL
+from azure_sql_mcp.index_review import CAPTURE_SUMMARY_READ_SQL
 from azure_sql_mcp.index_review import CONTRACT_CHECKS
 from azure_sql_mcp.index_review import CONTRACT_DEFAULTS
 from azure_sql_mcp.index_review import CONTRACT_PROBE_SQL
@@ -176,6 +177,7 @@ class _Session:
         self.run_params = None
         self.snapshot_params = []
         self.statements = []
+        self.executed = []
 
     def fetch_all(self, statement, params=None):
         self.statements.append(statement)
@@ -187,10 +189,17 @@ class _Session:
 
     def execute(self, statement, params=None):
         self.statements.append(statement)
+        self.executed.append((statement, list(params or ())))
         if statement == INSERT_RUN_SQL:
             self.run_params = list(params or ())
-        elif statement == INSERT_SNAPSHOT_SQL:
-            self.snapshot_params.append(list(params or ()))
+        elif statement.lstrip().startswith("INSERT INTO dbatools.IndexReviewSnapshot"):
+            # One statement carries one or more VALUES rows.
+            values = list(params or ())
+            width = INSERT_SNAPSHOT_SQL.count("?")
+            assert statement.count("?") == len(values)
+            self.snapshot_params.extend(
+                values[start : start + width] for start in range(0, len(values), width)
+            )
         elif statement != READ_COMMITTED_SQL:
             raise AssertionError("unexpected transaction statement")
 
@@ -210,6 +219,20 @@ class _Executor:
             return [_CursorResult(rows) for rows in self.probe_rows]
         if statement == CAPTURE_READ_SQL:
             return [_CursorResult(self.run_rows), _CursorResult(self.snapshot_rows)]
+        if statement == CAPTURE_SUMMARY_READ_SQL:
+            return [
+                _CursorResult(
+                    [
+                        {
+                            **row,
+                            "SnapshotRowCount": sum(
+                                item["RunId"] == row["RunId"] for item in self.snapshot_rows
+                            ),
+                        }
+                        for row in self.run_rows
+                    ]
+                )
+            ]
         raise AssertionError("unexpected read statement")
 
     async def execute_transaction_exactly_once(self, database_name, callback):

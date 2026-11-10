@@ -256,10 +256,15 @@ The local `index-review` profile enforces this boundary by exposing only
 `recall_lessons` from the learning plane, and capabilities report
 `index_learning_mode=recall_only`.
 
-Each review returns exactly seven recommend-only artifacts:
+Each review has seven recommend-only artifacts:
 `index-review.json`, `index-review.md`, `create-candidates.sql`,
 `consolidation-candidates.sql`, `drop-candidates.sql`, `rollback.sql`, and
 `validation.sql`. SQL is commented or guarded and is never executed by MCP.
+The MCP tools return the compact review by default, without
+`index-review.json` and with `validation.sql` for the candidates only;
+`include_full_review=true` returns all seven. The
+`azure-sql-mcp-index-history capture` CLI still prints the full stored
+snapshot.
 If exact reverse DDL cannot be reconstructed, the subject remains `observe`.
 
 For scheduled local capture:

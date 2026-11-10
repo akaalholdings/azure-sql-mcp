@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import Any
@@ -37,6 +38,9 @@ CHECK_NAMES = (
 
 RETIRED_QUERY_HEALTH_CHECKS = frozenset({"index", "buffer"})
 
+# Below the default pool size of 5, so a sweep leaves a connection free.
+CHECK_CONCURRENCY = 4
+
 STATUS_SEVERITY = {
     "pass": 0,
     "warning": 1,
@@ -71,14 +75,6 @@ PEAK_METRICS = (
     "max_session_percent",
 )
 
-SESSION_LIMITS_SQL = """
-SELECT
-    max_sessions,
-    primary_group_max_workers
-FROM sys.dm_user_db_resource_governance
-WHERE database_id = DB_ID()
-"""
-
 GEO_LINK_SQL = """
 SELECT
     link_guid,
@@ -106,6 +102,44 @@ WHERE database_id = DB_ID()
 """
 
 
+class _SharedRead:
+    """A read that several checks use: run at most once, replay the outcome.
+
+    A failure is replayed to each check, so each one degrades in its own way.
+    """
+
+    def __init__(self, read: Callable[[], Awaitable[Any]]) -> None:
+        self._read = read
+        self._lock = asyncio.Lock()
+        self._outcome: tuple[Any, Exception | None] | None = None
+
+    async def get(self) -> Any:
+        async with self._lock:
+            if self._outcome is None:
+                try:
+                    self._outcome = (await self._read(), None)
+                except Exception as exc:
+                    self._outcome = (None, exc)
+        value, error = self._outcome
+        if error is not None:
+            raise error
+        return value
+
+
+class _SharedReads:
+    """The sources that both the connection and the resource check read."""
+
+    def __init__(self, service: HealthService, database_name: str) -> None:
+        self.resource_history = _SharedRead(
+            lambda: service.resource_governance.get_resource_stats_history(
+                database_name, RESOURCE_WINDOW_MINUTES
+            )
+        )
+        self.governance_rows = _SharedRead(
+            lambda: service.executor.fetch_all(database_name, GOVERNANCE_SQL)
+        )
+
+
 class HealthService:
     def __init__(
         self,
@@ -119,28 +153,27 @@ class HealthService:
 
     async def analyze(self, database_name: str, health_type: str) -> dict[str, Any]:
         requested = self._parse_requested_checks(health_type)
+        shared = _SharedReads(self, database_name)
         handlers: dict[str, HealthCheck] = {
-            "connection": self._connection_health,
+            "connection": lambda name: self._connection_health(name, shared),
             "constraint": self._constraint_health,
             "replication": self._replication_health,
             "identity": self._identity_health,
             "query_store": self._query_store_health,
             "tuning": self._tuning_health,
-            "resource": self._resource_health,
+            "resource": lambda name: self._resource_health(name, shared),
             "storage": self._storage_health,
             "statistics": self._statistics_health,
         }
+        slots = asyncio.Semaphore(CHECK_CONCURRENCY)
 
-        payload: dict[str, Any] = {"database_name": database_name, "checks": {}}
-        for check_name in CHECK_NAMES:
-            if check_name not in requested:
-                continue
-            payload["checks"][check_name] = await self._run_check(
-                check_name,
-                database_name,
-                handlers[check_name],
-            )
-        return payload
+        async def run(check_name: str) -> dict[str, Any]:
+            async with slots:
+                return await self._run_check(check_name, database_name, handlers[check_name])
+
+        check_names = [name for name in CHECK_NAMES if name in requested]
+        results = await asyncio.gather(*(run(name) for name in check_names))
+        return {"database_name": database_name, "checks": dict(zip(check_names, results))}
 
     def _parse_requested_checks(self, health_type: str) -> set[str]:
         normalized = health_type.lower()
@@ -433,7 +466,11 @@ class HealthService:
             findings=findings,
         )
 
-    async def _connection_health(self, database_name: str) -> dict[str, Any]:
+    async def _connection_health(
+        self,
+        database_name: str,
+        shared: _SharedReads,
+    ) -> dict[str, Any]:
         query = """
         SELECT
             COUNT(*) AS total_sessions,
@@ -456,7 +493,12 @@ class HealthService:
 
         # The documented limits, read on their own so a tier-gated permission
         # failure loses only the limit, not the check.
-        limit_rows, limit_error = await self._fetch_optional_rows(database_name, SESSION_LIMITS_SQL)
+        limit_error = None
+        try:
+            limit_rows = await shared.governance_rows.get()
+        except Exception as exc:
+            note_exception(exc, "health.optional_rows")
+            limit_rows, limit_error = [], sanitize_error_message(str(exc))
         limits = limit_rows[0] if limit_rows else {}
         session_limit = self._positive_int(limits.get("max_sessions"))
         worker_limit = self._positive_int(limits.get("primary_group_max_workers"))
@@ -471,12 +513,11 @@ class HealthService:
         pressure: dict[str, Any] = {}
         pressure_error = None
         try:
-            history = await self.resource_governance.get_resource_stats_history(
-                database_name, RESOURCE_WINDOW_MINUTES
-            )
+            history = await shared.resource_history.get()
             summary = history.get("summary") or {}
+            # Copies: the resource check returns the same history.
             pressure = {
-                metric: summary[metric]
+                metric: dict(summary[metric])
                 for metric in ("max_session_percent", "max_worker_percent")
                 if metric in summary
             }
@@ -1018,13 +1059,15 @@ class HealthService:
             findings=findings,
         )
 
-    async def _resource_health(self, database_name: str) -> dict[str, Any]:
-        history = await self.resource_governance.get_resource_stats_history(
-            database_name, RESOURCE_WINDOW_MINUTES
-        )
+    async def _resource_health(
+        self,
+        database_name: str,
+        shared: _SharedReads,
+    ) -> dict[str, Any]:
+        history = await shared.resource_history.get()
         rows: list[dict[str, Any]] = history.get("history") or []
         summary: dict[str, Any] = history.get("summary") or {}
-        governance = await self._fetch_governance_limits(database_name)
+        governance = await self._fetch_governance_limits(database_name, shared)
 
         status = "pass"
         findings: list[str] = []
@@ -1119,13 +1162,16 @@ class HealthService:
     )
 
     async def _fetch_governance_limits(
-        self, database_name: str,
+        self,
+        database_name: str,
+        shared: _SharedReads | None = None,
     ) -> dict[str, Any]:
         # SELECT * and project: column availability varies by tier, so a
         # missing column degrades to an absent field instead of failing the
         # probe. In an elastic pool the view has a row per pool database.
+        shared = shared or _SharedReads(self, database_name)
         try:
-            rows = await self.executor.fetch_all(database_name, GOVERNANCE_SQL)
+            rows = await shared.governance_rows.get()
         except Exception as exc:
             # WARNING is below the ERROR-level swallow handler: record it here.
             note_exception(exc, "health.governance_limits")

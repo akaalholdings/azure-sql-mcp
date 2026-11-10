@@ -257,7 +257,7 @@ def _blocking_findings(sessions: dict[str, Any]) -> list[dict[str, Any]]:
     chains = sessions.get("blocking_chains") or []
     if not chains:
         return []
-    blocked = sum(len(chain.get("blocked_sessions") or []) for chain in chains)
+    blocked = sum(len(chain.get("blocked_session_ids") or []) for chain in chains)
     head = chains[0].get("head_blocker_session_id")
     return [
         _finding(

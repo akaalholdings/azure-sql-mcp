@@ -59,6 +59,7 @@ from .query_store import _INDEX_CANDIDATE_SLOT_ARRAY_ENTRY
 from .query_store import _INDEX_CANDIDATE_USABLE_PAGE_BYTES
 from .query_store import _MAX_INDEX_CANDIDATE_COLUMNS
 from .query_store import _build_index_candidate_column_widths_sql
+from .query_store import index_evidence_row_intervals
 
 
 PUBLIC_CONTRACT_VERSION = "2.3.0"
@@ -1457,14 +1458,55 @@ class IndexReviewV1:
         }
 
 
+def _coverage_summary(coverage: Mapping[str, Any]) -> dict[str, Any]:
+    """Status per coverage source and the blocker codes of the sources that have any."""
+
+    sources: dict[str, str] = {}
+    blockers: dict[str, list[str]] = {}
+    for name, value in sorted(coverage.items()):
+        # "gaps" and "malformed" are lists, not sources; "malformed" repeats
+        # the Query Store blockers.
+        if name in {"gaps", "malformed"}:
+            continue
+        if isinstance(value, Mapping):
+            sources[name] = str(value.get("status", "incomplete"))
+            codes = [str(code) for code in value.get("blockers", [])]
+            if codes:
+                blockers[name] = codes
+        else:
+            sources[name] = str(value)
+    return {
+        "complete": all(status == "complete" for status in sources.values()),
+        "sources": sources,
+        "blockers": blockers,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class CaptureResult:
     run: IndexReviewRunV1
-    snapshot: IndexReviewSnapshotV1
+    # None when the capture was read back as a summary (run row only).
+    snapshot: IndexReviewSnapshotV1 | None
     already_captured: bool = False
     reconciled: bool = False
 
+    def as_summary(self) -> dict[str, Any]:
+        """Return the capture outcome without the run internals or the stored subjects."""
+
+        return {
+            "status": "already_captured" if self.already_captured else "captured",
+            "already_captured": self.already_captured,
+            "reconciled": self.reconciled,
+            "run_id": self.run.run_id,
+            "observed_at_utc": self.run.observed_at_utc,
+            "subject_count": self.run.subject_count,
+            "snapshot_set_fingerprint": self.run.snapshot_set_fingerprint,
+            "coverage": _coverage_summary(self.run.coverage),
+        }
+
     def as_dict(self) -> dict[str, Any]:
+        if self.snapshot is None:
+            raise ValueError("The snapshot was not read back; use as_summary().")
         return {
             "status": "already_captured" if self.already_captured else "captured",
             "already_captured": self.already_captured,
@@ -1971,6 +2013,21 @@ WHERE RunId IN (
 )
 ORDER BY RunId, SubjectId;
 """
+# The run row and the count of its snapshot rows: the post-commit check for a
+# capture that returns a summary and does not need the stored subjects.
+CAPTURE_SUMMARY_READ_SQL = """
+SELECT r.RunId, r.ContractVersion, r.SchemaVersion, r.CollectorVersion, r.DatabaseName,
+       r.DatabaseFingerprint, r.DatabaseIncarnationFingerprint, r.DatabaseIncarnationIdentity,
+       r.EngineFingerprint, r.EngineIdentity, r.EngineStartTimeUtc,
+       r.IdempotencyKeyHash, r.RequestFingerprint, r.ObservedAtUtc, r.CreatedAtUtc,
+       r.CounterEpochFingerprint, r.InventoryFingerprint, r.QueryStoreFingerprint,
+       r.QueryStoreState, r.QueryCaptureMode, r.ObservationStartUtc, r.ObservationEndUtc,
+       r.CoverageJson, r.SubjectCount, r.SnapshotSetFingerprint, r.QueryStoreJson,
+       (SELECT COUNT(*) FROM dbatools.IndexReviewSnapshot AS s
+        WHERE s.RunId = r.RunId) AS SnapshotRowCount
+FROM dbatools.IndexReviewRun AS r
+WHERE r.DatabaseFingerprint = ? AND r.IdempotencyKeyHash = ?;
+"""
 MISSING_INDEX_DMV_SQL = """
 SELECT TOP (?)
     OBJECT_SCHEMA_NAME(mid.object_id) AS schema_name,
@@ -2017,15 +2074,29 @@ INSERT INTO dbatools.IndexReviewRun
      SnapshotSetFingerprint, QueryStoreJson)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 """
-INSERT_SNAPSHOT_SQL = """
+_INSERT_SNAPSHOT_HEAD = """
 INSERT INTO dbatools.IndexReviewSnapshot
     (SnapshotId, RunId, SubjectId, SubjectKind, SubjectFingerprint, ObjectId, IndexId,
      SchemaName, ObjectName, IndexName, DefinitionJson, DefinitionFingerprint,
      CounterEpochFingerprint, CountersJson, ObservedAtUtc, FirstObservedAtUtc,
      LastObservedAtUtc, SizePages, SizeBytes, WriteBurden, QueryStoreReferencesJson,
      ProtectionsJson, MissingSignatureJson, AggregatesJson, CoverageJson)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-"""
+VALUES """
+_INSERT_SNAPSHOT_ROW = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+INSERT_SNAPSHOT_SQL = f"{_INSERT_SNAPSHOT_HEAD}{_INSERT_SNAPSHOT_ROW};\n"
+# A statement must stay under SQL Server's 2,100-parameter limit.
+_MAX_STATEMENT_PARAMETERS = 2_100
+SNAPSHOT_INSERT_MAX_ROWS = (_MAX_STATEMENT_PARAMETERS - 1) // _INSERT_SNAPSHOT_ROW.count("?")
+
+
+def snapshot_insert_sql(row_count: int) -> str:
+    """Return INSERT_SNAPSHOT_SQL with ``row_count`` VALUES rows in one statement."""
+
+    if not 1 <= row_count <= SNAPSHOT_INSERT_MAX_ROWS:
+        raise ValueError("row_count is outside the snapshot insert chunk size.")
+    if row_count == 1:
+        return INSERT_SNAPSHOT_SQL
+    return _INSERT_SNAPSHOT_HEAD + ",\n       ".join([_INSERT_SNAPSHOT_ROW] * row_count) + ";\n"
 
 
 def _rows_from_sets(value: Any) -> list[list[dict[str, Any]]]:
@@ -2694,13 +2765,75 @@ class SqlIndexHistoryRepository:
             return CaptureResult(run, snapshot, already_captured=True)
         return None
 
+    async def _read_capture_summary(
+        self,
+        context: CaptureContext,
+        written: IndexReviewRunV1 | None,
+    ) -> CaptureResult | None:
+        """Read back the run row and its snapshot row count, not the snapshot rows.
+
+        The caller has just probed the contract for write, so this does not
+        probe again. ``written`` is the run this call inserted, when it did.
+        """
+
+        result_sets = await self._execute_sets(
+            context.database_name,
+            CAPTURE_SUMMARY_READ_SQL,
+            [context.database_fingerprint, context.idempotency_key_hash],
+        )
+        for row in result_sets[0] if result_sets else []:
+            if row.get("IdempotencyKeyHash") != context.idempotency_key_hash:
+                continue
+            run = _run_from_row(row)
+            if run.request_fingerprint != context.request_fingerprint:
+                raise IndexReviewIdempotencyConflictError("Index history idempotency key was replayed with different request material.")
+            if _as_optional_int(row.get("SnapshotRowCount")) != run.subject_count:
+                raise IndexReviewIntegrityError(f"Run {run.run_id} subject count does not match its snapshot rows.")
+            if run.query_store_fingerprint != _digest("index-review-query-store-v1", run.query_store):
+                raise IndexReviewIntegrityError(f"Run {run.run_id} Query Store fingerprint is invalid.")
+            if written is not None and any(
+                getattr(run, name) != getattr(written, name)
+                for name in (
+                    "run_id",
+                    "subject_count",
+                    "snapshot_set_fingerprint",
+                    "inventory_fingerprint",
+                    "query_store_fingerprint",
+                )
+            ):
+                raise IndexReviewIntegrityError(f"Run {run.run_id} does not match the capture that was written.")
+            return CaptureResult(run, None, already_captured=True)
+        return None
+
     async def append_capture(
         self,
         context: CaptureContext,
         collector: Callable[[SqlTransactionSession, CaptureContext], CaptureResult],
+        *,
+        read_back_snapshot: bool = True,
     ) -> CaptureResult:
+        """Store one capture exactly once and read it back.
+
+        ``read_back_snapshot=False`` returns a result with ``snapshot=None``:
+        the post-commit check reads the run row and the count of its snapshot
+        rows in one round trip, without a second contract probe.
+        """
+
         self._require_write(context.database_name)
         await self.probe_contract(context.database_name, for_write=True)
+        written: list[IndexReviewRunV1] = []
+
+        async def read_back(*, inserted: bool) -> CaptureResult | None:
+            if read_back_snapshot:
+                return await self.get_capture_by_idempotency(
+                    context.database_name,
+                    context.idempotency_key_hash,
+                    request_fingerprint=context.request_fingerprint,
+                    database_fingerprint_value=context.database_fingerprint,
+                )
+            return await self._read_capture_summary(
+                context, written[-1] if inserted and written else None
+            )
 
         def transaction(session: SqlTransactionSession) -> bool:
             locked = session.fetch_all(
@@ -2722,6 +2855,8 @@ class SqlIndexHistoryRepository:
                 raise IndexReviewIntegrityError("Capture collector returned an unexpected run identity.")
             run = captured.run
             snapshot = captured.snapshot
+            if snapshot is None:
+                raise IndexReviewIntegrityError("Capture collector returned no snapshot.")
             if (
                 run.database_name != context.database_name
                 or run.database_fingerprint != context.database_fingerprint
@@ -2744,8 +2879,17 @@ class SqlIndexHistoryRepository:
                 if not isinstance(subject.get("definition"), Mapping):
                     raise IndexReviewIntegrityError("Capture collector returned invalid definition JSON.")
             session.execute(INSERT_RUN_SQL, _run_params(run))
-            for subject in snapshot.subjects:
-                session.execute(INSERT_SNAPSHOT_SQL, _snapshot_params(run, subject))
+            # One round trip per chunk of subjects, not per subject.
+            for start in range(0, len(snapshot.subjects), SNAPSHOT_INSERT_MAX_ROWS):
+                rows = [
+                    _snapshot_params(run, subject)
+                    for subject in snapshot.subjects[start : start + SNAPSHOT_INSERT_MAX_ROWS]
+                ]
+                session.execute(
+                    snapshot_insert_sql(len(rows)),
+                    [value for row in rows for value in row],
+                )
+            written.append(run)
             return True
 
         try:
@@ -2755,12 +2899,7 @@ class SqlIndexHistoryRepository:
             )
         except TransactionCommitOutcomeUnknownError:
             try:
-                reconciled = await self.get_capture_by_idempotency(
-                    context.database_name,
-                    context.idempotency_key_hash,
-                    request_fingerprint=context.request_fingerprint,
-                    database_fingerprint_value=context.database_fingerprint,
-                )
+                reconciled = await read_back(inserted=False)
             except IndexReviewIdempotencyConflictError:
                 raise
             except Exception as exc:
@@ -2777,12 +2916,7 @@ class SqlIndexHistoryRepository:
         except Exception as exc:
             raise IndexReviewWriteError("Index history transaction failed before commit.") from exc
 
-        result = await self.get_capture_by_idempotency(
-            context.database_name,
-            context.idempotency_key_hash,
-            request_fingerprint=context.request_fingerprint,
-            database_fingerprint_value=context.database_fingerprint,
-        )
+        result = await read_back(inserted=bool(inserted))
         if result is None:
             raise IndexReviewIntegrityError("Committed capture was not readable after commit.")
         return replace(result, already_captured=not bool(inserted))
@@ -2912,7 +3046,16 @@ class IndexReviewService:
             raise IndexReviewPolicyError("Database policy does not permit index history writes.")
         return MIN_OBSERVATION_DAYS + policy.business_cycle_extension_days
 
-    async def capture_snapshot(self, database_name: str, idempotency_key: str | None = None) -> CaptureResult:
+    async def capture_snapshot(
+        self,
+        database_name: str,
+        idempotency_key: str | None = None,
+        *,
+        include_snapshot: bool = True,
+    ) -> CaptureResult:
+        """Capture one snapshot. ``include_snapshot=False`` skips reading the stored
+        subjects back: the result has ``snapshot=None`` and serves ``as_summary()``."""
+
         minimum_days = self._require_capture(database_name)
         moment = self.clock()
         if moment.tzinfo is None:
@@ -2953,7 +3096,9 @@ class IndexReviewService:
             return self._collect_capture(session, captured, readable_replicas=readable_replicas)
 
         try:
-            return await self.repository.append_capture(context, collector)
+            return await self.repository.append_capture(
+                context, collector, read_back_snapshot=include_snapshot
+            )
         except (IndexReviewError, TransactionCommitOutcomeUnknownError):
             raise
         except Exception as exc:
@@ -3318,13 +3463,15 @@ class IndexReviewService:
             execution_count = _as_optional_int(raw_execution_count)
             if raw_execution_count is not None and execution_count is None:
                 execution_count = -1
+            raw_interval_ids, raw_positive_ids = index_evidence_row_intervals(row)
+            positive_interval_ids = {_as_int(value) for value in raw_positive_ids}
             parsed = parse_showplan_index_evidence(
                 str(row.get("query_plan_xml") or ""),
                 query_id=_as_int(row.get("query_id")),
                 plan_id=_as_int(row.get("plan_id")),
                 plan_hash=str(row.get("query_plan_hash")) if row.get("query_plan_hash") is not None else None,
                 execution_count=execution_count,
-                runtime_interval_ids=[_as_int(row.get("runtime_stats_interval_id"))] if row.get("runtime_stats_interval_id") is not None else [],
+                runtime_interval_ids=[_as_int(value) for value in raw_interval_ids],
                 last_seen=row.get("last_seen_utc"),
                 is_forced_plan=_as_bool(row.get("is_forced_plan")),
                 input_truncated=len(str(row.get("query_plan_xml") or "")) >= MAX_PLAN_XML_CHARS,
@@ -3438,9 +3585,13 @@ class IndexReviewService:
                     )
                 else:
                     item["execution_count"] += candidate_execution_count
-                    if candidate_execution_count > 0:
-                        item["positive_runtime_interval_ids"].update(interval_ids)
-                item["request_count"] += 1
+                    item["positive_runtime_interval_ids"].update(
+                        interval_id
+                        for interval_id in interval_ids
+                        if interval_id in positive_interval_ids
+                    )
+                # One request per plan x interval, as before the plan-grain read.
+                item["request_count"] += max(1, len(interval_ids))
                 item["is_forced_plan"] = _as_bool(
                     item.get("is_forced_plan")
                 ) or _as_bool(candidate.get("is_forced_plan"))
@@ -5052,10 +5203,144 @@ def _candidate_drop_ddl(subject: Mapping[str, Any]) -> str | None:
     )
 
 
-def render_index_review_artifacts(review: IndexReviewV1 | Mapping[str, Any]) -> dict[str, str]:
+_ACTIONABLE_REVIEW_STATES = frozenset(
+    {"create_candidate", "consolidate_candidate", "drop_candidate"}
+)
+MAX_REVIEW_SUBJECT_PAGE = 100
+
+
+def _review_subjects(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    return sorted(
+        payload.get("subjects", []), key=lambda item: str(item.get("subject_id", ""))
+    )
+
+
+def _actionable_subject_sql(subject: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    """Return the inert DDL and rollback that the artifact files render for one candidate."""
+
+    if str(subject.get("state")) == "create_candidate":
+        ddl = _create_candidate_ddl(subject)
+        inverse = _candidate_drop_ddl(subject)
+        return (
+            _comment_sql(ddl) if ddl else None,
+            _comment_sql(inverse) if inverse else None,
+        )
+    return render_inert_proposed_drop(subject), render_inert_candidate_rollback(subject)
+
+
+def compact_index_review(review: IndexReviewV1 | Mapping[str, Any]) -> dict[str, Any]:
+    """Project a review to what a decision needs.
+
+    Each create, consolidate and drop candidate keeps its inert DDL and
+    rollback. Keep and observe subjects are only counted, and the reason codes
+    of the observe subjects are grouped as blockers. ``index_review_subjects``
+    returns the full entry of any subject.
+    """
+
+    payload = review.as_dict() if isinstance(review, IndexReviewV1) else dict(review)
+    subjects = _review_subjects(payload)
+    payload.pop("subjects", None)
+    states = [str(subject.get("state", "observe")) for subject in subjects]
+    actionable: list[dict[str, Any]] = []
+    omitted: dict[str, int] = {}
+    blockers: dict[str, int] = {}
+    for subject, state in zip(subjects, states, strict=True):
+        reasons = [str(code) for code in subject.get("reason_codes", [])]
+        if state not in _ACTIONABLE_REVIEW_STATES:
+            omitted[state] = omitted.get(state, 0) + 1
+            if state == "observe":
+                for code in reasons:
+                    blockers[code] = blockers.get(code, 0) + 1
+            continue
+        ddl, rollback = _actionable_subject_sql(subject)
+        entry: dict[str, Any] = {
+            "subject_id": subject.get("subject_id"),
+            "subject_kind": subject.get("subject_kind"),
+            "state": state,
+            "reason_codes": reasons,
+            "schema_name": subject.get("schema_name"),
+            "table_name": subject.get("table_name") or subject.get("object_name"),
+            "index_name": subject.get("index_name"),
+            "ddl": ddl,
+            "rollback": rollback,
+        }
+        if subject.get("survivor_reference"):
+            entry["survivor_reference"] = subject["survivor_reference"]
+        actionable.append(entry)
+    return {
+        **payload,
+        "subject_count": len(subjects),
+        "state_counts": {state: states.count(state) for state in sorted(INDEX_REVIEW_STATES)},
+        "actionable_subjects": actionable,
+        "blockers": [
+            {"code": code, "subject_count": count}
+            for code, count in sorted(blockers.items(), key=lambda item: (-item[1], item[0]))
+        ],
+        "omitted_subjects": {
+            "total": sum(omitted.values()),
+            "by_state": dict(sorted(omitted.items())),
+        },
+    }
+
+
+def index_review_subjects(
+    review: IndexReviewV1 | Mapping[str, Any],
+    *,
+    subject_ids: Sequence[str] | None = None,
+    offset: int = 0,
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Return full subject entries of a review: the named ones, or one page.
+
+    Subjects come back in subject-id order with their gate, definition and
+    protections, exactly as the review holds them.
+    """
+
+    if offset < 0 or not 1 <= limit <= MAX_REVIEW_SUBJECT_PAGE:
+        raise ValueError(
+            f"offset must be >= 0 and limit between 1 and {MAX_REVIEW_SUBJECT_PAGE}."
+        )
+    payload = review.as_dict() if isinstance(review, IndexReviewV1) else dict(review)
+    subjects = _review_subjects(payload)
+    subject_count = len(subjects)
+    unknown: list[str] = []
+    if subject_ids is not None:
+        wanted = list(dict.fromkeys(str(subject_id) for subject_id in subject_ids))
+        known = {str(subject.get("subject_id")) for subject in subjects}
+        unknown = [subject_id for subject_id in wanted if subject_id not in known]
+        subjects = [
+            subject for subject in subjects if str(subject.get("subject_id")) in wanted
+        ]
+    return {
+        "review_id": payload.get("review_id"),
+        "database_name": payload.get("database_name"),
+        "as_of_run_id": payload.get("as_of_run_id"),
+        "subject_count": subject_count,
+        "matched_count": len(subjects),
+        "offset": offset,
+        "limit": limit,
+        "next_offset": offset + limit if offset + limit < len(subjects) else None,
+        "unknown_subject_ids": unknown,
+        "subjects": [dict(subject) for subject in subjects[offset : offset + limit]],
+    }
+
+
+def render_index_review_artifacts(
+    review: IndexReviewV1 | Mapping[str, Any],
+    *,
+    include_json: bool = True,
+    actionable_only: bool = False,
+) -> dict[str, str]:
+    """Render the review as inert files.
+
+    ``include_json=False`` leaves out index-review.json, a copy of the review.
+    ``actionable_only=True`` lists and validates only the create, consolidate
+    and drop candidates; the other subjects are counted in index-review.md.
+    """
+
     payload = review.as_dict() if isinstance(review, IndexReviewV1) else dict(review)
     subjects = list(payload.get("subjects", []))
-    json_text = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    not_listed: dict[str, int] = {}
     md_lines = [
         "# Index portfolio review",
         "",
@@ -5074,6 +5359,9 @@ def render_index_review_artifacts(review: IndexReviewV1 | Mapping[str, Any]) -> 
     validation_lines = ["-- Recommend-only artifact. Verify current metadata before any separately authorised change."]
     for subject in sorted(subjects, key=lambda item: str(item.get("subject_id", ""))):
         state = str(subject.get("state", "observe"))
+        if actionable_only and state not in _ACTIONABLE_REVIEW_STATES:
+            not_listed[state] = not_listed.get(state, 0) + 1
+            continue
         reasons = ", ".join(str(item) for item in subject.get("reason_codes", [])) or "-"
         md_lines.append(f"| `{subject.get('subject_id', '')}` | `{subject.get('subject_kind', '')}` | `{state}` | {reasons} |")
         if state == "create_candidate":
@@ -5116,8 +5404,16 @@ def render_index_review_artifacts(review: IndexReviewV1 | Mapping[str, Any]) -> 
             validation_lines.append(
                 f"-- {subject.get('subject_id')}: validate the recorded definition and coverage."
             )
+    if not_listed:
+        by_state = ", ".join(f"{state} {count}" for state, count in sorted(not_listed.items()))
+        md_lines.extend(["", f"Not listed: {sum(not_listed.values())} subjects ({by_state})."])
+    artifacts: dict[str, str] = {}
+    if include_json:
+        artifacts["index-review.json"] = (
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        )
     return {
-        "index-review.json": json_text,
+        **artifacts,
         "index-review.md": "\n".join(md_lines) + "\n",
         "create-candidates.sql": "\n".join(create_lines) + "\n",
         "consolidation-candidates.sql": "\n".join(consolidate_lines) + "\n",
@@ -5133,6 +5429,7 @@ __all__ = [
     "CONTRACT_PROBE_SQL",
     "CONTRACT_SCHEMA_FINGERPRINT",
     "CAPTURE_READ_SQL",
+    "CAPTURE_SUMMARY_READ_SQL",
     "ContractProbeResult",
     "HISTORY_READ_SQL",
     "IDEMPOTENCY_LOCK_SQL",
@@ -5162,16 +5459,20 @@ __all__ = [
     "IndexReviewWriteError",
     "MIN_OBSERVATION_DAYS",
     "PUBLIC_CONTRACT_VERSION",
+    "SNAPSHOT_INSERT_MAX_ROWS",
     "SNAPSHOT_REUSE_HOURS",
     "SqlIndexHistoryRepository",
     "classify_index_subject",
+    "compact_index_review",
     "daily_idempotency_key",
     "database_fingerprint",
     "evaluate_drop_gate",
     "evaluate_removal_gate",
     "idempotency_key_hash",
+    "index_review_subjects",
     "parse_review_id",
     "render_index_review_artifacts",
     "review_index_portfolio",
+    "snapshot_insert_sql",
     "validate_contract_probe",
 ]

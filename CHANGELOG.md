@@ -6,6 +6,127 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [2.6.4] - 2026-11-10
+
+Smaller tool responses and cheaper reads on the customer database, from the
+2026-11-03 review. No evidence is removed: each trimmed response has an opt-in
+that returns the old form.
+
+### Changed
+
+Responses that are smaller by default:
+
+- `explain_query` no longer returns `summary.operators` or the cost-ranked
+  `summary.top_operators`. `plan_digest` ranks operators by self time and was
+  contradicted by that second list. `include_operator_summary=true` returns the
+  operator list, with the cost-ranked list named
+  `summary.top_operators_by_estimated_cost`.
+- `get_active_sessions` returns the plan XML only with `include_plans=true`.
+  Each request now returns `plan_handle` and `query_hash`. A blocking chain
+  returns `head_blocker_session_id`, `head_blocker_has_active_request`,
+  `blocked_session_ids` and `blocked_session_waits`; it no longer repeats the
+  full row of each session (`head_blocker`, `blocked_sessions`). A head blocker
+  with no active request is idle in an open transaction.
+- `review_index_portfolio` and `get_index_review` return a compact review:
+  state counts, the create, consolidate and drop candidates with their inert
+  DDL and rollback, blockers by code, and the count of omitted subjects. The
+  artifacts leave out `index-review.json`, and `validation.sql` covers the
+  candidates only. `get_index_review` returns full subject entries with
+  `subject_ids`, or a page with `subject_offset` and `subject_limit`.
+  `include_full_review=true` returns the old response.
+- `capture_index_review_snapshot` returns the run id, subject count,
+  fingerprint and coverage. `include_snapshot=true` returns every stored
+  subject.
+- `analyze_query_indexes`, `analyze_workload_indexes` and `optimize_indexes`
+  list a compact entry for the indexes of the tables they analysed, with
+  `existing_indexes_total` and `existing_indexes_omitted`.
+  `include_all_existing_indexes=true` returns the full metadata of every index.
+- `collect_performance_evidence` and `tune_query` return the sections and the
+  profile once. `evidence.metadata.sections` and
+  `evidence.metadata.profile_summary` are no longer in the response;
+  `get_performance_case` still returns the stored record in full.
+- `get_object_index_diagnostics` reads the buffer pool only with
+  `include_buffer_usage=true`. That read walks every buffer of the instance,
+  also for one table.
+- `get_lock_details`: `total_locks`, `waiting_locks` and
+  `locks_by_resource_type` are now the true totals for the database. The new
+  `returned_locks` is the number of rows in the response.
+
+Tools and profiles:
+
+- `review_workload_indexes` takes `query_ids`: those Query Store queries are
+  analysed whatever their rank or table scope. Pass the query that is being
+  tuned.
+- `analyze_workload_indexes` is no longer in the optimizer and sandbox
+  profiles, and the troubleshoot prompt calls `review_workload_indexes`. The
+  tool stays available when no profile is set.
+- The plan reference check of `review_workload_indexes` compares index names
+  with a binary collation. A plan that names an index with different letter
+  case no longer counts as a reference.
+
+### Fixed
+
+- `get_lock_details` reported the number of returned rows as the total, so a
+  storm of 300,000 locks read as 200. It now names the object of KEY, PAGE, RID
+  and HOBT locks; before, only OBJECT locks had a name.
+- Index portfolio capture read Query Store evidence as one row per plan and
+  runtime interval, each with the plan XML. About 12 hourly plans filled the
+  10,000-row cap over 35 days, so coverage was always `capped` once retention
+  allowed a full window. The read returns one row per plan, and the cap counts
+  plans.
+- `capture_index_review_snapshot` had the default tool timeout (query timeout
+  plus 15 seconds) for all its reads and one insert per index. On a large
+  database every attempt could time out and roll back. Snapshot rows are
+  inserted in chunks of up to 83, and the tool has a longer timeout.
+- `review_workload_indexes` with `table_names` did not always analyse the query
+  that the optimizer was tuning; see `query_ids` above.
+
+### Performance
+
+- Every read sent `SET LOCK_TIMEOUT` as its own round trip. A plain SELECT or
+  WITH read now sends it in the same batch, and a profiled run uses three round
+  trips, not six. Gated writes and SHOWPLAN sessions are unchanged.
+- A failed read closed its pooled connection, so each permission-denied
+  optional read cost a new login. A plain read keeps the connection after an
+  invalid object or column, a divide by zero or a permission error, and the
+  pool checks it with `SELECT 1` before the next use.
+- `analyze_db_health` runs its checks four at a time and reads the resource
+  history and the governance row once.
+- `review_workload_indexes` runs its independent reads together (at most four
+  at a time) and reads the Query Store runtime aggregate once; before, the SQL
+  expanded it about four times.
+- `get_top_cached_queries` and `get_cached_routine_stats` take the top rows
+  before they build plan XML.
+- Plan summaries walk each operator once. An 801-operator plan took 1.4 s on
+  the event loop and now takes 17 ms; the output is the same.
+- The index benchmark and lease cleanup read the indexes of one table, not the
+  whole catalog, and partitions no longer multiply the column rows of the
+  index metadata read.
+- `optimize_indexes` reads row count, column widths and write ratio once per
+  table.
+
+Measured on a 43 GB Azure SQL Database (General Purpose serverless, 4 vCores,
+16 million posts, 112 million votes) against 2.6.3, same script:
+
+- `review_index_portfolio` response: 3.6 MB to 3.3 KB.
+  `capture_index_review_snapshot`: 2.7 MB to 755 bytes.
+  `get_active_sessions` with 40 blocked sessions: 323 KB to 35 KB.
+- `analyze_db_health`: 5.1 s and 28 round trips to 1.4 s and 12.
+  `review_workload_indexes`: 11.5 s and 36 round trips to 5.9 s and 18.
+  `get_object_index_diagnostics` for one table: 20.6 s to 2.7 s.
+- Old and new SQL returned the same rows in all 23 comparisons. The scoped
+  workload read used about 10 times less CPU, the plan reference check 3
+  times less, the index evidence read about 5 times less.
+
+### Known issues
+
+- `get_top_cached_queries` showed no gain at 1,000 cached statements; the
+  top-rows-first change is unproven at that size.
+- The whole-database index metadata read costs slightly more on a database
+  with no partitioned tables. Its gain is on partitioned tables and on the
+  one-table reads.
+- The multi-row snapshot insert was run live with 27 indexes only.
+
 ## [2.6.3] - 2026-11-06
 
 Correctness fixes from the 2026-11-03 review, found and proven by live testing on

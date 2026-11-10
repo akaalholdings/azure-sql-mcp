@@ -12,12 +12,14 @@ checks) degrades to a reported gap instead of failing the review.
 from __future__ import annotations
 
 import asyncio
+import copy
 import threading
 from collections.abc import Awaitable
 from datetime import datetime
 from datetime import timezone
 from typing import Any
 from typing import TypeVar
+from typing import cast
 
 from .azure_tier import dmv_permission_hint
 from .connection import AzureSqlExecutor
@@ -49,6 +51,11 @@ MAX_TOP_QUERIES = 500
 MAX_PLANS_PER_QUERY = 3
 MAX_DETAIL_TABLES = 200
 MAX_REFERENCE_CHECKS = 40
+# Query ids a caller may pin into the analysed set, whatever their rank.
+MAX_QUERY_IDS = 50
+# Reads one review runs at once. The connection pool default is 5; a review
+# that took every connection would make other tool calls wait.
+MAX_CONCURRENT_READS = 4
 QUERY_TEXT_PREVIEW_CHARS = 300
 # Forced-plan dependency read: plan count, bytes per plan XML, bytes in total.
 MAX_FORCED_PLANS = 500
@@ -125,6 +132,10 @@ ORDER BY p.plan_id
 
 _T = TypeVar("_T")
 
+# One pass over the runtime aggregate: SQL Server inlines a CTE at each
+# reference, so plan_stats and every CTE built on it are referenced once.
+# Per-query totals, plan rank, workload totals and workload rank are window
+# functions over that one result.
 _WORKLOAD_SQL_TEMPLATE = """
 WITH plan_stats AS (
     SELECT
@@ -146,78 +157,60 @@ WITH plan_stats AS (
       AND rsi.end_time > TODATETIMEOFFSET(CAST(? AS datetime2), 0)
     GROUP BY p.query_id, rs.plan_id
 ),
-query_stats AS (
-    SELECT
-        query_id,
-        SUM(executions) AS executions,
-        SUM(total_cpu_us) AS total_cpu_us,
-        SUM(total_duration_us) AS total_duration_us,
-        SUM(total_logical_reads) AS total_logical_reads,
-        SUM(total_logical_writes) AS total_logical_writes,
-        SUM(total_rowcount) AS total_rowcount,
-        MAX(active_days) AS active_days
-    FROM plan_stats
-    GROUP BY query_id
-),
-totals AS (
-    SELECT
-        COUNT_BIG(*) AS workload_query_count,
-        SUM(executions) AS workload_executions,
-        SUM(total_cpu_us) AS workload_cpu_us,
-        SUM(total_duration_us) AS workload_duration_us,
-        SUM(total_logical_reads) AS workload_logical_reads
-    FROM query_stats
-),
-ranked AS (
-    SELECT TOP (?)
-        qs.*,
-        ROW_NUMBER() OVER (ORDER BY qs.{objective} DESC, qs.query_id) AS workload_rank
-    FROM query_stats AS qs{scope_filter}
-    ORDER BY qs.{objective} DESC, qs.query_id
-),
-dominant AS (
+windowed AS (
     SELECT
         ps.*,
+        SUM(ps.{objective}) OVER (PARTITION BY ps.query_id) AS query_objective,
         ROW_NUMBER() OVER (
             PARTITION BY ps.query_id ORDER BY ps.{objective} DESC, ps.plan_id
-        ) AS plan_rank
-    FROM plan_stats AS ps
-    WHERE ps.query_id IN (SELECT query_id FROM ranked)
+        ) AS plan_rank,
+        SUM(ps.executions) OVER () AS workload_executions,
+        SUM(ps.total_cpu_us) OVER () AS workload_cpu_us,
+        SUM(ps.total_duration_us) OVER () AS workload_duration_us,
+        SUM(ps.total_logical_reads) OVER () AS workload_logical_reads{in_scope}
+    FROM plan_stats AS ps{scope_join}
+),
+ranked AS (
+    SELECT
+        w.*,
+        SUM(CASE WHEN w.plan_rank = 1 THEN CAST(1 AS bigint) ELSE 0 END) OVER () AS workload_query_count,
+        DENSE_RANK() OVER (
+            ORDER BY {scope_first}w.query_objective DESC, w.query_id
+        ) AS workload_rank
+    FROM windowed AS w
 )
 SELECT
     r.query_id,
-    d.plan_id,
-    d.plan_rank,
+    r.plan_id,
+    r.plan_rank,
     r.workload_rank,
-    d.executions,
-    d.total_cpu_us,
-    d.total_duration_us,
-    d.total_logical_reads,
-    d.total_logical_writes,
-    d.total_rowcount,
-    d.active_days,
-    t.workload_query_count,
-    t.workload_executions,
-    t.workload_cpu_us,
-    t.workload_duration_us,
-    t.workload_logical_reads,
+    r.executions,
+    r.total_cpu_us,
+    r.total_duration_us,
+    r.total_logical_reads,
+    r.total_logical_writes,
+    r.total_rowcount,
+    r.active_days,
+    r.workload_query_count,
+    r.workload_executions,
+    r.workload_cpu_us,
+    r.workload_duration_us,
+    r.workload_logical_reads,
     OBJECT_SCHEMA_NAME(q.object_id) AS object_schema,
     OBJECT_NAME(q.object_id) AS object_name,
     LEFT(qt.query_sql_text, {preview}) AS query_text_preview,
     p.is_forced_plan,
     CAST(p.query_plan AS nvarchar(max)) AS query_plan
 FROM ranked AS r
-CROSS JOIN totals AS t
-INNER JOIN dominant AS d
-    ON d.query_id = r.query_id
-   AND d.plan_rank <= ?
 INNER JOIN sys.query_store_query AS q
     ON q.query_id = r.query_id
 INNER JOIN sys.query_store_query_text AS qt
     ON qt.query_text_id = q.query_text_id
 INNER JOIN sys.query_store_plan AS p
-    ON p.plan_id = d.plan_id
-ORDER BY r.workload_rank, d.plan_rank
+    ON p.plan_id = r.plan_id
+WHERE ({top_queries}{pinned})
+  AND r.plan_rank <= ?
+ORDER BY r.workload_rank, r.plan_rank
 """
 
 _OBJECTIVE_SORT_COLUMNS = {
@@ -324,23 +317,29 @@ ORDER BY fk.object_id, fkc.constraint_column_id
 
 # One row per (index, plan) match in the window: index_match when the plan
 # names the index (Index="[name]"), stats_match when its OptimizerStatsUsage
-# read the index statistics. Each index_match plan's XML comes back once (on
-# its first row) within the byte budget, so Python can tell a read of the index
-# from a write plan that only maintains it. The budget is spent round-robin:
-# each index's smallest plan, then each index's next smallest, and so on. Internal queries (ALTER INDEX
-# REBUILD, UPDATE STATISTICS) are maintenance, not use.
+# read the index statistics. The plans are the outer side, so each plan XML is
+# read once and every pattern is applied to it; the comparison is binary
+# because showplan writes exact catalog names. Each index_match plan's XML
+# comes back once (on its first row) within the byte budget, so Python can tell
+# a read of the index from a write plan that only maintains it. The budget is
+# spent round-robin: each index's smallest plan, then each index's next
+# smallest, and so on. Internal queries (ALTER INDEX REBUILD, UPDATE
+# STATISTICS) are maintenance, not use.
 _INDEX_REFERENCE_SQL_TEMPLATE = """
-WITH matches AS (
+WITH refs AS (
+    SELECT v.ref_id, v.index_pattern, v.stats_pattern
+    FROM (VALUES {values}) AS v(ref_id, index_pattern, stats_pattern)
+),
+matches AS (
     SELECT
-        v.ref_id,
+        hit.ref_id,
         x.plan_id,
         x.query_id,
         x.is_forced_plan,
         x.plan_bytes,
-        CASE WHEN CHARINDEX(v.index_pattern, x.plan_xml) > 0 THEN 1 ELSE 0 END AS index_match,
-        CASE WHEN CHARINDEX(v.stats_pattern, x.plan_xml) > 0 THEN 1 ELSE 0 END AS stats_match
-    FROM (VALUES {values}) AS v(ref_id, index_pattern, stats_pattern)
-    INNER JOIN (
+        CASE WHEN hit.index_at > 0 THEN 1 ELSE 0 END AS index_match,
+        CASE WHEN hit.stats_at > 0 THEN 1 ELSE 0 END AS stats_match
+    FROM (
         SELECT
             p.plan_id,
             p.query_id,
@@ -353,8 +352,15 @@ WITH matches AS (
         WHERE p.last_execution_time > TODATETIMEOFFSET(CAST(? AS datetime2), 0)
           AND q.is_internal_query = 0
     ) AS x
-        ON CHARINDEX(v.index_pattern, x.plan_xml) > 0
-        OR CHARINDEX(v.stats_pattern, x.plan_xml) > 0
+    CROSS APPLY (
+        SELECT
+            v.ref_id,
+            CHARINDEX(v.index_pattern COLLATE Latin1_General_100_BIN2, x.plan_xml COLLATE Latin1_General_100_BIN2) AS index_at,
+            CHARINDEX(v.stats_pattern COLLATE Latin1_General_100_BIN2, x.plan_xml COLLATE Latin1_General_100_BIN2) AS stats_at
+        FROM refs AS v
+    ) AS hit
+    WHERE hit.index_at > 0
+       OR hit.stats_at > 0
 ),
 ranked AS (
     SELECT
@@ -399,25 +405,41 @@ ORDER BY b.plan_id, b.plan_row
 """
 
 
-def workload_sql(objective: str, scope_pattern_count: int = 0) -> str:
+def workload_sql(objective: str, scope_pattern_count: int = 0, pinned_query_count: int = 0) -> str:
+    """Parameters, in order: window end, window start, scope patterns, top
+    queries, pinned query ids, plans per query."""
+
     column = _OBJECTIVE_SORT_COLUMNS[objective]
-    scope_filter = ""
+    # An unscoped review has no in_scope column: a constant there would be a
+    # constant window ORDER BY expression, which SQL Server refuses (5309).
+    in_scope = scope_join = scope_first = ""
+    top_queries = "r.workload_rank <= ?"
     if scope_pattern_count:
         # A scoped review ranks only queries whose plans touch the scope, before
-        # the TOP cap; else a busy database pushes the scope's queries out of it.
-        # Totals stay database-wide.
+        # the top-queries cap; else a busy database pushes the scope's queries
+        # out of it. Totals stay database-wide.
         matches = " OR ".join(
             ["CHARINDEX(?, CAST(sp.query_plan AS nvarchar(max))) > 0"] * scope_pattern_count
         )
-        scope_filter = (
-            "\n    WHERE EXISTS (\n"
-            "        SELECT 1 FROM plan_stats AS sps\n"
-            "        INNER JOIN sys.query_store_plan AS sp ON sp.plan_id = sps.plan_id\n"
-            f"        WHERE sps.query_id = qs.query_id AND ({matches})\n"
-            "    )"
+        in_scope = (
+            f",\n        MAX(CASE WHEN {matches} THEN 1 ELSE 0 END)"
+            " OVER (PARTITION BY ps.query_id) AS in_scope"
         )
+        scope_join = "\n    INNER JOIN sys.query_store_plan AS sp\n        ON sp.plan_id = ps.plan_id"
+        scope_first = "w.in_scope DESC, "
+        top_queries = "(r.in_scope = 1 AND r.workload_rank <= ?)"
+    pinned = ""
+    if pinned_query_count:
+        # Given query ids are analysed whatever their rank or scope.
+        pinned = " OR r.query_id IN (" + ", ".join(["?"] * pinned_query_count) + ")"
     return _WORKLOAD_SQL_TEMPLATE.format(
-        objective=column, preview=QUERY_TEXT_PREVIEW_CHARS, scope_filter=scope_filter
+        objective=column,
+        preview=QUERY_TEXT_PREVIEW_CHARS,
+        in_scope=in_scope,
+        scope_join=scope_join,
+        scope_first=scope_first,
+        top_queries=top_queries,
+        pinned=pinned,
     )
 
 
@@ -481,6 +503,7 @@ class WorkloadIndexAdvisor:
         min_table_rows: int = 10_000,
         max_recommendations_per_table: int = 5,
         include_existing_index_review: bool = True,
+        query_ids: list[int] | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
         if objective not in OBJECTIVES:
@@ -490,35 +513,84 @@ class WorkloadIndexAdvisor:
         plans_per_query = max(1, min(int(plans_per_query), MAX_PLANS_PER_QUERY))
         if table_names and not schema_name:
             raise ValueError("table_names requires schema_name")
+        pinned_ids = list(dict.fromkeys(int(query_id) for query_id in query_ids or ()))
+        if any(query_id <= 0 for query_id in pinned_ids):
+            raise ValueError("query_ids must be positive Query Store query ids")
+        if len(pinned_ids) > MAX_QUERY_IDS:
+            raise ValueError(f"query_ids accepts at most {MAX_QUERY_IDS} ids")
         start, end = resolve_window(lookback_days, as_of_utc, now=now)
-        gaps: list[str] = []
 
-        query_store, query_store_readable = await self._query_store_options(database_name, gaps)
-        queries: list[WorkloadQuery] = []
-        totals: dict[str, float] = {}
-        if query_store_readable:
+        # Every read of this review, nested ones too, goes through one limiter.
+        reader = copy.copy(self)
+        reader.executor = cast(AzureSqlExecutor, _LimitedReads(self.executor, MAX_CONCURRENT_READS))
+
+        # Stage 1: reads that need nothing from each other. Gaps are kept per
+        # read and joined in a fixed order, so the report does not depend on
+        # which read ends first.
+        workload_gaps: list[str] = []
+        table_gaps: list[str] = []
+        foreign_key_gaps: list[str] = []
+
+        async def read_workload() -> tuple[dict[str, Any], bool, list[WorkloadQuery], dict[str, float]]:
+            # The workload read needs the Query Store state, so the two stay in order.
+            query_store, readable = await reader._query_store_options(database_name, workload_gaps)
+            queries: list[WorkloadQuery] = []
+            totals: dict[str, float] = {}
+            if readable:
+                try:
+                    queries, totals = await reader._workload(
+                        database_name,
+                        objective,
+                        start,
+                        end,
+                        top_queries,
+                        plans_per_query,
+                        _scope_plan_patterns(schema_name, table_names),
+                        pinned_ids,
+                    )
+                except Exception as exc:
+                    note_exception(exc, "workload_index_advisor.workload")
+                    workload_gaps.append(
+                        "Query Store workload could not be read: "
+                        + sanitize_error_message(str(exc))
+                    )
+                    readable = False
+                else:
+                    analysed = {query.query_id for query in queries}
+                    missing = [str(query_id) for query_id in pinned_ids if query_id not in analysed]
+                    if missing:
+                        workload_gaps.append(
+                            f"Query id(s) {', '.join(missing)} have no Query Store runtime statistics "
+                            "in the window, so they were not analysed"
+                        )
+            return query_store, readable, queries, totals
+
+        async def read_existing() -> list[ExistingIndex] | Exception:
             try:
-                queries, totals = await self._workload(
-                    database_name,
-                    objective,
-                    start,
-                    end,
-                    top_queries,
-                    plans_per_query,
-                    _scope_plan_patterns(schema_name, table_names),
-                )
+                return await collect_existing_indexes(reader.executor, database_name)
             except Exception as exc:
-                note_exception(exc, "workload_index_advisor.workload")
-                gaps.append(
-                    "Query Store workload could not be read: "
-                    + sanitize_error_message(str(exc))
-                )
-                query_store_readable = False
+                note_exception(exc, "workload_index_advisor.existing_indexes")
+                return exc
 
-        try:
-            existing = await collect_existing_indexes(self.executor, database_name)
-        except Exception as exc:
-            note_exception(exc, "workload_index_advisor.existing_indexes")
+        (
+            (query_store, query_store_readable, queries, totals),
+            existing,
+            tables,
+            foreign_keys,
+            readable_replicas,
+        ) = await asyncio.gather(
+            read_workload(),
+            read_existing(),
+            reader._tables(database_name, table_gaps),
+            reader._foreign_keys(database_name, foreign_key_gaps),
+            collect_readable_replica_status(
+                reader.executor, database_name, site="workload_index_advisor"
+            )
+            if include_existing_index_review
+            else _value(None),
+        )
+        gaps: list[str] = list(workload_gaps)
+        if isinstance(existing, Exception):
             return {
                 "database_name": database_name,
                 "recommend_only": True,
@@ -527,12 +599,12 @@ class WorkloadIndexAdvisor:
                 **status_payload(
                     ResultStatus.UNAVAILABLE,
                     "Existing index metadata could not be read, so no index advice is safe: "
-                    + sanitize_error_message(str(exc))
+                    + sanitize_error_message(str(existing))
                     + ". The index catalog views need VIEW DEFINITION. "
                     + dmv_permission_hint("sys.dm_db_index_usage_stats"),
                 ),
             }
-        tables = await self._tables(database_name, gaps)
+        gaps.extend(table_gaps)
         by_id: dict[int, tuple[str, str]] = {
             object_id: key
             for key, info in tables.items()
@@ -577,14 +649,22 @@ class WorkloadIndexAdvisor:
             if info.is_heap and (object_id := info.object_id) is not None
         ][:MAX_DETAIL_TABLES]
 
-        columns = await self._columns(database_name, detail_ids, by_id, gaps)
+        # Stage 2: reads that need the workload's tables.
+        column_gaps: list[str] = []
+        forwarded_gaps: list[str] = []
+        selectivity_gaps: list[str] = []
+        columns, _, selectivity = await asyncio.gather(
+            reader._columns(database_name, detail_ids, by_id, column_gaps),
+            reader._forwarded_fetches(database_name, heap_ids, tables, by_id, forwarded_gaps),
+            reader._selectivity(database_name, detail_ids, by_id, selectivity_gaps),
+        )
+        gaps.extend(column_gaps)
         gaps.extend(_unusable_computed_column_gaps(columns, tables))
-        await self._forwarded_fetches(database_name, heap_ids, tables, by_id, gaps)
-        selectivity = await self._selectivity(database_name, detail_ids, by_id, gaps)
-        foreign_keys = await self._foreign_keys(database_name, gaps)
+        gaps.extend(forwarded_gaps + selectivity_gaps + foreign_key_gaps)
 
-        # Optional dependency reads run concurrently, each bounded; a timeout or
-        # failure becomes a gap. Gaps are kept per read for a stable order.
+        # Stage 3: optional dependency reads, each bounded; a timeout or failure
+        # becomes a gap. They get a stage of their own so that no read waits
+        # for a slot inside its timeout.
         reference_gaps: list[str] = []
         forced_gaps: list[str] = []
         hint_gaps: list[str] = []
@@ -606,7 +686,7 @@ class WorkloadIndexAdvisor:
             coverage,
         ) = await asyncio.gather(
             self._bounded(
-                self._index_references(database_name, scoped_existing, start, reference_gaps)
+                reader._index_references(database_name, scoped_existing, start, reference_gaps)
                 if pin_reads
                 else _value(({}, {})),
                 fallback=({}, {}),
@@ -616,7 +696,7 @@ class WorkloadIndexAdvisor:
                 site="workload_index_advisor.index_references",
             ),
             self._bounded(
-                self._forced_plans(database_name, forced_gaps)
+                reader._forced_plans(database_name, forced_gaps)
                 if pin_reads
                 else _value(([], "not_checked")),
                 fallback=([], "incomplete"),
@@ -626,7 +706,7 @@ class WorkloadIndexAdvisor:
                 site="workload_index_advisor.forced_plans",
             ),
             self._bounded(
-                self._index_hints(database_name, existing, hint_gaps)
+                reader._index_hints(database_name, existing, hint_gaps)
                 if include_existing_index_review
                 else _value(({}, "not_checked")),
                 fallback=({}, "incomplete"),
@@ -636,7 +716,7 @@ class WorkloadIndexAdvisor:
                 site="workload_index_advisor.index_hints",
             ),
             self._bounded(
-                self._query_store_coverage(database_name, start, end, coverage_gaps)
+                reader._query_store_coverage(database_name, start, end, coverage_gaps)
                 if query_store_readable
                 else _value(None),
                 fallback=None,
@@ -652,13 +732,6 @@ class WorkloadIndexAdvisor:
                 "Query Store plan references could not be checked; unused-index findings stay low confidence"
             )
 
-        readable_replicas = (
-            await collect_readable_replica_status(
-                self.executor, database_name, site="workload_index_advisor"
-            )
-            if include_existing_index_review
-            else None
-        )
         engine_start = next(
             (
                 index.usage_context.get("engine_start_time_utc")
@@ -740,12 +813,14 @@ class WorkloadIndexAdvisor:
         top_queries: int,
         plans_per_query: int,
         scope_patterns: list[str] | None = None,
+        query_ids: list[int] | None = None,
     ) -> tuple[list[WorkloadQuery], dict[str, float]]:
         patterns = list(scope_patterns or ())
+        pinned = list(query_ids or ())
         rows = await self.executor.fetch_all(
             database_name,
-            workload_sql(objective, len(patterns)),
-            params=[_iso(end), _iso(start), top_queries, *patterns, plans_per_query],
+            workload_sql(objective, len(patterns), len(pinned)),
+            params=[_iso(end), _iso(start), *patterns, top_queries, *pinned, plans_per_query],
         )
         totals: dict[str, float] = {}
         queries: list[WorkloadQuery] = []
@@ -1318,6 +1393,21 @@ def _plan_reads(
 
 async def _value(value: _T) -> _T:
     return value
+
+
+class _LimitedReads:
+    """An executor view whose reads share ``limit`` slots."""
+
+    def __init__(self, executor: AzureSqlExecutor, limit: int) -> None:
+        self._executor = executor
+        self._slots = asyncio.Semaphore(limit)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._executor, name)
+
+    async def fetch_all(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        async with self._slots:
+            return await self._executor.fetch_all(*args, **kwargs)
 
 
 def _hint_place(source: str, source_id: dict[str, Any]) -> str:

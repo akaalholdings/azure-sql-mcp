@@ -131,6 +131,7 @@ async def test_execute_batches_admin_mode_does_not_replay_transient_failure(
     assert kwargs == {
         "drain_all_result_sets": True,
         "outcome_unknown_after_dispatch": True,
+        "lock_timeout_in_batch": False,
     }
     pool.discard.assert_awaited_once_with("appdb", connection)
     pool.release.assert_not_awaited()
@@ -1317,7 +1318,9 @@ async def test_cancelled_profiled_sample_does_not_dispatch_user_query(
 ) -> None:
     # A measured sample cancelled during its SET setup must not start the
     # user query afterwards: nobody will read the measurement.
-    connection = DriverLikeConnection(block_on="SET STATISTICS XML ON")
+    connection = DriverLikeConnection(
+        block_on="SET LOCK_TIMEOUT 30000; SET STATISTICS IO ON; SET STATISTICS XML ON;"
+    )
     pool, discarded = _recording_pool(connection)
     executor = AzureSqlExecutor(sample_server_config, MagicMock(), pool)
 
