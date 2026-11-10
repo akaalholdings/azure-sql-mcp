@@ -15,29 +15,31 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 from typing import Any
 
+from .plan_tree import ParsedPlan
 from .plan_tree import PlanNode
 from .plan_tree import PlanParseError
 from .plan_tree import _batch_threads
 from .plan_tree import _child_threads
 from .plan_tree import _per_thread_self
-from .plan_tree import build_tree
 from .plan_tree import ce_guess_fraction
 from .plan_tree import clean_text
 from .plan_tree import cross_join_check
 from .plan_tree import cursor_operation
 from .plan_tree import estimate_check
+from .plan_tree import estimate_origins
 from .plan_tree import is_eager_index_spool
 from .plan_tree import is_true
 from .plan_tree import node_objects
 from .plan_tree import outer_references
 from .plan_tree import output_columns
-from .plan_tree import parse_showplan
+from .plan_tree import parse_plan
+from .plan_tree import partition_access
 from .plan_tree import query_time_stats
 from .plan_tree import residual_predicate
 from .plan_tree import scan_order
 from .plan_tree import seek_predicates
 from .plan_tree import statement_elapsed_ms
-from .plan_tree import statements
+from .plan_tree import statement_kind
 from .plan_tree import unquote
 from .plan_tree import warning_texts
 from .showplan_access import eager_spool_index
@@ -78,20 +80,25 @@ REPEATED_OBJECT_NOTE = (
 
 
 def build_plan_digest(
-    plan_xml: str,
+    plan: str | ParsedPlan,
     *,
     top_n: int = TOP_OPERATORS,
     tree_budget: int = TREE_BUDGET,
     pin_plan_hash: str | None = None,
+    in_flight: bool = False,
 ) -> dict[str, Any]:
-    """``pin_plan_hash`` names the requested statement in a batch plan (a last actual plan is the
-    whole cached batch): every statement with that QueryPlanHash is kept past the statement cut."""
+    """``plan`` is showplan XML, or a ParsedPlan so one tool call parses once.
+
+    ``pin_plan_hash`` names the requested statement in a batch plan (a last actual plan is the
+    whole cached batch): every statement with that QueryPlanHash is kept past the statement cut.
+    ``in_flight`` marks a running request's plan: counts are partial, so overestimates and thread
+    skew on operators that have not finished are left out."""
 
     try:
-        root = parse_showplan(plan_xml)
-        parsed = [(statement, query_plan, build_tree(query_plan)) for statement, query_plan in statements(root)]
+        parsed_plan = parse_plan(plan)
     except PlanParseError as exc:
         return {"contract": DIGEST_CONTRACT, "parse_error": str(exc), "statements": []}
+    parsed = [(item.statement, item.query_plan, item.nodes) for item in parsed_plan.statements]
     nodes = [node for _, _, statement_nodes in parsed for node in statement_nodes]
     row_counts = any(node.has_runtime for node in nodes)
     operator_times = any(node.has_timing for node in nodes)
@@ -112,7 +119,7 @@ def build_plan_digest(
         ),
     )[: max(MAX_STATEMENTS, len(pinned))]
     kept = [
-        _statement_digest(index, statement, query_plan, statement_nodes, top_n, tree_budget)
+        _statement_digest(index, statement, query_plan, statement_nodes, top_n, tree_budget, in_flight)
         for index, (statement, query_plan, statement_nodes) in sorted(ranked)
     ]
     digest: dict[str, Any] = {
@@ -129,12 +136,18 @@ def build_plan_digest(
             ),
         },
         "ranking_basis": "self_elapsed_ms" if operator_times else "estimated_self_cost",
-        "what_this_plan_can_show": _can_show(row_counts, operator_times),
+        "what_this_plan_can_show": _can_show(row_counts, operator_times, in_flight),
         "statement_count": len(parsed),
         "statements": kept,
         "statements_truncated": len(parsed) > len(kept),
         "untrusted_text": UNTRUSTED_TEXT,
     }
+    if in_flight:
+        digest["in_flight"] = True
+    if any(
+        query_plan is not None and is_true(query_plan.get("ExclusiveProfileTimeActive")) for _, query_plan, _ in parsed
+    ):
+        digest["runtime"]["exclusive_operator_times"] = True
     if pin_plan_hash:
         for entry in kept:
             entry["is_requested_statement"] = entry["statement_index"] in pinned
@@ -155,21 +168,29 @@ def matches_plan_hash(statement: ET.Element, plan_hash: str) -> bool:
 
 
 def describe_plan_node(
-    plan_xml: str, node_id: int, *, statement_index: int | None = None
+    plan: str | ParsedPlan, node_id: int, *, statement_index: int | None = None
 ) -> dict[str, Any] | None:
-    """Everything the plan records about one operator; None when no statement has it."""
+    """Everything the plan records about one operator; None when no statement has it.
 
-    root = parse_showplan(plan_xml)
-    for index, (_, query_plan) in enumerate(statements(root)):
+    Pass the ParsedPlan of an earlier read to skip parsing the XML again.
+    """
+
+    for index, item in enumerate(parse_plan(plan).statements):
         if statement_index is not None and index != statement_index:
             continue
-        for node in build_tree(query_plan):
+        for node in item.nodes:
             if node.node_id == node_id:
                 return _node_detail(index, node)
     return None
 
 
-def _can_show(row_counts: bool, operator_times: bool) -> str:
+def _can_show(row_counts: bool, operator_times: bool, in_flight: bool = False) -> str:
+    if in_flight:
+        return (
+            "In-flight plan of a running request: counts and times are partial and still growing. "
+            "An underestimate is real already; overestimates on operators that have not finished are "
+            "hidden, because their rows have not arrived yet."
+        )
     if not row_counts:
         return (
             "Estimated plan: nothing ran. It shows shape, estimates, index use and type problems, "
@@ -194,10 +215,14 @@ def _statement_digest(
     nodes: list[PlanNode],
     top_n: int,
     tree_budget: int,
+    in_flight: bool = False,
 ) -> dict[str, Any]:
+    kind = statement_kind(statement)
     entry: dict[str, Any] = {
         "statement_index": index,
         "statement_type": clean_text(statement.get("StatementType"), 40),
+        # An IF or WHILE condition that runs a query has its own plan.
+        "statement_kind": "condition" if kind == "condition" else None,
         "statement_text": clean_text(statement.get("StatementText"), 300) or None,
         "query_hash": clean_text(statement.get("QueryHash"), 40),
         "query_plan_hash": clean_text(statement.get("QueryPlanHash"), 40),
@@ -244,9 +269,12 @@ def _statement_digest(
     if repeated:
         entry["repeated_objects"] = repeated
         entry["repeated_objects_note"] = REPEATED_OBJECT_NOTE
+    entry["engine"] = _engine(statement, query_plan)
+    entry["columnstore_scans"] = _columnstore_scans(nodes)
+    entry["adaptive_joins"] = _adaptive_joins(nodes)
     if runtime:
-        entry["cardinality_skew"] = _cardinality_skew(nodes, top_n, cited)
-        entry["thread_skew"] = _thread_skew(nodes, top_n, cited)
+        entry["cardinality_skew"] = _cardinality_skew(nodes, top_n, cited, in_flight)
+        entry["thread_skew"] = _thread_skew(nodes, top_n, cited, in_flight)
     else:
         entry["estimate_fingerprints"] = _fingerprints(nodes, top_n)
     entry["eager_index_spools"] = spools
@@ -560,12 +588,118 @@ def _repeated_objects(nodes: list[PlanNode], timed: bool) -> list[dict[str, Any]
     ]
 
 
-def _cardinality_skew(nodes: list[PlanNode], top_n: int, cited: list[PlanNode]) -> list[dict[str, Any]]:
+def _engine(statement: ET.Element, query_plan: ET.Element) -> dict[str, Any]:
+    """Engine features that shaped this statement's plan; empty when none applies."""
+
+    section: dict[str, Any] = {}
+    if is_true(statement.get("BatchModeOnRowStoreUsed")):
+        section["batch_mode_on_rowstore"] = True
+    if statement.get("QueryStoreStatementHintId") or statement.get("QueryStoreStatementHintText"):
+        section["query_store_hint"] = _compact(
+            {
+                "id": _int(statement.get("QueryStoreStatementHintId")),
+                "text": clean_text(statement.get("QueryStoreStatementHintText"), 200),
+                "source": clean_text(statement.get("QueryStoreStatementHintSource"), 40),
+            }
+        )
+    if is_true(query_plan.get("ContainsInlineScalarTsqlUdfs")):
+        section["contains_inlined_scalar_udfs"] = True
+    predicates = statement.findall(f"{_Q}Dispatcher/{_Q}ParameterSensitivePredicate")
+    if predicates:
+        section["parameter_sensitive_plan"] = {
+            "role": "dispatcher",
+            "predicates": [
+                _compact(
+                    {
+                        "low_boundary": _optional_number(item.get("LowBoundary")),
+                        "high_boundary": _optional_number(item.get("HighBoundary")),
+                        "predicate": _scalar_string(item.find(f"{_Q}Predicate/{_Q}ScalarOperator")),
+                    }
+                )
+                for item in predicates[:3]
+            ],
+        }
+    elif query_plan.get("QueryVariantID"):
+        section["parameter_sensitive_plan"] = {
+            "role": "variant",
+            "query_variant_id": _int(query_plan.get("QueryVariantID")),
+            "note": "One of several plans for this query, chosen by the parameter value at run time.",
+        }
+    return section
+
+
+def _scalar_string(scalar: ET.Element | None) -> str | None:
+    return clean_text(scalar.get("ScalarString"), 200) if scalar is not None else None
+
+
+def _columnstore_scans(nodes: list[PlanNode]) -> list[dict[str, Any]]:
+    """Columnstore scans with what decides their cost: execution mode and rowgroups read or skipped."""
+
+    found: list[dict[str, Any]] = []
+    for node in nodes:
+        if _storage(node) != "ColumnStore":
+            continue
+        item: dict[str, Any] = {
+            "node_id": node.node_id,
+            "object": _first(_objects(node)),
+            "execution_mode": node.mode or None,
+        }
+        if node.has_runtime:
+            item.update(
+                {
+                    "segments_read": node.segment_reads,
+                    "segments_skipped": node.segment_skips,
+                    "rows": node.actual_rows,
+                    "rows_read": node.actual_rows_read,
+                }
+            )
+        found.append({key: value for key, value in item.items() if value is not None})
+    return found[:10]
+
+
+def _storage(node: PlanNode) -> str | None:
+    for element in node.own_elements:
+        if element.tag == f"{_Q}Object" and element.get("Storage"):
+            return clean_text(element.get("Storage"), 20)
+    return None
+
+
+def _adaptive_joins(nodes: list[PlanNode]) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    for node in nodes:
+        if not is_true(node.element.get("IsAdaptive")):
+            continue
+        found.append(
+            _compact(
+                {
+                    "node_id": node.node_id,
+                    "threshold_rows": _optional_number(node.element.get("AdaptiveThresholdRows")),
+                    "estimated_join_type": clean_text(node.element.get("EstimatedJoinType"), 40),
+                    "actual_join_type": next(
+                        (clean_text(counter.join_type, 40) for counter in node.threads if counter.join_type), None
+                    ),
+                    "build_rows": (
+                        node.children[0].actual_rows if node.children and node.children[0].has_runtime else None
+                    ),
+                }
+            )
+        )
+    return found[:10]
+
+
+def _cardinality_skew(
+    nodes: list[PlanNode], top_n: int, cited: list[PlanNode], in_flight: bool = False
+) -> list[dict[str, Any]]:
     skewed: list[tuple[float, PlanNode, dict[str, Any]]] = []
+    origins = estimate_origins(nodes, factor_floor=SKEW_FACTOR)
     for node in nodes:
         check = estimate_check(node)
         if check is None or check.factor < SKEW_FACTOR:
             continue
+        # A running operator has not produced its rows yet: only an underestimate is real.
+        if in_flight and check.direction == "over" and not node.finished:
+            continue
+        origin = origins.get(id(node))
         if max(node.actual_rows, check.estimated_per_execution * max(1.0, check.executions)) < SKEW_ROW_FLOOR:
             continue
         guess = ce_guess_fraction(node)
@@ -585,6 +719,10 @@ def _cardinality_skew(nodes: list[PlanNode], top_n: int, cited: list[PlanNode]) 
                         "direction": check.direction,
                         "factor": round(check.factor, 1),
                         "fixed_guess_fraction": round(guess, 4) if guess is not None else None,
+                        # The error first appears lower in the plan: read that operator first.
+                        "inherited_from_node_id": (
+                            origin.origin_node_id if origin is not None and origin.propagated else None
+                        ),
                     }
                 ),
             )
@@ -595,11 +733,13 @@ def _cardinality_skew(nodes: list[PlanNode], top_n: int, cited: list[PlanNode]) 
     return [item for _, _, item in skewed[:top_n]]
 
 
-def _thread_skew(nodes: list[PlanNode], top_n: int, cited: list[PlanNode]) -> list[dict[str, Any]]:
+def _thread_skew(
+    nodes: list[PlanNode], top_n: int, cited: list[PlanNode], in_flight: bool = False
+) -> list[dict[str, Any]]:
     skewed: list[tuple[float, PlanNode, dict[str, Any]]] = []
     for node in nodes:
         workers = [counter.rows for counter in node.threads if counter.thread > 0]
-        if len(workers) < 2:
+        if len(workers) < 2 or (in_flight and not node.finished):
             continue
         busiest, quietest = max(workers), min(workers)
         # A 4x imbalance over a dozen rows means nothing.
@@ -814,6 +954,8 @@ def _node_detail(index: int, node: PlanNode) -> dict[str, Any]:
         "execution_mode": node.mode or None,
         "parallel": node.parallel,
         "objects": _objects(node),
+        "storage": _storage(node),
+        "partitions": _partitions(node),
         "scan": scan_order(node),
         "seek": seek_predicates(node, limit=32),
         "predicate": residual_predicate(node),
@@ -852,6 +994,10 @@ def _node_detail(index: int, node: PlanNode) -> dict[str, Any]:
                 "rows_read": node.actual_rows_read,
                 "end_of_scans": node.actual_end_of_scans,
                 "logical_reads": node.logical_reads,
+                "segments_read": node.segment_reads,
+                "segments_skipped": node.segment_skips,
+                "rebinds": node.actual_rebinds,
+                "rewinds": node.actual_rewinds,
                 "self_elapsed_ms": round(node.self_elapsed_ms, 1) if timed and node.self_elapsed_ms is not None else None,
                 "self_cpu_ms": round(node.self_cpu_ms, 1) if timed and node.self_cpu_ms is not None else None,
                 "cumulative_elapsed_ms": node.elapsed_ms if timed else None,
@@ -895,6 +1041,24 @@ def _node_detail(index: int, node: PlanNode) -> dict[str, Any]:
             }
         )
     return _compact(detail)
+
+
+def _partitions(node: PlanNode) -> dict[str, Any] | None:
+    partitions = partition_access(node)
+    if partitions is None:
+        return None
+    return {
+        key: value
+        for key, value in {
+            "partitioned": True,
+            "accessed": partitions.accessed,
+            "ranges": list(partitions.ranges) or None,
+            # A seek key on the partition id means elimination ran (static or dynamic).
+            "seek_key": partitions.seek_key,
+            "partition_count": partitions.partition_count,
+        }.items()
+        if value is not None
+    }
 
 
 def _objects(node: PlanNode) -> list[str]:

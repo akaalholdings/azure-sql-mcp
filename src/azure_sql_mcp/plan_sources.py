@@ -19,6 +19,7 @@ from .azure_tier import dmv_permission_hint
 from .connection import AzureSqlExecutor
 from .observability import sanitize_error_message
 from .plan_digest import matches_plan_hash
+from .plan_tree import ParsedPlan
 from .plan_tree import PlanParseError
 from .plan_tree import parse_showplan
 from .plan_tree import statements
@@ -272,8 +273,11 @@ class PlanSourceService:
             f"Session {session_id} is running a request with no live plan yet (compiling, or between statements).",
         )
 
-    async def query_store_runtime(self, database_name: str, plan_id: int, plan_xml: str) -> dict[str, Any]:
-        """Measured statement-level runtime and waits for a Query Store plan, over its retention."""
+    async def query_store_runtime(self, database_name: str, plan_id: int, plan_xml: str | ParsedPlan) -> dict[str, Any]:
+        """Measured statement-level runtime and waits for a Query Store plan, over its retention.
+
+        Pass the ParsedPlan of the same tool call to skip parsing the XML again.
+        """
 
         try:
             rows = await self.executor.fetch_all(database_name, PLAN_RUNTIME_SQL, params=[int(plan_id)])
@@ -315,12 +319,15 @@ class PlanSourceService:
         return runtime
 
 
-def _statement_estimated_rows(plan_xml: str) -> float | None:
-    try:
-        root = parse_showplan(plan_xml)
-    except PlanParseError:
-        return None
-    for statement, _ in statements(root):
+def _statement_estimated_rows(plan: str | ParsedPlan) -> float | None:
+    if isinstance(plan, ParsedPlan):
+        found = [item.statement for item in plan.statements]
+    else:
+        try:
+            found = [statement for statement, _ in statements(parse_showplan(plan))]
+        except PlanParseError:
+            return None
+    for statement in found:
         value = _float(statement.get("StatementEstRows"))
         if value is not None:
             return value

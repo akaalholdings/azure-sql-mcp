@@ -159,6 +159,7 @@ def _legacy_summarize_operator(
     )
     estimated_mode = node.attrib.get("EstimatedExecutionMode")
     parallel_exchange = service._parallel_exchange_payload(node, counters)
+    rows_per_execution = service._rows_per_execution(counters, actual_rows)
 
     return {
         "node_id": service._optional_int(node.attrib.get("NodeId")),
@@ -172,14 +173,17 @@ def _legacy_summarize_operator(
         "estimated_rows": estimated_rows,
         "estimated_rows_without_row_goal": estimated_without_row_goal,
         "actual_rows": actual_rows,
+        # Changed with the summary on purpose (review finding 27): rows per execution,
+        # because EstimateRows is per execution.
+        "actual_rows_per_execution": rows_per_execution,
         "actual_rows_ratio": (
-            actual_rows / estimated_rows
-            if actual_rows is not None and estimated_rows not in (None, 0)
+            rows_per_execution / estimated_rows
+            if rows_per_execution is not None and estimated_rows not in (None, 0)
             else None
         ),
         "estimate_error_ratio": (
-            actual_rows / estimated_rows
-            if actual_rows is not None and estimated_rows not in (None, 0)
+            rows_per_execution / estimated_rows
+            if rows_per_execution is not None and estimated_rows not in (None, 0)
             else None
         ),
         "estimated_io": service._optional_float(node.attrib.get("EstimateIO")),

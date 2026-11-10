@@ -1,0 +1,61 @@
+<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan" Version="1.564" Build="17.0.1000.7">
+  <BatchSequence>
+    <Batch>
+      <Statements>
+        <StmtSimple StatementText="SELECT fo.OrderId, fo.Amount FROM dbo.FactOrders AS fo WHERE CONVERT(date, fo.OrderDate) = @Day" StatementId="1" StatementCompId="1" StatementType="SELECT" RetrievedFromCache="true" StatementSubTreeCost="842.5" StatementEstRows="96000" SecurityPolicyApplied="false" StatementOptmLevel="FULL" QueryHash="0x4D5E6F708192A3B4" QueryPlanHash="0xB4C5D6E7F8091A2B" CardinalityEstimationModelVersion="160">
+          <QueryPlan DegreeOfParallelism="1" CachedPlanSize="32" CompileTime="4" CompileCPU="4" CompileMemory="392">
+            <QueryTimeStats CpuTime="17600" ElapsedTime="18000" />
+            <RelOp NodeId="0" PhysicalOp="Clustered Index Scan" LogicalOp="Clustered Index Scan" EstimateRows="96000" EstimatedRowsRead="96000000" EstimateIO="736.9" EstimateCPU="105.6" AvgRowSize="23" EstimatedTotalSubtreeCost="842.5" TableCardinality="96000000" Parallel="0" Partitioned="1" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row">
+              <OutputList>
+                <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactOrders]" Alias="[fo]" Column="OrderId" />
+                <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactOrders]" Alias="[fo]" Column="Amount" />
+              </OutputList>
+              <RunTimeInformation>
+                <RunTimeCountersPerThread Thread="0" ActualRows="88200" ActualRowsRead="96000000" ActualEndOfScans="1" ActualExecutions="1" ActualExecutionMode="Row" ActualElapsedms="17950" ActualCPUms="17560" ActualScans="48" ActualLogicalReads="994800" ActualPhysicalReads="0" ActualReadAheads="0" ActualLobLogicalReads="0" ActualLobPhysicalReads="0" ActualLobReadAheads="0" />
+              </RunTimeInformation>
+              <RunTimePartitionSummary>
+                <PartitionsAccessed PartitionCount="48">
+                  <PartitionRange Start="1" End="48" />
+                </PartitionsAccessed>
+              </RunTimePartitionSummary>
+              <IndexScan Ordered="0" ForcedIndex="0" ForceScan="0" NoExpandHint="0" Storage="RowStore">
+                <DefinedValues>
+                  <DefinedValue>
+                    <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactOrders]" Alias="[fo]" Column="OrderId" />
+                  </DefinedValue>
+                  <DefinedValue>
+                    <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactOrders]" Alias="[fo]" Column="Amount" />
+                  </DefinedValue>
+                </DefinedValues>
+                <Object Database="[salesdb]" Schema="[dbo]" Table="[FactOrders]" Index="[PK_FactOrders]" Alias="[fo]" IndexKind="Clustered" Storage="RowStore" />
+                <Predicate>
+                  <ScalarOperator ScalarString="CONVERT(date,[salesdb].[dbo].[FactOrders].[OrderDate] as [fo].[OrderDate],0)=[@Day]">
+                    <Compare CompareOp="EQ">
+                      <ScalarOperator>
+                        <Convert DataType="date" Style="0" Implicit="0">
+                          <ScalarOperator>
+                            <Identifier>
+                              <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactOrders]" Alias="[fo]" Column="OrderDate" />
+                            </Identifier>
+                          </ScalarOperator>
+                        </Convert>
+                      </ScalarOperator>
+                      <ScalarOperator>
+                        <Identifier>
+                          <ColumnReference Column="@Day" />
+                        </Identifier>
+                      </ScalarOperator>
+                    </Compare>
+                  </ScalarOperator>
+                </Predicate>
+              </IndexScan>
+            </RelOp>
+            <ParameterList>
+              <ColumnReference Column="@Day" ParameterDataType="date" ParameterCompiledValue="'2026-03-14'" ParameterRuntimeValue="'2026-03-14'" />
+            </ParameterList>
+          </QueryPlan>
+        </StmtSimple>
+      </Statements>
+    </Batch>
+  </BatchSequence>
+</ShowPlanXML>

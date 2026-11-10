@@ -193,7 +193,11 @@ def test_rid_lookup_and_scan_with_seekable_filters_are_index_leads() -> None:
             "scalar_udf",
             "medium",
         ),
-        (_relop(0, "Table-valued function", "Table-valued function", "<TableValuedFunction />", rows=100), "multi_statement_tvf", "medium"),
+        (
+            _relop(0, "Table-valued function", "Table-valued function", '<TableValuedFunction><Object Database="[db]" Schema="[dbo]" Table="[fn_OpenOrders]" /></TableValuedFunction>', rows=100),
+            "multi_statement_tvf",
+            "medium",
+        ),
         (_scan(0, "[@staging]", rows=1, cost=1.0), "table_variable", "medium"),
     ],
 )
@@ -476,8 +480,11 @@ def test_estimate_gap_names_a_fixed_guess(showplan) -> None:
         showplan.scan(0, est_rows=30_000, attrs='TableCardinality="100000"', runtime=rt((0, 120, 1, 40, 40)))
     )
 
-    gap = _rules(analyze_plan(plan))["row_estimate_gap"]
+    # The scan is the whole plan and returned 0.12% of the table: the specific finding replaces the generic gap.
+    rules = _rules(analyze_plan(plan))
+    gap = rules["scan_cardinality_misestimate"]
 
+    assert "row_estimate_gap" not in rules
     assert gap["evidence"]["estimate_matches_fixed_guess"] == 0.3
     assert "fixed-guess fraction" in gap["message"]
 

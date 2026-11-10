@@ -20,6 +20,7 @@ from dataclasses import field
 from typing import Any
 from typing import Iterator
 
+from .plan_tree import ParsedPlan
 from .plan_tree import PlanParseError
 from .plan_tree import is_true
 from .plan_tree import parse_showplan
@@ -103,6 +104,7 @@ class TableAccess:
     order_columns: tuple[tuple[str, str], ...] = ()
     join_columns: tuple[str, ...] = ()
     estimated_rows: float = 0.0
+    table_cardinality: float = 0.0
     estimated_executions: float = 1.0
     own_cost: float = 0.0
     cost_share: float = 0.0
@@ -209,16 +211,36 @@ class PlanAccessSummary:
             yield from statement.accesses
 
 
-def parse_plan_access(plan_xml: str) -> PlanAccessSummary:
-    try:
-        root = parse_showplan(plan_xml)
-    except PlanParseError as exc:
-        return PlanAccessSummary(parse_error=str(exc))
+def parse_plan_access(plan: str | ParsedPlan) -> PlanAccessSummary:
+    """Access records of every statement; a ParsedPlan is read without parsing the XML again."""
+
+    if isinstance(plan, ParsedPlan):
+        pairs = [(item.statement, item.query_plan) for item in plan.statements]
+    else:
+        try:
+            pairs = statements(parse_showplan(plan))
+        except PlanParseError as exc:
+            return PlanAccessSummary(parse_error=str(exc))
     summary = PlanAccessSummary()
     # The same statement list as plan_tree.statements: rules join the two by position.
-    for statement, query_plan in statements(root):
+    for statement, query_plan in pairs:
         summary.statements.append(_parse_statement(statement, query_plan, _cursor_cost(statement)))
     return summary
+
+
+def classify_predicate(
+    predicate: ET.Element, schema: str, table: str, alias: str | None
+) -> tuple[dict[str, str], dict[str, str]]:
+    """(residual, nonsargable) columns of one table in a ``Predicate`` element.
+
+    The same classification a table access gets for its own predicate, for a
+    predicate that sits on another operator (a Filter above the access).
+    """
+
+    residual: dict[str, str] = {}
+    nonsargable: dict[str, str] = {}
+    _classify_predicate(predicate, lambda ref: _same_table(ref, schema, table, alias), residual, nonsargable, [])
+    return residual, nonsargable
 
 
 def _cursor_cost(statement: ET.Element) -> float | None:
@@ -346,6 +368,7 @@ def _parse_access(
         implicit_conversion_columns=tuple(dict.fromkeys(implicit)),
         output_columns=tuple(dict.fromkeys(outputs)),
         estimated_rows=_float(relop.get("EstimateRows")),
+        table_cardinality=_float(relop.get("TableCardinality")),
         estimated_executions=executions,
         own_cost=own_cost,
         cost_share=(own_cost / statement_cost) if statement_cost > 0 else 0.0,

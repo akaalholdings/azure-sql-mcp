@@ -237,6 +237,11 @@ class ThreadCounters:
     logical_reads: float | None
     mode: str
     end_of_scans: float | None = None
+    rebinds: float | None = None
+    rewinds: float | None = None
+    segment_reads: float | None = None
+    segment_skips: float | None = None
+    join_type: str = ""
 
 
 @dataclass(eq=False)
@@ -301,6 +306,51 @@ class PlanNode:
 
         values = [counter.end_of_scans for counter in self.threads if counter.end_of_scans is not None]
         return sum(values) if values else None
+
+    @property
+    def actual_rebinds(self) -> float | None:
+        return self._thread_total("rebinds")
+
+    @property
+    def actual_rewinds(self) -> float | None:
+        return self._thread_total("rewinds")
+
+    @property
+    def segment_reads(self) -> float | None:
+        """Columnstore rowgroups read; None when the plan does not record them."""
+
+        return self._thread_total("segment_reads")
+
+    @property
+    def segment_skips(self) -> float | None:
+        """Columnstore rowgroups eliminated by their min and max values."""
+
+        return self._thread_total("segment_skips")
+
+    def _thread_total(self, name: str) -> float | None:
+        values = [value for counter in self.threads if (value := getattr(counter, name)) is not None]
+        return sum(values) if values else None
+
+    @property
+    def finished(self) -> bool:
+        """Every execution read to the end of its input: the counts are final.
+
+        An in-flight plan holds partial counts. Without ``ActualEndOfScans`` the
+        operator counts as unfinished.
+        """
+
+        workers = [counter for counter in self.work_threads if counter.executions > 0]
+        return bool(workers) and all(
+            counter.end_of_scans is not None and counter.end_of_scans >= counter.executions for counter in workers
+        )
+
+    @property
+    def estimated_rows_read(self) -> float | None:
+        return _number(self.element.get("EstimatedRowsRead"))
+
+    @property
+    def partitioned(self) -> bool:
+        return is_true(self.element.get("Partitioned"))
 
     @property
     def elapsed_ms(self) -> float:
@@ -419,11 +469,87 @@ class CrossJoinCheck:
     measured: bool
 
 
+@dataclass(frozen=True)
+class PartitionAccess:
+    """How one operator read a partitioned object.
+
+    ``seek_key`` says the access is bounded on the partition id (static or dynamic
+    elimination). ``partition_count`` is known only when the plan computes the
+    partition from the boundary values (``RangePartitionNew``).
+    """
+
+    partitioned: bool
+    accessed: int | None
+    ranges: tuple[str, ...]
+    seek_key: bool
+    partition_count: int | None
+
+
+@dataclass(frozen=True)
+class EstimateOrigin:
+    """Where a row misestimate first appears below an operator.
+
+    ``propagated`` means a descendant already carries the same error, so this
+    operator only inherits it. ``amplifies_node_id`` names a descendant whose
+    error this operator made at least ORIGIN_AMPLIFICATION times worse.
+    """
+
+    origin_node_id: int
+    propagated: bool
+    amplifies_node_id: int | None
+
+
+@dataclass(frozen=True)
+class StatsUsage:
+    schema: str
+    table: str
+    statistics: str
+    modification_count: float | None
+    sampling_percent: float | None
+    last_update: str | None
+
+
+@dataclass
+class ParsedStatement:
+    statement: ET.Element
+    query_plan: ET.Element | None
+    nodes: list[PlanNode]
+
+
+@dataclass
+class ParsedPlan:
+    """A showplan parsed once: the root and every statement's operator tree.
+
+    Rules, digest, access records and drill-down all read this, so one tool call
+    parses the XML and builds the trees once. Treat it as read-only.
+    """
+
+    root: ET.Element
+    statements: list[ParsedStatement]
+
+
+def parse_plan(plan: str | ParsedPlan | None) -> ParsedPlan:
+    """Parse showplan XML and build every statement's tree; a ParsedPlan is returned as it is.
+
+    Pure and synchronous: safe to run in a worker thread. Raises PlanParseError.
+    """
+
+    if isinstance(plan, ParsedPlan):
+        return plan
+    root = parse_showplan(plan)
+    return ParsedPlan(
+        root,
+        [ParsedStatement(statement, query_plan, build_tree(query_plan)) for statement, query_plan in statements(root)],
+    )
+
+
 def statements(root: ET.Element) -> list[tuple[ET.Element, ET.Element | None]]:
     """Every statement with its ``QueryPlan`` (None when it has none), in document order.
 
     A cursor (``StmtCursor``) keeps its plans under ``CursorPlan/Operation``, one per
     populate, fetch or refresh query; each is listed with the cursor statement.
+    An IF or WHILE (``StmtCond``) whose condition runs a query keeps that plan
+    under ``Condition``; a condition without a query is not listed.
     """
 
     found: list[tuple[ET.Element, ET.Element | None]] = []
@@ -433,7 +559,21 @@ def statements(root: ET.Element) -> list[tuple[ET.Element, ET.Element | None]]:
         elif element.tag == f"{_Q}StmtCursor":
             plans = element.findall(f"{_Q}CursorPlan/{_Q}Operation/{_Q}QueryPlan")
             found.extend([(element, plan) for plan in plans] or [(element, None)])
+        elif element.tag == f"{_Q}StmtCond":
+            condition = element.find(f"{_Q}Condition/{_Q}QueryPlan")
+            if condition is not None:
+                found.append((element, condition))
     return found
+
+
+def statement_kind(statement: ET.Element) -> str:
+    """``condition`` for an IF or WHILE condition plan, ``cursor`` for a cursor plan, else ``statement``."""
+
+    if statement.tag == f"{_Q}StmtCond":
+        return "condition"
+    if statement.tag == f"{_Q}StmtCursor":
+        return "cursor"
+    return "statement"
 
 
 def cursor_operation(statement: ET.Element, query_plan: ET.Element | None) -> tuple[str | None, str | None]:
@@ -469,8 +609,125 @@ def build_tree(query_plan: ET.Element | None) -> list[PlanNode]:
         nodes.append(node)
         node.children = [_node(child, node, node.depth + 1) for child in child_relops(node.element)]
         stack.extend(reversed(node.children))
-    _attribute_self_times(nodes)
+    _attribute_self_times(nodes, exclusive=is_true(query_plan.get("ExclusiveProfileTimeActive")))
     return nodes
+
+
+def subtree(node: PlanNode) -> list[PlanNode]:
+    """The operator and every operator below it, in document order."""
+
+    found: list[PlanNode] = []
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        found.append(current)
+        stack.extend(reversed(current.children))
+    return found
+
+
+def partition_access(node: PlanNode) -> PartitionAccess | None:
+    """Partition facts of one operator; None when the object is not partitioned."""
+
+    summary = node.element.find(f"{_Q}RunTimePartitionSummary/{_Q}PartitionsAccessed")
+    if not node.partitioned and summary is None:
+        return None
+    seek_key = False
+    partition_count: int | None = None
+    for element in node.own_elements:
+        if _local(element.tag) not in {"Prefix", "StartRange", "EndRange"}:
+            continue
+        columns = element.find(f"{_Q}RangeColumns")
+        names = [ref.get("Column") or "" for ref in columns.findall(f"{_Q}ColumnReference")] if columns is not None else []
+        if not any(name.lower().startswith("ptnid") for name in names):
+            continue
+        seek_key = True
+        for function in element.iter(f"{_Q}Intrinsic"):
+            if (function.get("FunctionName") or "").lower() == "rangepartitionnew":
+                # Operands: the value, the boundary side, then one constant per boundary.
+                boundaries = len(function.findall(f"{_Q}ScalarOperator")) - 2
+                if boundaries >= 1:
+                    partition_count = boundaries + 1
+    ranges: list[str] = []
+    accessed: int | None = None
+    if summary is not None:
+        accessed = int(_number(summary.get("PartitionCount")) or 0)
+        for item in summary.findall(f"{_Q}PartitionRange")[:8]:
+            start, end = clean_text(item.get("Start"), 12) or "?", clean_text(item.get("End"), 12) or "?"
+            ranges.append(start if start == end else f"{start}-{end}")
+    return PartitionAccess(True, accessed, tuple(ranges), seek_key, partition_count)
+
+
+def predicate_variables(node: PlanNode) -> list[str]:
+    """``@names`` the operator's own seek keys and predicates compare against."""
+
+    found: list[str] = []
+    for element in node.own_elements:
+        if element.tag != f"{_Q}ColumnReference" or element.get("Table"):
+            continue
+        name = element.get("Column") or ""
+        if name.startswith("@") and name not in found:
+            found.append(name)
+    return found
+
+
+def statistics_used(query_plan: ET.Element | None) -> list[StatsUsage]:
+    """Statistics the optimizer loaded for this statement (``OptimizerStatsUsage``)."""
+
+    if query_plan is None:
+        return []
+    found: list[StatsUsage] = []
+    for info in query_plan.findall(f"{_Q}OptimizerStatsUsage/{_Q}StatisticsInfo"):
+        found.append(
+            StatsUsage(
+                schema=clean_text(unquote(info.get("Schema")), 128) or "",
+                table=clean_text(unquote(info.get("Table")), 128) or "",
+                statistics=clean_text(unquote(info.get("Statistics")), 128) or "",
+                modification_count=_number(info.get("ModificationCount")),
+                sampling_percent=_number(info.get("SamplingPercent")),
+                last_update=clean_text(info.get("LastUpdate"), 40),
+            )
+        )
+    return found
+
+
+ORIGIN_AMPLIFICATION = 10.0
+
+
+def estimate_origins(nodes: list[PlanNode], *, factor_floor: float) -> dict[int, EstimateOrigin]:
+    """For each misestimated operator, the lowest operator where that error first appears.
+
+    A parent whose error has the same direction as a checked descendant's, and is
+    less than ORIGIN_AMPLIFICATION times larger, inherits it. Operators with no
+    estimate check (exchanges, operators without counters) are looked through.
+    Keys are ``id(node)``: node ids repeat across statements, not within one tree.
+    """
+
+    gaps: dict[int, EstimateCheck] = {}
+    for node in nodes:
+        check = estimate_check(node)
+        if check is not None and check.factor >= factor_floor:
+            gaps[id(node)] = check
+    origins: dict[int, EstimateOrigin] = {}
+    # The nearest misestimated descendants of each node, through unchecked or correct nodes.
+    below: dict[int, list[PlanNode]] = {}
+    for node in reversed(nodes):
+        nearest: list[PlanNode] = []
+        for child in node.children:
+            nearest.extend([child] if id(child) in gaps else below[id(child)] if estimate_check(child) is None else [])
+        below[id(node)] = nearest
+        check = gaps.get(id(node))
+        if check is None:
+            continue
+        same = [child for child in nearest if gaps[id(child)].direction == check.direction]
+        if not same:
+            origins[id(node)] = EstimateOrigin(node.node_id, False, None)
+            continue
+        worst = max(same, key=lambda child: gaps[id(child)].factor)
+        if check.factor <= gaps[id(worst)].factor * ORIGIN_AMPLIFICATION:
+            origins[id(node)] = EstimateOrigin(origins[id(worst)].origin_node_id, True, None)
+        else:
+            origins[id(node)] = EstimateOrigin(node.node_id, False, worst.node_id)
+    return origins
 
 
 def child_relops(relop: ET.Element) -> list[ET.Element]:
@@ -733,6 +990,11 @@ def _node(element: ET.Element, parent: PlanNode | None, depth: int) -> PlanNode:
                     logical_reads=_number(counter.get("ActualLogicalReads")),
                     mode=counter.get("ActualExecutionMode") or "",
                     end_of_scans=_number(counter.get("ActualEndOfScans")),
+                    rebinds=_number(counter.get("ActualRebinds")),
+                    rewinds=_number(counter.get("ActualRewinds")),
+                    segment_reads=_number(counter.get("SegmentReads")),
+                    segment_skips=_number(counter.get("SegmentSkips")),
+                    join_type=counter.get("ActualJoinType") or "",
                 )
             )
     return PlanNode(
@@ -755,10 +1017,19 @@ def _node(element: ET.Element, parent: PlanNode | None, depth: int) -> PlanNode:
     )
 
 
-def _attribute_self_times(nodes: list[PlanNode]) -> None:
-    """Fill ``self_elapsed_ms`` and ``self_cpu_ms``; children are visited before parents."""
+def _attribute_self_times(nodes: list[PlanNode], *, exclusive: bool = False) -> None:
+    """Fill ``self_elapsed_ms`` and ``self_cpu_ms``; children are visited before parents.
+
+    ``exclusive`` is QueryPlan@ExclusiveProfileTimeActive: the operator times are
+    already each operator's own, so nothing is subtracted (an exchange stays advisory).
+    """
 
     if not any(node.has_timing for node in nodes):
+        return
+    if exclusive:
+        for node in nodes:
+            node.self_elapsed_ms = node.elapsed_ms if node.has_runtime else 0.0
+            node.self_cpu_ms = node.cpu_ms if node.has_runtime else 0.0
         return
     contribution: dict[str, dict[PlanNode, float]] = {"elapsed": {}, "cpu": {}}
     batch_total: dict[str, dict[PlanNode, float]] = {"elapsed": {}, "cpu": {}}

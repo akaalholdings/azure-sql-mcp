@@ -831,6 +831,7 @@ class PlansService:
             if counters
             else None
         )
+        rows_per_execution = self._rows_per_execution(counters, actual_rows)
         estimated_without_row_goal = self._optional_float(
             node.attrib.get("EstimateRowsWithoutRowGoal")
         )
@@ -883,14 +884,16 @@ class PlansService:
             "estimated_rows": estimated_rows,
             "estimated_rows_without_row_goal": estimated_without_row_goal,
             "actual_rows": actual_rows,
+            "actual_rows_per_execution": rows_per_execution,
+            # EstimateRows is per execution, so both ratios compare rows per execution.
             "actual_rows_ratio": (
-                actual_rows / estimated_rows
-                if actual_rows is not None and estimated_rows not in (None, 0)
+                rows_per_execution / estimated_rows
+                if rows_per_execution is not None and estimated_rows not in (None, 0)
                 else None
             ),
             "estimate_error_ratio": (
-                actual_rows / estimated_rows
-                if actual_rows is not None and estimated_rows not in (None, 0)
+                rows_per_execution / estimated_rows
+                if rows_per_execution is not None and estimated_rows not in (None, 0)
                 else None
             ),
             "estimated_io": self._optional_float(node.attrib.get("EstimateIO")),
@@ -910,6 +913,27 @@ class PlansService:
             "implicit_conversions": implicit_conversions,
             "warnings": operator_warnings,
         }
+
+    @staticmethod
+    def _rows_per_execution(
+        counters: list[dict[str, Any]], actual_rows: float | None
+    ) -> float | None:
+        """Actual rows per execution: ActualRows is a total over every execution and thread.
+
+        The inner side of a nested loop runs once per outer row, so its total
+        against the per-execution estimate reads as an error it does not have.
+        Parallel workers that each ran once count as one execution, as in
+        plan_tree.PlanNode.logical_executions.
+        """
+        if actual_rows is None:
+            return None
+        workers = [counter for counter in counters if (counter["thread"] or 0) > 0] or counters
+        runs = [counter["actual_executions"] or 0 for counter in workers]
+        if len(workers) > 1 and all(run <= 1 for run in runs):
+            executions = 1 if any(runs) else 0
+        else:
+            executions = sum(counter["actual_executions"] or 0 for counter in counters)
+        return actual_rows / executions if executions else actual_rows
 
     @staticmethod
     def _local_name(tag: str) -> str:

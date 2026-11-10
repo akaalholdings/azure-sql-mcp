@@ -1,0 +1,91 @@
+<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan" Version="1.564" Build="17.0.1000.7">
+  <BatchSequence>
+    <Batch>
+      <Statements>
+        <StmtSimple StatementText="SELECT SUM(fs.Amount) FROM dbo.FactSales AS fs WHERE fs.SaleDate &gt;= @FromDate" StatementId="1" StatementCompId="1" StatementType="SELECT" RetrievedFromCache="true" StatementSubTreeCost="12.4" StatementEstRows="1" SecurityPolicyApplied="false" StatementOptmLevel="FULL" QueryHash="0x1A2B3C4D5E6F7081" QueryPlanHash="0x8192A3B4C5D6E7F8" CardinalityEstimationModelVersion="160">
+          <QueryPlan DegreeOfParallelism="1" MemoryGrant="1024" CachedPlanSize="40" CompileTime="6" CompileCPU="6" CompileMemory="480">
+            <MemoryGrantInfo SerialRequiredMemory="0" SerialDesiredMemory="0" GrantedMemory="1024" MaxUsedMemory="256" />
+            <QueryTimeStats CpuTime="4050" ElapsedTime="4200" />
+            <RelOp NodeId="0" PhysicalOp="Compute Scalar" LogicalOp="Compute Scalar" EstimateRows="1" EstimateIO="0" EstimateCPU="0.0000001" AvgRowSize="15" EstimatedTotalSubtreeCost="12.4" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row">
+              <OutputList>
+                <ColumnReference Column="Expr1002" />
+              </OutputList>
+              <ComputeScalar>
+                <DefinedValues>
+                  <DefinedValue>
+                    <ColumnReference Column="Expr1002" />
+                    <ScalarOperator ScalarString="CASE WHEN [Expr1006]=(0) THEN NULL ELSE [Expr1007] END">
+                      <Identifier>
+                        <ColumnReference Column="Expr1007" />
+                      </Identifier>
+                    </ScalarOperator>
+                  </DefinedValue>
+                </DefinedValues>
+                <RelOp NodeId="1" PhysicalOp="Hash Match" LogicalOp="Aggregate" EstimateRows="1" EstimateIO="0" EstimateCPU="0.6" AvgRowSize="23" EstimatedTotalSubtreeCost="12.4" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Batch">
+                  <OutputList>
+                    <ColumnReference Column="Expr1006" />
+                    <ColumnReference Column="Expr1007" />
+                  </OutputList>
+                  <RunTimeInformation>
+                    <RunTimeCountersPerThread Thread="0" ActualRows="1" Batches="1" ActualEndOfScans="0" ActualExecutions="1" ActualExecutionMode="Batch" ActualElapsedms="150" ActualCPUms="150" />
+                  </RunTimeInformation>
+                  <Hash>
+                    <DefinedValues>
+                      <DefinedValue>
+                        <ColumnReference Column="Expr1007" />
+                        <ScalarOperator ScalarString="SUM([salesdb].[dbo].[FactSales].[Amount] as [fs].[Amount])">
+                          <Aggregate AggType="SUM" Distinct="0">
+                            <ScalarOperator>
+                              <Identifier>
+                                <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactSales]" Alias="[fs]" Column="Amount" />
+                              </Identifier>
+                            </ScalarOperator>
+                          </Aggregate>
+                        </ScalarOperator>
+                      </DefinedValue>
+                    </DefinedValues>
+                    <RelOp NodeId="2" PhysicalOp="Clustered Index Scan" LogicalOp="Clustered Index Scan" EstimateRows="1500000" EstimatedRowsRead="50331648" EstimateIO="6.1" EstimateCPU="5.5" AvgRowSize="16" EstimatedTotalSubtreeCost="11.6" TableCardinality="50331648" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Batch">
+                      <OutputList>
+                        <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactSales]" Alias="[fs]" Column="Amount" />
+                      </OutputList>
+                      <RunTimeInformation>
+                        <RunTimeCountersPerThread Thread="0" ActualRows="1204000" ActualRowsRead="50331648" Batches="1338" ActualEndOfScans="0" ActualExecutions="1" ActualExecutionMode="Batch" ActualElapsedms="3900" ActualCPUms="3880" ActualScans="1" ActualLogicalReads="0" ActualPhysicalReads="0" ActualReadAheads="0" ActualLobLogicalReads="41200" ActualLobPhysicalReads="0" ActualLobReadAheads="0" SegmentReads="48" SegmentSkips="0" />
+                      </RunTimeInformation>
+                      <IndexScan Ordered="0" ForcedIndex="0" ForceSeek="0" ForceScan="0" NoExpandHint="0" Storage="ColumnStore">
+                        <DefinedValues>
+                          <DefinedValue>
+                            <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactSales]" Alias="[fs]" Column="Amount" />
+                          </DefinedValue>
+                        </DefinedValues>
+                        <Object Database="[salesdb]" Schema="[dbo]" Table="[FactSales]" Index="[CCI_FactSales]" Alias="[fs]" IndexKind="Clustered" Storage="ColumnStore" />
+                        <Predicate>
+                          <ScalarOperator ScalarString="[salesdb].[dbo].[FactSales].[SaleDate] as [fs].[SaleDate]&gt;=[@FromDate]">
+                            <Compare CompareOp="GE">
+                              <ScalarOperator>
+                                <Identifier>
+                                  <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactSales]" Alias="[fs]" Column="SaleDate" />
+                                </Identifier>
+                              </ScalarOperator>
+                              <ScalarOperator>
+                                <Identifier>
+                                  <ColumnReference Column="@FromDate" />
+                                </Identifier>
+                              </ScalarOperator>
+                            </Compare>
+                          </ScalarOperator>
+                        </Predicate>
+                      </IndexScan>
+                    </RelOp>
+                  </Hash>
+                </RelOp>
+              </ComputeScalar>
+            </RelOp>
+            <ParameterList>
+              <ColumnReference Column="@FromDate" ParameterDataType="date" ParameterCompiledValue="'2026-01-01'" ParameterRuntimeValue="'2026-01-01'" />
+            </ParameterList>
+          </QueryPlan>
+        </StmtSimple>
+      </Statements>
+    </Batch>
+  </BatchSequence>
+</ShowPlanXML>

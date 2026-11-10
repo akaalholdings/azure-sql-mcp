@@ -1,0 +1,99 @@
+<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan" Version="1.564" Build="17.0.1000.7">
+  <BatchSequence>
+    <Batch>
+      <Statements>
+        <StmtSimple StatementText="SELECT fo.OrderId, fo.Amount FROM dbo.FactOrders AS fo WHERE fo.OrderDate &gt;= @Day AND fo.OrderDate &lt; DATEADD(day, 1, @Day) AND ABS(fo.Amount) &gt; 100" StatementId="1" StatementCompId="1" StatementType="SELECT" RetrievedFromCache="true" StatementSubTreeCost="17.6" StatementEstRows="96000" SecurityPolicyApplied="false" StatementOptmLevel="FULL" QueryHash="0x5E6F708192A3B4C5" QueryPlanHash="0xC5D6E7F8091A2B3C" CardinalityEstimationModelVersion="160">
+          <QueryPlan DegreeOfParallelism="1" CachedPlanSize="40" CompileTime="5" CompileCPU="5" CompileMemory="424">
+            <QueryTimeStats CpuTime="390" ElapsedTime="400" />
+            <RelOp NodeId="0" PhysicalOp="Clustered Index Seek" LogicalOp="Clustered Index Seek" EstimateRows="96000" EstimatedRowsRead="2000000" EstimateIO="15.4" EstimateCPU="2.2" AvgRowSize="23" EstimatedTotalSubtreeCost="17.6" TableCardinality="96000000" Parallel="0" Partitioned="1" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row">
+              <OutputList>
+                <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactOrders]" Alias="[fo]" Column="OrderId" />
+                <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactOrders]" Alias="[fo]" Column="Amount" />
+              </OutputList>
+              <RunTimeInformation>
+                <RunTimeCountersPerThread Thread="0" ActualRows="88200" ActualRowsRead="2000000" ActualEndOfScans="1" ActualExecutions="1" ActualExecutionMode="Row" ActualElapsedms="395" ActualCPUms="388" ActualScans="1" ActualLogicalReads="20800" ActualPhysicalReads="0" ActualReadAheads="0" ActualLobLogicalReads="0" ActualLobPhysicalReads="0" ActualLobReadAheads="0" />
+              </RunTimeInformation>
+              <RunTimePartitionSummary>
+                <PartitionsAccessed PartitionCount="1">
+                  <PartitionRange Start="39" End="39" />
+                </PartitionsAccessed>
+              </RunTimePartitionSummary>
+              <IndexScan Ordered="1" ScanDirection="FORWARD" ForcedIndex="0" ForceSeek="0" ForceScan="0" NoExpandHint="0" Storage="RowStore">
+                <DefinedValues>
+                  <DefinedValue>
+                    <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactOrders]" Alias="[fo]" Column="OrderId" />
+                  </DefinedValue>
+                  <DefinedValue>
+                    <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactOrders]" Alias="[fo]" Column="Amount" />
+                  </DefinedValue>
+                </DefinedValues>
+                <Object Database="[salesdb]" Schema="[dbo]" Table="[FactOrders]" Index="[PK_FactOrders]" Alias="[fo]" IndexKind="Clustered" Storage="RowStore" />
+                <SeekPredicates>
+                  <SeekPredicateNew>
+                    <SeekKeys>
+                      <StartRange ScanType="GE">
+                        <RangeColumns>
+                          <ColumnReference Column="PtnId1000" />
+                          <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactOrders]" Alias="[fo]" Column="OrderDate" />
+                        </RangeColumns>
+                        <RangeExpressions>
+                          <ScalarOperator ScalarString="RangePartitionNew([@Day],(1),'2023-01-01','2023-02-01','2023-03-01')">
+                            <Intrinsic FunctionName="RangePartitionNew">
+                              <ScalarOperator>
+                                <Identifier>
+                                  <ColumnReference Column="@Day" />
+                                </Identifier>
+                              </ScalarOperator>
+                              <ScalarOperator>
+                                <Const ConstValue="(1)" />
+                              </ScalarOperator>
+                              <ScalarOperator>
+                                <Const ConstValue="'2023-01-01'" />
+                              </ScalarOperator>
+                              <ScalarOperator>
+                                <Const ConstValue="'2023-02-01'" />
+                              </ScalarOperator>
+                              <ScalarOperator>
+                                <Const ConstValue="'2023-03-01'" />
+                              </ScalarOperator>
+                            </Intrinsic>
+                          </ScalarOperator>
+                          <ScalarOperator ScalarString="[@Day]">
+                            <Identifier>
+                              <ColumnReference Column="@Day" />
+                            </Identifier>
+                          </ScalarOperator>
+                        </RangeExpressions>
+                      </StartRange>
+                    </SeekKeys>
+                  </SeekPredicateNew>
+                </SeekPredicates>
+                <Predicate>
+                  <ScalarOperator ScalarString="abs([salesdb].[dbo].[FactOrders].[Amount] as [fo].[Amount])&gt;(100.00)">
+                    <Compare CompareOp="GT">
+                      <ScalarOperator>
+                        <Intrinsic FunctionName="abs">
+                          <ScalarOperator>
+                            <Identifier>
+                              <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactOrders]" Alias="[fo]" Column="Amount" />
+                            </Identifier>
+                          </ScalarOperator>
+                        </Intrinsic>
+                      </ScalarOperator>
+                      <ScalarOperator>
+                        <Const ConstValue="(100.00)" />
+                      </ScalarOperator>
+                    </Compare>
+                  </ScalarOperator>
+                </Predicate>
+              </IndexScan>
+            </RelOp>
+            <ParameterList>
+              <ColumnReference Column="@Day" ParameterDataType="date" ParameterCompiledValue="'2026-03-14'" ParameterRuntimeValue="'2026-03-14'" />
+            </ParameterList>
+          </QueryPlan>
+        </StmtSimple>
+      </Statements>
+    </Batch>
+  </BatchSequence>
+</ShowPlanXML>

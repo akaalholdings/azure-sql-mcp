@@ -1,0 +1,74 @@
+<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan" Version="1.564" Build="17.0.1000.7">
+  <BatchSequence>
+    <Batch>
+      <Statements>
+        <StmtSimple StatementText="SELECT COUNT_BIG(*) FROM dbo.FactSales AS fs WHERE UPPER(fs.Region) = N'NORTH'" StatementId="1" StatementCompId="1" StatementType="SELECT" RetrievedFromCache="true" StatementSubTreeCost="31.9" StatementEstRows="1" SecurityPolicyApplied="false" StatementOptmLevel="FULL" QueryHash="0x3C4D5E6F708192A3" QueryPlanHash="0xA3B4C5D6E7F8091A" CardinalityEstimationModelVersion="160">
+          <QueryPlan DegreeOfParallelism="1" MemoryGrant="1024" CachedPlanSize="40" CompileTime="7" CompileCPU="7" CompileMemory="496">
+            <MemoryGrantInfo SerialRequiredMemory="0" SerialDesiredMemory="0" GrantedMemory="1024" MaxUsedMemory="128" />
+            <QueryTimeStats CpuTime="9300" ElapsedTime="9500" />
+            <RelOp NodeId="0" PhysicalOp="Hash Match" LogicalOp="Aggregate" EstimateRows="1" EstimateIO="0" EstimateCPU="0.4" AvgRowSize="15" EstimatedTotalSubtreeCost="31.9" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Batch">
+              <OutputList>
+                <ColumnReference Column="Expr1002" />
+              </OutputList>
+              <RunTimeInformation>
+                <RunTimeCountersPerThread Thread="0" ActualRows="1" Batches="1" ActualEndOfScans="0" ActualExecutions="1" ActualExecutionMode="Batch" ActualElapsedms="60" ActualCPUms="60" />
+              </RunTimeInformation>
+              <Hash>
+                <DefinedValues>
+                  <DefinedValue>
+                    <ColumnReference Column="Expr1002" />
+                    <ScalarOperator ScalarString="COUNT_BIG(*)">
+                      <Aggregate AggType="COUNT_BIG" Distinct="0" />
+                    </ScalarOperator>
+                  </DefinedValue>
+                </DefinedValues>
+                <RelOp NodeId="1" PhysicalOp="Filter" LogicalOp="Filter" EstimateRows="5033164" EstimateIO="0" EstimateCPU="19.4" AvgRowSize="9" EstimatedTotalSubtreeCost="31.5" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Batch">
+                  <OutputList />
+                  <RunTimeInformation>
+                    <RunTimeCountersPerThread Thread="0" ActualRows="6291456" Batches="6991" ActualEndOfScans="0" ActualExecutions="1" ActualExecutionMode="Batch" ActualElapsedms="6400" ActualCPUms="6300" />
+                  </RunTimeInformation>
+                  <Filter StartupExpression="0">
+                    <RelOp NodeId="2" PhysicalOp="Clustered Index Scan" LogicalOp="Clustered Index Scan" EstimateRows="50331648" EstimatedRowsRead="50331648" EstimateIO="6.1" EstimateCPU="5.5" AvgRowSize="29" EstimatedTotalSubtreeCost="12.1" TableCardinality="50331648" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Batch">
+                      <OutputList>
+                        <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactSales]" Alias="[fs]" Column="Region" />
+                      </OutputList>
+                      <RunTimeInformation>
+                        <RunTimeCountersPerThread Thread="0" ActualRows="50331648" Batches="55924" ActualEndOfScans="0" ActualExecutions="1" ActualExecutionMode="Batch" ActualElapsedms="3040" ActualCPUms="2940" ActualScans="1" ActualLogicalReads="0" ActualPhysicalReads="0" ActualReadAheads="0" ActualLobLogicalReads="38100" ActualLobPhysicalReads="0" ActualLobReadAheads="0" SegmentReads="48" SegmentSkips="0" />
+                      </RunTimeInformation>
+                      <IndexScan Ordered="0" ForcedIndex="0" ForceSeek="0" ForceScan="0" NoExpandHint="0" Storage="ColumnStore">
+                        <DefinedValues>
+                          <DefinedValue>
+                            <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactSales]" Alias="[fs]" Column="Region" />
+                          </DefinedValue>
+                        </DefinedValues>
+                        <Object Database="[salesdb]" Schema="[dbo]" Table="[FactSales]" Index="[CCI_FactSales]" Alias="[fs]" IndexKind="Clustered" Storage="ColumnStore" />
+                      </IndexScan>
+                    </RelOp>
+                    <Predicate>
+                      <ScalarOperator ScalarString="upper([salesdb].[dbo].[FactSales].[Region] as [fs].[Region])=N'NORTH'">
+                        <Compare CompareOp="EQ">
+                          <ScalarOperator>
+                            <Intrinsic FunctionName="upper">
+                              <ScalarOperator>
+                                <Identifier>
+                                  <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactSales]" Alias="[fs]" Column="Region" />
+                                </Identifier>
+                              </ScalarOperator>
+                            </Intrinsic>
+                          </ScalarOperator>
+                          <ScalarOperator>
+                            <Const ConstValue="N'NORTH'" />
+                          </ScalarOperator>
+                        </Compare>
+                      </ScalarOperator>
+                    </Predicate>
+                  </Filter>
+                </RelOp>
+              </Hash>
+            </RelOp>
+          </QueryPlan>
+        </StmtSimple>
+      </Statements>
+    </Batch>
+  </BatchSequence>
+</ShowPlanXML>

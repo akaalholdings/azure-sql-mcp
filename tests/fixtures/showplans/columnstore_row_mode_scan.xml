@@ -1,0 +1,84 @@
+<ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan" Version="1.564" Build="17.0.1000.7">
+  <BatchSequence>
+    <Batch>
+      <Statements>
+        <StmtSimple StatementText="SELECT fs.StoreId, SUM(dbo.fn_NetAmount(fs.Amount)) FROM dbo.FactSales AS fs GROUP BY fs.StoreId" StatementId="1" StatementCompId="1" StatementType="SELECT" RetrievedFromCache="true" StatementSubTreeCost="96.2" StatementEstRows="420" SecurityPolicyApplied="false" StatementOptmLevel="FULL" QueryHash="0x2B3C4D5E6F708192" QueryPlanHash="0x92A3B4C5D6E7F809" CardinalityEstimationModelVersion="160">
+          <QueryPlan DegreeOfParallelism="0" NonParallelPlanReason="TSQLUserDefinedFunctionsNotParallelizable" MemoryGrant="2048" CachedPlanSize="48" CompileTime="9" CompileCPU="9" CompileMemory="560">
+            <MemoryGrantInfo SerialRequiredMemory="1024" SerialDesiredMemory="2048" GrantedMemory="2048" MaxUsedMemory="640" />
+            <QueryTimeStats CpuTime="21800" ElapsedTime="22000" UdfCpuTime="9000" UdfElapsedTime="9100" />
+            <RelOp NodeId="0" PhysicalOp="Hash Match" LogicalOp="Aggregate" EstimateRows="420" EstimateIO="0" EstimateCPU="38.5" AvgRowSize="23" EstimatedTotalSubtreeCost="96.2" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row">
+              <OutputList>
+                <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactSales]" Alias="[fs]" Column="StoreId" />
+                <ColumnReference Column="Expr1003" />
+              </OutputList>
+              <RunTimeInformation>
+                <RunTimeCountersPerThread Thread="0" ActualRows="420" ActualEndOfScans="1" ActualExecutions="1" ActualExecutionMode="Row" ActualElapsedms="21900" ActualCPUms="21700" />
+              </RunTimeInformation>
+              <Hash>
+                <DefinedValues>
+                  <DefinedValue>
+                    <ColumnReference Column="Expr1003" />
+                    <ScalarOperator ScalarString="SUM([Expr1002])">
+                      <Aggregate AggType="SUM" Distinct="0">
+                        <ScalarOperator>
+                          <Identifier>
+                            <ColumnReference Column="Expr1002" />
+                          </Identifier>
+                        </ScalarOperator>
+                      </Aggregate>
+                    </ScalarOperator>
+                  </DefinedValue>
+                </DefinedValues>
+                <HashKeysBuild>
+                  <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactSales]" Alias="[fs]" Column="StoreId" />
+                </HashKeysBuild>
+                <RelOp NodeId="1" PhysicalOp="Compute Scalar" LogicalOp="Compute Scalar" EstimateRows="50331648" EstimateIO="0" EstimateCPU="5.03" AvgRowSize="23" EstimatedTotalSubtreeCost="57.7" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row">
+                  <OutputList>
+                    <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactSales]" Alias="[fs]" Column="StoreId" />
+                    <ColumnReference Column="Expr1002" />
+                  </OutputList>
+                  <ComputeScalar>
+                    <DefinedValues>
+                      <DefinedValue>
+                        <ColumnReference Column="Expr1002" />
+                        <ScalarOperator ScalarString="[salesdb].[dbo].[fn_NetAmount]([salesdb].[dbo].[FactSales].[Amount] as [fs].[Amount])">
+                          <UserDefinedFunction FunctionName="[salesdb].[dbo].[fn_NetAmount]">
+                            <ScalarOperator>
+                              <Identifier>
+                                <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactSales]" Alias="[fs]" Column="Amount" />
+                              </Identifier>
+                            </ScalarOperator>
+                          </UserDefinedFunction>
+                        </ScalarOperator>
+                      </DefinedValue>
+                    </DefinedValues>
+                    <RelOp NodeId="2" PhysicalOp="Clustered Index Scan" LogicalOp="Clustered Index Scan" EstimateRows="50331648" EstimatedRowsRead="50331648" EstimateIO="6.1" EstimateCPU="46.5" AvgRowSize="20" EstimatedTotalSubtreeCost="52.6" TableCardinality="50331648" Parallel="0" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row">
+                      <OutputList>
+                        <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactSales]" Alias="[fs]" Column="StoreId" />
+                        <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactSales]" Alias="[fs]" Column="Amount" />
+                      </OutputList>
+                      <RunTimeInformation>
+                        <RunTimeCountersPerThread Thread="0" ActualRows="50331648" ActualRowsRead="50331648" ActualEndOfScans="1" ActualExecutions="1" ActualExecutionMode="Row" ActualElapsedms="8200" ActualCPUms="8100" ActualScans="1" ActualLogicalReads="0" ActualPhysicalReads="0" ActualReadAheads="0" ActualLobLogicalReads="52400" ActualLobPhysicalReads="0" ActualLobReadAheads="0" SegmentReads="48" SegmentSkips="0" />
+                      </RunTimeInformation>
+                      <IndexScan Ordered="0" ForcedIndex="0" ForceSeek="0" ForceScan="0" NoExpandHint="0" Storage="ColumnStore">
+                        <DefinedValues>
+                          <DefinedValue>
+                            <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactSales]" Alias="[fs]" Column="StoreId" />
+                          </DefinedValue>
+                          <DefinedValue>
+                            <ColumnReference Database="[salesdb]" Schema="[dbo]" Table="[FactSales]" Alias="[fs]" Column="Amount" />
+                          </DefinedValue>
+                        </DefinedValues>
+                        <Object Database="[salesdb]" Schema="[dbo]" Table="[FactSales]" Index="[CCI_FactSales]" Alias="[fs]" IndexKind="Clustered" Storage="ColumnStore" />
+                      </IndexScan>
+                    </RelOp>
+                  </ComputeScalar>
+                </RelOp>
+              </Hash>
+            </RelOp>
+          </QueryPlan>
+        </StmtSimple>
+      </Statements>
+    </Batch>
+  </BatchSequence>
+</ShowPlanXML>
