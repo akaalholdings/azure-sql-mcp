@@ -22,6 +22,7 @@ from azure_sql_mcp.server import AzureSqlMcpApplication
 from azure_sql_mcp.server import TEST_INDEX_DEFINITION_PROPERTY
 from azure_sql_mcp.server import TEST_INDEX_OWNER_PROPERTY
 from azure_sql_mcp.server import TEST_INDEX_PREFIX
+from azure_sql_mcp.server import generated_test_index_name
 
 
 def make_config(
@@ -125,12 +126,18 @@ async def test_create_offline_is_refused_and_no_includes_emits_no_include(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_create_refuses_non_test_prefix(tmp_path: Path) -> None:
+async def test_create_preview_moves_a_non_test_name_under_the_test_prefix(tmp_path: Path) -> None:
+    # S13a (owner decision): a preview never fails on the name. The drop tool
+    # keeps its refusal; that guard is what protects application indexes.
+    app = unrestricted_app(tmp_path)
+    payload = await app._create_test_index(
+        "appdb", "dbo", "Orders", "IX_Orders_Status",
+        key_columns=["Status"], include_columns=None, online=True, dry_run=True,
+    )
+    assert payload["index_name"] == f"{TEST_INDEX_PREFIX}IX_Orders_Status"
+    assert "index_name_note" in payload
     with pytest.raises(ValueError, match="test prefix"):
-        await unrestricted_app(tmp_path)._create_test_index(
-            "appdb", "dbo", "Orders", "IX_Orders_Status",
-            key_columns=["Status"], include_columns=None, online=True, dry_run=True,
-        )
+        await app._drop_test_index("appdb", "dbo", "Orders", "IX_Orders_Status", dry_run=True)
 
 
 @pytest.mark.asyncio
@@ -353,13 +360,16 @@ async def test_filtered_benchmark_drops_index_stored_in_sql_server_spelling(
     app = _app(server_config_factory)
     sql = "SELECT id FROM dbo.Items WHERE status = 1"
     session_id, candidate_id = _candidate(app, sql)
-    index_name = "IX_Testing_" + IndexCandidate(
-        schema="dbo",
-        table="Items",
-        key_columns=("status",),
-        include_columns=("id",),
-        filter_definition=user_filter,
-    ).definition_fingerprint[:16]
+    index_name = generated_test_index_name(
+        "IX_Testing_",
+        IndexCandidate(
+            schema="dbo",
+            table="Items",
+            key_columns=("status",),
+            include_columns=("id",),
+            filter_definition=user_filter,
+        ),
+    )
     stored_index = ExistingIndex(
         schema="dbo",
         table="Items",

@@ -275,6 +275,8 @@ Read:
   the existing indexes with their usage.
 - Per recommendation: action, keys, includes, supporting query ids,
   confidence, reason_codes, blockers, write_impact, ddl and rollback_ddl.
+- offline_build: the table has a columnstore index, so the CREATE INDEX has
+  no ONLINE option and its build blocks writes. Say so with the DDL.
 - estimated_max_benefit_pct: an upper bound from optimizer cost shares. It
   ranks options; it is not a measured saving.
 - rewrite_opportunities: non-sargable predicates and implicit conversions.
@@ -381,6 +383,14 @@ Read:
   that used none is not evidence for the index.
 - lease.status: cleanup_required means a test index may still exist. Give
   the user rollback_ddl and stop sandbox work in that database.
+  create_failed: the build failed and no index is left; the next test runs.
+- failure_diagnostic: failed_step, cause_class (timeout with
+  timeout_seconds, lock_wait_abort, engine_error, definition_mismatch,
+  connection_lost), native_error_code and engine_message. Fix that cause;
+  do not repeat the same call.
+- A table with a columnstore index is built offline only. The policy must
+  set allow_offline_test_index, else the call is refused before any run.
+  offline_build in the result says the build blocked writes.
 - proof_scope hinted_evidence (with replaces): what the index costs when
   used. It does not show that the optimizer will choose it.
 Avoid:
@@ -793,8 +803,15 @@ Read:
   include_columns, filter_definition, is_unique, data_compression}, ...].
   A key column may end in DESC. One lease covers the set: every index is
   created or none is left, and every one is dropped on every path.
-- index_name_prefix: only when the engagement needs its own prefix. The tool
-  generates the rest of each name.
+- index_name_prefix: only when the engagement needs its own prefix. Pass a
+  prefix from test_index_name_prefixes, or one that extends it with letters,
+  digits and underscores (IX_bench_T7_ when the policy lists IX_bench_; at
+  most 64 characters). Any other value is not refused: the first policy
+  prefix is used, the usable start of your text is kept in the name, and
+  index_name_note in the result says which name was used.
+- Index names are generated: <prefix><Table>_<KeyColumn1>_<KeyColumn2>_<8 hex>,
+  at most 100 characters. Read the full name from indexes[].index_name,
+  lease.index_name or index_ddl; never build it yourself.
 - replaces: the existing index a one-index candidate would replace. The
   candidate arm is hinted and the result is hinted_evidence.
 - slow_baseline_cases={"case": seconds}: a baseline too slow to repeat runs

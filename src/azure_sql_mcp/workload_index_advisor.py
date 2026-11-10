@@ -528,6 +528,7 @@ class WorkloadIndexAdvisor:
         include_existing_index_review: bool = True,
         query_ids: list[int] | None = None,
         now: datetime | None = None,
+        test_index_name_prefixes: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         if objective not in OBJECTIVES:
             raise ValueError(f"objective must be one of {sorted(OBJECTIVES)}")
@@ -645,6 +646,7 @@ class WorkloadIndexAdvisor:
             include_existing_index_review=include_existing_index_review,
             focus_tables=focus_tables,
             focus_schema=schema_name if not table_names else None,
+            test_index_name_prefixes=tuple(test_index_name_prefixes),
         )
 
         detail_keys = [

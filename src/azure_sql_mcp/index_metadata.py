@@ -16,6 +16,8 @@ from typing import cast
 
 from .azure_tier import classify_service_tier
 from .connection import AzureSqlExecutor
+from .database_policy import MAX_CALLER_TEST_INDEX_PREFIX_LENGTH
+from .database_policy import extends_test_index_prefix
 from .incident_log import note_exception
 
 
@@ -340,12 +342,42 @@ INDEX_PROTECTION_METADATA_SQL = index_protection_metadata_sql()
 # Names the tool gives its own sandbox test indexes. An index with one of these
 # names is an experiment (or its leftover), never part of the design.
 TEST_INDEX_NAME_PREFIXES = ("IX_Testing_", "IX_Tuning_")
+# A generated test index name: <prefix><Table>_<KeyColumn>..._<8 hex>. The
+# readable part is cut so the whole name holds at most this many characters
+# (the engine allows 128).
+MAX_GENERATED_TEST_INDEX_NAME_LENGTH = 100
 
 
-def is_test_index_name(name: str | None) -> bool:
-    return bool(name) and str(name).casefold().startswith(
-        tuple(prefix.casefold() for prefix in TEST_INDEX_NAME_PREFIXES)
+def is_test_index_name(name: str | None, policy_prefixes: Iterable[str] = ()) -> bool:
+    """Whether an index name is a sandbox test index.
+
+    Every name under a built-in prefix is one. ``policy_prefixes`` are the
+    prefixes a database policy lists (test_index_name_prefixes): an
+    application index may share such a prefix, so there only a name of the
+    generated form counts. That form is the prefix, an optional caller part,
+    and ``<Table>_<KeyColumns>_<8 hex>``; before 3.0 it was 16 hex digits.
+    """
+
+    if not name:
+        return False
+    text = str(name)
+    folded = text.casefold()
+    if folded.startswith(tuple(prefix.casefold() for prefix in TEST_INDEX_NAME_PREFIXES)):
+        return True
+    prefixes = tuple(policy_prefixes)
+    if not prefixes or re.fullmatch(r"[A-Za-z0-9_]+", text) is None:
+        return False
+    readable_scheme = (
+        len(text) <= MAX_GENERATED_TEST_INDEX_NAME_LENGTH
+        and re.search(r"_[0-9a-f]{8}$", folded) is not None
+        and folded.startswith(tuple(prefix.casefold() for prefix in prefixes))
     )
+    hash_only_scheme = (
+        len(text) <= MAX_CALLER_TEST_INDEX_PREFIX_LENGTH + 16
+        and re.search(r"[0-9a-f]{16}$", folded) is not None
+        and extends_test_index_prefix(text[:-16], prefixes)
+    )
+    return readable_scheme or hash_only_scheme
 
 
 _DIRECTION_PATTERN = re.compile(
@@ -1039,9 +1071,11 @@ def existing_index_covers_candidate(
     data_space_name: str | None = None,
     partition_columns: Iterable[str] = (),
     exact_catalog_names: bool = False,
+    test_index_name_prefixes: Iterable[str] = (),
 ) -> bool:
     # A test index is dropped when its experiment ends, so it covers nothing.
-    if index.is_disabled or is_test_index_name(index.name):
+    # ``test_index_name_prefixes``: the prefixes of the database policy.
+    if index.is_disabled or is_test_index_name(index.name, test_index_name_prefixes):
         return False
     normalize_identifier = (
         _exact_catalog_identifier if exact_catalog_names else _clean_identifier
@@ -1866,6 +1900,7 @@ __all__ = [
     "collect_existing_indexes",
     "coerce_existing_indexes",
     "existing_index_covers_candidate",
+    "MAX_GENERATED_TEST_INDEX_NAME_LENGTH",
     "is_test_index_name",
     "existing_index_metadata_sql",
     "existing_index_response",

@@ -33,6 +33,21 @@ _SP_EXECUTESQL_UNICODE_CONTROL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _MAX_FAILURE_DIAGNOSTIC_TEXT = 240
+_MAX_ENGINE_MESSAGE_TEXT = 500
+# What marks a text as a driver diagnostic record, and the tags to strip from it.
+_DRIVER_TAG_PATTERN = re.compile(
+    r"\[(?:Microsoft|SQL Server|ODBC Driver \d+(?:\.\d+)? for SQL Server"
+    r"|ODBC SQL Server Driver|[0-9A-Z]{5})\]\s*"
+)
+_ENGINE_RECORD_MARKER = re.compile(r"\[(?:Microsoft|SQL Server)\]")
+# The code that ends a record: "(1222)" or "(1222) (SQLExecDirectW)".
+_TRAILING_NATIVE_CODE_PATTERN = re.compile(r"\s*\(\d{1,6}\)(?:\s*\(SQL\w+\))?\s*$")
+# A duplicate-key error names the key of the row that collided.
+_DUPLICATE_KEY_VALUE_PATTERN = re.compile(
+    r"(duplicate key value is)\b.*", re.IGNORECASE | re.DOTALL
+)
+# 3621 "The statement has been terminated" only accompanies another error.
+_COMPANION_NATIVE_CODES = frozenset({3621})
 
 # The state stores raise "Unknown <kind>: <id>." from a KeyError subclass named
 # ...NotFoundError. str() of a KeyError is the quoted repr of that text.
@@ -214,7 +229,48 @@ def is_transient_error(exc: BaseException, transient_codes: Collection[int]) -> 
     return any(code in transient_codes for code in native_error_codes(exc))
 
 
-def extract_failure_diagnostic(exc: Exception) -> dict[str, Any]:
+def engine_error_message(exc: BaseException) -> str | None:
+    """The engine's message for a failed statement, redacted and capped.
+
+    Reads the driver record nearest the root cause (``ddbc_error``, a text
+    with a driver tag, or a ``(sqlstate, message)`` pair). Driver tags and the
+    trailing error number are removed. ``sanitize_error_message`` redacts
+    quoted values, server names and addresses and keeps the identifier a
+    compile error names; a duplicate key value is removed as well. Returns
+    None when the chain holds no engine text.
+    """
+
+    for current in reversed(_exception_chain(exc)):
+        texts: list[str] = []
+        ddbc_error = getattr(current, "ddbc_error", None)
+        if isinstance(ddbc_error, str):
+            texts.append(ddbc_error)
+        for arg in getattr(current, "args", ()):
+            marker = _ENGINE_RECORD_MARKER.search(arg) if isinstance(arg, str) else None
+            if marker is not None:
+                # Drops a wrapper prefix such as "Driver Error: ...; DDBC Error: ".
+                texts.append(arg[marker.start() :])
+            elif (
+                isinstance(arg, tuple)
+                and len(arg) >= 2
+                and isinstance(arg[0], str)
+                and len(arg[0]) == 5
+                and isinstance(arg[1], str)
+            ):
+                texts.append(arg[1])
+        for text in texts:
+            message = _TRAILING_NATIVE_CODE_PATTERN.sub(
+                "", _DRIVER_TAG_PATTERN.sub("", " ".join(text.split()))
+            )
+            message = _DUPLICATE_KEY_VALUE_PATTERN.sub(
+                r"\1 [redacted]", sanitize_error_message(message, keep_identifiers=True)
+            ).strip()
+            if message:
+                return message[:_MAX_ENGINE_MESSAGE_TEXT]
+    return None
+
+
+def extract_failure_diagnostic(exc: Exception, *, engine_text: bool = False) -> dict[str, Any]:
     """Return only an allowlisted, value-free failure diagnostic.
 
     Generic exception text is intentionally not persisted.  An unknown,
@@ -224,6 +280,12 @@ def extract_failure_diagnostic(exc: Exception) -> dict[str, Any]:
     when an ``sp_executesql`` control argument is bound as a non-Unicode
     value.  Its engine text contains no query or parameter values, so it can
     be returned as a stable, capped receipt.
+
+    ``engine_text=True`` is for a statement the server built itself, such as
+    test index DDL. The diagnostic then also carries ``native_error_code``
+    when the driver reported one and ``engine_message``
+    (``engine_error_message``), so the caller can tell why the engine refused
+    the statement. Leave it off for caller SQL.
     """
 
     not_found = not_found_details(exc)
@@ -262,11 +324,25 @@ def extract_failure_diagnostic(exc: Exception) -> dict[str, Any]:
                 }
         current = current.__cause__ or current.__context__
 
-    diagnostic = {"diagnostic_code": "sql_execution_failed"}
+    diagnostic: dict[str, Any] = {"diagnostic_code": "sql_execution_failed"}
     if isinstance(info.get("sqlstate"), str):
         diagnostic["sqlstate"] = info["sqlstate"]
     if isinstance(info.get("native_error_code"), int):
         diagnostic["native_error_code"] = info["native_error_code"]
+    if engine_text:
+        message = engine_error_message(exc)
+        if message is not None:
+            diagnostic["engine_message"] = message
+            code = next(
+                (
+                    code
+                    for code in native_error_codes(exc)
+                    if code not in _COMPANION_NATIVE_CODES
+                ),
+                None,
+            )
+            if code is not None:
+                diagnostic.setdefault("native_error_code", code)
     return diagnostic
 
 

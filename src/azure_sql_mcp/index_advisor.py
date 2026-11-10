@@ -30,8 +30,10 @@ from typing import Any
 from typing import Iterable
 from typing import Mapping
 
+from .index_ddl import COLUMNSTORE_OFFLINE_BUILD_NOTE
 from .index_ddl import quote_identifier
 from .index_ddl import render_reverse_index_ddl
+from .index_ddl import without_online_create
 from .index_metadata import ExistingIndex
 from .index_metadata import IndexKeyColumn
 from .index_metadata import is_test_index_name
@@ -223,6 +225,8 @@ class AdvisorSettings:
     include_existing_index_review: bool = True
     focus_tables: frozenset[tuple[str, str]] | None = None
     focus_schema: str | None = None
+    # Test index prefixes of the database policy; the built-in ones always apply.
+    test_index_name_prefixes: tuple[str, ...] = ()
 
 
 @dataclass
@@ -371,7 +375,8 @@ def build_index_advice(inputs: AdvisorInputs) -> dict[str, Any]:
         leftover = [
             index
             for index in existing_by_table.get(key, [])
-            if not index.is_hypothetical and is_test_index_name(index.name)
+            if not index.is_hypothetical
+            and is_test_index_name(index.name, inputs.settings.test_index_name_prefixes)
         ]
         existing = [
             index
@@ -455,7 +460,14 @@ def build_index_advice(inputs: AdvisorInputs) -> dict[str, Any]:
         table_recs = actionable[: settings.max_recommendations_per_table] + advisory
         if not table_accesses and not table_recs:
             continue
+        # The engine refuses an online index build on a table that has an
+        # enabled columnstore index.
+        columnstore_table = any(
+            _is_columnstore_index(index) and not index.is_disabled for index in existing
+        )
         for rec in table_recs:
+            if columnstore_table:
+                _build_offline(rec)
             rec["id"] = f"R{len(recommendations) + 1}"
             recommendations.append(rec)
 
@@ -2338,6 +2350,32 @@ def _foreign_key_findings(
 # ---------------------------------------------------------------------------
 # Columnstore
 # ---------------------------------------------------------------------------
+
+
+def _build_offline(rec: dict[str, Any]) -> None:
+    """Take ONLINE out of every CREATE INDEX statement of one recommendation, and say so."""
+
+    changed = False
+
+    def offline(value: Any) -> Any:
+        nonlocal changed
+        if isinstance(value, str):
+            statement = without_online_create(value)
+            changed = changed or statement != value
+            return statement
+        if isinstance(value, dict):
+            return {key: offline(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [offline(item) for item in value]
+        return value
+
+    for key, value in list(rec.items()):
+        rec[key] = offline(value)
+    if changed:
+        rec["offline_build"] = {
+            "reason": "columnstore_table",
+            "note": COLUMNSTORE_OFFLINE_BUILD_NOTE,
+        }
 
 
 def _is_columnstore_index(index: ExistingIndex) -> bool:

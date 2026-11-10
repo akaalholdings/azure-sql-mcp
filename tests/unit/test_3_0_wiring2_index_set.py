@@ -28,6 +28,7 @@ from azure_sql_mcp.index_metadata import parse_candidate_key
 from azure_sql_mcp.index_optimizer import IndexCandidate
 from azure_sql_mcp.server import AzureSqlMcpApplication
 from azure_sql_mcp.server import TEST_INDEX_PREFIX
+from azure_sql_mcp.server import generated_test_index_name
 from tests.unit.test_index_benchmark_workflow import _profile
 from tests.unit.test_index_benchmark_workflow import _set_session_deadline
 
@@ -230,14 +231,16 @@ def _session(
 
 def _names(prefix: str = TEST_INDEX_PREFIX, *specs: dict[str, Any]) -> list[str]:
     return [
-        prefix
-        + IndexCandidate(
-            schema="dbo",
-            table=spec["table_name"],
-            key_columns=tuple(spec["key_columns"]),
-            include_columns=tuple(spec.get("include_columns") or ()),
-            compression=spec.get("data_compression"),
-        ).definition_fingerprint[:16]
+        generated_test_index_name(
+            prefix,
+            IndexCandidate(
+                schema="dbo",
+                table=spec["table_name"],
+                key_columns=tuple(spec["key_columns"]),
+                include_columns=tuple(spec.get("include_columns") or ()),
+                compression=spec.get("data_compression"),
+            ),
+        )
         for spec in specs
     ]
 
@@ -644,22 +647,16 @@ async def test_a_leftover_test_index_on_any_table_of_the_set_stops_the_run_befor
 
 
 @pytest.mark.asyncio
-async def test_a_name_prefix_is_allowed_only_when_the_database_policy_lists_it(
+async def test_a_name_prefix_the_database_policy_lists_is_used(
     server_config_factory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # T1: the engagement required its own index name, the tool generated its
     # own, so no test index was built and the answer was not measured.
+    # S13a: an unlisted prefix is no longer refused (owner decision); it falls
+    # back to the policy prefix with a note, see test_3_0_s13a_index_prefix.py.
     app = _app(server_config_factory)
     sandbox = _Sandbox(app, monkeypatch)
     session_id, candidate_id = _session(app)
-    app.plans.profile_query = AsyncMock()  # type: ignore[method-assign]
-
-    with pytest.raises(PermissionError, match="test_index_name_prefixes"):
-        await _benchmark(
-            app, session_id, candidate_id, indexes=[BADGES], index_name_prefix="IX_Bench_"
-        )
-    assert sandbox.create_calls == []
-    assert _open_leases(app) == []
 
     app.database_policy = _policy(test_index_name_prefixes=["IX_Bench_"])
     [badges] = _names("IX_Bench_", BADGES)
@@ -677,7 +674,8 @@ async def test_a_name_prefix_is_allowed_only_when_the_database_policy_lists_it(
 
     assert result["classification"] == "improved"
     # The caller chose the prefix; the rest of the name is still generated.
-    assert re.fullmatch(r"IX_Bench_[0-9a-f]{16}", sandbox.created[0])
+    assert re.fullmatch(r"IX_Bench_Badges_\w+_[0-9a-f]{8}", sandbox.created[0])
+    assert "index_name_note" not in result
     assert sandbox.dropped == sandbox.created
     assert result["lease"]["index_name"] == badges
 

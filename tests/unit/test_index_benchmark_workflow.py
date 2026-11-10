@@ -23,6 +23,7 @@ from azure_sql_mcp.plans import ProfiledPlanResult
 from azure_sql_mcp.performance_store import IdempotencyConflictError
 from azure_sql_mcp.performance_workflows import database_fingerprint
 from azure_sql_mcp.server import AzureSqlMcpApplication
+from azure_sql_mcp.server import generated_test_index_name
 from azure_sql_mcp.tuning_sessions import InvalidTransitionError
 
 
@@ -123,7 +124,7 @@ def _install_catalog(
         filter_definition=filter_definition,
         is_unique=is_unique,
     )
-    index_name = f"IX_Testing_{provisional.definition_fingerprint[:16]}"
+    index_name = generated_test_index_name("IX_Testing_", provisional)
     existing = ExistingIndex(
         schema="dbo",
         table="Items",
@@ -1227,7 +1228,7 @@ async def test_terminal_race_after_index_create_still_cleans_owned_index(
         key_columns=("status",),
         include_columns=(),
     )
-    index_name = f"IX_Testing_{provisional.definition_fingerprint[:16]}"
+    index_name = generated_test_index_name("IX_Testing_", provisional)
     existing = ExistingIndex(
         schema="dbo",
         table="Items",
@@ -2699,13 +2700,16 @@ def _stateful_index_catalog(
 ) -> tuple[str, dict[str, bool]]:
     """Model a database whose catalog shows the index once CREATE committed."""
 
-    index_name = "IX_Testing_" + IndexCandidate(
-        schema="dbo",
-        table="Items",
-        key_columns=("status",),
-        include_columns=(),
-        filter_definition=candidate_filter,
-    ).definition_fingerprint[:16]
+    index_name = generated_test_index_name(
+        "IX_Testing_",
+        IndexCandidate(
+            schema="dbo",
+            table="Items",
+            key_columns=("status",),
+            include_columns=(),
+            filter_definition=candidate_filter,
+        ),
+    )
     existing = ExistingIndex(
         schema="dbo",
         table="Items",

@@ -40,6 +40,7 @@ from pydantic import ValidationError
 from .admin_policy import AdminAction
 from .admin_policy import AdminPolicy
 from .admin_policy import ConfirmationTokens
+from .admin_policy import _is_timeout_error
 from .application_patterns import ApplicationPatternService
 from .artifact_store import ArtifactStore
 from .artifacts import ErrorPayload
@@ -64,6 +65,7 @@ from .database_baseline import DatabaseBaselineService
 from .database_diagnosis import DatabaseDiagnosisService
 from .database_policy import DatabasePolicy
 from .database_policy import WORKFLOW_TEST_INDEX_PREFIX
+from .database_policy import extends_test_index_prefix
 from .database_policy import load_database_policy_or_deny
 from .diagnostics import DiagnosticQueryService
 from .elastic_pool import ElasticPoolService
@@ -92,6 +94,7 @@ from .incident_log import record_startup_failure
 from .incident_log import summarize_backlog
 from .incident_log import tool_failure_code
 from .index_advisor import build_index_change_plan
+from .index_optimizer import TEST_INDEX_LOW_PRIORITY_WAIT_MINUTES
 from .index_optimizer import IndexCandidate
 from .index_optimizer import IndexOptimizer
 from .index_optimizer import ReplacementExperiment
@@ -104,7 +107,9 @@ from .index_optimizer import plan_replacement_experiment
 from .index_optimizer import verify_plan_uses_index
 from .index_metadata import collect_existing_indexes
 from .index_metadata import existing_index_covers_candidate
+from .index_metadata import MAX_GENERATED_TEST_INDEX_NAME_LENGTH
 from .index_metadata import is_test_index_name
+from .index_metadata import parse_candidate_key
 from .index_recommendations import IndexRecommendationService
 from .index_review import IndexReviewService
 from .index_review import IndexReviewSetupError
@@ -302,18 +307,49 @@ class IndexDefinitionInput(BaseModel):
     data_compression: Literal["NONE", "ROW", "PAGE"] | None = None
 
 
-def _is_generated_test_index_name(name: str | None, prefixes: Sequence[str]) -> bool:
-    """A name the index workflow generated: a known test prefix, or a policy
-    prefix followed by the 16 hex digits of a definition fingerprint."""
+_GENERATED_NAME_HASH_LENGTH = 8
 
-    if not name:
-        return False
-    if is_test_index_name(name):
-        return True
-    return any(
-        re.fullmatch(re.escape(prefix) + r"[0-9a-f]{16}", name, re.IGNORECASE)
-        for prefix in prefixes
+
+# Caller text kept in a generated name when its prefix could not be used.
+_MAX_TEST_INDEX_NAME_TAG_LENGTH = 24
+
+
+def generated_test_index_name(prefix: str, candidate: IndexCandidate, tag: str = "") -> str:
+    """The name of a workflow test index: readable, and one name per definition.
+
+    ``<prefix><Table>_<KeyColumn1>_<KeyColumn2>..._<hash>``: the table name
+    without its schema, the key columns in order (no ASC or DESC), every
+    character outside letters, digits and underscore replaced by an
+    underscore, then the first 8 hex digits of the definition fingerprint.
+    A ``tag`` goes before the table name. The readable part is cut to keep
+    the name within ``MAX_GENERATED_TEST_INDEX_NAME_LENGTH`` characters.
+    """
+
+    parts = [
+        *([tag] if tag else []),
+        candidate.table,
+        *(parse_candidate_key(key).name for key in candidate.key_columns),
+    ]
+    readable = "_".join(re.sub(r"[^A-Za-z0-9_]", "_", part) for part in parts)
+    room = (
+        MAX_GENERATED_TEST_INDEX_NAME_LENGTH - len(prefix) - 1 - _GENERATED_NAME_HASH_LENGTH
     )
+    readable = readable[: max(0, room)].rstrip("_")
+    suffix = candidate.definition_fingerprint[:_GENERATED_NAME_HASH_LENGTH]
+    return f"{prefix}{readable}_{suffix}"
+
+
+def _usable_name_text(text: str | None) -> str:
+    """The leading letters, digits and underscores of caller text, for a name."""
+
+    usable = re.match(r"[A-Za-z0-9_]*", str(text or "").strip())
+    return usable.group().strip("_") if usable is not None else ""
+
+
+def _is_generated_test_index_name(name: str | None, prefixes: Sequence[str]) -> bool:
+    """A name the index workflow generated, under a built-in or a policy prefix."""
+
+    return is_test_index_name(name, prefixes)
 
 
 def _indexes_used(plan_use: Mapping[str, Any]) -> list[str]:
@@ -349,6 +385,125 @@ def _replacement_summary(experiment: ReplacementExperiment) -> dict[str, Any]:
     }
 
 
+@dataclass(frozen=True)
+class _TestIndexTable:
+    """Catalog facts about the table a test index is built on."""
+
+    schema: str
+    table: str
+    # An enabled columnstore index: the engine then refuses an online index build.
+    has_columnstore_index: bool = False
+    partition_scheme: str | None = None
+    partition_function: str | None = None
+    partition_column: str | None = None
+
+    def placement(self) -> dict[str, Any]:
+        """IndexCandidate fields that align a test index with a partitioned table.
+
+        CREATE INDEX without an ON clause builds the index on the table's
+        partition scheme. The request names that placement, so the built index
+        is compared with what the engine creates.
+        """
+
+        if self.partition_scheme is None or self.partition_column is None:
+            return {}
+        return {
+            "data_space_name": self.partition_scheme,
+            "partition_columns": (self.partition_column,),
+            "partition_scheme_name": self.partition_scheme,
+            "partition_function_name": self.partition_function,
+        }
+
+
+_COLUMNSTORE_OFFLINE_BUILD_NOTE = (
+    "The table has a columnstore index. Azure SQL Database cannot build an index online "
+    "on such a table, so the test index is built offline. An offline build blocks all "
+    "writes to the table while it runs."
+)
+
+
+def _test_index_build_online(
+    policy: DatabasePolicy, online: bool, table: _TestIndexTable | None
+) -> bool:
+    """Whether a test index is built online on this table.
+
+    A table with a columnstore index takes an offline build only. Raises when
+    the database policy does not allow that build.
+    """
+
+    if table is None or not table.has_columnstore_index:
+        return online
+    if not policy.allow_offline_test_index:
+        raise PermissionError(
+            f"{table.schema}.{table.table} has a columnstore index. Azure SQL Database "
+            "cannot build an index online on a table that has a columnstore index, so a "
+            "test index on it must be built offline, and an offline build blocks all "
+            "writes to the table while it runs. The database policy does not allow that "
+            "build. A DBA must set allow_offline_test_index to true for this database "
+            "before a test index can be built on this table. No query and no DDL was run."
+        )
+    return False
+
+
+_INDEX_DDL_STEPS = frozenset({"create_index", "drop_index"})
+
+
+def _index_experiment_failure(
+    exc: Exception,
+    *,
+    step: str,
+    query_timeout_seconds: int,
+    create_failure: Mapping[str, Any] | None = None,
+    definition_mismatch: bool = False,
+    online_build: bool = False,
+) -> dict[str, Any]:
+    """The diagnostic of a failed index experiment: the step and the class of its cause.
+
+    ``failed_step`` is baseline_before, create_index, verify_created_index,
+    candidate_measure, baseline_after or drop_index. ``cause_class`` is
+    timeout (with the limit and the setting that holds it), lock_wait_abort,
+    connection_lost, definition_mismatch, engine_error or internal_error. The
+    engine message is returned for the DDL steps only: that DDL is built here,
+    the measured statement is the caller's.
+    """
+
+    diagnostic = extract_failure_diagnostic(exc, engine_text=step in _INDEX_DDL_STEPS)
+    diagnostic["failed_step"] = step
+    if diagnostic["diagnostic_code"] != "sql_execution_failed":
+        return diagnostic
+    failure = create_failure if step == "create_index" and create_failure else {}
+    if "native_error_code" not in diagnostic and failure.get("error_number") is not None:
+        diagnostic["native_error_code"] = failure["error_number"]
+    if definition_mismatch:
+        diagnostic["cause_class"] = "definition_mismatch"
+    elif _is_timeout_error(exc):
+        # Every statement of the experiment runs under the query timeout.
+        diagnostic["cause_class"] = "timeout"
+        diagnostic["timeout_seconds"] = query_timeout_seconds
+        diagnostic["timeout_setting"] = "AZURE_SQL_QUERY_TIMEOUT_SECONDS"
+    elif diagnostic.get("native_error_code") == 1222:
+        diagnostic["cause_class"] = "lock_wait_abort"
+        diagnostic["lock_timeout_seconds"] = query_timeout_seconds
+        if step == "create_index" and online_build:
+            # WAIT_AT_LOW_PRIORITY with ABORT_AFTER_WAIT = SELF ends the build.
+            diagnostic["low_priority_wait_seconds"] = TEST_INDEX_LOW_PRIORITY_WAIT_MINUTES * 60
+    elif failure.get("reason") == "connection_or_timeout":
+        diagnostic["cause_class"] = "connection_lost"
+    elif "engine_message" in diagnostic or _driver_exception(exc) is not None:
+        diagnostic["cause_class"] = "engine_error"
+    else:
+        diagnostic["cause_class"] = "internal_error"
+    return diagnostic
+
+
+def _offline_build_report(tables: Sequence[_TestIndexTable]) -> dict[str, Any]:
+    return {
+        "reason": "columnstore_table",
+        "tables": [f"{table.schema}.{table.table}" for table in tables],
+        "note": _COLUMNSTORE_OFFLINE_BUILD_NOTE,
+    }
+
+
 @dataclass
 class _IndexSetMember:
     """One index of a test-index set and where it is in the create and cleanup sequence."""
@@ -365,6 +520,9 @@ class _IndexSetMember:
     rollback_ddl: str
     create_key: str
     cleanup_key: str
+    table_facts: _TestIndexTable
+    # False on a columnstore table: the engine builds that index offline only.
+    online: bool
     # What the lease holds for this index. The lease of a one-index set keeps
     # these fields at its top level, as every lease before sets did.
     state: dict[str, Any] = field(default_factory=dict)
@@ -384,6 +542,39 @@ class _IndexSetMember:
     @property
     def fingerprint(self) -> str:
         return self.candidate.definition_fingerprint
+# One row per table: its catalog spelling, whether it has an enabled
+# columnstore index (type 5 or 6), and its partition scheme and column.
+_TEST_INDEX_TABLE_SQL = """
+SELECT TOP (2)
+    s.name AS schema_name,
+    t.name AS table_name,
+    CASE WHEN EXISTS (
+        SELECT 1
+        FROM sys.indexes AS cs
+        WHERE cs.object_id = t.object_id
+          AND cs.type IN (5, 6)
+          AND cs.is_disabled = 0
+    ) THEN 1 ELSE 0 END AS has_columnstore_index,
+    ps.name AS partition_scheme_name,
+    pf.name AS partition_function_name,
+    pc.name AS partitioning_column
+FROM sys.tables AS t
+INNER JOIN sys.schemas AS s ON s.schema_id = t.schema_id
+LEFT JOIN sys.indexes AS base
+    ON base.object_id = t.object_id AND base.index_id IN (0, 1)
+LEFT JOIN sys.partition_schemes AS ps ON ps.data_space_id = base.data_space_id
+LEFT JOIN sys.partition_functions AS pf ON pf.function_id = ps.function_id
+LEFT JOIN sys.index_columns AS ic
+    ON ic.object_id = base.object_id
+    AND ic.index_id = base.index_id
+    AND ic.partition_ordinal = 1
+    AND ps.data_space_id IS NOT NULL
+LEFT JOIN sys.columns AS pc
+    ON pc.object_id = ic.object_id AND pc.column_id = ic.column_id
+WHERE LOWER(s.name) = LOWER(?)
+  AND LOWER(t.name) = LOWER(?)
+ORDER BY s.name, t.name
+"""
 TEST_INDEX_OWNER_PROPERTY = "AzureSqlMcpLeaseOwner"
 TEST_INDEX_DEFINITION_PROPERTY = "AzureSqlMcpDefinitionFingerprint"
 _PLAIN_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -2581,8 +2772,11 @@ class AzureSqlMcpApplication:
                 default=None,
                 description=(
                     "Prefix of the generated index names, when the engagement needs "
-                    "its own. It must be listed in the database policy field "
-                    "test_index_name_prefixes; the tool generates the rest of each name."
+                    "its own. Use a prefix the database policy lists in "
+                    "test_index_name_prefixes, or one that extends it (IX_bench_T7_ "
+                    "for IX_bench_). Any other value is not refused: the policy prefix "
+                    "is used and index_name_note says so. The tool generates the rest "
+                    "of each name: <prefix><Table>_<KeyColumns>_<8 hex>."
                 ),
             ),
             replaces: str | None = Field(
@@ -2606,7 +2800,16 @@ class AzureSqlMcpApplication:
                 default="screening",
                 description="Benchmark phase: screening or finalist.",
             ),
-            online: bool = Field(default=True),
+            online: bool = Field(
+                default=True,
+                description=(
+                    "Build the test index online. A table with a columnstore index is "
+                    "built offline only (the engine refuses ONLINE there): the build "
+                    "then needs allow_offline_test_index in the database policy, blocks "
+                    "writes to the table while it runs, and the result says so in "
+                    "offline_build."
+                ),
+            ),
             compare_order: bool | None = Field(
                 default=None,
                 description=(
@@ -3481,6 +3684,16 @@ class AzureSqlMcpApplication:
             ),
         ) -> ResponseType:
             async def review(db: str) -> dict[str, Any]:
+                # A leftover test index under a policy prefix is not part of
+                # the design. The built-in prefixes need no argument.
+                extra_prefixes = tuple(
+                    prefix
+                    for prefix in self.database_policy.policy_for(db).test_index_name_prefixes
+                    if prefix != TEST_INDEX_PREFIX
+                )
+                policy_prefixes: dict[str, Any] = (
+                    {"test_index_name_prefixes": extra_prefixes} if extra_prefixes else {}
+                )
                 report = await self.workload_index_advisor.review(
                     db,
                     schema_name=schema_name,
@@ -3494,6 +3707,7 @@ class AzureSqlMcpApplication:
                     max_recommendations_per_table=max_recommendations_per_table,
                     include_existing_index_review=include_existing_index_review,
                     query_ids=query_ids,
+                    **policy_prefixes,
                 )
                 if query_ids:
                     report = _lead_with_requested_queries(report, query_ids)
@@ -5378,8 +5592,10 @@ class AzureSqlMcpApplication:
                 table_name: str = Field(description="Table name."),
                 index_name: str = Field(
                     description=(
-                        "Index name. It must start with IX_Testing_ or with a prefix the "
-                        "database policy lists in test_index_name_prefixes."
+                        "Index name, under IX_Testing_ or a prefix the database policy "
+                        "lists in test_index_name_prefixes. Any other name is not "
+                        "refused: the preview moves it under the policy prefix and "
+                        "index_name_note gives the name used."
                     ),
                 ),
                 key_columns: list[str] = Field(
@@ -5394,7 +5610,10 @@ class AzureSqlMcpApplication:
                 ),
                 online: bool = Field(
                     default=True,
-                    description="Use ONLINE=ON (avoids blocking during the build).",
+                    description=(
+                        "Use ONLINE=ON (avoids blocking during the build). A table with a "
+                        "columnstore index is built offline only: see offline_build."
+                    ),
                 ),
                 dry_run: bool = Field(
                     default=True,
@@ -5407,14 +5626,19 @@ class AzureSqlMcpApplication:
                     description="Optional database name.",
                 ),
             ) -> ResponseType:
-                return await self._run_tool(
-                    "create_test_index",
-                    database_name,
-                    lambda db: self._create_test_index(
+                async def preview(db: str) -> dict[str, Any]:
+                    # One catalog read, so the preview shows the DDL the
+                    # engine accepts on this table.
+                    table_facts = await self._resolve_canonical_table_identity(
+                        db, schema_name, table_name
+                    )
+                    return await self._create_test_index(
                         db, schema_name, table_name, index_name,
                         key_columns, include_columns, online, dry_run,
-                    ),
-                )
+                        table_facts=table_facts,
+                    )
+
+                return await self._run_tool("create_test_index", database_name, preview)
 
             @self.mcp.tool(
                 description=(
@@ -5433,7 +5657,11 @@ class AzureSqlMcpApplication:
                 schema_name: str = Field(description="Schema name (e.g. 'dbo')."),
                 table_name: str = Field(description="Table name."),
                 index_name: str = Field(
-                    description="Index name — must start with the IX_Testing_ prefix.",
+                    description=(
+                        "Index name. It must start with IX_Testing_ or a prefix the "
+                        "database policy lists in test_index_name_prefixes. Any other "
+                        "name is refused, so an application index cannot be dropped."
+                    ),
                 ),
                 dry_run: bool = Field(
                     default=True,
@@ -8246,17 +8474,28 @@ class AzureSqlMcpApplication:
         self,
         policy: DatabasePolicy,
         index_name_prefix: str | None,
-    ) -> str:
+    ) -> tuple[str, str]:
+        """The prefix of the generated test index names, and a tag for their readable part.
+
+        A requested prefix that is, or extends, an allowed prefix is used as
+        given. Any other value never refuses the call: the first prefix of the
+        database policy is used, and the leading letters, digits and
+        underscores of the request are kept as a tag in the name. Every
+        generated name so starts with an allowed prefix, which is what the
+        drop guard and lease cleanup check.
+        """
+
         if index_name_prefix is None:
-            return TEST_INDEX_PREFIX
-        allowed = self._allowed_test_index_prefixes(policy)
-        if index_name_prefix not in allowed:
-            raise PermissionError(
-                "index_name_prefix is not one of the prefixes the database policy "
-                f"allows in test_index_name_prefixes: {', '.join(allowed)}. "
-                "The tool generates the rest of the name."
-            )
-        return index_name_prefix
+            return TEST_INDEX_PREFIX, ""
+        if extends_test_index_prefix(
+            index_name_prefix, self._allowed_test_index_prefixes(policy)
+        ):
+            return index_name_prefix, ""
+        prefix = policy.test_index_name_prefixes[0]
+        tag = _usable_name_text(index_name_prefix)
+        if tag.casefold().startswith(prefix.casefold()):
+            tag = tag[len(prefix) :]
+        return prefix, tag.strip("_")[:_MAX_TEST_INDEX_NAME_TAG_LENGTH].rstrip("_")
 
     @staticmethod
     def _index_set_specs(
@@ -8668,7 +8907,7 @@ class AzureSqlMcpApplication:
             raise PermissionError("Database policy does not permit temporary indexes.")
         if phase not in {"screening", "finalist"}:
             raise ValueError("phase must be screening or finalist.")
-        name_prefix = self._resolve_test_index_prefix(policy, index_name_prefix)
+        name_prefix, name_tag = self._resolve_test_index_prefix(policy, index_name_prefix)
         allowed_session_statuses = {
             "created",
             "screening",
@@ -8941,6 +9180,8 @@ class AzureSqlMcpApplication:
             ]
         if name_prefix != TEST_INDEX_PREFIX:
             request_identity["index_name_prefix"] = name_prefix
+        if name_tag:
+            request_identity["index_name_tag"] = name_tag
         if replaces is not None:
             request_identity["replaces"] = replaces
         if slow_cases:
@@ -8975,7 +9216,7 @@ class AzureSqlMcpApplication:
             for parameter_case in cases
         ]
         self._require_tuning_session_time(session_id)
-        canonical_tables: dict[tuple[str, str], tuple[str, str]] = {}
+        canonical_tables: dict[tuple[str, str], _TestIndexTable] = {}
         members: list[_IndexSetMember] = []
         for ordinal, spec in enumerate(index_specs):
             spelled = (spec["schema"], spec["table"])
@@ -8983,7 +9224,11 @@ class AzureSqlMcpApplication:
                 canonical_tables[spelled] = await self._resolve_canonical_table_identity(
                     database_name, *spelled
                 )
-            member_schema, member_table = canonical_tables[spelled]
+            table_facts = canonical_tables[spelled]
+            member_schema, member_table = table_facts.schema, table_facts.table
+            # Refused here, before the request binds and before any baseline
+            # run, when the engine needs an offline build the policy forbids.
+            member_online = _test_index_build_online(policy, online, table_facts)
             provisional_index = IndexCandidate(
                 schema=member_schema,
                 table=member_table,
@@ -8992,12 +9237,13 @@ class AzureSqlMcpApplication:
                 filter_definition=spec["filter_definition"],
                 is_unique=spec["is_unique"],
                 compression=spec["data_compression"],
+                **table_facts.placement(),
             )
             # The caller chooses the prefix at most; the rest of the name is the
             # definition, so two requests can never fight over one name.
             member_candidate = replace(
                 provisional_index,
-                index_name=f"{name_prefix}{provisional_index.definition_fingerprint[:16]}",
+                index_name=generated_test_index_name(name_prefix, provisional_index, name_tag),
             )
             members.append(
                 _IndexSetMember(
@@ -9011,7 +9257,7 @@ class AzureSqlMcpApplication:
                     candidate=member_candidate,
                     index_ddl=build_test_index_statement(
                         member_candidate,
-                        online=online,
+                        online=member_online,
                         allow_offline=policy.allow_offline_test_index,
                         maxdop=policy.test_index_maxdop or None,
                     ),
@@ -9021,10 +9267,24 @@ class AzureSqlMcpApplication:
                     ),
                     create_key=member_operation_key("index-benchmark-create-key", ordinal),
                     cleanup_key=member_operation_key("index-benchmark-cleanup-key", ordinal),
+                    table_facts=table_facts,
+                    online=member_online,
                 )
             )
         if len({member.index_name for member in members}) != len(members):
             raise ValueError("indexes holds the same index definition twice.")
+        # Said in every result from here on: the name is not the one asked for.
+        name_note: dict[str, str] = {}
+        if index_name_prefix is not None and not extends_test_index_prefix(
+            index_name_prefix, self._allowed_test_index_prefixes(policy)
+        ):
+            name_note["index_name_note"] = (
+                "The requested index_name_prefix is not in test_index_name_prefixes ("
+                + ", ".join(self._allowed_test_index_prefixes(policy))
+                + f") and does not extend one of them. The prefix {name_prefix} was used: "
+                + ", ".join(member.index_name for member in members)
+                + "."
+            )
         is_set = len(members) > 1
         tables = list(dict.fromkeys((member.schema, member.table) for member in members))
         # A one-index lease keeps the identity it always had.
@@ -9109,6 +9369,7 @@ class AzureSqlMcpApplication:
                 return {
                     "session_id": session_id,
                     "candidate_id": candidate_id,
+                    **name_note,
                     "classification": candidate.state,
                     "durable_state": candidate.state,
                     "reason": (
@@ -9136,7 +9397,7 @@ class AzureSqlMcpApplication:
             raise ValueError("Index candidate finalist validation has already been measured.")
 
         if existing_reservation is not None:
-            return self._recover_index_benchmark_result(
+            recovered = self._recover_index_benchmark_result(
                 session_id=session_id,
                 candidate_id=candidate_id,
                 phase=phase,
@@ -9151,6 +9412,7 @@ class AzureSqlMcpApplication:
                 rollback_ddl=rollback_ddl,
                 index_definition_fingerprint=object_fingerprint,
             )
+            return {**recovered, **name_note}
 
         def member_index(indexes: Sequence[Any], member: _IndexSetMember) -> Any:
             return next(
@@ -9175,6 +9437,7 @@ class AzureSqlMcpApplication:
                 include_columns=member.include_columns or (),
                 filter_definition=member.filter_definition,
                 is_unique=member.is_unique,
+                test_index_name_prefixes=policy.test_index_name_prefixes,
             ):
                 return False
             if member.data_compression is None:
@@ -9220,6 +9483,7 @@ class AzureSqlMcpApplication:
             return {
                 "session_id": session_id,
                 "candidate_id": candidate_id,
+                **name_note,
                 "classification": "inconclusive",
                 "durable_state": updated.state,
                 "reason": (
@@ -9250,6 +9514,7 @@ class AzureSqlMcpApplication:
             return {
                 "session_id": session_id,
                 "candidate_id": candidate_id,
+                **name_note,
                 "classification": "cleanup_required",
                 "reason": (
                     "The target table holds test indexes that no open lease owns; "
@@ -9293,6 +9558,7 @@ class AzureSqlMcpApplication:
             return {
                 "session_id": session_id,
                 "candidate_id": candidate_id,
+                **name_note,
                 "classification": "inconclusive",
                 "durable_state": updated.state,
                 "reason": (
@@ -9325,6 +9591,7 @@ class AzureSqlMcpApplication:
             return {
                 "session_id": session_id,
                 "candidate_id": candidate_id,
+                **name_note,
                 "classification": "neutral",
                 "durable_state": updated.state,
                 "reason": "an existing enabled index already covers this candidate",
@@ -9361,7 +9628,7 @@ class AzureSqlMcpApplication:
             execution_reservation["status"] != "reserved"
             or execution_reservation.get("replayed") is True
         ):
-            return self._recover_index_benchmark_result(
+            recovered = self._recover_index_benchmark_result(
                 session_id=session_id,
                 candidate_id=candidate_id,
                 phase=phase,
@@ -9376,6 +9643,7 @@ class AzureSqlMcpApplication:
                 rollback_ddl=rollback_ddl,
                 index_definition_fingerprint=object_fingerprint,
             )
+            return {**recovered, **name_note}
         lease_id = (
             f"lease-{fingerprint_json({'session': session_id, 'candidate': candidate_id, 'key': idempotency_key})[:32]}"
         )
@@ -9420,6 +9688,12 @@ class AzureSqlMcpApplication:
                 }
                 if member.data_compression:
                     member.state["data_compression"] = member.data_compression
+                if member.table_facts.placement():
+                    # Part of the definition fingerprint; ownership recovery
+                    # rebuilds the request from these fields.
+                    member.state["partition_scheme"] = member.table_facts.partition_scheme
+                    member.state["partition_function"] = member.table_facts.partition_function
+                    member.state["partition_column"] = member.table_facts.partition_column
                 if is_set:
                     member.state["index_name"] = member.index_name
                     member.state["object_fingerprint"] = member.fingerprint
@@ -9461,6 +9735,7 @@ class AzureSqlMcpApplication:
                 return {
                     "session_id": session_id,
                     "candidate_id": candidate_id,
+                    **name_note,
                     "classification": (
                         "cleanup_required"
                         if lease["status"] == "cleanup_required"
@@ -9524,7 +9799,12 @@ class AzureSqlMcpApplication:
             for bound_case in bound_cases
         ]
         cleanup_error: str | None = None
+        cleanup_failure: dict[str, Any] | None = None
         create_failure: dict[str, Any] | None = None
+        # The step a failure diagnostic names, and the index being built then.
+        step = "baseline_before"
+        building: _IndexSetMember | None = None
+        definition_mismatch = False
         benchmark_error: str | None = None
         benchmark_failure_diagnostic: dict[str, Any] | None = None
         terminal_error: InvalidTransitionError | None = None
@@ -9697,6 +9977,8 @@ class AzureSqlMcpApplication:
             # The CREATE batch commits the ownership markers with the index, so a
             # visible index whose markers match is ours even when the reply was lost.
             cancelled_during_probe = False
+            # None: the catalog could not be read.
+            index_in_catalog: bool | None = None
             try:
                 observed_index = member_index(
                     await collect_existing_indexes(
@@ -9707,6 +9989,7 @@ class AzureSqlMcpApplication:
                     ),
                     member,
                 )
+                index_in_catalog = observed_index is not None
                 if await record_observed_index(
                     member,
                     observed_index,
@@ -9722,6 +10005,15 @@ class AzureSqlMcpApplication:
                     extra={"lease_id": lease_id},
                     exc_info=True,
                 )
+            if create_failure is not None:
+                create_failure["index_in_catalog"] = index_in_catalog
+                if index_in_catalog is False and create_failure["reason"] != "connection_or_timeout":
+                    # The engine reported the error, so the batch has ended, and
+                    # the catalog holds no such index: nothing is left to clean.
+                    # After a lost connection or a timeout the build may still
+                    # run on the server, so that lease stays open.
+                    member.create_outcome_settled = True
+                    return False
             update_lease(
                 "cleanup_required",
                 {
@@ -9842,6 +10134,13 @@ class AzureSqlMcpApplication:
                     member,
                 )
                 member.create_attempted = True
+                step, building = "create_index", member
+                # Passed only when set, as before these options existed.
+                create_options: dict[str, Any] = {}
+                if member.data_compression:
+                    create_options["data_compression"] = member.data_compression
+                if member.table_facts.has_columnstore_index or member.table_facts.placement():
+                    create_options["table_facts"] = member.table_facts
                 try:
                     await self._create_test_index(
                         database_name,
@@ -9850,18 +10149,14 @@ class AzureSqlMcpApplication:
                         member.index_name,
                         member.key_columns,
                         member.include_columns,
-                        online,
+                        member.online,
                         dry_run=False,
                         workflow_managed=True,
                         filter_definition=member.filter_definition,
                         is_unique=member.is_unique,
                         idempotency_key=member.create_key,
                         ownership_proof=lease_owner,
-                        **(
-                            {"data_compression": member.data_compression}
-                            if member.data_compression
-                            else {}
-                        ),
+                        **create_options,
                     )
                 except Exception as create_error:
                     create_failure = classify_create_index_failure(create_error)
@@ -9872,6 +10167,7 @@ class AzureSqlMcpApplication:
                     if is_set:
                         create_failure["index_name"] = member.index_name
                     raise
+                step = "verify_created_index"
                 observed_index = member_index(
                     await collect_existing_indexes(
                         self.executor,
@@ -9888,9 +10184,11 @@ class AzureSqlMcpApplication:
                 ):
                     if observed_index is not None:
                         await drop_index_proven_by_owner_marker(member, observed_index)
+                    definition_mismatch = observed_index is not None
                     raise RuntimeError(
                         "Created index definition could not be verified exactly."
                     )
+            step = "candidate_measure"
             for member in members:
                 member.built = await self._built_index_facts(database_name, member)
             for measurement in measurements:
@@ -9942,7 +10240,14 @@ class AzureSqlMcpApplication:
         except Exception as exc:
             note_exception(exc, "server.index_benchmark")
             benchmark_error = type(exc).__name__
-            benchmark_failure_diagnostic = extract_failure_diagnostic(exc)
+            benchmark_failure_diagnostic = _index_experiment_failure(
+                exc,
+                step=step,
+                query_timeout_seconds=self.config.query_timeout_seconds,
+                create_failure=create_failure,
+                definition_mismatch=definition_mismatch,
+                online_build=building is not None and building.online,
+            )
             try:
                 if await reconcile_create_outcome():
                     cancelled = True
@@ -9998,6 +10303,11 @@ class AzureSqlMcpApplication:
                         )
                 except Exception as exc:
                     cleanup_error = type(exc).__name__
+                    cleanup_failure = _index_experiment_failure(
+                        exc,
+                        step="drop_index",
+                        query_timeout_seconds=self.config.query_timeout_seconds,
+                    )
                     update_lease("cleanup_required", {"cleanup_error_type": cleanup_error})
             elif benchmark_error:
                 if lease["status"] not in {"cleanup_required", "cleaned"}:
@@ -10022,7 +10332,11 @@ class AzureSqlMcpApplication:
             except Exception as exc:
                 note_exception(exc, "server.index_benchmark_after")
                 benchmark_error = type(exc).__name__
-                benchmark_failure_diagnostic = extract_failure_diagnostic(exc)
+                benchmark_failure_diagnostic = _index_experiment_failure(
+                    exc,
+                    step="baseline_after",
+                    query_timeout_seconds=self.config.query_timeout_seconds,
+                )
 
         if terminal_error is not None:
             reservation_update = (
@@ -10219,6 +10533,7 @@ class AzureSqlMcpApplication:
                     "filter_definition": member.filter_definition,
                     "is_unique": member.is_unique,
                     "data_compression": member.data_compression or "NONE",
+                    "online": member.online,
                     "built": member.ownership_recorded,
                     **(member.built or {}),
                     "used_in_cases": [
@@ -10359,6 +10674,7 @@ class AzureSqlMcpApplication:
         result = {
             "session_id": session_id,
             "candidate_id": candidate_id,
+            **name_note,
             "classification": state,
             "performance_classification": performance_classification,
             "objective": str(case.metadata.get("objective") or "elapsed_time"),
@@ -10395,6 +10711,17 @@ class AzureSqlMcpApplication:
             result["failure_diagnostic"] = benchmark_failure_diagnostic
         if create_failure is not None:
             result["create_failure"] = create_failure
+        if cleanup_failure is not None:
+            result["cleanup_failure"] = cleanup_failure
+        offline_tables = list(
+            dict.fromkeys(
+                member.table_facts
+                for member in members
+                if member.table_facts.has_columnstore_index
+            )
+        )
+        if offline_tables:
+            result["offline_build"] = _offline_build_report(offline_tables)
         # A forced plan or Query Store hint on the application's query does
         # not apply to the marked benchmark text.
         result["plan_controls_not_applied"] = True
@@ -10771,21 +11098,17 @@ class AzureSqlMcpApplication:
         database_name: str,
         schema_name: str,
         table_name: str,
-    ) -> tuple[str, str]:
-        """Resolve catalog spelling before generating any table DDL."""
+    ) -> _TestIndexTable:
+        """Resolve catalog spelling and the facts a test index build depends on.
+
+        One read, before any table DDL is generated: the canonical names,
+        whether the table has an enabled columnstore index, and the partition
+        scheme and partitioning column of a partitioned table.
+        """
 
         rows = await self.executor.fetch_all(
             database_name,
-            """
-            SELECT TOP (2)
-                s.name AS schema_name,
-                t.name AS table_name
-            FROM sys.tables AS t
-            INNER JOIN sys.schemas AS s ON s.schema_id = t.schema_id
-            WHERE LOWER(s.name) = LOWER(?)
-              AND LOWER(t.name) = LOWER(?)
-            ORDER BY s.name, t.name
-            """,
+            _TEST_INDEX_TABLE_SQL,
             params=[schema_name, table_name],
             max_rows=2,
             sql_origin="server_built",
@@ -10803,7 +11126,24 @@ class AzureSqlMcpApplication:
             str(rows[0].get("table_name") or ""),
             "catalog table_name",
         )
-        return resolved_schema, resolved_table
+        partition_scheme = rows[0].get("partition_scheme_name")
+        partition_column = rows[0].get("partitioning_column")
+        if partition_scheme is not None and partition_column is None:
+            raise ValueError(
+                "The partitioning column of the target table could not be read; "
+                "no index DDL was dispatched."
+            )
+        partition_function = rows[0].get("partition_function_name")
+        return _TestIndexTable(
+            schema=resolved_schema,
+            table=resolved_table,
+            has_columnstore_index=bool(rows[0].get("has_columnstore_index")),
+            partition_scheme=str(partition_scheme) if partition_scheme is not None else None,
+            partition_function=(
+                str(partition_function) if partition_function is not None else None
+            ),
+            partition_column=str(partition_column) if partition_column is not None else None,
+        )
 
     async def _run_database_pair_tool(
         self,
@@ -11141,7 +11481,15 @@ class AzureSqlMcpApplication:
         idempotency_key: str | None = None,
         ownership_proof: str | None = None,
         data_compression: str | None = None,
+        table_facts: _TestIndexTable | None = None,
     ) -> dict[str, Any]:
+        """Preview or, for the leased workflow, build one test index.
+
+        ``table_facts`` (``_resolve_canonical_table_identity``) makes the DDL
+        fit the table: no ONLINE option on a table with a columnstore index,
+        and the partition scheme of a partitioned table.
+        """
+
         if not dry_run and not workflow_managed:
             raise PermissionError(
                 "Direct test-index creation is preview-only; use benchmark_index_candidate."
@@ -11149,13 +11497,21 @@ class AzureSqlMcpApplication:
         if not dry_run:
             self._require_test_index_database(database_name)
         policy = self.database_policy.policy_for(database_name)
-        index = self._validate_test_index_name(
-            index_name, self._allowed_test_index_prefixes(policy)
+        allowed = self._allowed_test_index_prefixes(policy)
+        requested_name = (index_name or "").strip()
+        # A preview never fails on the name: a name outside the allowed
+        # prefixes is moved under the policy prefix. The leased build keeps
+        # the strict check, because its names are generated.
+        renamed = not workflow_managed and not (
+            _PLAIN_IDENTIFIER.match(requested_name)
+            and requested_name.upper().startswith(tuple(prefix.upper() for prefix in allowed))
         )
+        index = "" if renamed else self._validate_test_index_name(index_name, allowed)
         schema = self._validate_plain_identifier(schema_name, "schema_name")
         table = self._validate_plain_identifier(table_name, "table_name")
         if not key_columns:
             raise ValueError("key_columns must contain at least one column.")
+        online = _test_index_build_online(policy, online, table_facts)
 
         candidate = IndexCandidate(
             schema=schema,
@@ -11166,7 +11522,17 @@ class AzureSqlMcpApplication:
             is_unique=is_unique,
             index_name=index,
             compression=data_compression,
+            **(table_facts.placement() if table_facts is not None else {}),
         )
+        if renamed:
+            prefix = policy.test_index_name_prefixes[0]
+            usable = _usable_name_text(requested_name)
+            index = (
+                f"{prefix}{usable}"[:MAX_GENERATED_TEST_INDEX_NAME_LENGTH].rstrip("_")
+                if usable
+                else generated_test_index_name(prefix, candidate)
+            )
+            candidate = replace(candidate, index_name=index)
         # Online builds wait at low priority and abort themselves. An offline
         # build is refused unless the database policy allows it.
         sql = build_test_index_statement(
@@ -11239,6 +11605,7 @@ class AzureSqlMcpApplication:
         )
         payload.update({
             "index": f"[{schema}].[{table}].[{index}]",
+            "index_name": index,
             "key_columns": key_columns,
             "include_columns": include_columns or [],
             "filter_definition": filter_definition,
@@ -11247,6 +11614,14 @@ class AzureSqlMcpApplication:
             "action": "test_index_created",
             "note": "Disposable test index — drop it with drop_test_index after measuring.",
         })
+        if table_facts is not None and table_facts.has_columnstore_index:
+            payload["offline_build"] = _offline_build_report([table_facts])
+        if renamed:
+            payload["index_name_note"] = (
+                "The requested index_name is not under an allowed test index prefix ("
+                + ", ".join(allowed)
+                + f"). The name {index} was used."
+            )
         return payload
 
     async def _drop_test_index(
@@ -11432,8 +11807,9 @@ class AzureSqlMcpApplication:
         value = cls._validate_plain_identifier(index_name, "index_name")
         if not value.upper().startswith(tuple(prefix.upper() for prefix in prefixes)):
             raise ValueError(
-                f"index_name must start with the test prefix {' or '.join(prefixes)} — "
-                "these tools only manage disposable test indexes."
+                f"index_name must start with the test prefix {' or '.join(prefixes)}. "
+                "These tools create and drop only disposable test indexes under these "
+                "prefixes, so they can never drop an application index."
             )
         return value
 
@@ -12563,6 +12939,12 @@ class AzureSqlMcpApplication:
             data_compression = metadata.get("data_compression")
             if data_compression is not None and not isinstance(data_compression, str):
                 raise ValueError("pending CREATE lease compression is invalid")
+            partition = tuple(
+                metadata.get(name)
+                for name in ("partition_scheme", "partition_function", "partition_column")
+            )
+            if any(value is not None and not isinstance(value, str) for value in partition):
+                raise ValueError("pending CREATE lease partition placement is invalid")
             candidate = IndexCandidate(
                 schema=schema_name,
                 table=table_name,
@@ -12572,6 +12954,13 @@ class AzureSqlMcpApplication:
                 is_unique=is_unique,
                 index_name=index_name,
                 compression=data_compression,
+                **_TestIndexTable(
+                    schema_name,
+                    table_name,
+                    partition_scheme=partition[0],
+                    partition_function=partition[1],
+                    partition_column=partition[2],
+                ).placement(),
             )
         else:
             candidate = IndexCandidate(

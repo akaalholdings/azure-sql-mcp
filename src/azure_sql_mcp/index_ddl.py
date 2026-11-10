@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from collections.abc import Mapping
 from typing import Any
@@ -19,6 +20,79 @@ _REQUIRED_SET_OPTIONS = (
     "SET CONCAT_NULL_YIELDS_NULL ON;",
     "SET NUMERIC_ROUNDABORT OFF;",
 )
+
+
+# Said with every adviser statement that had to lose its ONLINE option.
+COLUMNSTORE_OFFLINE_BUILD_NOTE = (
+    "The table has a columnstore index. Azure SQL Database cannot build an index online "
+    "on such a table, so the CREATE INDEX statement has no ONLINE option: the build is "
+    "offline and blocks all writes to the table while it runs. Plan a window for it."
+)
+_CREATE_INDEX_START = re.compile(
+    r"\bCREATE\s+(?:UNIQUE\s+)?(?:(?:NON)?CLUSTERED\s+)?INDEX\b", re.IGNORECASE
+)
+# ONLINE = ON, with or without (WAIT_AT_LOW_PRIORITY (...)).
+_ONLINE_OPTION = re.compile(
+    r"ONLINE\s*=\s*ON(?:\s*\((?:[^()]|\([^()]*\))*\))?", re.IGNORECASE
+)
+_EMPTY_WITH = re.compile(r"(?:\n--[ \t]*|\s*)WITH\s*\(\s*\)", re.IGNORECASE)
+
+
+def without_online_create(ddl: str) -> str:
+    """Remove the ONLINE = ON option from every CREATE INDEX statement in ``ddl``.
+
+    For a table with a columnstore index, where the engine refuses an online
+    index build. Other statements (DROP INDEX, ALTER INDEX ... REBUILD) and
+    commented statements keep their form.
+    """
+
+    parts: list[str] = []
+    position = 0
+    for match in _CREATE_INDEX_START.finditer(ddl):
+        if match.start() < position:
+            continue
+        end = _statement_end(ddl, match.end())
+        parts.append(ddl[position : match.start()])
+        parts.append(_without_online_option(ddl[match.start() : end]))
+        position = end
+    parts.append(ddl[position:])
+    return "".join(parts)
+
+
+def _statement_end(sql: str, start: int) -> int:
+    """Index of the ';' that ends the statement; a ';' in a literal or a name does not."""
+
+    closing: str | None = None
+    index = start
+    while index < len(sql):
+        character = sql[index]
+        if closing is not None:
+            if character == closing:
+                if sql[index + 1 : index + 2] == closing:
+                    index += 1
+                else:
+                    closing = None
+        elif character == "'":
+            closing = "'"
+        elif character == "[":
+            closing = "]"
+        elif character == ";":
+            return index
+        index += 1
+    return len(sql)
+
+
+def _without_online_option(statement: str) -> str:
+    option = _ONLINE_OPTION.search(statement)
+    if option is None:
+        return statement
+    before, after = statement[: option.start()], statement[option.end() :]
+    following = re.match(r"\s*,\s*", after)
+    if following is not None:
+        after = after[following.end() :]
+    else:
+        before = re.sub(r",\s*$", "", before)
+    return _EMPTY_WITH.sub("", before + after, count=1)
 
 
 def quote_identifier(identifier: str) -> str:
@@ -708,6 +782,7 @@ def _comment_sql(value: str) -> str:
 
 
 __all__ = [
+    "COLUMNSTORE_OFFLINE_BUILD_NOTE",
     "quote_identifier",
     "render_candidate_rollback",
     "render_exact_reverse_index_ddl",
@@ -718,4 +793,5 @@ __all__ = [
     "render_reverse_index_definition",
     "render_reverse_index_ddl",
     "render_validation_selects",
+    "without_online_create",
 ]

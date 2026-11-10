@@ -32,10 +32,13 @@ Version 1 documents a small, database-scoped allowlist::
     }
 
 ``test_index_name_prefixes`` lists the name prefixes a test index may take;
-the workflow prefix ``IX_Testing_`` is the default and is always valid. The
-tool generates the rest of the name. ``test_index_maxdop`` caps the build
-(0 leaves the database default). ``allow_offline_test_index`` permits an
-offline build, which blocks every writer of the table while it runs.
+the workflow prefix ``IX_Testing_`` is the default and is always valid. A
+caller may extend a listed prefix (``IX_Testing_T7_``); a prefix outside the
+list is replaced by the first listed one. The tool generates the rest of the
+name. ``test_index_maxdop`` caps the build (0 leaves the database default).
+``allow_offline_test_index`` permits an offline build, which blocks every
+writer of the table while it runs. A table with a columnstore index can only
+be built offline, so a test index on it needs this field.
 
 ``application_intent`` is optional. ``read_only`` connects with
 ApplicationIntent=ReadOnly, so a read scale-out replica is the diagnosis
@@ -56,6 +59,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 from typing import Mapping
+from typing import Sequence
 
 
 POLICY_VERSION = 1
@@ -88,6 +92,30 @@ MAX_TEST_INDEX_NAME_PREFIXES = 8
 MAX_TEST_INDEX_MAXDOP = 64
 # Long enough that a generated name cannot be taken for an application index.
 _TEST_INDEX_NAME_PREFIX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{3,31}$")
+# A caller may extend an allowed prefix (IX_bench_ -> IX_bench_D04_). The
+# generated name is the prefix plus 16 hex digits: at most 80 of the engine's
+# 128 characters.
+MAX_CALLER_TEST_INDEX_PREFIX_LENGTH = 64
+_CALLER_TEST_INDEX_PREFIX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def extends_test_index_prefix(prefix: str, allowed: Sequence[str]) -> bool:
+    """True when ``prefix`` is an allowed test index prefix or extends one.
+
+    The prefix must start with an allowed prefix (case is ignored, as in the
+    engine's name comparison on Azure SQL Database defaults), hold only
+    letters, digits and underscores, and be at most
+    ``MAX_CALLER_TEST_INDEX_PREFIX_LENGTH`` characters.
+    """
+
+    if (
+        not isinstance(prefix, str)
+        or len(prefix) > MAX_CALLER_TEST_INDEX_PREFIX_LENGTH
+        or not _CALLER_TEST_INDEX_PREFIX.fullmatch(prefix)
+    ):
+        return False
+    folded = prefix.casefold()
+    return any(folded.startswith(item.casefold()) for item in allowed)
 _REQUIRED_DATABASE_FIELDS = frozenset({"environment", "allow_read"})
 _UNKNOWN_ENVIRONMENTS = frozenset({"", "none", "null", "unknown"})
 
@@ -648,6 +676,7 @@ def _validate_environment(value: object) -> None:
 
 __all__ = [
     "ENVIRONMENT_CLASSES",
+    "MAX_CALLER_TEST_INDEX_PREFIX_LENGTH",
     "POLICY_VERSION",
     "WORKFLOW_TEST_INDEX_PREFIX",
     "DatabasePolicy",
@@ -656,6 +685,7 @@ __all__ = [
     "DatabasePolicySet",
     "DatabasePolicyValidationError",
     "classify_environment",
+    "extends_test_index_prefix",
     "load_database_policy",
     "load_database_policy_or_deny",
 ]

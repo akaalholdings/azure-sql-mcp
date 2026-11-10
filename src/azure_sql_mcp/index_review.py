@@ -21,7 +21,9 @@ from .connection import SqlTransactionSession
 from .connection import TransactionCommitOutcomeUnknownError
 from .database_policy import DatabasePolicySet
 from .incident_log import note_exception
+from .index_ddl import COLUMNSTORE_OFFLINE_BUILD_NOTE
 from .index_ddl import render_reverse_index_definition
+from .index_ddl import without_online_create
 from .index_ddl import render_inert_candidate_rollback
 from .index_ddl import render_inert_proposed_drop
 from .index_ddl import render_validation_selects
@@ -5356,17 +5358,69 @@ def _review_subjects(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     )
 
 
-def _actionable_subject_sql(subject: Mapping[str, Any]) -> tuple[str | None, str | None]:
+def _columnstore_tables(subjects: Sequence[Mapping[str, Any]]) -> frozenset[tuple[str, str]]:
+    """The tables of a review that have an enabled columnstore index.
+
+    The engine refuses an online index build on such a table.
+    """
+
+    tables: set[tuple[str, str]] = set()
+    for subject in subjects:
+        if subject.get("subject_kind") != "existing_index":
+            continue
+        definition = subject.get("definition")
+        definition = definition if isinstance(definition, Mapping) else {}
+        reversible = definition.get("reversible_definition")
+        reversible = reversible if isinstance(reversible, Mapping) else {}
+        index_type = str(definition.get("index_type") or reversible.get("index_type") or "")
+        if (
+            _as_int(reversible.get("index_type_code"), 0) in {5, 6}
+            or "COLUMNSTORE" in index_type.upper()
+        ) and not reversible.get("is_disabled"):
+            tables.add(_subject_table(subject))
+    return frozenset(tables)
+
+
+def _subject_table(subject: Mapping[str, Any]) -> tuple[str, str]:
+    return (
+        str(subject.get("schema_name") or subject.get("schema") or ""),
+        str(subject.get("table_name") or subject.get("object_name") or subject.get("table") or ""),
+    )
+
+
+def _offline_on_columnstore(
+    inert_sql: str | None,
+    subject: Mapping[str, Any],
+    columnstore_tables: frozenset[tuple[str, str]],
+) -> str | None:
+    """Inert SQL of a subject, with no ONLINE build when its table has a columnstore index."""
+
+    if inert_sql is None or _subject_table(subject) not in columnstore_tables:
+        return inert_sql
+    offline = without_online_create(inert_sql)
+    if offline == inert_sql:
+        return inert_sql
+    return _comment_sql(COLUMNSTORE_OFFLINE_BUILD_NOTE) + "\n" + offline
+
+
+def _actionable_subject_sql(
+    subject: Mapping[str, Any],
+    columnstore_tables: frozenset[tuple[str, str]] = frozenset(),
+) -> tuple[str | None, str | None]:
     """Return the inert DDL and rollback that the artifact files render for one candidate."""
 
     if str(subject.get("state")) == "create_candidate":
         ddl = _create_candidate_ddl(subject)
         inverse = _candidate_drop_ddl(subject)
         return (
-            _comment_sql(ddl) if ddl else None,
+            _offline_on_columnstore(
+                _comment_sql(ddl) if ddl else None, subject, columnstore_tables
+            ),
             _comment_sql(inverse) if inverse else None,
         )
-    return render_inert_proposed_drop(subject), render_inert_candidate_rollback(subject)
+    return render_inert_proposed_drop(subject), _offline_on_columnstore(
+        render_inert_candidate_rollback(subject), subject, columnstore_tables
+    )
 
 
 def compact_index_review(review: IndexReviewV1 | Mapping[str, Any]) -> dict[str, Any]:
@@ -5382,6 +5436,7 @@ def compact_index_review(review: IndexReviewV1 | Mapping[str, Any]) -> dict[str,
     subjects = _review_subjects(payload)
     payload.pop("subjects", None)
     states = [str(subject.get("state", "observe")) for subject in subjects]
+    columnstore_tables = _columnstore_tables(subjects)
     actionable: list[dict[str, Any]] = []
     omitted: dict[str, int] = {}
     blockers: dict[str, int] = {}
@@ -5393,7 +5448,7 @@ def compact_index_review(review: IndexReviewV1 | Mapping[str, Any]) -> dict[str,
                 for code in reasons:
                     blockers[code] = blockers.get(code, 0) + 1
             continue
-        ddl, rollback = _actionable_subject_sql(subject)
+        ddl, rollback = _actionable_subject_sql(subject, columnstore_tables)
         entry: dict[str, Any] = {
             "subject_id": subject.get("subject_id"),
             "subject_kind": subject.get("subject_kind"),
@@ -5498,6 +5553,7 @@ def render_index_review_artifacts(
     drop_lines = ["-- Recommend-only artifact. Every statement is commented and inert."]
     rollback_lines = ["-- Recommend-only artifact. Every statement is commented and inert."]
     validation_lines = ["-- Recommend-only artifact. Verify current metadata before any separately authorised change."]
+    columnstore_tables = _columnstore_tables(subjects)
     for subject in sorted(subjects, key=lambda item: str(item.get("subject_id", ""))):
         state = str(subject.get("state", "observe"))
         if actionable_only and state not in _ACTIONABLE_REVIEW_STATES:
@@ -5506,10 +5562,10 @@ def render_index_review_artifacts(
         reasons = ", ".join(str(item) for item in subject.get("reason_codes", [])) or "-"
         md_lines.append(f"| `{subject.get('subject_id', '')}` | `{subject.get('subject_kind', '')}` | `{state}` | {reasons} |")
         if state == "create_candidate":
-            ddl = _create_candidate_ddl(subject)
+            ddl = _actionable_subject_sql(subject, columnstore_tables)[0]
             if ddl:
                 create_lines.append(f"-- create_candidate {subject.get('subject_fingerprint')}")
-                create_lines.append(_comment_sql(ddl))
+                create_lines.append(ddl)
             inverse = _candidate_drop_ddl(subject)
             if inverse:
                 rollback_lines.append(
@@ -5534,7 +5590,9 @@ def render_index_review_artifacts(
             if proposed:
                 drop_lines.append(proposed)
         if state in {"drop_candidate", "consolidate_candidate"}:
-            rollback = render_inert_candidate_rollback(subject)
+            rollback = _offline_on_columnstore(
+                render_inert_candidate_rollback(subject), subject, columnstore_tables
+            )
             if rollback:
                 rollback_lines.append(f"-- exact recreation for {subject.get('subject_id')}")
                 rollback_lines.append(rollback)
