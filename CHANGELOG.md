@@ -17,6 +17,10 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
   (`session_not_found`), an apply with no fingerprint (`dry_run_required`)
   and a session that is no longer the one the dry run saw
   (`session_changed`). A refusal is written to the audit log.
+- `get_plan_cache_analysis`: `total_plans`, `total_single_use_plans` and
+  `single_use_size_mb` now count compiled plans only. New fields:
+  `total_cache_entries`, `single_use_plan_pct`, `single_use_bloat_rule` and
+  `optimize_for_ad_hoc_workloads` (the setting as read).
 - `get_active_sessions`: new field `blocked_without_session`.
 
 ### Fixed
@@ -39,6 +43,15 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
   one-session cycle. Both are now left out of the chains and of
   `blocked_request_count`; the requests that wait on a code are listed in
   `blocked_without_session` with the documented meaning of the code.
+- Plan cache: single-use plan bloat was reported when over 50% of all cache
+  entries had one use, with no size floor. View parse trees and plan stubs
+  were counted as plans, so a small idle cache, or a database with the ad hoc
+  setting already on, was called bloated. It now needs over 50% of the
+  compiled plans and at least 100 MB of single-use plans. The advice named
+  the server option, which Azure SQL Database does not have; it now gives
+  the database scoped statement in `remediation`, and leaves it out when the
+  setting is already on. `SUM(usecounts)` is cast to bigint, so a busy cache
+  no longer overflows the read.
 - Permission hints: `sys.dm_tran_session_transactions` is now listed as a view
   that needs `##MS_ServerStateReader##` on Basic, S0, S1 and elastic pool
   databases, as Microsoft documents it. The documented-column contract used

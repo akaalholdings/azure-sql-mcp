@@ -6,6 +6,17 @@ from .connection import AzureSqlExecutor
 
 RECOMPILING_MIN_GENERATIONS = 10
 RECOMPILING_WINDOW_MINUTES = 60
+# Single-use plans are bloat only when they are most of the compiled plans and
+# hold enough memory to matter. A small or idle cache is mostly single-use plans.
+SINGLE_USE_BLOAT_SHARE = 0.5
+SINGLE_USE_BLOAT_MIN_MB = 100.0
+# Azure SQL Database has no server option: the setting is database scoped.
+AD_HOC_PLAN_STUBS_SQL = "ALTER DATABASE SCOPED CONFIGURATION SET OPTIMIZE_FOR_AD_HOC_WORKLOADS = ON;"
+AD_HOC_SETTING_SQL = """
+SELECT CAST(value AS nvarchar(20)) AS value
+FROM sys.database_scoped_configurations
+WHERE name = N'OPTIMIZE_FOR_AD_HOC_WORKLOADS'
+"""
 
 
 class PlanCacheService:
@@ -79,16 +90,28 @@ class PlanCacheService:
         self,
         database_name: str,
     ) -> dict[str, Any]:
-        """Plan cache health: type distribution, single-use bloat, top plans by size."""
+        """Plan cache health: type distribution, single-use bloat, top plans by size.
+
+        A plan is a compiled plan. The cache also holds parse trees (views) and
+        plan stubs, which are entries but not plans: they count in
+        ``total_cache_entries`` and ``total_size_mb`` only. Single-use plans are
+        reported as bloat when they are over ``SINGLE_USE_BLOAT_SHARE`` of the
+        compiled plans and hold at least ``SINGLE_USE_BLOAT_MIN_MB``.
+        """
         distribution_query = """
         SELECT
             objtype AS plan_type,
             COUNT(*) AS plan_count,
+            SUM(CASE WHEN cacheobjtype = 'Compiled Plan' THEN 1 ELSE 0 END) AS compiled_plan_count,
             SUM(CAST(size_in_bytes AS BIGINT)) / (1024.0 * 1024.0) AS total_size_mb,
-            SUM(usecounts) AS total_use_counts,
-            SUM(CASE WHEN usecounts = 1 THEN 1 ELSE 0 END) AS single_use_count,
-            SUM(CASE WHEN usecounts = 1 THEN CAST(size_in_bytes AS BIGINT) ELSE 0 END)
-                / (1024.0 * 1024.0) AS single_use_size_mb
+            SUM(CAST(usecounts AS BIGINT)) AS total_use_counts,
+            SUM(CASE WHEN usecounts = 1 AND cacheobjtype = 'Compiled Plan' THEN 1 ELSE 0 END) AS single_use_count,
+            SUM(
+                CASE
+                    WHEN usecounts = 1 AND cacheobjtype = 'Compiled Plan' THEN CAST(size_in_bytes AS BIGINT)
+                    ELSE 0
+                END
+            ) / (1024.0 * 1024.0) AS single_use_size_mb
         FROM sys.dm_exec_cached_plans
         GROUP BY objtype
         ORDER BY total_size_mb DESC
@@ -107,33 +130,66 @@ class PlanCacheService:
 
         distribution = await self.executor.fetch_all(database_name, distribution_query)
         top_plans = await self.executor.fetch_all(database_name, top_plans_query)
+        setting = await self.executor.fetch_all(database_name, AD_HOC_SETTING_SQL)
+        # None when the setting row is not there: then it is not known to be on.
+        stubs_on = str(setting[0].get("value") or "").strip().upper() in {"1", "ON", "TRUE"} if setting else None
 
-        total_plans = sum(r.get("plan_count", 0) for r in distribution)
-        total_single_use = sum(r.get("single_use_count", 0) for r in distribution)
+        total_entries = sum(r.get("plan_count") or 0 for r in distribution)
+        total_plans = sum(r.get("compiled_plan_count") or 0 for r in distribution)
+        total_single_use = sum(r.get("single_use_count") or 0 for r in distribution)
         total_size_mb = sum(float(r.get("total_size_mb", 0) or 0) for r in distribution)
         single_use_size = sum(
             float(r.get("single_use_size_mb", 0) or 0) for r in distribution
         )
 
+        single_use_share = total_single_use / total_plans if total_plans else 0.0
         warnings: list[dict[str, Any]] = []
-        if total_plans > 0 and total_single_use / total_plans > 0.5:
-            warnings.append(
-                {
-                    "type": "single_use_plan_bloat",
-                    "message": (
-                        f"{total_single_use}/{total_plans} plans ({round(total_single_use / total_plans * 100)}%) "
-                        f"are single-use, consuming {round(single_use_size, 1)} MB. "
-                        "Consider enabling 'optimize for ad hoc workloads'."
-                    ),
-                }
+        if single_use_share > SINGLE_USE_BLOAT_SHARE and single_use_size >= SINGLE_USE_BLOAT_MIN_MB:
+            found = (
+                f"{total_single_use} of {total_plans} compiled plans ({round(single_use_share * 100)}%) "
+                f"were used once and hold {round(single_use_size, 1)} MB. "
             )
+            parameterize = (
+                "parameterize them in the application. Forced parameterization changes plans for every "
+                "statement, so test it first."
+            )
+            if stubs_on:
+                # The stub setting cannot shrink this further: do not recommend it again.
+                warnings.append(
+                    {
+                        "type": "single_use_plan_bloat",
+                        "message": (
+                            f"{found}OPTIMIZE_FOR_AD_HOC_WORKLOADS is already on, so these statements "
+                            f"compile again and again: {parameterize}"
+                        ),
+                    }
+                )
+            else:
+                warnings.append(
+                    {
+                        "type": "single_use_plan_bloat",
+                        "message": (
+                            f"{found}First step: keep a plan stub for a batch until it runs a second time "
+                            "(the database scoped setting in remediation). If statements still compile again "
+                            f"and again, {parameterize}"
+                        ),
+                        "remediation": AD_HOC_PLAN_STUBS_SQL,
+                    }
+                )
 
         return {
             "database_name": database_name,
+            "total_cache_entries": total_entries,
             "total_plans": total_plans,
             "total_single_use_plans": total_single_use,
+            "single_use_plan_pct": round(single_use_share * 100, 1),
             "total_size_mb": round(total_size_mb, 2),
             "single_use_size_mb": round(single_use_size, 2),
+            "single_use_bloat_rule": {
+                "min_share_of_compiled_plans": SINGLE_USE_BLOAT_SHARE,
+                "min_single_use_size_mb": SINGLE_USE_BLOAT_MIN_MB,
+            },
+            "optimize_for_ad_hoc_workloads": stubs_on,
             "distribution": distribution,
             "top_plans_by_size": top_plans,
             "warnings": warnings,

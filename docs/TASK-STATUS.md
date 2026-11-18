@@ -176,7 +176,7 @@
 | # | Task | Status | Owner | Started | Completed | Notes |
 |---|------|--------|-------|---------|-----------|-------|
 | 13.1 | `check_statistics_health` tool — stale stats, high modification, low sample rates | `done` | — | 2026-04-01 | 2026-04-01 | `plan_cache.py`; configurable stale_days and mod_pct_threshold |
-| 13.2 | `get_plan_cache_analysis` tool — plan type distribution, single-use bloat detection | `done` | — | 2026-04-01 | 2026-04-01 | Warns when >50% plans are single-use |
+| 13.2 | `get_plan_cache_analysis` tool — plan type distribution, single-use bloat detection | `done` | — | 2026-04-01 | 2026-04-01 | Warns when >50% of compiled plans are single-use and they hold 100 MB or more |
 | 13.3 | `get_query_compilation_stats` tool — excessive recompilation detection | `done` | — | 2026-04-01 | 2026-04-01 | Flags queries with recompile ratio >50% and >10 executions |
 | 13.4 | Add stale statistics check to `analyze_db_health` as a new health category | `done` | — | 2026-04-01 | 2026-04-01 | `_statistics_health()` in health.py; stale (>7 days) and high-modification (>20%) checks |
 | 13.5 | Unit tests for statistics & plan cache module | `done` | — | 2026-04-01 | 2026-04-01 | `test_plan_cache.py`: 5 tests |
