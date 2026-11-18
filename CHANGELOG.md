@@ -22,6 +22,12 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
   `total_cache_entries`, `single_use_plan_pct`, `single_use_bloat_rule` and
   `optimize_for_ad_hoc_workloads` (the setting as read).
 - `get_active_sessions`: new field `blocked_without_session`.
+- Plan digest: `executions` now means executions of the operator as a whole
+  everywhere (`top_operators`, `eager_index_spools`, the node detail and the
+  rule findings), as it already did in `cardinality_skew` and the operator
+  tree. A DOP 4 scan that ran once shows 1, where it showed 4. In the node
+  detail, `actuals.logical_executions` is gone; the per-thread total is
+  `actuals.thread_executions`, shown when it differs.
 
 ### Fixed
 
@@ -56,6 +62,40 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
   that needs `##MS_ServerStateReader##` on Basic, S0, S1 and elastic pool
   databases, as Microsoft documents it. The documented-column contract used
   by the tests now covers that view.
+- Plan reading: an operator above a parallel exchange no longer gets the time
+  of the branch below it as its own. Thread numbers were paired across the
+  exchange, so when the rows below it ran on fewer threads, a Sort that did
+  1 ms of work reported the whole branch (17,109 ms in the test case) and
+  ranked as a top operator. The slowest producer thread below an exchange now
+  comes off every thread above it, also when a batch-mode operator sits
+  between the two (its time is its own, so the wait is in none of its
+  counters). An exchange's own time is its slowest thread less the same wait.
+- Plan reading: self CPU no longer crosses an exchange. CPU is counted on the
+  thread that burned it, so the CPU of the branch below an exchange is in no
+  counter above it. It was taken off the operator above by thread number. On
+  real plans a Hash Match that burned 5,921 ms showed 0 ms, and a Merge Join
+  that burned 1,189 ms showed 13,055 ms. The operator above an exchange now
+  loses only the exchange's own CPU, and the exchange keeps that as its own.
+  The operators' self CPU now adds up to the CPU that the operators recorded,
+  with nothing counted twice.
+- Plan reading: the "it waited, it did not work" note is judged on each
+  thread's own time. On a plan with `ExclusiveProfileTimeActive` the children
+  were taken off a second time, which hid the note.
+- Plan reading: `ActualExecutions` is per thread, and it is now turned into
+  executions of the operator as a whole. On the inner side of a nested loop
+  (or the third input of an Adaptive Join) with no exchange in between, the
+  threads add up. Anywhere else the largest per-thread value is used. A
+  parallel branch that a serial nested loop ran 3 times on 8 threads was read
+  as 24 executions and a false 8x overestimate. A scan below a spool on a
+  parallel inner side was read as one execution and a false underestimate.
+  This changes `cardinality_skew`, the estimate findings, the per-execution
+  rows in the operator tree and `actual_rows_per_execution` in the operator
+  summary. The findings that quote a run count (`key_lookup`,
+  `nested_loops_high_inner_executions`, `join_or_predicate`,
+  `top_above_scan`) use the same count: a branch that a serial loop ran 30
+  times on 4 threads read as "ran 120 times" and crossed the floor of 100.
+- Plan reading: the row-goal note on a parallel scan says "stopped early on
+  3 of 4 threads" where it said "3 of 4 executions stopped early".
 
 ## [3.0.0rc2] - 2026-11-10
 

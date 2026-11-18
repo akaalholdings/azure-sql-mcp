@@ -215,6 +215,91 @@ def test_waited_compares_each_threads_own_self_time_not_its_cumulative_time(show
     assert any("waited" in note for note in top["notes"])
 
 
+def test_operator_above_an_exchange_that_worked_for_its_own_time_is_not_called_waited(showplan) -> None:
+    # Each Sort thread ran 10,500 ms: 10,000 ms was the wait for the producers
+    # below the exchange, and it burned 485 ms CPU in the 500 ms that are its own.
+    # Judging the wait on the whole 10,500 ms called a CPU-bound Sort "waited".
+    rt = showplan.runtime
+    workers = range(1, 5)
+    scan = showplan.scan(3, runtime=rt((0, 0, 0, 0, 0), *((thread, 10, 1, 10_000, 9_900) for thread in workers)), attrs='Parallel="1"')
+    exchange = showplan.relop(
+        2,
+        "Parallelism",
+        "Repartition Streams",
+        scan,
+        runtime=rt((0, 0, 0, 0, 0), *((thread, 10, 1, 10_400, 5) for thread in workers)),
+        attrs='Parallel="1"',
+    )
+    sort = showplan.relop(
+        1, "Sort", None, exchange, runtime=rt((0, 0, 0, 0, 0), *((thread, 10, 1, 10_500, 485) for thread in workers)), attrs='Parallel="1"'
+    )
+    gather = showplan.relop(0, "Parallelism", "Gather Streams", sort, runtime=rt((0, 40, 1, 10_600, 0)), attrs='Parallel="1"')
+
+    top = _top_operator(_statement(build_plan_digest(showplan.plan(gather, plan_attrs='DegreeOfParallelism="4"'))), 1)
+
+    assert top["self_elapsed_ms"] == 500
+    assert top["self_cpu_ms"] == 1920  # four threads at 485 less the exchange's 5 on each
+    assert not any("waited" in note for note in top.get("notes", []))
+
+
+def test_operator_above_an_exchange_that_stalled_in_its_own_time_is_still_called_waited(showplan) -> None:
+    # The same shape, but the Sort burned 20 ms in its own 500 ms: that is a wait.
+    rt = showplan.runtime
+    workers = range(1, 5)
+    scan = showplan.scan(3, runtime=rt((0, 0, 0, 0, 0), *((thread, 10, 1, 10_000, 9_900) for thread in workers)), attrs='Parallel="1"')
+    exchange = showplan.relop(
+        2,
+        "Parallelism",
+        "Repartition Streams",
+        scan,
+        runtime=rt((0, 0, 0, 0, 0), *((thread, 10, 1, 10_400, 5) for thread in workers)),
+        attrs='Parallel="1"',
+    )
+    sort = showplan.relop(
+        1, "Sort", None, exchange, runtime=rt((0, 0, 0, 0, 0), *((thread, 10, 1, 10_500, 25) for thread in workers)), attrs='Parallel="1"'
+    )
+    gather = showplan.relop(0, "Parallelism", "Gather Streams", sort, runtime=rt((0, 40, 1, 10_600, 0)), attrs='Parallel="1"')
+
+    top = _top_operator(_statement(build_plan_digest(showplan.plan(gather, plan_attrs='DegreeOfParallelism="4"'))), 1)
+
+    assert top["self_elapsed_ms"] == 500
+    assert any("waited" in note for note in top["notes"])
+
+
+def test_waited_is_judged_on_own_times_when_the_plan_already_holds_them(showplan) -> None:
+    # ExclusiveProfileTimeActive: each operator's times are its own. The Sort ran
+    # 5,000 ms and burned 100 ms on each thread, so it waited. Subtracting the
+    # scan below it a second time left the Sort nothing to judge.
+    rt = showplan.runtime
+    scan = showplan.scan(2, runtime=rt((1, 10, 1, 6000, 5900), (2, 10, 1, 6000, 5900)), attrs='Parallel="1"')
+    sort = showplan.relop(1, "Sort", None, scan, runtime=rt((1, 10, 1, 5000, 100), (2, 10, 1, 5000, 100)), attrs='Parallel="1"')
+    gather = showplan.relop(0, "Parallelism", "Gather Streams", sort, runtime=rt((0, 20, 1, 11_100, 0)), attrs='Parallel="1"')
+    plan = showplan.plan(gather, plan_attrs='DegreeOfParallelism="2" ExclusiveProfileTimeActive="true"')
+
+    top = _top_operator(_statement(build_plan_digest(plan)), 1)
+
+    assert top["self_elapsed_ms"] == 5000
+    assert any("waited" in note for note in top["notes"])
+
+
+def test_executions_in_the_digest_count_the_operator_not_its_threads(showplan) -> None:
+    # A DOP 4 scan ran once. Each of its four threads opened it once.
+    rt = showplan.runtime
+    scan = showplan.scan(
+        1, runtime=rt((0, 0, 0, 0, 0), *((thread, 10, 1, 1000, 900) for thread in range(1, 5))), attrs='Parallel="1"'
+    )
+    gather = showplan.relop(0, "Parallelism", "Gather Streams", scan, runtime=rt((0, 40, 1, 1005, 0)), attrs='Parallel="1"')
+    plan = showplan.plan(gather, plan_attrs='DegreeOfParallelism="4"')
+
+    top = _top_operator(_statement(build_plan_digest(plan)), 1)
+    actuals = describe_plan_node(plan, 1)["actuals"]
+
+    assert top["executions"] == 1
+    assert actuals["executions"] == 1
+    assert actuals["thread_executions"] == 4  # the per-thread total, for end_of_scans, rebinds and rewinds
+    assert "logical_executions" not in actuals
+
+
 def test_rows_read_far_above_rows_returned_is_called_out(showplan) -> None:
     rt = showplan.runtime
     plan = showplan.plan(showplan.scan(0, runtime=rt((0, 10, 1, 400, 390, 2_000_000))))
@@ -279,6 +364,28 @@ def test_row_goal_that_read_to_the_end_says_so(showplan) -> None:
     assert any("Reads far more rows" in note for note in top["notes"])
     assert any("every execution read to the end" in note for note in top["notes"])
     assert not any("stopped early" in note for note in top["notes"])
+
+
+def test_row_goal_on_a_parallel_scan_counts_threads_not_executions(showplan) -> None:
+    # Ported from sqlserver-query-plans 1.5.7 (MIT): one execution split over four
+    # threads, three of which stopped early. "3 of 4 executions stopped early"
+    # described executions that never happened.
+    rt = showplan.runtime
+    scan = showplan.scan(
+        1,
+        "Users",
+        attrs='EstimateRowsWithoutRowGoal="1000000" Parallel="1"',
+        runtime=rt(*((thread, 3, 1, 50, 50, 1000, 0) for thread in (1, 2, 3)), (4, 1, 1, 50, 50, 1000, 1)),
+    )
+    plan = showplan.plan(
+        showplan.relop(0, "Parallelism", "Gather Streams", scan, runtime=rt((0, 10, 1, 60, 0))),
+        plan_attrs='DegreeOfParallelism="4"',
+    )
+
+    notes = _top_operator(_statement(build_plan_digest(plan)), 1)["notes"]
+
+    assert any("stopped early on 3 of 4 threads" in note for note in notes)
+    assert not any("executions stopped early" in note for note in notes)
 
 
 def test_row_goal_without_end_of_scans_still_shows_the_reads_flag(showplan) -> None:

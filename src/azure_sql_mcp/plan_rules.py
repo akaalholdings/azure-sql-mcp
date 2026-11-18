@@ -707,7 +707,7 @@ def _access_rules(rules: _StatementRules) -> None:
         # An actual plan counts the lookups that ran: an underestimated outer
         # input can run a lookup the optimizer expected once 200,000 times, and
         # an overestimated one can run it far less often (or never).
-        actual_executions = node.actual_executions if node is not None and node.has_runtime else None
+        actual_executions = node.logical_executions if node is not None and node.has_runtime else None
         measured = actual_executions is not None
         timed = node is not None and node.has_timing
         executions = actual_executions if actual_executions is not None else access.estimated_executions
@@ -1108,7 +1108,7 @@ def _operator_rules(node: PlanNode, rules: _StatementRules) -> None:
     if physical == "Nested Loops" and len(node.children) >= 2:
         inner = node.children[1]
         measured = actual and inner.has_runtime
-        executions = inner.actual_executions if measured else inner.estimated_executions
+        executions = (inner.logical_executions or 0.0) if measured else inner.estimated_executions
         if executions >= NESTED_LOOP_EXECUTION_FLOOR:
             add(
                 "nested_loops_high_inner_executions",
@@ -2105,7 +2105,7 @@ def _or_join(rules: _StatementRules, node: PlanNode) -> None:
     if branches < 2 or sum(1 for item in below if item.physical_op == "Constant Scan") < 2:
         return
     measured = node.has_runtime
-    executions = node.actual_executions if measured else node.estimated_executions
+    executions = (node.logical_executions or 0.0) if measured else node.estimated_executions
     if executions < REPEATED_EXECUTION_FLOOR:
         return
     loop = node.parent if node.parent is not None and node.parent.physical_op == "Nested Loops" else None
@@ -2200,7 +2200,7 @@ def _top_above_scan(rules: _StatementRules, node: PlanNode) -> None:
             loop = parent
         current = parent
     measured = node.has_runtime
-    executions = node.actual_executions if measured else node.estimated_executions
+    executions = (node.logical_executions or 0.0) if measured else node.estimated_executions
     if loop is None or executions < REPEATED_EXECUTION_FLOOR:
         return
     table = clean_text(f"{access.schema}.{access.table}", 200)

@@ -22,6 +22,8 @@ from .plan_tree import child_relops
 from .plan_tree import describe_result_shape
 from .plan_tree import is_true
 from .plan_tree import merge_showplans
+from .plan_tree import rebinds_child
+from .plan_tree import shared_executions
 from .plan_tree import showplan_from_results
 from .plan_tree import showplans_from_results
 from .plan_tree import statements
@@ -900,7 +902,10 @@ class PlansService:
                 }
             )
 
-        operators = [self._summarize_operator(node) for node in operator_nodes]
+        thread_local = self._thread_local_operators(operator_nodes)
+        operators = [
+            self._summarize_operator(node, thread_local=node in thread_local) for node in operator_nodes
+        ]
         for operator, node in zip(operators, operator_nodes):
             # Subtree cost is cumulative, so ranking by it always crowns the
             # root. Self cost is still an estimate, in every plan.
@@ -982,7 +987,24 @@ class PlansService:
     ) -> dict[str, Any]:
         return summarize_statistics_io_samples(samples)
 
-    def _summarize_operator(self, node: ET.Element) -> dict[str, Any]:
+    @staticmethod
+    def _thread_local_operators(operator_nodes: list[ET.Element]) -> set[ET.Element]:
+        """Operators on a nested loop's inner side with no exchange in between.
+
+        ``operator_nodes`` is in document order, so a parent comes before its children.
+        """
+
+        found: set[ET.Element] = set()
+        for node in operator_nodes:
+            physical = node.attrib.get("PhysicalOp", "")
+            # An exchange starts a new set of threads, so thread-locality stops at one.
+            inherited = node in found and physical != "Parallelism"
+            for index, child in enumerate(child_relops(node)):
+                if inherited or rebinds_child(physical, index):
+                    found.add(child)
+        return found
+
+    def _summarize_operator(self, node: ET.Element, *, thread_local: bool = False) -> dict[str, Any]:
         estimated_rows = self._optional_float(node.attrib.get("EstimateRows"))
         owned, seek_predicates, residual_predicates = self._owned_elements(node)
         counters = [
@@ -993,7 +1015,7 @@ class PlansService:
             if counters
             else None
         )
-        rows_per_execution = self._rows_per_execution(counters, actual_rows)
+        rows_per_execution = self._rows_per_execution(counters, actual_rows, thread_local=thread_local)
         estimated_without_row_goal = self._optional_float(
             node.attrib.get("EstimateRowsWithoutRowGoal")
         )
@@ -1078,23 +1100,21 @@ class PlansService:
 
     @staticmethod
     def _rows_per_execution(
-        counters: list[dict[str, Any]], actual_rows: float | None
+        counters: list[dict[str, Any]], actual_rows: float | None, *, thread_local: bool = False
     ) -> float | None:
         """Actual rows per execution: ActualRows is a total over every execution and thread.
 
         The inner side of a nested loop runs once per outer row, so its total
         against the per-execution estimate reads as an error it does not have.
-        Parallel workers that each ran once count as one execution, as in
-        plan_tree.PlanNode.logical_executions.
+        ActualExecutions is per thread: plan_tree.shared_executions turns it into
+        executions of the operator as a whole, and ``thread_local`` says which of
+        its two rules applies.
         """
         if actual_rows is None:
             return None
-        workers = [counter for counter in counters if (counter["thread"] or 0) > 0] or counters
-        runs = [counter["actual_executions"] or 0 for counter in workers]
-        if len(workers) > 1 and all(run <= 1 for run in runs):
-            executions = 1 if any(runs) else 0
-        else:
-            executions = sum(counter["actual_executions"] or 0 for counter in counters)
+        executions = shared_executions(
+            [counter["actual_executions"] or 0 for counter in counters], thread_local=thread_local
+        )
         return actual_rows / executions if executions else actual_rows
 
     @staticmethod

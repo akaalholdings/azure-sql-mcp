@@ -12,6 +12,18 @@ coordinator, whose elapsed time is the wall clock of the whole branch. Self
 time is therefore computed per thread, never across threads, and an exchange's
 self time is advisory.
 
+Thread numbers do not pair across an exchange: the workers above and below it
+are different ones. For elapsed time the slowest producer thread below an
+exchange comes off every thread above it (PerformanceMonitor issue 7979). Two
+rules differ from upstream on purpose. Keep them when a later upstream version
+is ported:
+
+- CPU does not cross an exchange. CPU is counted on the thread that burned it,
+  so the operator above an exchange loses the exchange's own (consumer side)
+  CPU and nothing from below it. Upstream pairs the thread numbers for CPU.
+- A batch operator directly above an exchange carries the wait on it up, as a
+  pass-through does. Upstream drops the wait there.
+
 Cost is an estimate in every plan, including actual plans. Every string read
 from a plan is untrusted: ``clean_text`` flattens it to one bounded line.
 """
@@ -298,8 +310,14 @@ class PlanNode:
     estimated_mode: str
     threads: tuple[ThreadCounters, ...]
     children: list[PlanNode] = field(default_factory=list)
+    # True on the inner side of a Nested Loops (or the third input of an Adaptive
+    # Join) with no exchange in between: each thread runs whole executions alone.
+    thread_local: bool = False
     self_elapsed_ms: float | None = None
     self_cpu_ms: float | None = None
+    # Self time of each thread in ``work_threads`` order; None with one thread or no timing.
+    thread_self_elapsed_ms: tuple[float, ...] | None = None
+    thread_self_cpu_ms: tuple[float, ...] | None = None
     _own_elements: list[ET.Element] | None = field(default=None, repr=False)
 
     @property
@@ -323,6 +341,12 @@ class PlanNode:
 
     @property
     def actual_executions(self) -> float:
+        """``ActualExecutions`` summed over threads: how often any thread opened the operator.
+
+        Rebinds, rewinds and ``ActualEndOfScans`` are per thread too, so compare
+        those with this. For rows per execution use ``logical_executions``.
+        """
+
         return sum(counter.executions for counter in self.threads)
 
     @property
@@ -430,19 +454,11 @@ class PlanNode:
 
     @property
     def logical_executions(self) -> float | None:
-        """Executions comparable with the per-execution ``EstimateRows``.
-
-        A parallel operator that each worker ran once is one logical execution:
-        its estimate covers all threads, so dividing by the thread count would
-        invent an overestimate.
-        """
+        """Executions of the operator as a whole, the unit ``EstimateRows`` is per."""
 
         if not self.threads:
             return None
-        workers = self.work_threads
-        if len(workers) > 1 and all(counter.executions <= 1 for counter in workers):
-            return 1.0 if any(counter.executions > 0 for counter in workers) else 0.0
-        return self.actual_executions
+        return shared_executions([counter.executions for counter in self.threads], thread_local=self.thread_local)
 
     @property
     def own_cost(self) -> float:
@@ -465,6 +481,40 @@ class PlanNode:
                 stack.extend(reversed(list(element)))
             self._own_elements = found
         return self._own_elements
+
+
+def rebinds_child(physical_op: str, index: int) -> bool:
+    """True when this input of the operator is opened again for every outer row.
+
+    That is the inner input of Nested Loops, and the third input of an Adaptive
+    Join (build, hash probe, nested-loops inner).
+    """
+
+    if physical_op == "Nested Loops":
+        return index >= 1
+    if physical_op == "Adaptive Join":
+        return index >= 2
+    return False
+
+
+def shared_executions(per_thread: Sequence[float], *, thread_local: bool) -> float:
+    """How often an operator ran as a whole, from its per-thread ``ActualExecutions``.
+
+    - Serial: one thread, so both rules below give the same number.
+    - ``thread_local`` (inner side of a nested loop, no exchange in between):
+      each thread runs complete executions for the outer rows it holds, so the
+      threads add up.
+    - Anywhere else the threads share each execution: a DOP 8 scan reports one
+      execution on each of eight threads and ran once. Every thread opens the
+      operator once per execution, or N times when the whole branch is rebound N
+      times under a serial nested loop, so the largest per-thread value is the
+      count. Summing divides the actual rows by the thread count and invents an
+      overestimate.
+    """
+
+    if not per_thread:
+        return 0.0
+    return sum(per_thread) if thread_local else max(per_thread)
 
 
 @dataclass(frozen=True)
@@ -643,6 +693,11 @@ def build_tree(query_plan: ET.Element | None) -> list[PlanNode]:
             raise PlanParseError("plan_too_deep")
         nodes.append(node)
         node.children = [_node(child, node, node.depth + 1) for child in child_relops(node.element)]
+        for index, child in enumerate(node.children):
+            # An exchange starts a new set of threads, so thread-locality stops at one.
+            child.thread_local = rebinds_child(node.physical_op, index) or (
+                node.thread_local and not node.is_parallelism
+            )
         stack.extend(reversed(node.children))
     _attribute_self_times(nodes, exclusive=is_true(query_plan.get("ExclusiveProfileTimeActive")))
     return nodes
@@ -1053,7 +1108,7 @@ def _node(element: ET.Element, parent: PlanNode | None, depth: int) -> PlanNode:
 
 
 def _attribute_self_times(nodes: list[PlanNode], *, exclusive: bool = False) -> None:
-    """Fill ``self_elapsed_ms`` and ``self_cpu_ms``; children are visited before parents.
+    """Fill the self times, in total and per thread; children are visited before parents.
 
     ``exclusive`` is QueryPlan@ExclusiveProfileTimeActive: the operator times are
     already each operator's own, so nothing is subtracted (an exchange stays advisory).
@@ -1065,24 +1120,32 @@ def _attribute_self_times(nodes: list[PlanNode], *, exclusive: bool = False) -> 
         for node in nodes:
             node.self_elapsed_ms = node.elapsed_ms if node.has_runtime else 0.0
             node.self_cpu_ms = node.cpu_ms if node.has_runtime else 0.0
+            if len(node.threads) > 1:
+                node.thread_self_elapsed_ms = _own_thread_values(node, "elapsed")
+                node.thread_self_cpu_ms = _own_thread_values(node, "cpu")
         return
     contribution: dict[str, dict[PlanNode, float]] = {"elapsed": {}, "cpu": {}}
     batch_total: dict[str, dict[PlanNode, float]] = {"elapsed": {}, "cpu": {}}
     by_thread: dict[str, dict[PlanNode, dict[int, float]]] = {"elapsed": {}, "cpu": {}}
     batch_by_thread: dict[str, dict[PlanNode, dict[int, float]]] = {"elapsed": {}, "cpu": {}}
+    producer_wait: dict[PlanNode, float] = {}
     for node in reversed(nodes):
         for key in ("elapsed", "cpu"):
+            # A batch operator's time is its own, so a zone adds up everything
+            # below it, an exchange child included (see _contribution).
             batch_total[key][node] = _value(node, key) + sum(
-                batch_total[key][child] if _batch(child) else contribution[key][child]
-                for child in node.children
-                if not child.is_parallelism
+                batch_total[key][child] if _batch(child) else contribution[key][child] for child in node.children
             )
             contribution[key][node] = _contribution(node, key, contribution[key], batch_total[key])
             batch_by_thread[key][node] = _batch_threads(node, key, by_thread[key], batch_by_thread[key])
             by_thread[key][node] = _child_threads(node, key, by_thread[key], batch_by_thread[key])
+        producer_wait[node] = _producer_wait(node, by_thread["elapsed"], producer_wait)
     for node in nodes:
-        node.self_elapsed_ms = _self_elapsed(node, contribution["elapsed"], by_thread["elapsed"])
+        node.self_elapsed_ms = _self_elapsed(node, contribution["elapsed"], by_thread["elapsed"], producer_wait)
         node.self_cpu_ms = _self_cpu(node, contribution["cpu"], by_thread["cpu"])
+        if len(node.threads) > 1:
+            node.thread_self_elapsed_ms = _thread_self_elapsed(node, by_thread["elapsed"], producer_wait)
+            node.thread_self_cpu_ms = _thread_self_cpu(node, by_thread["cpu"])
 
 
 def _batch(node: PlanNode) -> bool:
@@ -1103,6 +1166,11 @@ def _contribution(
     """Time this operator adds to its parent's cumulative total."""
 
     if node.is_parallelism and node.children:
+        if key == "cpu":
+            # CPU is counted on the thread that burned it. What is below an
+            # exchange ran on other threads, so only the exchange's own CPU (its
+            # consumer side) is in the CPU of the operator above it.
+            return _value(node, key)
         return max(contribution[child] for child in node.children)
     if _batch(node):
         # Batch operators pipeline, so a contiguous batch zone adds up. CPU
@@ -1124,8 +1192,8 @@ def _batch_threads(
 ) -> dict[int, float]:
     totals = {counter.thread: _thread_value(counter, key) for counter in node.work_threads}
     for child in node.children:
-        if child.is_parallelism:
-            continue  # zone boundary
+        # An exchange child ends the zone: it adds its own CPU, which these
+        # threads burned, and no elapsed time (its wait is in _producer_wait).
         _merge(totals, batch_by_thread[child] if _batch(child) else by_thread[child])
     return totals
 
@@ -1139,9 +1207,13 @@ def _child_threads(
     """What this operator contributes to its parent, per thread."""
 
     if node.is_parallelism and node.children:
-        # Exchange times are unreliable: follow the dominant branch.
-        busiest = max(node.children, key=lambda child: _value(child, key))
-        return dict(by_thread[busiest])
+        if key == "elapsed":
+            # What is below an exchange ran on other threads, so nothing pairs by
+            # thread number. Its wait comes off every thread: see _producer_wait.
+            return {}
+        # The exchange's consumer side runs on its parent's threads, so its own
+        # CPU pairs with them. Nothing below it is in a counter above it.
+        return {counter.thread: _thread_value(counter, key) for counter in node.work_threads}
     if _batch(node):
         return dict(batch_by_thread[node])
     if node.has_runtime and _value(node, key) > 0:
@@ -1152,17 +1224,52 @@ def _child_threads(
     return totals
 
 
-def _per_thread_self(node: PlanNode, key: str, by_thread: dict[PlanNode, dict[int, float]]) -> list[float]:
-    """Self time of each worker thread: subtract within a thread, never across threads."""
+def _producer_wait(
+    node: PlanNode, by_thread: dict[PlanNode, dict[int, float]], producer_wait: dict[PlanNode, float]
+) -> float:
+    """Elapsed time this operator makes every thread of its parent wait, whatever the thread number.
+
+    An exchange moves rows between threads: every consumer thread waits on all
+    the producers, and none finishes before the slowest producer does. So the
+    slowest producer thread below an exchange comes off every thread above it.
+    Pairing by thread number gave a Sort over a branch that ran on one producer
+    thread the whole branch's time on every other thread. The exchange's own
+    time is not used: it also holds time a spilling parent spends.
+    """
+
+    if node.is_parallelism and node.children:
+        return max(
+            max(by_thread[child].values(), default=0.0) + producer_wait[child] for child in node.children
+        )
+    if node.has_runtime and node.elapsed_ms > 0 and not _batch(node):
+        return 0.0  # its own per-thread times already hold the wait
+    # A pass-through carries the wait up. So does a batch operator, whose time is
+    # its own: the wait on an exchange below it is in no counter of the zone.
+    return sum(producer_wait[child] for child in node.children)
+
+
+def _per_thread_self(
+    node: PlanNode, key: str, by_thread: dict[PlanNode, dict[int, float]], every_thread: float = 0.0
+) -> list[float]:
+    """Self time of each worker thread: subtract within a thread, never across threads.
+
+    ``every_thread`` is the time that comes off every thread alike (_producer_wait).
+    """
 
     children: dict[int, float] = {}
     for child in node.children:
         _merge(children, by_thread[child])
-    return [max(0.0, _thread_value(counter, key) - children.get(counter.thread, 0.0)) for counter in node.work_threads]
+    return [
+        max(0.0, _thread_value(counter, key) - children.get(counter.thread, 0.0) - every_thread)
+        for counter in node.work_threads
+    ]
 
 
 def _self_elapsed(
-    node: PlanNode, contribution: dict[PlanNode, float], by_thread: dict[PlanNode, dict[int, float]]
+    node: PlanNode,
+    contribution: dict[PlanNode, float],
+    by_thread: dict[PlanNode, dict[int, float]],
+    producer_wait: dict[PlanNode, float],
 ) -> float:
     if not node.has_runtime or node.elapsed_ms <= 0:
         return 0.0
@@ -1172,10 +1279,12 @@ def _self_elapsed(
         workers = [counter.elapsed_ms or 0.0 for counter in node.threads if counter.thread > 0]
         if not workers:
             return 0.0
-        return max(0.0, max(workers) - sum(contribution[child] for child in node.children))
+        # Its slowest consumer thread, less the same wait its parent loses.
+        return max(0.0, max(workers) - producer_wait[node])
     if len(node.threads) > 1:
         # Wall clock: the operator finished when its slowest thread did.
-        return max(_per_thread_self(node, "elapsed", by_thread), default=0.0)
+        waited = sum(producer_wait[child] for child in node.children)
+        return max(_per_thread_self(node, "elapsed", by_thread, waited), default=0.0)
     return max(0.0, node.elapsed_ms - sum(contribution[child] for child in node.children))
 
 
@@ -1184,13 +1293,40 @@ def _self_cpu(
 ) -> float:
     if not node.has_runtime or node.cpu_ms <= 0:
         return 0.0
-    if node.mode == "Batch":
+    if node.mode == "Batch" or (node.is_parallelism and node.children):
+        # Batch times are the operator's own. So is an exchange's CPU: its
+        # children burned theirs on other threads.
         return node.cpu_ms
     if len(node.threads) > 1:
         # Every thread burned its own CPU, so the threads add up; the slowest
         # one alone is a single worker's share.
         return sum(_per_thread_self(node, "cpu", by_thread))
     return max(0.0, node.cpu_ms - sum(contribution[child] for child in node.children))
+
+
+def _own_thread_values(node: PlanNode, key: str) -> tuple[float, ...]:
+    return tuple(_thread_value(counter, key) for counter in node.work_threads)
+
+
+def _thread_self_elapsed(
+    node: PlanNode, by_thread: dict[PlanNode, dict[int, float]], producer_wait: dict[PlanNode, float]
+) -> tuple[float, ...]:
+    """Self elapsed time of each worker thread, by the rules of ``_self_elapsed``."""
+
+    if node.mode == "Batch":
+        return _own_thread_values(node, "elapsed")
+    if node.is_parallelism and node.children:
+        return tuple(max(0.0, value - producer_wait[node]) for value in _own_thread_values(node, "elapsed"))
+    waited = sum(producer_wait[child] for child in node.children)
+    return tuple(_per_thread_self(node, "elapsed", by_thread, waited))
+
+
+def _thread_self_cpu(node: PlanNode, by_thread: dict[PlanNode, dict[int, float]]) -> tuple[float, ...]:
+    """Self CPU of each worker thread, by the rules of ``_self_cpu``."""
+
+    if node.mode == "Batch" or (node.is_parallelism and node.children):
+        return _own_thread_values(node, "cpu")
+    return tuple(_per_thread_self(node, "cpu", by_thread))
 
 
 def _pinned_values(top: PlanNode) -> set[str]:

@@ -199,6 +199,259 @@ def test_row_mode_parent_over_a_batch_sort_does_not_absorb_the_zone_cpu(showplan
     assert nodes[0].self_cpu_ms == 100  # 1000 - (600 batch Sort + 300 row-mode loops below it)
 
 
+# An exchange moves rows between threads: thread 2 above it does not do thread
+# 2's work below it. The cases below follow PerformanceMonitor #7979 (MIT).
+
+
+def _workers(showplan, *elapsed_ms: int, mode: str = "Row") -> str:
+    """Coordinator thread 0, then one worker thread per elapsed time."""
+
+    threads = [(0, 0, 0, 0, 0), *((thread, 10, 1, ms, 0) for thread, ms in enumerate(elapsed_ms, start=1))]
+    return showplan.runtime(*threads, mode=mode)
+
+
+def _repartition(showplan, node_id: int, child: str, *elapsed_ms: int) -> str:
+    return showplan.relop(
+        node_id, "Parallelism", "Repartition Streams", child, runtime=_workers(showplan, *elapsed_ms), attrs='Parallel="1"'
+    )
+
+
+def test_skewed_producer_below_an_exchange_is_not_paired_by_thread_number(showplan) -> None:
+    # Every row landed on producer thread 1. Both Sort threads waited for it, so
+    # the Sort did 1 ms of its own work. Pairing by thread number gave Sort
+    # thread 2 the whole branch (100 - 0) and crowned the Sort.
+    producer = showplan.relop(2, "Nested Loops", "Inner Join", runtime=_workers(showplan, 99, 0), attrs='Parallel="1"')
+    sort = showplan.relop(
+        0, "Sort", None, _repartition(showplan, 1, producer, 100, 100), runtime=_workers(showplan, 100, 100), attrs='Parallel="1"'
+    )
+
+    nodes = _nodes(showplan.plan(sort, plan_attrs='DegreeOfParallelism="2"'))
+
+    assert nodes[0].self_elapsed_ms == 1
+    assert nodes[1].self_elapsed_ms == 1  # the exchange: its consumers at 100 ms less the slowest producer
+    assert _hottest(nodes) == 2
+
+
+def test_even_producer_below_an_exchange_keeps_its_self_time(showplan) -> None:
+    # No skew: the slowest producer thread off every Sort thread gives the same
+    # 20 ms as pairing by thread did (100 - 80 and 95 - 80).
+    producer = showplan.relop(2, "Nested Loops", "Inner Join", runtime=_workers(showplan, 80, 80), attrs='Parallel="1"')
+    sort = showplan.relop(
+        0, "Sort", None, _repartition(showplan, 1, producer, 100, 95), runtime=_workers(showplan, 100, 95), attrs='Parallel="1"'
+    )
+
+    nodes = _nodes(showplan.plan(sort, plan_attrs='DegreeOfParallelism="2"'))
+
+    assert nodes[0].self_elapsed_ms == 20
+
+
+def test_exchange_behind_a_pass_through_still_comes_off_every_thread(showplan) -> None:
+    # Sort <- exchange <- Compute Scalar (no runtime stats) <- exchange <- producer.
+    # The pass-through carries the second exchange's slowest producer (90 ms) up.
+    producer = showplan.relop(4, "Nested Loops", "Inner Join", runtime=_workers(showplan, 90, 0), attrs='Parallel="1"')
+    pass_through = showplan.relop(2, "Compute Scalar", None, _repartition(showplan, 3, producer, 100, 100))
+    sort = showplan.relop(
+        0, "Sort", None, _repartition(showplan, 1, pass_through, 100, 100), runtime=_workers(showplan, 100, 100), attrs='Parallel="1"'
+    )
+
+    nodes = _nodes(showplan.plan(sort, plan_attrs='DegreeOfParallelism="2"'))
+
+    assert nodes[0].self_elapsed_ms == 10
+
+
+def test_exchange_under_a_batch_zone_still_comes_off_every_thread(showplan) -> None:
+    # Below the outer exchange a batch Hash Match owns 30 ms on each thread and,
+    # through a pass-through, a second exchange's slowest producer took 50 ms.
+    # The slowest thread below the outer exchange is 30 + 50, so the Sort owns 20.
+    producer = showplan.relop(5, "Nested Loops", "Inner Join", runtime=_workers(showplan, 50, 0), attrs='Parallel="1"')
+    pass_through = showplan.relop(3, "Compute Scalar", None, _repartition(showplan, 4, producer, 100, 100))
+    hash_match = showplan.relop(
+        2, "Hash Match", "Aggregate", pass_through, runtime=_workers(showplan, 30, 30, mode="Batch"), attrs='Parallel="1"'
+    )
+    sort = showplan.relop(
+        0, "Sort", None, _repartition(showplan, 1, hash_match, 100, 100), runtime=_workers(showplan, 100, 100), attrs='Parallel="1"'
+    )
+
+    nodes = _nodes(showplan.plan(sort, plan_attrs='DegreeOfParallelism="2"'))
+
+    assert nodes[0].self_elapsed_ms == 20
+
+
+def test_join_above_two_exchanges_takes_both_slowest_producers_off(showplan) -> None:
+    # A row-mode join reads its inputs one after the other, so each exchange's
+    # slowest producer comes off every join thread: 100 - 40 - 50.
+    build = showplan.scan(2, "Users", runtime=_workers(showplan, 40, 0), attrs='Parallel="1"')
+    probe = showplan.scan(4, "Posts", runtime=_workers(showplan, 0, 50), attrs='Parallel="1"')
+    join = showplan.relop(
+        0,
+        "Hash Match",
+        "Inner Join",
+        _repartition(showplan, 1, build, 40, 40),
+        _repartition(showplan, 3, probe, 100, 100),
+        runtime=_workers(showplan, 100, 100),
+        attrs='Parallel="1"',
+    )
+
+    nodes = _nodes(showplan.plan(join, plan_attrs='DegreeOfParallelism="2"'))
+
+    assert nodes[0].self_elapsed_ms == 10
+
+
+def test_exchange_directly_under_a_batch_operator_comes_off_every_thread_too(showplan) -> None:
+    # The same zone with no pass-through between the batch Hash Match and the
+    # second exchange. A batch operator's time is its own, so the wait on the
+    # producers below it (60 ms) is not in its 30 ms: 100 - 30 - 60. Dropping the
+    # exchange child gave the Sort 70 ms here and 10 ms with a Compute Scalar in between.
+    producer = showplan.relop(4, "Nested Loops", "Inner Join", runtime=_workers(showplan, 60, 0), attrs='Parallel="1"')
+    hash_match = showplan.relop(
+        2,
+        "Hash Match",
+        "Aggregate",
+        _repartition(showplan, 3, producer, 100, 100),
+        runtime=_workers(showplan, 30, 30, mode="Batch"),
+        attrs='Parallel="1"',
+    )
+    sort = showplan.relop(
+        0, "Sort", None, _repartition(showplan, 1, hash_match, 100, 100), runtime=_workers(showplan, 100, 100), attrs='Parallel="1"'
+    )
+
+    nodes = _nodes(showplan.plan(sort, plan_attrs='DegreeOfParallelism="2"'))
+
+    assert nodes[0].self_elapsed_ms == 10
+    assert nodes[1].self_elapsed_ms == 10  # the exchange: 100 less the same 90 its consumer lost
+
+
+def test_each_threads_own_time_above_an_exchange_is_kept_for_the_wait_test(showplan) -> None:
+    # The digest judges "waited" per thread. Each Sort thread ran 10,500 ms, of
+    # which 10,000 ms was the wait for the producers.
+    scan = showplan.scan(2, runtime=_workers(showplan, 10_000, 10_000), attrs='Parallel="1"')
+    sort = showplan.relop(
+        0, "Sort", None, _repartition(showplan, 1, scan, 10_500, 10_500), runtime=_workers(showplan, 10_500, 10_500), attrs='Parallel="1"'
+    )
+
+    nodes = _nodes(showplan.plan(sort, plan_attrs='DegreeOfParallelism="2"'))
+
+    assert nodes[0].thread_self_elapsed_ms == (500, 500)
+    assert nodes[2].thread_self_elapsed_ms == (10_000, 10_000)
+
+
+# CPU is counted on the thread that burned it. What is below an exchange ran on
+# other threads, so its CPU is in no counter above the exchange. The numbers in
+# the next two cases are from real DOP 4 and DOP 6 plans (see NOTICE).
+
+
+def _timed(showplan, *threads: tuple[float, float], mode: str = "Row") -> str:
+    """Coordinator thread 0, then one worker thread per (elapsed_ms, cpu_ms)."""
+
+    rows = [(0, 0, 0, 0, 0), *((thread, 10, 1, elapsed, cpu) for thread, (elapsed, cpu) in enumerate(threads, start=1))]
+    return showplan.runtime(*rows, mode=mode)
+
+
+def test_cpu_above_an_exchange_does_not_hold_the_cpu_below_it(showplan) -> None:
+    # A Merge Join over two Repartition Streams. Its threads burned 296 to 322 ms.
+    # The scans below the exchanges burned more than that under the same thread
+    # numbers, on other workers. Pairing by thread number left the join 9 ms and
+    # the exchanges nothing, so 1,224 ms of CPU was in no operator.
+    small = showplan.scan(4, "Users", runtime=_timed(showplan, (48, 48), (37, 37), (44, 44), (51, 51)), attrs='Parallel="1"')
+    large = showplan.scan(6, "Posts", runtime=_timed(showplan, (401, 401), (413, 413), (255, 255), (364, 364)), attrs='Parallel="1"')
+    first = showplan.relop(
+        3, "Parallelism", "Repartition Streams", small, runtime=_timed(showplan, (17, 11), (18, 11), (22, 11), (31, 10)), attrs='Parallel="1"'
+    )
+    second = showplan.relop(
+        5,
+        "Parallelism",
+        "Repartition Streams",
+        large,
+        runtime=_timed(showplan, (1355, 200), (1344, 187), (1307, 189), (1566, 182)),
+        attrs='Parallel="1"',
+    )
+    join = showplan.relop(
+        2,
+        "Merge Join",
+        "Inner Join",
+        first,
+        second,
+        wrapper="Merge",
+        runtime=_timed(showplan, (1484, 322), (1472, 307), (1437, 308), (1701, 296)),
+        attrs='Parallel="1"',
+    )
+    gather = showplan.relop(0, "Parallelism", "Gather Streams", join, runtime=showplan.runtime((0, 40, 1, 1735, 217)), attrs='Parallel="1"')
+
+    nodes = _nodes(showplan.plan(gather, plan_attrs='DegreeOfParallelism="4"'))
+
+    assert nodes[2].self_cpu_ms == 432  # each thread less the two exchanges on that thread: 111 + 109 + 108 + 104
+    assert (nodes[3].self_cpu_ms, nodes[5].self_cpu_ms) == (43, 758)  # an exchange's CPU is its consumer side's own
+    assert nodes[0].self_cpu_ms == 217
+    assert (nodes[4].self_cpu_ms, nodes[6].self_cpu_ms) == (180, 1433)
+    # Every millisecond the operators recorded is counted once.
+    assert sum(node.self_cpu_ms or 0.0 for node in nodes.values()) == 217 + 1233 + 180 + 1433
+    assert nodes[2].self_elapsed_ms == 1237  # unchanged: 1701 less the slowest producer below each exchange (51 + 413)
+
+
+def test_cpu_far_larger_below_an_exchange_does_not_zero_the_operator_above(showplan) -> None:
+    # A Hash Match burned about 1,650 ms per thread above a branch that burned
+    # 1.5 million ms per thread. Subtracting the branch left the join 0 ms.
+    loops = showplan.relop(
+        4, "Nested Loops", "Inner Join", runtime=_timed(showplan, (1_566_000, 1_565_544), (1_559_000, 1_558_536)), attrs='Parallel="1"'
+    )
+    exchange = showplan.relop(
+        3, "Parallelism", "Repartition Streams", loops, runtime=_timed(showplan, (1_567_000, 93), (1_560_000, 102)), attrs='Parallel="1"'
+    )
+    build = showplan.scan(2, "Users", runtime=_timed(showplan, (600, 562), (620, 584)), attrs='Parallel="1"')
+    join = showplan.relop(
+        1,
+        "Hash Match",
+        "Inner Join",
+        build,
+        exchange,
+        wrapper="Hash",
+        runtime=_timed(showplan, (1_569_000, 1640), (1_562_000, 1690)),
+        attrs='Parallel="1"',
+    )
+
+    nodes = _nodes(showplan.plan(join, plan_attrs='DegreeOfParallelism="2"'))
+
+    assert nodes[1].self_cpu_ms == (1640 - 562 - 93) + (1690 - 584 - 102)
+    assert nodes[3].self_cpu_ms == 93 + 102
+    assert nodes[1].thread_self_cpu_ms == (985, 1004)
+
+
+def test_serial_operator_above_a_gather_streams_keeps_its_cpu(showplan) -> None:
+    # The serial Sort burned 300 ms, 72 ms of it inside the Gather Streams on the
+    # same thread. The scan's 9,858 ms ran on the workers. Taking the scan off
+    # the Sort left it 0 ms, and the Gather Streams lost its 72 ms the same way.
+    scan = showplan.scan(2, runtime=_timed(showplan, (4965, 4965), (4893, 4893)), attrs='Parallel="1"')
+    gather = showplan.relop(1, "Parallelism", "Gather Streams", scan, runtime=showplan.runtime((0, 20, 1, 5000, 72)), attrs='Parallel="1"')
+    sort = showplan.relop(0, "Sort", None, gather, runtime=showplan.runtime((0, 20, 1, 5300, 300)))
+
+    nodes = _nodes(showplan.plan(sort, plan_attrs='DegreeOfParallelism="2"'))
+
+    assert nodes[0].self_cpu_ms == 228
+    assert nodes[1].self_cpu_ms == 72
+    assert nodes[0].self_elapsed_ms == 335  # unchanged: 5300 less the slowest worker below the exchange
+
+
+def test_row_parent_over_a_batch_operator_over_an_exchange_takes_the_exchange_cpu_off_too(showplan) -> None:
+    # Row-mode CPU is cumulative on its thread, and the exchange's consumer side
+    # runs on that thread: 500 - 100 (batch Hash Match, its own) - 20 (exchange).
+    producer = showplan.scan(4, runtime=_timed(showplan, (900, 5000), (900, 5000)), attrs='Parallel="1"')
+    exchange = showplan.relop(
+        3, "Parallelism", "Repartition Streams", producer, runtime=_timed(showplan, (950, 20), (950, 20)), attrs='Parallel="1"'
+    )
+    hash_match = showplan.relop(
+        2, "Hash Match", "Aggregate", exchange, wrapper="Hash", runtime=_timed(showplan, (100, 100), (100, 100), mode="Batch"), attrs='Parallel="1"'
+    )
+    aggregate = showplan.relop(
+        1, "Stream Aggregate", "Aggregate", hash_match, runtime=_timed(showplan, (1500, 500), (1500, 500)), attrs='Parallel="1"'
+    )
+
+    nodes = _nodes(showplan.plan(aggregate, plan_attrs='DegreeOfParallelism="2"'))
+
+    assert nodes[1].self_cpu_ms == 760
+    assert (nodes[2].self_cpu_ms, nodes[3].self_cpu_ms, nodes[4].self_cpu_ms) == (200, 40, 10_000)
+    assert sum(node.self_cpu_ms or 0.0 for node in nodes.values()) == 1000 + 10_000
+
+
 def test_cursor_statement_plans_are_read_from_each_operation(showplan) -> None:
     # DECLARE CURSOR keeps its plans under CursorPlan/Operation, one per populate
     # or fetch query. Reading only StmtSimple left every cursor unanalysed.
@@ -244,6 +497,143 @@ def test_parallel_operator_run_once_per_worker_is_one_logical_execution(showplan
 
     assert node.logical_executions == 1
     assert check is not None and check.factor == 1  # dividing by 4 threads would invent a 4x overestimate
+
+
+# ActualExecutions is per thread. The cases below are ported from
+# sqlserver-query-plans 1.5.7 (MIT): where threads share an execution the count
+# is the largest per-thread value, and on an inner side the threads add up.
+
+# Per-thread rows of a real DOP 8 plan: a parallel scan feeding a nested loop
+# whose inner side is a seek run once per outer row.
+_OUTER_ROWS = (587, 1017, 561, 455, 438, 672, 1348, 751)  # 5,829
+_INNER_ROWS = (573, 1001, 546, 439, 429, 659, 1336, 735)  # 5,718
+
+
+def _counts(showplan, *threads: tuple[int, float, float]) -> str:
+    """Runtime counters from (thread, rows, executions)."""
+
+    return showplan.runtime(*((thread, rows, executions, 0, 0) for thread, rows, executions in threads))
+
+
+def _each_worker(showplan, rows: float, executions: float, workers: int = 4) -> str:
+    return _counts(showplan, *((thread, rows, executions) for thread in range(1, workers + 1)))
+
+
+def test_parallel_branch_rebound_under_a_serial_loop_counts_each_rebind_once(showplan) -> None:
+    # A serial nested loop re-runs the whole parallel branch per outer row. Three
+    # outer rows: every worker opens the scan three times, and the scan ran three
+    # times, not twelve. Summing made 300 rows read as 25 per execution.
+    scan = showplan.scan(3, est_rows=100, attrs='Parallel="1"', runtime=_each_worker(showplan, 75, 3))
+    gather = showplan.relop(2, "Parallelism", "Gather Streams", scan, est_rows=100, runtime=_counts(showplan, (0, 300, 3)))
+    outer = showplan.relop(1, "Constant Scan", None, est_rows=3, runtime=_counts(showplan, (0, 3, 1)))
+    loops = showplan.relop(0, "Nested Loops", "Inner Join", outer, gather, est_rows=300, runtime=_counts(showplan, (0, 300, 1)))
+
+    node = _nodes(showplan.plan(loops))[3]
+    check = estimate_check(node)
+
+    assert node.logical_executions == 3
+    assert node.actual_executions == 12  # per-thread starts, kept for the counters that are per thread
+    assert check is not None and check.actual_per_execution == 100 and check.factor == 1
+
+
+def test_parallel_inner_side_executions_add_up_across_threads(showplan) -> None:
+    # 5,829 executions spread over eight threads, 5,718 rows back, estimate 1 row
+    # each. The busiest thread's 1,348 alone would invent a 4x underestimate. The
+    # scan and the join above it ran once, shared by the eight threads.
+    scan = showplan.scan(
+        2,
+        "Users",
+        est_rows=27_572,
+        attrs='Parallel="1"',
+        runtime=_counts(showplan, *((thread, rows, 1) for thread, rows in enumerate(_OUTER_ROWS, start=1))),
+    )
+    seek = showplan.scan(
+        3,
+        "Posts",
+        physical="Index Seek",
+        est_rows=1,
+        attrs='Parallel="1"',
+        runtime=_counts(
+            showplan, *((thread, inner, outer) for thread, (outer, inner) in enumerate(zip(_OUTER_ROWS, _INNER_ROWS), start=1))
+        ),
+    )
+    loops = showplan.relop(
+        1,
+        "Nested Loops",
+        "Left Outer Join",
+        scan,
+        seek,
+        est_rows=27_572,
+        attrs='Parallel="1"',
+        runtime=_counts(showplan, *((thread, rows, 1) for thread, rows in enumerate(_OUTER_ROWS, start=1))),
+    )
+    gather = showplan.relop(0, "Parallelism", "Gather Streams", loops, est_rows=27_572, runtime=_counts(showplan, (0, 5_829, 1)))
+
+    nodes = _nodes(showplan.plan(gather, plan_attrs='DegreeOfParallelism="8"'))
+    inner = estimate_check(nodes[3])
+    outer = estimate_check(nodes[2])
+
+    assert nodes[3].logical_executions == 5_829
+    assert inner is not None and round(inner.actual_per_execution, 3) == 0.981
+    assert nodes[2].logical_executions == 1 and nodes[1].logical_executions == 1
+    assert outer is not None and outer.actual_per_execution == 5_829  # 4.7x over, not 37.8x
+
+
+def test_below_an_inner_side_spool_each_thread_runs_its_own_copy(showplan) -> None:
+    # A spool on a parallel inner side is per thread: each of four threads filled
+    # its own from a full scan. Four executions of 1,000 rows, as estimated, not
+    # one execution of 4,000.
+    scan = showplan.scan(3, est_rows=1000, attrs='Parallel="1"', runtime=_each_worker(showplan, 1000, 1))
+    spool = showplan.relop(
+        2, "Table Spool", "Lazy Spool", scan, wrapper="Spool", est_rows=1000, attrs='Parallel="1"',
+        runtime=_each_worker(showplan, 5000, 5),
+    )
+    outer = showplan.scan(1, "Users", est_rows=20, attrs='Parallel="1"', runtime=_each_worker(showplan, 5, 1))
+    loops = showplan.relop(
+        0, "Nested Loops", "Inner Join", outer, spool, est_rows=20_000, attrs='Parallel="1"',
+        runtime=_each_worker(showplan, 5000, 1),
+    )
+
+    nodes = _nodes(showplan.plan(loops, plan_attrs='DegreeOfParallelism="4"'))
+    checks = {node_id: estimate_check(nodes[node_id]) for node_id in (0, 2, 3)}
+
+    assert nodes[3].logical_executions == 4 and nodes[2].logical_executions == 20 and nodes[0].logical_executions == 1
+    assert all(check is not None and check.factor == 1 for check in checks.values())
+
+
+def test_an_exchange_ends_the_inner_side(showplan) -> None:
+    # Below an exchange a new set of threads shares each execution again, even
+    # when that exchange sits on a nested loop's inner side.
+    scan = showplan.scan(3, est_rows=100, attrs='Parallel="1"', runtime=_each_worker(showplan, 25, 1))
+    gather = showplan.relop(2, "Parallelism", "Gather Streams", scan, est_rows=100, runtime=_counts(showplan, (0, 100, 1)))
+    outer = showplan.relop(1, "Constant Scan", None, est_rows=1, runtime=_counts(showplan, (0, 1, 1)))
+    loops = showplan.relop(0, "Nested Loops", "Inner Join", outer, gather, est_rows=100, runtime=_counts(showplan, (0, 100, 1)))
+
+    assert _nodes(showplan.plan(loops))[3].logical_executions == 1
+
+
+def test_adaptive_join_third_input_is_an_inner_side(showplan) -> None:
+    # Adaptive Join inputs: build, hash probe, nested-loops inner. It ran as a
+    # nested loop: each thread ran the seek once for its one build row.
+    build = showplan.scan(1, "Badges", est_rows=4, attrs='Parallel="1"', runtime=_each_worker(showplan, 1, 1))
+    probe = showplan.scan(2, "Users", est_rows=4000, attrs='Parallel="1"', runtime=_each_worker(showplan, 0, 0))
+    seek = showplan.scan(
+        3, "Users", physical="Index Seek", est_rows=1, attrs='Parallel="1"', runtime=_each_worker(showplan, 1, 1)
+    )
+    join = showplan.relop(
+        0, "Adaptive Join", "Inner Join", build, probe, seek, est_rows=4, attrs='Parallel="1"',
+        runtime=_each_worker(showplan, 1, 1),
+    )
+
+    nodes = _nodes(showplan.plan(join, plan_attrs='DegreeOfParallelism="4"'))
+    inner = estimate_check(nodes[3])
+    shared = estimate_check(nodes[1])
+
+    assert nodes[3].logical_executions == 4
+    assert inner is not None and inner.actual_per_execution == 1 and inner.factor == 1
+    assert nodes[1].logical_executions == 1
+    assert shared is not None and shared.actual_per_execution == 4 and shared.factor == 1
+    assert estimate_check(nodes[2]) is None  # the hash probe never ran: its zero rows say nothing
 
 
 def test_exchange_operators_are_not_estimate_checked(showplan) -> None:

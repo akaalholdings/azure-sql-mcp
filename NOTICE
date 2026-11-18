@@ -5,22 +5,34 @@ This product includes plan-reading logic adapted from the sqlserver-query-plans
 plugin by Erik Darling (https://github.com/erikdarlingdata/claude-plugins):
 self-time attribution across row mode, batch mode, exchanges and threads
 (including self CPU summed across threads, from version 1.5.6),
-per-execution estimate checks, fixed-guess estimate fingerprints, the runtime
+per-execution estimate checks, executions of a parallel operator counted as a
+whole (from version 1.5.7), fixed-guess estimate fingerprints, the runtime
 row-goal result read from ActualEndOfScans (from version 1.5.5), and handling
 of untrusted plan text. See src/azure_sql_mcp/plan_tree.py and
-src/azure_sql_mcp/plan_digest.py. Tests for those two versions are ported in
+src/azure_sql_mcp/plan_digest.py. Tests for those three versions are ported in
 tests/unit/test_plan_tree.py and tests/unit/test_plan_digest.py.
 
 Cursor-statement coverage and the leading-wildcard LIKE check close gaps that
 were found by comparison with PerformanceMonitor by Erik Darling and Darling
 Data, LLC (https://github.com/erikdarlingdata/PerformanceMonitor, MIT
-License). No PerformanceMonitor code is included.
+License). The rule that takes the slowest producer thread below an exchange
+off every thread above it (src/azure_sql_mcp/plan_tree.py), and its test cases
+(tests/unit/test_plan_tree.py), are adapted from PerformanceMonitor 3.13.0
+(pull request 7986). No other PerformanceMonitor code is included.
 
-The sqlserver-query-plans work is licensed as follows:
+The per-thread counter values in two self-CPU tests
+(tests/unit/test_plan_tree.py) were read from execution plans in the public
+test folder of PerformanceStudio by Erik Darling and Darling Data, LLC
+(https://github.com/erikdarlingdata/PerformanceStudio, MIT License). No plan
+file and no PerformanceStudio code is included.
+
+The sqlserver-query-plans, PerformanceMonitor and PerformanceStudio work is
+licensed as follows:
 
 MIT License
 
 Copyright (c) 2026 Erik Darling
+Copyright (c) 2026 Erik Darling, Darling Data LLC
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

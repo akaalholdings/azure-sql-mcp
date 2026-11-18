@@ -18,9 +18,6 @@ from typing import Any
 from .plan_tree import ParsedPlan
 from .plan_tree import PlanNode
 from .plan_tree import PlanParseError
-from .plan_tree import _batch_threads
-from .plan_tree import _child_threads
-from .plan_tree import _per_thread_self
 from .plan_tree import ce_guess_fraction
 from .plan_tree import clean_text
 from .plan_tree import cross_join_check
@@ -471,7 +468,6 @@ def _top_by_time(
     nodes: list[PlanNode], elapsed: float | None, top_n: int, cited: list[PlanNode]
 ) -> list[dict[str, Any]]:
     timed = sorted((node for node in nodes if (node.self_elapsed_ms or 0.0) > 0), key=lambda node: -(node.self_elapsed_ms or 0.0))
-    per_thread = _per_thread_self_times(nodes)
     rows: list[dict[str, Any]] = []
     for node in timed[:top_n]:
         cited.append(node)
@@ -482,7 +478,10 @@ def _top_by_time(
         # worked ran nearly as long (else the time would be about the same without
         # the stall). An average hides a skewed operator whose one busy thread did
         # all the work; a short busy side thread must not hide a stall either.
-        elapsed_by_thread, cpu_by_thread = per_thread.get(node, ([own], [node.self_cpu_ms or 0.0]))
+        # Each thread's own time comes from plan_tree, so the wait on an exchange
+        # below the operator is already off it.
+        elapsed_by_thread = node.thread_self_elapsed_ms or (own,)
+        cpu_by_thread = node.thread_self_cpu_ms or (node.self_cpu_ms or 0.0,)
         slowest = max(range(len(elapsed_by_thread)), key=elapsed_by_thread.__getitem__)
         slowest_elapsed = elapsed_by_thread[slowest]
         waited = cpu_by_thread[slowest] < slowest_elapsed * WAITED_CPU_RATIO and not any(
@@ -503,7 +502,8 @@ def _top_by_time(
             "self_cpu_ms": round(node.self_cpu_ms or 0.0, 1) if has_cpu else None,
             "elapsed_share": round(min(1.0, own / elapsed), 4) if elapsed else None,
             "rows": node.actual_rows,
-            "executions": node.actual_executions,
+            # Of the operator as a whole: the threads of a parallel scan share one execution.
+            "executions": node.logical_executions,
         }
         rows_read = node.actual_rows_read
         if rows_read and rows_read >= ROWS_READ_NOTE_RATIO * max(node.actual_rows, 1.0):
@@ -523,35 +523,6 @@ def _top_by_time(
     return rows
 
 
-def _per_thread_self_times(nodes: list[PlanNode]) -> dict[PlanNode, tuple[list[float], list[float]]]:
-    """(self elapsed, self CPU) of each worker thread of a parallel operator.
-
-    Row mode is rebuilt with plan_tree's own attribution, which keeps only the
-    totals; batch mode counters are already self times.
-    """
-
-    by_key: dict[str, dict[PlanNode, dict[int, float]]] = {}
-    for key in ("elapsed", "cpu"):
-        by_thread: dict[PlanNode, dict[int, float]] = {}
-        batch_by_thread: dict[PlanNode, dict[int, float]] = {}
-        for node in reversed(nodes):
-            batch_by_thread[node] = _batch_threads(node, key, by_thread, batch_by_thread)
-            by_thread[node] = _child_threads(node, key, by_thread, batch_by_thread)
-        by_key[key] = by_thread
-    found: dict[PlanNode, tuple[list[float], list[float]]] = {}
-    for node in nodes:
-        if len(node.threads) <= 1:
-            continue
-        if node.mode == "Batch":
-            found[node] = (
-                [counter.elapsed_ms or 0.0 for counter in node.work_threads],
-                [counter.cpu_ms or 0.0 for counter in node.work_threads],
-            )
-        else:
-            found[node] = (_per_thread_self(node, "elapsed", by_key["elapsed"]), _per_thread_self(node, "cpu", by_key["cpu"]))
-    return found
-
-
 def _row_goal_runtime(node: PlanNode) -> str | None:
     """What a row goal did at runtime; None when the plan does not record it.
 
@@ -561,14 +532,21 @@ def _row_goal_runtime(node: PlanNode) -> str | None:
     """
 
     end_of_scans = node.actual_end_of_scans
-    executions = node.actual_executions
-    if end_of_scans is None or executions <= 0:
+    # ActualEndOfScans is per thread, so compare it with the per-thread total.
+    opened = node.actual_executions
+    if end_of_scans is None or opened <= 0:
         return None
-    if end_of_scans >= executions:
+    if end_of_scans >= opened:
         return "it did not stop early, every execution read to the end"
-    if executions == 1:
+    if opened == 1:
         return "it stopped early"
-    return f"{executions - end_of_scans:,.0f} of {executions:,.0f} executions stopped early"
+    stopped = opened - end_of_scans
+    executions = node.logical_executions
+    if executions != opened:
+        # Threads shared the executions: name what was counted.
+        unit = "threads" if executions == 1 else "per-thread executions"
+        return f"it stopped early on {stopped:,.0f} of {opened:,.0f} {unit}"
+    return f"{stopped:,.0f} of {opened:,.0f} executions stopped early"
 
 
 def _top_by_cost(nodes: list[PlanNode], cost: float, top_n: int, cited: list[PlanNode]) -> list[dict[str, Any]]:
@@ -829,7 +807,7 @@ def _spools(nodes: list[PlanNode], runtime: bool, cited: list[PlanNode]) -> list
             "estimated_executions": node.estimated_executions,
         }
         if runtime and node.has_runtime:
-            item["executions"] = node.actual_executions
+            item["executions"] = node.logical_executions
             item["self_elapsed_ms"] = round(node.self_elapsed_ms, 1) if node.self_elapsed_ms is not None else None
         found.append(_compact(item))
     return found
@@ -1015,10 +993,13 @@ def _node_detail(index: int, node: PlanNode) -> dict[str, Any]:
         "untrusted_text": UNTRUSTED_TEXT,
     }
     if node.has_runtime:
+        executions = node.logical_executions
         detail["actuals"] = _compact(
             {
-                "executions": node.actual_executions,
-                "logical_executions": node.logical_executions,
+                # Of the operator as a whole. thread_executions is the per-thread
+                # total, shown when the threads shared executions.
+                "executions": executions,
+                "thread_executions": node.actual_executions if node.actual_executions != executions else None,
                 "rows": node.actual_rows,
                 "rows_per_execution": round(check.actual_per_execution, 3) if check else None,
                 "estimate_factor": round(check.factor, 1) if check else None,
@@ -1034,7 +1015,11 @@ def _node_detail(index: int, node: PlanNode) -> dict[str, Any]:
                 "self_cpu_ms": round(node.self_cpu_ms, 1) if timed and node.self_cpu_ms is not None else None,
                 "cumulative_elapsed_ms": node.elapsed_ms if timed else None,
                 "cumulative_cpu_ms": node.cpu_ms if timed else None,
-                "note": "Row mode times are cumulative (they include children); self times subtract them per thread.",
+                "note": (
+                    "Row mode times are cumulative (they include children); self times subtract them per thread. "
+                    "end_of_scans, rebinds and rewinds are per-thread totals: compare them with thread_executions "
+                    "when it is shown."
+                ),
             }
         )
         detail["threads"] = [

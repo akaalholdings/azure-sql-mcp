@@ -226,6 +226,37 @@ def test_top_above_a_scan_on_the_inner_side_of_a_loop_is_named(showplan) -> None
     assert "dbo.Orders" in finding["fix"] and "CustomerID" in finding["fix"]
 
 
+def _top_over_scan_in_a_parallel_branch(showplan, *, rebinds: int, workers: int = 4) -> str:
+    """A serial loop that re-runs a whole parallel branch (Gather Streams, Top, scan) per outer row."""
+
+    def each_worker(rows: int, extra: str = "") -> str:
+        counters = "".join(
+            f'<RunTimeCountersPerThread Thread="{thread}" ActualRows="{rows}" ActualExecutions="{rebinds}" '
+            f'ActualExecutionMode="Row" ActualElapsedms="7000" ActualCPUms="7000" {extra}/>'
+            for thread in range(1, workers + 1)
+        )
+        return f"<RunTimeInformation>{counters}</RunTimeInformation>"
+
+    body = _predicate(_compare(showplan, "Orders", "CustomerID", "Customers.CustomerID"))
+    scan = showplan.scan(4, "Orders", est_rows=1, cost=0.6, body=body, runtime=each_worker(rebinds, 'ActualRowsRead="10000000"'), attrs='Parallel="1"')
+    top = showplan.relop(3, "Top", None, scan, cost=0.61, runtime=each_worker(rebinds), attrs='Parallel="1"')
+    gather = showplan.relop(2, "Parallelism", "Gather Streams", top, cost=0.62, runtime=_run(rebinds, executions=rebinds, elapsed=7100))
+    outer = showplan.scan(1, "Customers", cost=0.3, runtime=_run(rebinds, elapsed=50))
+    loop = showplan.relop(0, "Nested Loops", "Left Outer Join", outer, gather, wrapper="NestedLoops", cost=1.0, runtime=_run(rebinds, elapsed=7200))
+    return showplan.plan(loop, plan_attrs='DegreeOfParallelism="4"', plan_children='<QueryTimeStats ElapsedTime="7200" CpuTime="28000" />')
+
+
+def test_top_above_a_scan_in_a_parallel_branch_counts_runs_not_threads(showplan) -> None:
+    # 30 outer rows re-ran the branch 30 times. Its four threads each opened the
+    # Top 30 times, which read as 120 runs and crossed the floor of 100.
+    assert "top_above_scan" not in _rules(_top_over_scan_in_a_parallel_branch(showplan, rebinds=30))
+
+    finding = _rules(_top_over_scan_in_a_parallel_branch(showplan, rebinds=300))["top_above_scan"]
+
+    assert finding["evidence"]["executions"] == 300
+    assert "300 times" in finding["message"]
+
+
 def test_top_above_a_scan_run_once_is_not_reported(showplan) -> None:
     assert "top_above_scan" not in _rules(_top_over_scan(showplan, executions=1, inner=False))
 

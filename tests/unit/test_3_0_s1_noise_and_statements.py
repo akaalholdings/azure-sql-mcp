@@ -216,6 +216,51 @@ def test_summary_ratio_of_an_inner_seek_is_per_execution(showplan) -> None:
     assert seek["actual_rows_ratio"] == 1.0
 
 
+def _summary_rows_per_execution(plan: str, node_id: int) -> float:
+    service = PlansService(executor=None, validator=SafeSqlValidator())  # type: ignore[arg-type]
+    operators = service.summarize_showplan_xml(plan)["operators"]
+    return next(item for item in operators if item["node_id"] == node_id)["actual_rows_per_execution"]
+
+
+def test_summary_ratio_follows_the_same_execution_rule_as_the_plan_tree(showplan) -> None:
+    # sqlserver-query-plans 1.5.7 (MIT). ActualExecutions is per thread.
+    rt = showplan.runtime
+
+    def each_worker(rows: int, executions: int) -> str:
+        return rt(*((thread, rows, executions, 0, 0) for thread in range(1, 5)))
+
+    # A serial loop rebinds the whole parallel branch three times: three executions, not twelve.
+    rebound = showplan.plan(
+        showplan.relop(
+            0, "Nested Loops", "Inner Join",
+            showplan.relop(1, "Constant Scan", None, est_rows=3, runtime=rt((0, 3, 1, 0, 0))),
+            showplan.relop(
+                2, "Parallelism", "Gather Streams",
+                showplan.scan(3, est_rows=100, attrs='Parallel="1"', runtime=each_worker(75, 3)),
+                est_rows=100, runtime=rt((0, 300, 3, 0, 0)),
+            ),
+            est_rows=300, runtime=rt((0, 300, 1, 0, 0)),
+        )
+    )
+    # On a parallel inner side each thread fills its own spool: four executions of 1,000 rows.
+    inner_side = showplan.plan(
+        showplan.relop(
+            0, "Nested Loops", "Inner Join",
+            showplan.scan(1, "Users", est_rows=20, attrs='Parallel="1"', runtime=each_worker(5, 1)),
+            showplan.relop(
+                2, "Table Spool", "Lazy Spool",
+                showplan.scan(3, est_rows=1000, attrs='Parallel="1"', runtime=each_worker(1000, 1)),
+                wrapper="Spool", est_rows=1000, attrs='Parallel="1"', runtime=each_worker(5000, 5),
+            ),
+            est_rows=20_000, attrs='Parallel="1"', runtime=each_worker(5000, 1),
+        )
+    )
+
+    assert _summary_rows_per_execution(rebound, 3) == 100
+    assert _summary_rows_per_execution(inner_side, 3) == 1000
+    assert _summary_rows_per_execution(inner_side, 0) == 20_000
+
+
 # --- IF and WHILE condition plans -----------------------------------------------------------------
 
 

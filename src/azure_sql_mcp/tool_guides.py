@@ -540,6 +540,12 @@ Read:
 - Compare rows per execution at the same operator (cardinality_skew). An
   estimate is per execution; an actual count is a total over executions and
   threads. A wrong execution count belongs to the outer input of the loop.
+- Runtime counters are per thread, and the thread numbers above and below
+  an exchange are different workers. The digest allows for it: executions
+  count the operator as a whole (a DOP 8 scan that ran once shows 1), and no
+  time or CPU is paired by thread number across an exchange.
+- An operator above an exchange with elapsed time far above its CPU waited on
+  the branch below or on the exchange. Read that branch and its warnings.
 - Separate seek predicates from residual predicates, and one useful lookup
   from millions of repeated lookups.
 - Read what the engine recorded: warnings, spills, memory grant requested,

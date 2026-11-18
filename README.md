@@ -420,7 +420,11 @@ Self time follows the rules in Erik Darling's
 [`sqlserver-query-plans`](https://github.com/erikdarlingdata/claude-plugins)
 plugin: row mode reports cumulative time, batch mode reports each operator on
 its own, exchanges and the coordinator thread are excluded, and parallel
-operators are subtracted per thread. See [NOTICE](NOTICE).
+operators are subtracted per thread. Thread numbers are not paired across an
+exchange: the slowest producer thread below it comes off the elapsed time of
+every thread above it, and no CPU from below it comes off anything above it.
+Execution counts are of the operator as a whole, not a sum over its threads.
+See [NOTICE](NOTICE).
 
 ## Iterative optimizer workflow
 
