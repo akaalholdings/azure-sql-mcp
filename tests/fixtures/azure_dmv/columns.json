@@ -1366,6 +1366,29 @@
         "basic_s0_s1_pool": "##MS_ServerStateReader##",
         "note": "Read as tempdb.sys.dm_db_file_space_usage for tempdb space."
       }
+    },
+    "sys.dm_tran_session_transactions": {
+      "doc_page": "sql/relational-databases/system-dynamic-management-objects/sys-dm-tran-session-transactions-transact-sql",
+      "retrieved_utc": "2026-11-18",
+      "kind": "view",
+      "columns": [
+        "session_id",
+        "transaction_id",
+        "transaction_descriptor",
+        "enlist_count",
+        "is_user_transaction",
+        "is_local",
+        "is_enlisted",
+        "is_bound",
+        "open_transaction_count"
+      ],
+      "excluded": {
+        "pdw_node_id": "Azure Synapse Analytics only"
+      },
+      "permission": {
+        "default": "VIEW DATABASE STATE",
+        "basic_s0_s1_pool": "##MS_ServerStateReader##"
+      }
     }
   }
 }

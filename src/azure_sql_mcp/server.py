@@ -258,6 +258,9 @@ from .showplan_access import parse_plan_access
 from .server_instructions import SERVER_INSTRUCTIONS
 from .schema_compare import SchemaCompareService
 from .sessions import SessionsService
+from .sessions import kill_target_fingerprint
+from .sessions import kill_target_refusal
+from .sessions import kill_target_unchanged
 from .tempdb_memory import TempdbMemoryService
 from .time_windows import AS_OF_DESCRIPTION
 from .time_windows import iso_z
@@ -7017,8 +7020,11 @@ class AzureSqlMcpApplication:
 
             @self.mcp.tool(
                 description=(
-                    "Terminate a user session (SPID). Use to resolve blocking chains "
-                    "or kill runaway queries. Cannot kill system sessions."
+                    "Terminate a user session (SPID) of the selected database. Use to "
+                    "resolve blocking chains or kill runaway queries. Run with "
+                    "dry_run=true first: it returns session_fingerprint, which the "
+                    "apply needs. Refused for a system session, a session in another "
+                    "database, and a session that is no longer the one the dry run saw."
                 ),
                 annotations=ToolAnnotations(
                     title="Kill Session",
@@ -7041,11 +7047,19 @@ class AzureSqlMcpApplication:
                     default=None,
                     description="Optional database name.",
                 ),
+                session_fingerprint: str | None = Field(
+                    default=None,
+                    max_length=64,
+                    description=(
+                        "The session_fingerprint that the dry run returned. Required "
+                        "when dry_run is false."
+                    ),
+                ),
             ) -> ResponseType:
                 return await self._run_tool(
                     "kill_session",
                     database_name,
-                    lambda db: self._kill_session(db, session_id, dry_run),
+                    lambda db: self._kill_session(db, session_id, dry_run, session_fingerprint),
                 )
 
         @self.mcp.tool(
@@ -15813,27 +15827,78 @@ class AzureSqlMcpApplication:
         database_name: str,
         session_id: int,
         dry_run: bool = True,
+        session_fingerprint: str | None = None,
     ) -> dict[str, Any]:
-        if session_id <= 50:
-            raise ValueError(
-                f"Cannot kill session {session_id}: system sessions (SPID <= 50) are protected."
-            )
+        """End one user session of the selected database, after a dry run that saw the same session.
+
+        The dry run reads the session and returns its fingerprint. The apply reads
+        it again and is refused unless the session is still on the same work: the
+        same request, or the same open user transaction (kill_target_unchanged).
+        The read and the KILL are two round trips, so a change in the
+        milliseconds between them is not caught.
+        """
+
+        if session_id <= 0:
+            raise ValueError(f"session_id must be a positive integer; got {session_id}.")
         # KILL cannot be parameterized — use string formatting with validated int
-        sql = f"KILL {int(session_id)}"
-        payload = await self.admin_policy.execute(
-            AdminAction(
-                tool_name="kill_session",
-                database_name=database_name,
-                action_type="session",
-                sql=sql,
-                trusted_generated=True,
-            ),
-            self.executor,
-            dry_run=dry_run,
+        action = AdminAction(
+            tool_name="kill_session",
+            database_name=database_name,
+            action_type="session",
+            sql=f"KILL {int(session_id)}",
+            trusted_generated=True,
         )
+
+        def refuse(code: str, message: str) -> NoReturn:
+            self.admin_policy.audit.record(action, outcome="blocked", error=f"{code}: {message}")
+            self._raise_tool_error(code, message)
+
+        target = await self.sessions.read_kill_target(database_name, session_id)
+        # The row must be the session that the KILL names, or the checks judge another one.
+        if target is None or target.get("session_id") != session_id:
+            refuse(
+                "session_not_found",
+                f"Session {session_id} does not exist, or it is not visible from this database.",
+            )
+        refusal = kill_target_refusal(target)
+        if refusal is not None:
+            refuse(*refusal)
+        fingerprint = kill_target_fingerprint(target)
+        if not dry_run:
+            if not (session_fingerprint or "").strip():
+                refuse(
+                    "dry_run_required",
+                    "Run kill_session with dry_run=true first and pass its session_fingerprint.",
+                )
+            if not kill_target_unchanged(target, session_fingerprint):
+                refuse(
+                    "session_changed",
+                    f"Session {session_id} is not the session the dry run saw: it logged out, moved to "
+                    "other work or changed database. Nothing was ended. Run the dry run again.",
+                )
+        payload = await self.admin_policy.execute(action, self.executor, dry_run=dry_run)
         payload.update({
             "session_id": session_id,
-            "note": "Session termination initiated. Rollback of active transactions may take time.",
+            "session": {
+                name: target.get(name)
+                for name in (
+                    "login_name",
+                    "host_name",
+                    "program_name",
+                    "session_status",
+                    "open_transaction_count",
+                    "login_time",
+                    "last_request_start_time",
+                )
+            },
+            "session_fingerprint": fingerprint,
+            "note": (
+                "Nothing was ended. To end this session, call again with dry_run=false and this "
+                "session_fingerprint. The call is refused when the session has logged out, moved to "
+                "other work or changed database since this dry run."
+                if payload["status"] == "dry_run"
+                else "Session termination initiated. Rollback of active transactions may take time."
+            ),
         })
         if payload["status"] == "completed":
             payload["status"] = "kill_issued"

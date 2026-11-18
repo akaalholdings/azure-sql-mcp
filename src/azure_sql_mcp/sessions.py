@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 from collections import Counter
+from collections.abc import Mapping
 from typing import Any
 
 from .azure_tier import gated_read_unavailable
@@ -23,6 +25,17 @@ MAX_CHAIN_RESOURCES = 5
 REQUESTS_DMV = "sys.dm_exec_requests"
 TASK_SPACE_DMV = "sys.dm_db_task_space_usage"
 
+# Negative values of sys.dm_exec_requests.blocking_session_id, as Microsoft documents them.
+BLOCKING_CODES = {
+    -2: "The blocking resource is owned by an orphaned distributed transaction.",
+    -3: "The blocking resource is owned by a deferred recovery transaction.",
+    -4: "The latch owner could not be determined at this time (internal latch state transitions).",
+    -5: (
+        "The latch owner is not tracked for this latch type (for example an SH latch). "
+        "The request waits on an asynchronous action; this is common and not a performance problem by itself."
+    ),
+}
+
 # Net tempdb pages each running request holds now. The session-level view counts
 # a task only after it ends, so a running sort or spill shows here alone.
 TASK_SPACE_SQL = """
@@ -41,6 +54,35 @@ FROM sys.dm_db_task_space_usage AS tsu
 WHERE tsu.session_id <> @@SPID
 GROUP BY tsu.session_id, tsu.request_id
 HAVING SUM(tsu.user_objects_alloc_page_count + tsu.internal_objects_alloc_page_count) > 0
+"""
+
+_NO_OPEN_TRANSACTION = "0" * 16
+
+# What kill_session must know about its target before it ends it. The times
+# are formatted on the server, so a dry run and an apply compare equal text.
+KILL_TARGET_SQL = """
+SELECT
+    s.session_id,
+    s.is_user_process,
+    s.database_id,
+    DB_ID() AS current_database_id,
+    @@SPID AS own_session_id,
+    CONVERT(varchar(33), s.login_time, 126) AS login_time,
+    CONVERT(varchar(33), s.last_request_start_time, 126) AS last_request_start_time,
+    CONVERT(varchar(33), s.last_request_end_time, 126) AS last_request_end_time,
+    (
+        SELECT MIN(st.transaction_id)
+        FROM sys.dm_tran_session_transactions AS st
+        WHERE st.session_id = s.session_id
+          AND st.is_user_transaction = 1
+    ) AS user_transaction_id,
+    s.login_name,
+    s.host_name,
+    s.program_name,
+    s.status AS session_status,
+    s.open_transaction_count
+FROM sys.dm_exec_sessions AS s
+WHERE s.session_id = ?
 """
 
 HEAD_BLOCKERS_SQL = """
@@ -143,6 +185,113 @@ def _number(value: Any) -> float:
         return 0.0
 
 
+def kill_target_refusal(target: Mapping[str, Any]) -> tuple[str, str] | None:
+    """Why this session must not be ended, as (code, message); None when it may be.
+
+    ``target`` is one ``KILL_TARGET_SQL`` row. A system session is known by
+    ``is_user_process``: on Azure SQL Database a session id of 50 or below proves
+    nothing. A session in another database is out of reach, because the caller
+    chose one database and a KILL does not stop at its border.
+    """
+
+    session_id = target.get("session_id")
+    if session_id == target.get("own_session_id"):
+        return ("own_session", f"Session {session_id} is the connection that runs this tool.")
+    if target.get("is_user_process") not in (True, 1):
+        # Fail closed: anything but a real 1 is treated as a system session.
+        return ("system_session", f"Session {session_id} is a system session and is protected.")
+    database_id = target.get("database_id")
+    if database_id is None:
+        return ("session_database_unknown", f"The database of session {session_id} could not be read.")
+    if database_id != target.get("current_database_id"):
+        return (
+            "database_excluded",
+            f"Session {session_id} is in another database (database_id {database_id}). "
+            "Only a session in the selected database can be ended.",
+        )
+    return None
+
+
+def _identity_hash(target: Mapping[str, Any], kind: str, value: Any) -> str:
+    parts = (target.get("session_id"), target.get("login_time"), target.get("database_id"), kind, value)
+    return hashlib.sha256("\x1f".join(str(part) for part in parts).encode("utf-8")).hexdigest()[:16]
+
+
+def kill_target_fingerprint(target: Mapping[str, Any]) -> str:
+    """Identity of a session and of the work it holds; a dry run returns it and the apply needs it.
+
+    Two halves: the request the session last started, and its open user
+    transaction (``_NO_OPEN_TRANSACTION`` when it holds none). Both hold the
+    login time, which differs when a session id is reused, and the database.
+    The request half holds two times: when the last request started, and when
+    a request last ended. The second one moves when the running request ends,
+    so a request that finished on its own is not the same work any more.
+    """
+
+    transaction_id = target.get("user_transaction_id")
+    request = (target.get("last_request_start_time"), target.get("last_request_end_time"))
+    return _identity_hash(target, "request", request) + (
+        _NO_OPEN_TRANSACTION if transaction_id is None else _identity_hash(target, "transaction", transaction_id)
+    )
+
+
+def kill_target_unchanged(target: Mapping[str, Any], fingerprint: str | None) -> bool:
+    """True when the session is still the one, on the same work, that gave ``fingerprint``.
+
+    The work is the same while the session still runs the request it ran then
+    (one long statement, or a procedure whose statements each start a new
+    transaction), or still holds the user transaction it held then (a blocker
+    that is idle, or that keeps running statements inside it). A pooled
+    connection that moved on has a new request, and another transaction or none.
+    """
+
+    seen = (fingerprint or "").strip().lower()
+    now = kill_target_fingerprint(target)
+    if len(seen) != len(now):
+        return False
+    half = len(now) // 2
+    same_request = seen[:half] == now[:half]
+    same_transaction = seen[half:] != _NO_OPEN_TRANSACTION and seen[half:] == now[half:]
+    return same_request or same_transaction
+
+
+def blocking_session(session: dict[str, Any]) -> int | None:
+    """The other session that blocks this request, else None.
+
+    ``blocking_session_id`` is NULL or 0 when nothing blocks. A negative value is a
+    code, not a session (see ``BLOCKING_CODES``). A parallel request can name its
+    own session: its threads wait on each other, and no other session blocks it.
+    """
+
+    blocker = int(_number(session.get("blocking_session_id")))
+    if blocker <= 0 or blocker == session.get("session_id"):
+        return None
+    return blocker
+
+
+def blocked_without_session(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Requests that wait on a blocking code instead of a session, one entry per code.
+
+    They belong to no blocking chain: there is no session to name as the blocker.
+    """
+
+    groups: dict[int, list[dict[str, Any]]] = {}
+    for session in sessions:
+        code = int(_number(session.get("blocking_session_id")))
+        if code < 0:
+            groups.setdefault(code, []).append(session)
+    return [
+        {
+            "blocking_code": code,
+            "meaning": BLOCKING_CODES.get(code, "Not a documented code."),
+            "request_count": len(members),
+            "max_wait_time_ms": int(max(_number(member.get("wait_time_ms")) for member in members)),
+            "session_ids": [member.get("session_id") for member in members[:MAX_IDS_PER_GROUP]],
+        }
+        for code, members in sorted(groups.items(), reverse=True)
+    ]
+
+
 def query_pileups(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Statements that three or more requests run at once, largest group first."""
 
@@ -156,7 +305,7 @@ def query_pileups(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
         {
             "query_hash": query_hash,
             "request_count": len(members),
-            "blocked_request_count": sum(1 for member in members if member.get("blocking_session_id")),
+            "blocked_request_count": sum(1 for member in members if blocking_session(member) is not None),
             "max_elapsed_time_ms": int(max(_number(member.get("elapsed_time_ms")) for member in members)),
             "total_cpu_time_ms": int(sum(_number(member.get("cpu_time_ms")) for member in members)),
             "session_ids": [member.get("session_id") for member in members[:MAX_IDS_PER_GROUP]],
@@ -181,7 +330,7 @@ def load_by_caller(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "host_name": host,
             "login_name": login,
             "request_count": len(members),
-            "blocked_request_count": sum(1 for member in members if member.get("blocking_session_id")),
+            "blocked_request_count": sum(1 for member in members if blocking_session(member) is not None),
             "total_cpu_time_ms": int(sum(_number(member.get("cpu_time_ms")) for member in members)),
             "total_elapsed_time_ms": int(sum(_number(member.get("elapsed_time_ms")) for member in members)),
             "total_granted_memory_mb": round(sum(_number(member.get("granted_memory_mb")) for member in members), 2),
@@ -207,15 +356,18 @@ def blocking_chains(
     Ids and short wait summaries only; the full rows stay in ``sessions``.
     ``head_sessions`` holds the session rows of head blockers with no request,
     and ``resource_names`` the catalog names of blocked resources, when read.
+    Only another session is a blocker (``blocking_session``): a request that
+    waits on a blocking code or on its own session is not a victim, and it can
+    head a chain.
     """
 
-    blocked = {session["session_id"]: session for session in sessions if session.get("blocking_session_id")}
+    blocked = {session["session_id"]: session for session in sessions if blocking_session(session) is not None}
     if not blocked:
         return []
     by_id = {session.get("session_id"): session for session in sessions}
     children: dict[Any, list[dict[str, Any]]] = {}
     for session in blocked.values():
-        children.setdefault(session["blocking_session_id"], []).append(session)
+        children.setdefault(blocking_session(session), []).append(session)
 
     heads: list[tuple[Any, bool]] = [(head, False) for head in sorted(children) if head not in blocked]
     reached: set[Any] = set()
@@ -428,6 +580,7 @@ class SessionsService:
                 "truncated": False,
                 "sessions": [],
                 "blocking_chains": [],
+                "blocked_without_session": [],
                 **blocked,
             }
         truncated = len(sessions) > bounded_limit
@@ -447,7 +600,14 @@ class SessionsService:
             "blocking_chains": blocking_chains(
                 sessions, head_sessions=head_sessions, resource_names=resource_names
             ),
+            "blocked_without_session": blocked_without_session(sessions),
         }
+
+    async def read_kill_target(self, database_name: str, session_id: int) -> dict[str, Any] | None:
+        """The row kill_session judges its target by; None when the session is not visible here."""
+
+        rows = await self.executor.fetch_all(database_name, KILL_TARGET_SQL, params=[int(session_id)])
+        return rows[0] if rows else None
 
     async def _side_reads(
         self,
@@ -467,16 +627,9 @@ class SessionsService:
                 {},
             )
         active_ids = {session.get("session_id") for session in sessions}
-        victims = [session for session in sessions if session.get("blocking_session_id")]
-        idle_heads = sorted(
-            {
-                victim["blocking_session_id"]
-                for victim in victims
-                if isinstance(victim["blocking_session_id"], int)
-                and victim["blocking_session_id"] > 0
-                and victim["blocking_session_id"] not in active_ids
-            }
-        )[:MAX_IDS_PER_GROUP]
+        victims = [session for session in sessions if blocking_session(session) is not None]
+        blockers = {blocker for victim in victims if (blocker := blocking_session(victim)) is not None}
+        idle_heads = sorted(blockers - active_ids)[:MAX_IDS_PER_GROUP]
         parsed = [parse_wait_resource(victim.get("wait_resource")) for victim in victims]
         hobt_ids = sorted({item["hobt_id"] for item in parsed if "hobt_id" in item})[:MAX_RESOLVED_RESOURCES]
         object_ids = sorted({item["object_id"] for item in parsed if "object_id" in item})[:MAX_RESOLVED_RESOURCES]

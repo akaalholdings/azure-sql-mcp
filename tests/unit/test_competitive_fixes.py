@@ -7,6 +7,7 @@ R7: Logging on swallowed exceptions
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -14,6 +15,7 @@ from unittest.mock import MagicMock
 from unittest.mock import patch
 
 import pytest
+from mcp.server.fastmcp.exceptions import ToolError
 
 from azure_sql_mcp.config import AccessMode
 from azure_sql_mcp.config import ToolGroup
@@ -21,6 +23,7 @@ from azure_sql_mcp.config import WritePolicy
 from azure_sql_mcp.connection import AzureSqlExecutor
 from azure_sql_mcp.connection import QueryResult
 from azure_sql_mcp.server import AzureSqlMcpApplication
+from azure_sql_mcp.sessions import kill_target_fingerprint
 
 
 # ---------------------------------------------------------------------------
@@ -28,6 +31,41 @@ from azure_sql_mcp.server import AzureSqlMcpApplication
 # ---------------------------------------------------------------------------
 
 _TEST_AUDIT_DIR: Path | None = None
+
+
+def _kill_target(**values) -> dict:
+    """The row kill_session reads about its target: a head blocker idle in a transaction."""
+    row = {
+        "session_id": 123,
+        "is_user_process": True,
+        "database_id": 5,
+        "current_database_id": 5,
+        "own_session_id": 60,
+        "login_time": "2026-11-18T09:00:00.123",
+        "last_request_start_time": "2026-11-18T09:30:00.457",
+        "last_request_end_time": "2026-11-18T09:30:02.110",
+        "user_transaction_id": 9001,
+        "login_name": "app_user",
+        "host_name": "web-01",
+        "program_name": "OrdersApi",
+        "session_status": "sleeping",
+        "open_transaction_count": 1,
+    }
+    row.update(values)
+    return row
+
+
+def _kill_app(target: dict | None) -> AzureSqlMcpApplication:
+    app = _make_app(access_mode=AccessMode.UNRESTRICTED)
+    app.executor.fetch_all = AsyncMock(return_value=[] if target is None else [target])
+    app.executor.execute_non_query = AsyncMock(return_value=0)
+    return app
+
+
+async def _kill_refusal(app: AzureSqlMcpApplication, *args) -> str:
+    with pytest.raises(ToolError) as refused:
+        await app._kill_session("appdb", *args)
+    return json.loads(str(refused.value))["code"]
 
 
 @pytest.fixture(autouse=True)
@@ -226,21 +264,169 @@ class TestExecutionToolImplementation:
         app.executor.execute_non_query.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_kill_session_issues_kill(self) -> None:
-        app = _make_app(access_mode=AccessMode.UNRESTRICTED)
-        app.executor.execute_non_query = AsyncMock(return_value=0)
+    async def test_kill_session_dry_run_names_the_session_and_ends_nothing(self) -> None:
+        app = _kill_app(_kill_target())
 
-        result = await app._kill_session("appdb", 123, False)
+        result = await app._kill_session("appdb", 123, True)
+
+        assert result["status"] == "dry_run"
+        assert result["session_fingerprint"] == kill_target_fingerprint(_kill_target())
+        assert result["session"]["program_name"] == "OrdersApi"
+        assert result["session"]["open_transaction_count"] == 1
+        app.executor.execute_non_query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_kill_session_issues_kill(self) -> None:
+        app = _kill_app(_kill_target())
+
+        result = await app._kill_session("appdb", 123, False, kill_target_fingerprint(_kill_target()))
 
         sql = app.executor.execute_non_query.call_args[0][1]
         assert sql == "KILL 123"
         assert result["status"] == "kill_issued"
 
     @pytest.mark.asyncio
-    async def test_kill_session_rejects_system_spid(self) -> None:
-        app = _make_app(access_mode=AccessMode.UNRESTRICTED)
-        with pytest.raises(ValueError, match="system sessions"):
-            await app._kill_session("appdb", 10, False)
+    async def test_kill_session_needs_the_fingerprint_of_a_dry_run(self) -> None:
+        app = _kill_app(_kill_target())
+
+        assert await _kill_refusal(app, 123, False) == "dry_run_required"
+        app.executor.execute_non_query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "now",
+        [
+            # The session id was reused by a new login.
+            {"login_time": "2026-11-18T09:40:00.000"},
+            # A pooled connection finished that transaction and holds another one for a new request.
+            {"user_transaction_id": 9002, "last_request_start_time": "2026-11-18T09:41:00.000"},
+            # The transaction ended and the session runs something else.
+            {"user_transaction_id": None, "last_request_start_time": "2026-11-18T09:41:00.000"},
+        ],
+        ids=["id_reused", "other_transaction", "transaction_ended"],
+    )
+    async def test_kill_session_refuses_a_session_that_is_no_longer_the_one_seen(self, now: dict) -> None:
+        seen = kill_target_fingerprint(_kill_target())
+        app = _kill_app(_kill_target(**now))
+
+        assert await _kill_refusal(app, 123, False, seen) == "session_changed"
+        app.executor.execute_non_query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_kill_session_still_ends_a_blocker_that_ran_a_statement_in_the_same_transaction(self) -> None:
+        # A head blocker that keeps working inside one open transaction is the same work.
+        seen = kill_target_fingerprint(_kill_target())
+        app = _kill_app(_kill_target(last_request_start_time="2026-11-18T09:45:00.000"))
+
+        result = await app._kill_session("appdb", 123, False, seen)
+
+        assert result["status"] == "kill_issued"
+
+    @pytest.mark.asyncio
+    async def test_kill_session_still_ends_a_request_whose_statements_each_start_a_transaction(self) -> None:
+        # A runaway procedure is one request. Every statement in it starts a new
+        # transaction, so the transaction alone would refuse every apply.
+        seen = kill_target_fingerprint(_kill_target(session_status="running"))
+        app = _kill_app(_kill_target(session_status="running", user_transaction_id=9050))
+
+        result = await app._kill_session("appdb", 123, False, seen)
+
+        assert result["status"] == "kill_issued"
+
+    @pytest.mark.asyncio
+    async def test_kill_session_with_no_transaction_follows_the_request(self) -> None:
+        # A long SELECT holds no user transaction: it is the same work while the request is the same.
+        seen = kill_target_fingerprint(_kill_target(user_transaction_id=None))
+        same = _kill_app(_kill_target(user_transaction_id=None))
+        moved_on = _kill_app(_kill_target(user_transaction_id=None, last_request_start_time="2026-11-18T09:41:00.000"))
+
+        assert (await same._kill_session("appdb", 123, False, seen))["status"] == "kill_issued"
+        assert await _kill_refusal(moved_on, 123, False, seen) == "session_changed"
+        moved_on.executor.execute_non_query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_kill_session_refuses_a_request_that_ended_after_the_dry_run(self) -> None:
+        # The runaway query finished on its own. The session started nothing new,
+        # so its last request start is unchanged, but there is nothing left to end.
+        running = {"user_transaction_id": None, "session_status": "running", "last_request_end_time": "2026-11-18T09:29:00.000"}
+        seen = kill_target_fingerprint(_kill_target(**running))
+        finished = _kill_app(_kill_target(**{**running, "session_status": "sleeping", "last_request_end_time": "2026-11-18T09:50:00.000"}))
+
+        assert await _kill_refusal(finished, 123, False, seen) == "session_changed"
+        finished.executor.execute_non_query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_kill_session_refusal_is_written_to_the_audit_log(self) -> None:
+        app = _kill_app(_kill_target(is_user_process=False))
+
+        assert await _kill_refusal(app, 123, False, "0" * 32) == "system_session"
+
+        assert _TEST_AUDIT_DIR is not None
+        events = [json.loads(line) for file in sorted(_TEST_AUDIT_DIR.glob("*.jsonl")) for line in file.read_text().splitlines()]
+        (blocked,) = [event for event in events if event.get("outcome") == "blocked"]
+        assert blocked["tool_name"] == "kill_session"
+        assert blocked["error"].startswith("system_session:")
+
+    @pytest.mark.asyncio
+    async def test_kill_session_refuses_a_fingerprint_that_is_not_one(self) -> None:
+        app = _kill_app(_kill_target())
+
+        for value in ("abc", "0" * 32, kill_target_fingerprint(_kill_target())[:8]):
+            assert await _kill_refusal(app, 123, False, value) == "session_changed"
+        app.executor.execute_non_query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_kill_session_treats_an_unreadable_user_flag_as_a_system_session(self) -> None:
+        # Fail closed: only a real 1 marks a user session.
+        for flag in (None, "0", "1", 0):
+            assert await _kill_refusal(_kill_app(_kill_target(is_user_process=flag)), 123, True) == "system_session"
+
+    @pytest.mark.asyncio
+    async def test_kill_session_judges_a_system_session_by_its_flag_not_its_id(self) -> None:
+        # Azure SQL Database gives no meaning to ids up to 50.
+        system = _kill_app(_kill_target(is_user_process=False))
+        assert await _kill_refusal(system, 123, True) == "system_session"
+
+        low_user_id = _kill_app(_kill_target(session_id=12))
+        assert (await low_user_id._kill_session("appdb", 12, True))["status"] == "dry_run"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("now", "code"),
+        [
+            ({"database_id": 7}, "database_excluded"),
+            ({"database_id": None}, "session_database_unknown"),
+            ({"own_session_id": 123}, "own_session"),
+        ],
+    )
+    async def test_kill_session_refuses_a_session_it_must_not_reach(self, now: dict, code: str) -> None:
+        app = _kill_app(_kill_target(**now))
+
+        assert await _kill_refusal(app, 123, True) == code
+        assert await _kill_refusal(app, 123, False, kill_target_fingerprint(_kill_target(**now))) == code
+        app.executor.execute_non_query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_kill_session_refuses_a_session_that_is_not_there(self) -> None:
+        app = _kill_app(None)
+
+        assert await _kill_refusal(app, 123, True) == "session_not_found"
+
+    @pytest.mark.asyncio
+    async def test_kill_session_refuses_when_the_row_read_is_not_the_session_asked_for(self) -> None:
+        # The checks must judge the session that the KILL will name.
+        app = _kill_app(_kill_target(session_id=124))
+
+        assert await _kill_refusal(app, 123, True) == "session_not_found"
+        assert await _kill_refusal(app, 123, False, kill_target_fingerprint(_kill_target(session_id=124))) == "session_not_found"
+        app.executor.execute_non_query.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_kill_session_rejects_an_id_that_is_not_a_session(self) -> None:
+        app = _kill_app(_kill_target())
+        with pytest.raises(ValueError, match="positive"):
+            await app._kill_session("appdb", 0, True)
+        app.executor.fetch_all.assert_not_awaited()
 
 
 # ===========================================================================

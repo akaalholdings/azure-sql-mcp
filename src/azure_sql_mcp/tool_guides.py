@@ -438,6 +438,11 @@ Read:
   are the effect.
 - head_blocker_has_active_request false: the head blocker is idle with an
   open transaction. The application left a transaction open.
+- blocked_without_session: requests whose blocking_session_id is a negative
+  code, not a session. They are in no chain. Code -5 is common and is not a
+  problem by itself; -2 (orphaned distributed transaction) is.
+- A parallel request that names its own session as its blocker is not
+  blocked: its threads wait on each other.
 - Per request: wait type, elapsed time, plan_handle and query_hash. Three or
   more requests with one query_hash are a pile-up on one statement.
 Avoid:

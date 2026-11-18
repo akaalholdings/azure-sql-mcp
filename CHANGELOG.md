@@ -6,6 +6,44 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+### Changed
+
+- `kill_session`: ending a session (`dry_run=false`) now needs the
+  `session_fingerprint` that the dry run returns. The dry run reads the
+  session and returns who it is. The call is refused, with a code, for a
+  system session (`system_session`), a session in another database
+  (`database_excluded`, `session_database_unknown`), the tool's own
+  connection (`own_session`), a session that is not visible
+  (`session_not_found`), an apply with no fingerprint (`dry_run_required`)
+  and a session that is no longer the one the dry run saw
+  (`session_changed`). A refusal is written to the audit log.
+- `get_active_sessions`: new field `blocked_without_session`.
+
+### Fixed
+
+- `kill_session`: a system session was recognised by `session_id <= 50`,
+  which means nothing on Azure SQL Database. It is now `is_user_process`.
+  There was no check that the session is in the selected database, and no
+  check that the session is still the one that was reviewed: a session id is
+  reused after a logout, and a pooled connection moves on to other work.
+  The session is now identified by its login time, its database, the request
+  it last started and the user transaction it holds. The apply goes ahead
+  while the request or the transaction is still the same, so a long procedure
+  and a blocker that keeps working inside one transaction can both be ended.
+  A request that ended on its own after the dry run is refused.
+- Blocking chains: only another session is a blocker. A negative
+  `blocking_session_id` is a code (-2 orphaned distributed transaction, -3
+  deferred recovery, -4 and -5 a latch owner that is not known), and it gave
+  a chain whose head blocker was "session -5", shown as idle in an open
+  transaction. A parallel request that names its own session gave a
+  one-session cycle. Both are now left out of the chains and of
+  `blocked_request_count`; the requests that wait on a code are listed in
+  `blocked_without_session` with the documented meaning of the code.
+- Permission hints: `sys.dm_tran_session_transactions` is now listed as a view
+  that needs `##MS_ServerStateReader##` on Basic, S0, S1 and elastic pool
+  databases, as Microsoft documents it. The documented-column contract used
+  by the tests now covers that view.
+
 ## [3.0.0rc2] - 2026-11-10
 
 Second release candidate. Use it on a non-production copy only.

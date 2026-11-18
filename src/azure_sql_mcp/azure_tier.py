@@ -60,6 +60,7 @@ SERVER_STATE_GATED_DMVS = frozenset(
         "sys.dm_tran_persistent_version_store_stats",
         "sys.dm_tran_active_snapshot_database_transactions",
         "sys.dm_tran_database_transactions",
+        "sys.dm_tran_session_transactions",
         "sys.dm_db_session_space_usage",
         "sys.dm_db_task_space_usage",
         "sys.dm_os_out_of_memory_events",

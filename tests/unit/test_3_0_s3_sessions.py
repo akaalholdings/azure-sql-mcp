@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from azure_sql_mcp.sessions import SessionsService
+from azure_sql_mcp.sessions import blocked_without_session
 from azure_sql_mcp.sessions import blocking_chains
 from azure_sql_mcp.sessions import load_by_caller
 from azure_sql_mcp.sessions import parse_wait_resource
@@ -240,6 +241,85 @@ def test_a_blocking_cycle_still_yields_a_chain() -> None:
     assert chain["total_blocked_count"] == 2
 
 
+def test_a_blocking_code_is_not_a_head_blocker() -> None:
+    # blocking_session_id -5 means the latch owner is not tracked. It is not session -5,
+    # and a chain headed by it read as an idle session holding a transaction open.
+    assert blocking_chains([request(60, -5, wait_type="PAGELATCH_SH")]) == []
+
+
+def test_a_request_that_waits_on_a_code_can_still_head_a_chain() -> None:
+    sessions = [request(60, -4, wait_type="PAGELATCH_EX"), request(61, 60), request(62, 61)]
+
+    (chain,) = blocking_chains(sessions)
+
+    assert chain["head_blocker_session_id"] == 60
+    assert chain["head_blocker_state"] == "running"
+    assert chain["blocked_session_ids"] == [61]
+    assert chain["indirect_blocked_session_ids"] == [62]
+    assert chain["total_blocked_count"] == 2
+    assert "cycle" not in chain
+
+
+def test_a_parallel_request_that_names_its_own_session_is_not_blocked() -> None:
+    # The threads of one parallel query wait on each other. No other session blocks it.
+    assert blocking_chains([request(60, 60, wait_type="CXPACKET")]) == []
+
+    (chain,) = blocking_chains([request(60, 60, wait_type="CXPACKET"), request(61, 60)])
+
+    assert chain["head_blocker_session_id"] == 60
+    assert chain["blocked_session_ids"] == [61]
+    assert chain["total_blocked_count"] == 1
+    assert "cycle" not in chain
+
+
+def test_blocked_counts_leave_out_codes_and_waits_on_the_own_session() -> None:
+    sessions = [
+        request(61, query_hash="0xAAAA"),
+        request(62, 61, query_hash="0xAAAA"),
+        request(63, -5, query_hash="0xAAAA", wait_type="PAGELATCH_SH"),
+        request(64, 64, query_hash="0xAAAA", wait_type="CXPACKET"),
+    ]
+
+    assert query_pileups(sessions)[0]["blocked_request_count"] == 1
+    assert load_by_caller(sessions)[0]["blocked_request_count"] == 1
+
+
+def test_waits_on_a_blocking_code_are_summarised_with_the_documented_meaning() -> None:
+    sessions = [
+        request(60, -5, wait_type="PAGELATCH_SH", wait_time_ms=40),
+        request(61, -2, wait_type="LCK_M_X", wait_time_ms=90_000),
+        request(62, -5, wait_type="PAGELATCH_SH", wait_time_ms=900),
+        request(63, 61),
+        request(64),
+    ]
+
+    orphaned, untracked_latch = blocked_without_session(sessions)
+
+    assert orphaned == {
+        "blocking_code": -2,
+        "meaning": "The blocking resource is owned by an orphaned distributed transaction.",
+        "request_count": 1,
+        "max_wait_time_ms": 90_000,
+        "session_ids": [61],
+    }
+    assert (untracked_latch["blocking_code"], untracked_latch["request_count"]) == (-5, 2)
+    assert untracked_latch["session_ids"] == [60, 62]
+    assert untracked_latch["max_wait_time_ms"] == 900
+    assert "not a performance problem by itself" in untracked_latch["meaning"]
+    assert blocked_without_session([request(64), request(65, 64)]) == []
+
+
+@pytest.mark.asyncio
+async def test_a_blocking_code_starts_no_head_blocker_read() -> None:
+    executor = RoutedExecutor(routes([request(60, -5, wait_type="PAGELATCH_SH", wait_resource="")]))
+
+    result = await SessionsService(executor).get_active_sessions("appdb")  # type: ignore[arg-type]
+
+    assert result["blocking_chains"] == []
+    assert [item["blocking_code"] for item in result["blocked_without_session"]] == [-5]
+    assert not any("AS idle_seconds" in query for query, _ in executor.calls)
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
@@ -366,3 +446,22 @@ async def test_side_reads_are_valid_tsql_on_documented_columns() -> None:
     issued = " ".join(query for _, query, _ in executor.calls)
     for source in ("sys.dm_db_task_space_usage", "AS idle_seconds", "sys.partitions", "sys.objects"):
         assert source in issued
+
+
+# --- kill_session target read ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_kill_target_read_is_valid_tsql_on_documented_columns() -> None:
+    executor = StrictDmvExecutor()
+
+    await SessionsService(executor).read_kill_target("appdb", 77)  # type: ignore[arg-type]
+
+    assert executor.violations == []
+    ((_, query, params),) = executor.calls
+    assert "WHERE s.session_id = ?" in query and tuple(params) == (77,)
+
+
+@pytest.mark.asyncio
+async def test_kill_target_read_returns_none_for_a_session_that_is_not_visible() -> None:
+    assert await SessionsService(RoutedExecutor([])).read_kill_target("appdb", 77) is None  # type: ignore[arg-type]
